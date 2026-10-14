@@ -6,7 +6,9 @@
 //!
 //! With `--world`, a `.cxw` file is decoded on a background thread and streamed
 //! into a `CaelixScene` (see `world.rs`). Every frame: recycle, upload, flush the
-//! scene, then `caelix_renderer_render` traces the scene into the swapchain image.
+//! scene, then `caelix_renderer_render` traces the scene into the swapchain image:
+//! a debug view (`--mode primary`), the path-traced 1 spp image (`--mode pt`) or
+//! the accumulated reference (`--mode ref`).
 
 mod camera;
 mod world;
@@ -48,9 +50,12 @@ const LOG_EVERY_FRAMES: u64 = 120;
 /// Distance range of the depth view.
 const DEPTH_NEAR: f32 = 1.0;
 const DEPTH_FAR: f32 = 8192.0;
-/// Direction toward the sun (normalized by the library) and the sky colour.
-const SUN_DIR: [f32; 3] = [-0.45, 0.8, -0.3];
+/// Primary mode: direction toward the sun of the Lambert term (normalized by the library) and the
+/// sky colour. `--sun` overrides the direction.
+const PRIMARY_SUN_DIR: [f32; 3] = [-0.45, 0.8, -0.3];
 const SKY_COLOR: [f32; 3] = [0.55, 0.7, 0.9];
+/// Lighting modes: default direction toward the sun.
+const LIGHTING_SUN_DIR: [f32; 3] = [0.45, 0.7, 0.55];
 /// An absent render target (image 0): the library does not write it.
 const NO_TARGET: CaelixTargetImage = CaelixTargetImage { image: 0, format: 0, width: 0, height: 0, layout: 0 };
 
@@ -75,6 +80,39 @@ impl View {
             View::Brick => CaelixDebugView_CAELIX_VIEW_BRICK as u32,
             View::Steps => CaelixDebugView_CAELIX_VIEW_STEPS as u32,
         }
+    }
+}
+
+/// Rendering mode (`CaelixRenderMode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Mode {
+    /// Debug views of the primary hit (`--view`).
+    Primary,
+    /// Path-traced lighting, raw 1 sample per pixel.
+    Pt,
+    /// Path-traced lighting accumulated over frames (reference image).
+    Ref,
+}
+
+impl Mode {
+    fn raw(self) -> u32 {
+        match self {
+            Mode::Primary => CaelixRenderMode_CAELIX_MODE_PRIMARY as u32,
+            Mode::Pt => CaelixRenderMode_CAELIX_MODE_PATH_TRACE as u32,
+            Mode::Ref => CaelixRenderMode_CAELIX_MODE_REFERENCE as u32,
+        }
+    }
+}
+
+/// Parses "x,y,z" into three floats.
+fn parse_vec3(text: &str) -> Result<[f32; 3], String> {
+    let values: Vec<f32> = text
+        .split(',')
+        .map(|v| v.trim().parse::<f32>().map_err(|e| format!("'{v}': {e}")))
+        .collect::<Result<_, _>>()?;
+    match values[..] {
+        [x, y, z] => Ok([x, y, z]),
+        _ => Err(format!("expected 3 comma-separated numbers x,y,z, got {}", values.len())),
     }
 }
 
@@ -129,15 +167,50 @@ struct Args {
     /// Vertical field of view in degrees.
     #[arg(long, value_name = "DEGREES", default_value_t = 60.0)]
     fov: f32,
-    /// What the renderer writes.
+    /// Rendering mode. Default: `pt` with --world, else `primary`.
+    #[arg(long, value_enum)]
+    mode: Option<Mode>,
+    /// Primary mode: the debug view.
     #[arg(long, value_enum, default_value_t = View::Albedo)]
     view: View,
-    /// Albedo without Lambert shading.
+    /// Primary mode: albedo without Lambert shading.
     #[arg(long)]
     no_shading: bool,
+    /// Lighting modes: stochastic bounces after the primary hit (0..14).
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    bounces: u32,
+    /// Lighting modes: colour multiplier before the sRGB encode.
+    #[arg(long, value_name = "F", default_value_t = 1.0)]
+    exposure: f32,
+    /// Direction toward the sun (normalized by the library). Default: 0.45,0.7,0.55 in the
+    /// lighting modes; in the primary mode the Lambert direction -0.45,0.8,-0.3.
+    #[arg(long, value_name = "X,Y,Z", value_parser = parse_vec3, allow_hyphen_values = true)]
+    sun: Option<[f32; 3]>,
+    /// Lighting modes: linear RGB radiance of the sun disk.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_vec3, default_value = "20,19,18")]
+    sun_radiance: [f32; 3],
+    /// Lighting modes: angular radius of the sun disk in degrees.
+    #[arg(long, value_name = "DEGREES", default_value_t = 0.5)]
+    sun_angular_radius: f32,
+    /// Lighting modes: sky radiance straight up.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_vec3, default_value = "0.2,0.4,0.9")]
+    sky_zenith: [f32; 3],
+    /// Lighting modes: sky radiance at the horizon.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_vec3, default_value = "0.7,0.8,0.95")]
+    sky_horizon: [f32; 3],
+    /// Lighting modes: radiance below the horizon.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_vec3, default_value = "0.25,0.22,0.2")]
+    sky_ground: [f32; 3],
+    /// Lighting modes: the window shows black instead of the sky where the primary ray misses.
+    #[arg(long)]
+    no_sky_on_miss: bool,
+    /// Reference mode: take the --screenshot after N accumulated frames. The accumulation
+    /// restarts whenever the camera changes or the world is not complete yet.
+    #[arg(long, value_name = "N")]
+    accumulate: Option<u64>,
     /// Write a PNG of the window: 3 frames after the world is complete on the GPU
     /// (every brick uploaded, no acceleration structure build pending); without
-    /// --world at frame 10.
+    /// --world at frame 10; with --accumulate after N accumulated frames.
     #[arg(long, value_name = "PATH")]
     screenshot: Option<PathBuf>,
     /// Exit after the screenshot is written.
@@ -205,8 +278,19 @@ struct Timing {
     fps: f64,
 }
 
+/// Reference accumulation as the host sees it.
+struct Accumulation {
+    /// The camera of the previous frame, to detect changes.
+    last_camera: Option<CaelixCamera>,
+    /// Frames accumulated since the last reset, this frame included.
+    frames: u64,
+}
+
 struct App {
     args: Args,
+    /// The resolved `--mode`.
+    mode: Mode,
+    accumulation: Accumulation,
     state: Option<State>,
     camera: Camera,
     input: Input,
@@ -357,6 +441,8 @@ impl App {
                     self.load_mismatch = true;
                 }
             }
+            // The world is complete on the GPU after this frame's flush.
+            let world_ready = state.loader.as_ref().is_none_or(|loader| loader.is_ready());
 
             let targets = CaelixRenderTargets {
                 color: CaelixTargetImage {
@@ -374,16 +460,42 @@ impl App {
             };
             let aspect = frame.width as f32 / frame.height.max(1) as f32;
             let camera = self.camera.to_caelix(aspect, DEPTH_NEAR, DEPTH_FAR);
+            // Reference mode: restart while the camera moves or the scene still changes.
+            let camera_changed = self.accumulation.last_camera.is_none_or(|last| !same_camera(&last, &camera));
+            self.accumulation.last_camera = Some(camera);
+            let reset_accumulation = camera_changed || !world_ready;
+            self.accumulation.frames = if reset_accumulation { 1 } else { self.accumulation.frames + 1 };
+            let lighting = self.mode != Mode::Primary;
+            let mut flags = 0;
+            if self.mode == Mode::Primary && !self.args.no_shading {
+                flags |= CAELIX_RENDER_FLAG_SHADING;
+            }
+            if lighting && !self.args.no_sky_on_miss {
+                flags |= CAELIX_RENDER_FLAG_SKY_ON_MISS;
+            }
+            let default_sun = if lighting { LIGHTING_SUN_DIR } else { PRIMARY_SUN_DIR };
             let options = CaelixRenderOptions {
                 debug_view: self.args.view.raw(),
-                flags: if self.args.no_shading { 0 } else { CAELIX_RENDER_FLAG_SHADING },
-                sun_dir: SUN_DIR,
+                flags,
+                sun_dir: self.args.sun.unwrap_or(default_sun),
                 pad: 0.0,
                 sky_color: SKY_COLOR,
                 pad2: 0.0,
                 // The camera's projection is reverse-Z infinite.
                 miss_depth: 0.0,
                 miss_view_z: 1e30,
+                mode: self.mode.raw(),
+                bounce_count: self.args.bounces,
+                denoise: 0,
+                reset_accumulation: u32::from(reset_accumulation),
+                exposure: self.args.exposure,
+                sun_radiance: self.args.sun_radiance,
+                sun_angular_radius: self.args.sun_angular_radius.to_radians(),
+                sky_zenith: self.args.sky_zenith,
+                sky_horizon: self.args.sky_horizon,
+                sky_ground: self.args.sky_ground,
+                // A new random stream every frame.
+                frame_seed: frame.frame_number as u32,
             };
             // SAFETY: the command buffer is recording after this frame's flush; the image is
             // the acquired one; every struct is valid for the call.
@@ -392,8 +504,19 @@ impl App {
                 bail!("caelix_renderer_render(frame {}) failed: CaelixResult {result}", frame.frame_number);
             }
 
-            // Screenshot: wait for the world (or frame 10), then 3 more frames.
-            if self.args.screenshot.is_some() {
+            // Screenshot: wait for the world (or frame 10), then 3 more frames; with
+            // --accumulate, wait for N accumulated frames of the complete world.
+            if let (Some(n), Screenshot::Waiting) = (self.args.accumulate, self.screenshot) {
+                if self.args.screenshot.is_some() && world_ready && self.accumulation.frames >= n {
+                    state.context.request_readback();
+                    self.screenshot = Screenshot::Requested;
+                    log::info!(
+                        "screenshot requested at frame {} after {} accumulated frames",
+                        frame.frame_number,
+                        self.accumulation.frames
+                    );
+                }
+            } else if self.args.screenshot.is_some() {
                 if self.screenshot == Screenshot::Waiting {
                     let ready = match state.loader.as_ref() {
                         Some(loader) => loader.is_ready(),
@@ -571,17 +694,30 @@ impl ApplicationHandler for App {
     }
 }
 
-/// "Caelix Renderer | trace 1.23 ms | flush 0.45 ms | 144 fps"
+/// "Caelix Renderer | trace 1.23 ms | composite 0.05 ms | flush 0.45 ms | 144 fps"
 fn timing_line(renderer: *const CaelixRenderer, fps: f64) -> String {
-    let mut timings = CaelixGpuTimings { trace_ms: 0.0, flush_ms: 0.0, frame_number: 0 };
+    let mut timings =
+        CaelixGpuTimings { trace_ms: 0.0, flush_ms: 0.0, frame_number: 0, composite_ms: 0.0, pad: 0.0 };
     // SAFETY: the renderer is live and timings is writable.
     unsafe { caelix_renderer_get_gpu_timings(renderer, &mut timings) };
     format!(
-        "Caelix Renderer | trace {:.2} ms | flush {:.2} ms | {:.0} fps",
-        timings.trace_ms, timings.flush_ms, fps
+        "Caelix Renderer | trace {:.2} ms | composite {:.2} ms | flush {:.2} ms | {:.0} fps",
+        timings.trace_ms, timings.composite_ms, timings.flush_ms, fps
     )
 }
 
+/// Whether two cameras give the same image (reference accumulation).
+fn same_camera(a: &CaelixCamera, b: &CaelixCamera) -> bool {
+    a.position == b.position
+        && a.right == b.right
+        && a.up == b.up
+        && a.forward == b.forward
+        && a.tan_half_fov_y == b.tan_half_fov_y
+        && a.aspect == b.aspect
+}
+
+/// Writes an RGBA PNG with alpha forced to 255: in the lighting modes the swapchain alpha is the
+/// coverage (0 on the sky), which image viewers would show as transparent.
 fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> anyhow::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -591,7 +727,11 @@ fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> anyhow::Resul
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().context("PNG header")?;
-    writer.write_image_data(rgba).context("PNG data")?;
+    let mut opaque = rgba.to_vec();
+    for pixel in opaque.as_chunks_mut::<4>().0 {
+        pixel[3] = 255;
+    }
+    writer.write_image_data(&opaque).context("PNG data")?;
     writer.finish().context("PNG finish")?;
     Ok(())
 }
@@ -673,10 +813,26 @@ fn main() -> anyhow::Result<()> {
     // SAFETY: caelix_log is a valid callback for the whole process lifetime.
     unsafe { caelix_set_log_callback(Some(caelix_log), ptr::null_mut()) };
 
+    if args.bounces > CAELIX_MAX_BOUNCES {
+        bail!("--bounces {} is above the maximum {}", args.bounces, CAELIX_MAX_BOUNCES);
+    }
+    let mode = args.mode.unwrap_or(if args.world.is_some() { Mode::Pt } else { Mode::Primary });
+    if args.accumulate.is_some() && mode != Mode::Ref {
+        bail!("--accumulate needs --mode ref");
+    }
+    log::info!(
+        "mode {mode:?}, bounces {}, exposure {}, sky on miss {}",
+        args.bounces,
+        args.exposure,
+        !args.no_sky_on_miss
+    );
+
     let event_loop = EventLoop::new().context("cannot create the event loop")?;
     let fov = args.fov;
     let mut app = App {
         args,
+        mode,
+        accumulation: Accumulation { last_camera: None, frames: 0 },
         state: None,
         camera: Camera::from_pose([0.0; 3], 0.0, 0.0, fov),
         input: Input { keys: HashSet::new(), looking: false, speed: DEFAULT_SPEED },

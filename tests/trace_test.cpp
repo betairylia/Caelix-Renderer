@@ -1,8 +1,10 @@
-// The primary ray trace kernel (caelix_renderer_render): a one-brick scene and
+// The trace and composite kernels (caelix_renderer_render): a one-brick scene and
 // the random opaque scene are rendered into offscreen storage images (the colour
 // target and the optional geometry targets albedo, normal, depth, motion and
-// view_z), which are read back and checked pixel by pixel. Uses the public C ABI
-// only.
+// view_z), which are read back and checked pixel by pixel. The lighting modes are
+// checked against a CPU Monte Carlo estimate (an emissive ceiling over a grey
+// floor), the procedural sky, primary emission and the reference accumulation.
+// Uses the public C ABI only.
 #include "test_scenes.h"
 
 #include <algorithm>
@@ -47,6 +49,8 @@ uint32_t BytesPerPixel(VkFormat format) {
     case VK_FORMAT_R16G16B16A16_SFLOAT:
     case VK_FORMAT_R32G32_SFLOAT:
       return 8;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+      return 16;
     default:
       return 0;  // not a format of this test
   }
@@ -216,10 +220,11 @@ CaelixRenderOptions Options(uint32_t view) {
 
 // One frame: flush, render into the present targets, copy each to a host buffer.
 // Afterwards every present target holds its pixels and is in TRANSFER_SRC_OPTIMAL.
+// Without `readback` the targets are only rendered and stay in GENERAL.
 void Render(Rig& rig, CaelixRenderer* renderer, TargetSet& set, const CaelixCamera& camera,
-            const CaelixRenderOptions& options) {
+            const CaelixRenderOptions& options, bool readback = true) {
   Readback readbacks[kTargetCount];
-  for (int i = 0; i < kTargetCount; ++i) {
+  for (int i = 0; i < kTargetCount && readback; ++i) {
     if (set.t[i] != nullptr) {
       const Target& target = *set.t[i];
       CreateReadback(rig.gpu, static_cast<VkDeviceSize>(target.width) * target.height *
@@ -237,7 +242,7 @@ void Render(Rig& rig, CaelixRenderer* renderer, TargetSet& set, const CaelixCame
     const CaelixRenderTargets targets = ToAbi(set);
     REQUIRE(caelix_renderer_render(renderer, &desc, &targets, &camera, &options) == CAELIX_OK);
 
-    for (int i = 0; i < kTargetCount; ++i) {
+    for (int i = 0; i < kTargetCount && readback; ++i) {
       if (set.t[i] == nullptr) {
         continue;
       }
@@ -264,9 +269,19 @@ void Render(Rig& rig, CaelixRenderer* renderer, TargetSet& set, const CaelixCame
       vkCmdCopyImageToBuffer(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                              readbacks[i].buffer, 1, &region);
     }
-    CopyToHostBarrier(cmd);
+    if (readback) {
+      CopyToHostBarrier(cmd);
+    }
   });
   REQUIRE(caelix_scene_recycle(rig.scene, frame) == CAELIX_OK);
+  if (!readback) {
+    for (int i = 0; i < kTargetCount; ++i) {
+      if (set.t[i] != nullptr) {
+        set.t[i]->layout = VK_IMAGE_LAYOUT_GENERAL;
+      }
+    }
+    return;
+  }
   for (int i = 0; i < kTargetCount; ++i) {
     if (set.t[i] == nullptr) {
       continue;
@@ -676,5 +691,478 @@ TEST_CASE("random opaque scene: hits, no air boundary") {
   REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
   caelix_renderer_destroy(renderer);
   DestroyTarget(rig.gpu, target);
+  CloseRig(rig);
+}
+
+// ---------------------------------------------------------------------------
+// Lighting modes (CAELIX_MODE_PATH_TRACE, CAELIX_MODE_REFERENCE)
+
+namespace {
+
+constexpr float kPi = 3.14159265358979f;
+constexpr float kZenith[3] = {0.2f, 0.4f, 0.9f};
+constexpr float kHorizon[3] = {0.7f, 0.8f, 0.95f};
+constexpr float kGround[3] = {0.25f, 0.22f, 0.2f};
+
+void Set3(float out[3], const float in[3]) {
+  out[0] = in[0];
+  out[1] = in[1];
+  out[2] = in[2];
+}
+
+// Path-traced options: the given mode and bounces, the test sky, no sun radiance,
+// exposure 1.
+CaelixRenderOptions LightOptions(uint32_t mode, uint32_t bounces, uint32_t seed) {
+  CaelixRenderOptions options = Options(CAELIX_VIEW_ALBEDO);
+  options.mode = mode;
+  options.bounce_count = bounces;
+  options.flags = CAELIX_RENDER_FLAG_SKY_ON_MISS;
+  options.exposure = 1.0f;
+  Set3(options.sky_zenith, kZenith);
+  Set3(options.sky_horizon, kHorizon);
+  Set3(options.sky_ground, kGround);
+  options.frame_seed = seed;
+  return options;
+}
+
+// CPU copy of SkyRadiance in shaders/caelix_shading.hlsl, without the sun.
+void SkyRadiance(const float dir[3], float out[3]) {
+  for (int c = 0; c < 3; ++c) {
+    if (dir[1] >= 0.0f) {
+      const float t = std::sqrt(std::min(dir[1], 1.0f));
+      out[c] = kHorizon[c] + (kZenith[c] - kHorizon[c]) * t;
+    } else {
+      const float t = std::sqrt(std::min(-dir[1], 1.0f));
+      out[c] = kHorizon[c] + (kGround[c] - kHorizon[c]) * t;
+    }
+  }
+}
+
+// CPU copy of the primary ray direction (CaelixCamera's pinhole mapping).
+void PrimaryDirection(const CaelixCamera& camera, uint32_t px, uint32_t py, uint32_t width,
+                      uint32_t height, float out[3]) {
+  const float nx = (static_cast<float>(px) + 0.5f) / static_cast<float>(width) * 2.0f - 1.0f;
+  const float ny = 1.0f - (static_cast<float>(py) + 0.5f) / static_cast<float>(height) * 2.0f;
+  float length = 0.0f;
+  for (int c = 0; c < 3; ++c) {
+    out[c] = camera.right[c] * (nx * camera.tan_half_fov_y * camera.aspect) +
+             camera.up[c] * (ny * camera.tan_half_fov_y) + camera.forward[c];
+    length += out[c] * out[c];
+  }
+  length = std::sqrt(length);
+  for (int c = 0; c < 3; ++c) {
+    out[c] /= length;
+  }
+}
+
+float LinearToSrgb(float c) {
+  c = std::clamp(c, 0.0f, 1.0f);
+  return c <= 0.0031308f ? c * 12.92f : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+}
+
+// Mean of channel `c` of an RGBA32F target over the centre `size` x `size` pixels.
+double CentreMean(const Target& target, uint32_t size, uint32_t c) {
+  const uint32_t x0 = (target.width - size) / 2;
+  const uint32_t y0 = (target.height - size) / 2;
+  double sum = 0.0;
+  for (uint32_t y = y0; y < y0 + size; ++y) {
+    for (uint32_t x = x0; x < x0 + size; ++x) {
+      sum += target.F32(x, y, c);
+    }
+  }
+  return sum / (static_cast<double>(size) * size);
+}
+
+// The energy test scene, packed encoding: a grey floor of 64 x 64 x 8 blocks at
+// y in [-8, 0) and an emissive ceiling of 64 x 64 x 8 blocks at y in [24, 32),
+// both over x, z in [0, 64).
+constexpr uint16_t kGreyFloor = 0x8000u | (15u << 10) | (15u << 5) | 15u;          // rgb5 15/31
+constexpr uint16_t kWhiteEmitter = 0x4000u | (15u << 10) | (15u << 6) | (15u << 2);  // rgb4 1, strength 0
+constexpr float kCeilingY = 24.0f;
+constexpr float kRoomSize = 64.0f;
+constexpr float kCameraHeight = 12.0f;
+
+void UploadRoom(Rig& rig) {
+  World world;
+  Brick floor{};
+  floor.fill(kGreyFloor);
+  Brick ceiling{};
+  ceiling.fill(kWhiteEmitter);
+  for (int32_t z = 0; z < 8; ++z) {
+    for (int32_t x = 0; x < 8; ++x) {
+      world.bricks[{x, -1, z}] = floor;
+      world.bricks[{x, 3, z}] = ceiling;
+    }
+  }
+  Upload(rig, world, KeysOf(world));
+  DrainBuilds(rig);
+}
+
+// Camera at (32, 12, 32) looking straight down at the floor, vertical fov 30.
+CaelixCamera LookDown() {
+  CaelixCamera camera{};
+  camera.position[0] = 32.0f;
+  camera.position[1] = kCameraHeight;
+  camera.position[2] = 32.0f;
+  camera.right[0] = 1.0f;
+  camera.up[2] = 1.0f;
+  camera.forward[1] = -1.0f;
+  camera.tan_half_fov_y = std::tan(15.0f * kPi / 180.0f);
+  camera.aspect = 1.0f;
+  camera.near_z = kNear;
+  camera.far_z = kFar;
+  NormalZProjection(camera.projection, camera.tan_half_fov_y, camera.aspect);
+  return camera;
+}
+
+// CPU Monte Carlo estimate of the probability that a cosine-distributed direction
+// from a uniform point of the floor square [32 - h, 32 + h]^2 (y = 0) reaches the
+// bottom face of the ceiling (y = 24, x and z in [0, 64)). With one bounce the GPU
+// estimates albedo * emission * this probability.
+double CeilingHitProbability(double half_extent, uint32_t samples) {
+  std::mt19937_64 rng(42);
+  std::uniform_real_distribution<double> uniform(0.0, 1.0);
+  uint64_t hits = 0;
+  for (uint32_t i = 0; i < samples; ++i) {
+    const double px = 32.0 + (uniform(rng) * 2.0 - 1.0) * half_extent;
+    const double pz = 32.0 + (uniform(rng) * 2.0 - 1.0) * half_extent;
+    const double r1 = uniform(rng);
+    const double phi = 2.0 * 3.14159265358979323846 * uniform(rng);
+    const double s = std::sqrt(r1);
+    const double dx = s * std::cos(phi);
+    const double dz = s * std::sin(phi);
+    const double dy = std::sqrt(std::max(0.0, 1.0 - r1));
+    if (dy <= 0.0) {
+      continue;
+    }
+    const double t = kCeilingY / dy;
+    const double x = px + dx * t;
+    const double z = pz + dz * t;
+    if (x >= 0.0 && x < kRoomSize && z >= 0.0 && z < kRoomSize) {
+      ++hits;
+    }
+  }
+  return static_cast<double>(hits) / samples;
+}
+
+}  // namespace
+
+TEST_CASE("lighting: one bounce from an emissive ceiling matches a CPU Monte Carlo estimate") {
+  Rig rig;
+  OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+  UploadRoom(rig);
+  CaelixRenderer* renderer = nullptr;
+  REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+  Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+  TargetSet set;
+  set.t[kColor] = &color;
+  const CaelixCamera camera = LookDown();
+
+  // Black sky, no sun: the only light is the ceiling, seen by the one bounce.
+  const auto options_for = [](uint32_t mode, uint32_t seed) {
+    CaelixRenderOptions options = LightOptions(mode, 1, seed);
+    options.flags = 0;
+    const float black[3] = {0.0f, 0.0f, 0.0f};
+    Set3(options.sky_zenith, black);
+    Set3(options.sky_horizon, black);
+    Set3(options.sky_ground, black);
+    return options;
+  };
+
+  // The floor point of a pixel edge at ndc n is 32 + n * tan_half_fov_y * 12: the
+  // centre `size` pixels of the 256-pixel image cover a square of half extent
+  // (size / 256) * tan_half_fov_y * 12 around (32, 32).
+  const auto half_extent = [&](uint32_t size) {
+    return static_cast<double>(size) / kSize * camera.tan_half_fov_y * kCameraHeight;
+  };
+  // The composite multiplies by the RGBA8 albedo target: 15/31 quantized to 8 bits.
+  const double decoded_albedo = 15.0 / 31.0;
+  const double albedo = std::round(decoded_albedo * 255.0) / 255.0;
+
+  // 1. Reference mode, 2048 frames with a new seed each.
+  constexpr uint32_t kFrames = 2048;
+  for (uint32_t i = 0; i < kFrames; ++i) {
+    CaelixRenderOptions options = options_for(CAELIX_MODE_REFERENCE, 1000 + i);
+    options.reset_accumulation = i == 0 ? 1u : 0u;
+    Render(rig, renderer, set, camera, options, i + 1 == kFrames);
+  }
+  const double gpu_ref = CentreMean(color, 32, 0);
+  const double probability = CeilingHitProbability(half_extent(32), 200000);
+  const double cpu_ref = albedo * probability;
+  std::printf("energy, reference (%u frames, centre 32x32): GPU %.5f (g %.5f, b %.5f), CPU %.5f "
+              "(hit probability %.5f, albedo %.5f, unquantized albedo %.5f -> %.5f), ratio %.4f\n",
+              kFrames, gpu_ref, CentreMean(color, 32, 1), CentreMean(color, 32, 2), cpu_ref,
+              probability, albedo, decoded_albedo, decoded_albedo * probability, gpu_ref / cpu_ref);
+  CHECK(std::abs(gpu_ref / cpu_ref - 1.0) < 0.03);
+  CHECK(std::abs(CentreMean(color, 32, 1) - gpu_ref) < 1e-6);
+  CHECK(std::abs(CentreMean(color, 32, 2) - gpu_ref) < 1e-6);
+  CHECK(color.F32(kSize / 2, kSize / 2, 3) == 1.0f);  // coverage
+
+  // 2. One raw 1 spp frame. Every pixel is 0 or albedo (one Bernoulli sample), so
+  //    the mean over 32x32 pixels has a standard deviation of about 2.6 percent; the
+  //    5 percent check uses the centre 128x128 pixels (0.65 percent) against a CPU
+  //    estimate of that region.
+  Render(rig, renderer, set, camera, options_for(CAELIX_MODE_PATH_TRACE, 77));
+  const double gpu_raw_32 = CentreMean(color, 32, 0);
+  const double gpu_raw_128 = CentreMean(color, 128, 0);
+  const double cpu_raw_128 = albedo * CeilingHitProbability(half_extent(128), 200000);
+  std::printf("energy, 1 spp: GPU centre 32x32 %.5f (ratio %.4f to the 32x32 CPU estimate), GPU "
+              "centre 128x128 %.5f, CPU %.5f, ratio %.4f\n",
+              gpu_raw_32, gpu_raw_32 / cpu_ref, gpu_raw_128, cpu_raw_128, gpu_raw_128 / cpu_raw_128);
+  CHECK(std::abs(gpu_raw_128 / cpu_raw_128 - 1.0) < 0.05);
+  uint32_t other_values = 0;
+  for (uint32_t y = 64; y < 192; ++y) {
+    for (uint32_t x = 64; x < 192; ++x) {
+      const float v = color.F32(x, y, 0);
+      if (v != 0.0f && std::abs(v - static_cast<float>(albedo)) > 1e-6f) {
+        ++other_values;
+      }
+    }
+  }
+  CHECK(other_values == 0);  // 1 spp, one bounce, emission 1: exactly 0 or albedo
+
+  CaelixGpuTimings timings{};
+  caelix_renderer_get_gpu_timings(renderer, &timings);
+  std::printf("timings: trace %.4f ms, composite %.4f ms\n", timings.trace_ms, timings.composite_ms);
+  CHECK(timings.composite_ms > 0.0f);
+
+  REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+  caelix_renderer_release_target_views(renderer);
+  caelix_renderer_destroy(renderer);
+  DestroyTarget(rig.gpu, color);
+  CloseRig(rig);
+}
+
+TEST_CASE("lighting: modes, sky on miss, primary emission, sRGB output, argument checks") {
+  Rig rig;
+  OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+  UploadRedBrick(rig);
+  CaelixRenderer* renderer = nullptr;
+  REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+  Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+  TargetSet set;
+  set.t[kColor] = &color;
+  const CaelixCamera camera = LookPlusZ(4.0f, 4.0f, -20.0f);
+  constexpr uint32_t cx = kSize / 2;
+  constexpr uint32_t cy = kSize / 2;
+  float corner_dir[3];
+  PrimaryDirection(camera, 0, 0, kSize, kSize, corner_dir);
+  float corner_sky[3];
+  SkyRadiance(corner_dir, corner_sky);
+
+  // 1. No bounce: the centre is the opaque red brick without emission = black,
+  //    alpha 1; the corner is the sky radiance in its direction, alpha 0.
+  CaelixRenderOptions options = LightOptions(CAELIX_MODE_PATH_TRACE, 0, 1);
+  options.sun_radiance[0] = options.sun_radiance[1] = options.sun_radiance[2] = 50.0f;
+  options.sun_dir[0] = 0.0f;  // straight up: not in the corner's direction
+  options.sun_dir[1] = 1.0f;
+  options.sun_dir[2] = 0.0f;
+  Render(rig, renderer, set, camera, options);
+  std::printf("pt, 0 bounces: centre %.5f %.5f %.5f %.5f, corner %.5f %.5f %.5f %.5f, expected sky "
+              "%.5f %.5f %.5f\n",
+              color.F32(cx, cy, 0), color.F32(cx, cy, 1), color.F32(cx, cy, 2), color.F32(cx, cy, 3),
+              color.F32(0, 0, 0), color.F32(0, 0, 1), color.F32(0, 0, 2), color.F32(0, 0, 3),
+              corner_sky[0], corner_sky[1], corner_sky[2]);
+  for (uint32_t c = 0; c < 3; ++c) {
+    CHECK(color.F32(cx, cy, c) == 0.0f);
+    CHECK(std::abs(color.F32(0, 0, c) - corner_sky[c]) < 1e-4f);
+  }
+  CHECK(color.F32(cx, cy, 3) == 1.0f);
+  CHECK(color.F32(0, 0, 3) == 0.0f);
+
+  // The sun disk: aimed at the corner pixel, the corner is sky + sun radiance.
+  {
+    CaelixRenderOptions sun = options;
+    Set3(sun.sun_dir, corner_dir);
+    Render(rig, renderer, set, camera, sun);
+    for (uint32_t c = 0; c < 3; ++c) {
+      CHECK(std::abs(color.F32(0, 0, c) - (corner_sky[c] + 50.0f)) < 1e-3f);
+    }
+    // Pixel (8, 0) is about 1 degree away from the corner: sky only.
+    float near_dir[3];
+    PrimaryDirection(camera, 8, 0, kSize, kSize, near_dir);
+    float near_sky[3];
+    SkyRadiance(near_dir, near_sky);
+    CHECK(std::abs(color.F32(8, 0, 0) - near_sky[0]) < 1e-4f);
+  }
+
+  // Exposure scales the colour, the sky included.
+  options.exposure = 2.0f;
+  Render(rig, renderer, set, camera, options);
+  CHECK(std::abs(color.F32(0, 0, 0) - 2.0f * corner_sky[0]) < 2e-4f);
+  options.exposure = 1.0f;
+
+  // 2. Without CAELIX_RENDER_FLAG_SKY_ON_MISS a miss is (0, 0, 0, 0).
+  options.flags = 0;
+  Render(rig, renderer, set, camera, options);
+  for (uint32_t c = 0; c < 4; ++c) {
+    CHECK(color.F32(0, 0, c) == 0.0f);
+  }
+  CHECK(color.F32(cx, cy, 3) == 1.0f);
+
+  // 3. A UNORM colour target receives sRGB-encoded values.
+  {
+    Target unorm = CreateTarget(rig.gpu, VK_FORMAT_R8G8B8A8_UNORM);
+    TargetSet unorm_set;
+    unorm_set.t[kColor] = &unorm;
+    options.flags = CAELIX_RENDER_FLAG_SKY_ON_MISS;
+    Render(rig, renderer, unorm_set, camera, options);
+    const uint8_t* corner = unorm.at(0, 0);
+    PrintPixel("pt, RGBA8 corner", corner);
+    for (int c = 0; c < 3; ++c) {
+      CHECK(std::abs(static_cast<int>(corner[c]) -
+                     static_cast<int>(std::lround(LinearToSrgb(corner_sky[c]) * 255.0f))) <= 1);
+    }
+    CHECK(corner[3] == 0);
+    CHECK(unorm.at(cx, cy)[3] == 255);
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    DestroyTarget(rig.gpu, unorm);
+  }
+
+  // 4. G-buffer targets in a lighting mode: the trace still writes them, and a
+  //    lighting render without a colour target runs the trace only.
+  {
+    Target albedo = CreateTarget(rig.gpu, VK_FORMAT_R8G8B8A8_UNORM);
+    TargetSet albedo_only;
+    albedo_only.t[kAlbedo] = &albedo;
+    Render(rig, renderer, albedo_only, camera, options);
+    CHECK(albedo.at(cx, cy)[0] == 255);
+    CHECK(albedo.at(cx, cy)[3] == 255);
+    CHECK(albedo.at(0, 0)[3] == 0);
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    DestroyTarget(rig.gpu, albedo);
+  }
+
+  // 5. Primary emission: an emissive red brick (rgb4 (15, 0, 0), strength 0) is
+  //    deterministic = albedo * 1 = (1, 0, 0) at the centre, with no bounce.
+  {
+    World world;
+    Brick brick{};
+    brick.fill(static_cast<uint16_t>(0x4000u | (15u << 10)));
+    world.bricks[{0, 0, 0}] = brick;
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+  }
+  Render(rig, renderer, set, camera, options);
+  std::printf("pt, emissive brick, 0 bounces: centre %.5f %.5f %.5f %.5f\n", color.F32(cx, cy, 0),
+              color.F32(cx, cy, 1), color.F32(cx, cy, 2), color.F32(cx, cy, 3));
+  CHECK(color.F32(cx, cy, 0) == 1.0f);
+  CHECK(color.F32(cx, cy, 1) == 0.0f);
+  CHECK(color.F32(cx, cy, 2) == 0.0f);
+  CHECK(color.F32(cx, cy, 3) == 1.0f);
+  // With bounces the emitter only gains light.
+  options.bounce_count = 4;
+  Render(rig, renderer, set, camera, options);
+  CHECK(color.F32(cx, cy, 0) >= 1.0f);
+
+  // 6. Argument checks: an unknown mode and too many bounces.
+  ExpectLibraryErrors(1, [&] {
+    CaelixRenderOptions bad = LightOptions(3, 4, 0);
+    CaelixFrameDesc desc{};
+    desc.command_buffer = 1;
+    desc.frame_number = rig.frames.next;
+    const CaelixRenderTargets targets = ToAbi(set);
+    REQUIRE(caelix_renderer_render(renderer, &desc, &targets, &camera, &bad) ==
+            CAELIX_ERROR_INVALID_ARGUMENT);
+  });
+  ExpectLibraryErrors(1, [&] {
+    CaelixRenderOptions bad = LightOptions(CAELIX_MODE_PATH_TRACE, CAELIX_MAX_BOUNCES + 1, 0);
+    CaelixFrameDesc desc{};
+    desc.command_buffer = 1;
+    desc.frame_number = rig.frames.next;
+    const CaelixRenderTargets targets = ToAbi(set);
+    REQUIRE(caelix_renderer_render(renderer, &desc, &targets, &camera, &bad) ==
+            CAELIX_ERROR_INVALID_ARGUMENT);
+  });
+
+  // 7. The primary mode still works on the same renderer (the colour is the debug view, opaque).
+  Render(rig, renderer, set, camera, Options(CAELIX_VIEW_ALBEDO));
+  CHECK(color.F32(cx, cy, 0) == 1.0f);
+  CHECK(color.F32(0, 0, 3) == 1.0f);
+
+  REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+  caelix_renderer_release_target_views(renderer);
+  caelix_renderer_destroy(renderer);
+  DestroyTarget(rig.gpu, color);
+  CloseRig(rig);
+}
+
+TEST_CASE("lighting: reference accumulation is the running mean of the raw frames") {
+  Rig rig;
+  OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+  UploadRedBrick(rig);
+  CaelixRenderer* renderer = nullptr;
+  REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+  Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+  TargetSet set;
+  set.t[kColor] = &color;
+  // Off-centre camera: the brick's -Z and +X faces and the sky are in view.
+  const CaelixCamera camera = LookPlusZ(10.0f, 6.0f, -14.0f);
+  constexpr uint32_t kSeeds[3] = {7, 8, 9};
+  const size_t floats = static_cast<size_t>(kSize) * kSize * 4;
+
+  // Three raw frames.
+  std::vector<float> raw[3];
+  for (int i = 0; i < 3; ++i) {
+    Render(rig, renderer, set, camera, LightOptions(CAELIX_MODE_PATH_TRACE, 2, kSeeds[i]));
+    raw[i].resize(floats);
+    std::memcpy(raw[i].data(), color.bytes.data(), floats * sizeof(float));
+  }
+  uint32_t differ = 0;
+  uint32_t hits = 0;
+  for (size_t i = 0; i < floats; i += 4) {
+    hits += raw[0][i + 3] == 1.0f ? 1 : 0;
+    differ += (raw[0][i] != raw[1][i]) ? 1 : 0;
+  }
+  std::printf("accumulation: %u hit pixels, %u differ between seeds 7 and 8\n", hits, differ);
+  REQUIRE(hits > 1000);
+  REQUIRE(differ > 1000);
+
+  // The same frames in reference mode: the first after a reset is the raw frame
+  // bit for bit, then the running mean.
+  float max_error[3] = {0.0f, 0.0f, 0.0f};
+  uint32_t first_mismatch = 0;
+  for (int n = 0; n < 3; ++n) {
+    CaelixRenderOptions options = LightOptions(CAELIX_MODE_REFERENCE, 2, kSeeds[n]);
+    options.reset_accumulation = n == 0 ? 1u : 0u;
+    Render(rig, renderer, set, camera, options);
+    for (size_t i = 0; i < floats; ++i) {
+      const float value = color.F32(static_cast<uint32_t>((i / 4) % kSize),
+                                    static_cast<uint32_t>((i / 4) / kSize),
+                                    static_cast<uint32_t>(i % 4));
+      if (i % 4 == 3) {
+        continue;  // coverage
+      }
+      double mean = 0.0;
+      for (int k = 0; k <= n; ++k) {
+        mean += raw[k][i];
+      }
+      mean /= (n + 1);
+      if (n == 0 && value != raw[0][i]) {
+        ++first_mismatch;
+      }
+      max_error[n] = std::max(max_error[n], static_cast<float>(std::abs(value - mean) /
+                                                               std::max(1.0, std::abs(mean))));
+    }
+  }
+  std::printf("accumulation: first frame %u mismatches, max relative error after 1/2/3 frames "
+              "%.3g %.3g %.3g\n",
+              first_mismatch, max_error[0], max_error[1], max_error[2]);
+  CHECK(first_mismatch == 0);
+  CHECK(max_error[1] < 1e-5f);
+  CHECK(max_error[2] < 1e-5f);
+
+  // reset_accumulation restarts: the next frame is the raw frame of its seed.
+  CaelixRenderOptions options = LightOptions(CAELIX_MODE_REFERENCE, 2, kSeeds[1]);
+  options.reset_accumulation = 1;
+  Render(rig, renderer, set, camera, options);
+  CHECK(std::memcmp(color.bytes.data(), raw[1].data(), floats * sizeof(float)) == 0);
+
+  REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+  caelix_renderer_release_target_views(renderer);
+  caelix_renderer_destroy(renderer);
+  DestroyTarget(rig.gpu, color);
   CloseRig(rig);
 }

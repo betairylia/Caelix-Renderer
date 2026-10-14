@@ -8,6 +8,8 @@ add_library(caelix_renderer SHARED
   src/frame_constants.h
   src/gpu_buffer.cpp
   src/gpu_buffer.h
+  src/gpu_image.cpp
+  src/gpu_image.h
   src/gpu_timer.cpp
   src/gpu_timer.h
   src/hash_map.h
@@ -65,5 +67,7 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/caelix_block.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/caelix_frame.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/caelix_brick_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/caelix_shading.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/caelix_finalize.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_trace_primary.hlsl)
+    ${PROJECT_SOURCE_DIR}/shaders/caelix_path_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/caelix_composite.hlsl)

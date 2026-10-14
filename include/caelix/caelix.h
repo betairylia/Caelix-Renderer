@@ -43,7 +43,9 @@ extern "C" {
    the renderer API (caelix_renderer_*) and CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT, also
    without a bump. The optional-targets step appended CaelixCamera::projection,
    CaelixRenderOptions::miss_depth / miss_view_z and the albedo, normal, depth, motion and view_z
-   targets of CaelixRenderTargets, and made the colour target optional, also without a bump. A host
+   targets of CaelixRenderTargets, and made the colour target optional, also without a bump. The
+   lighting step (6a) appended the path-tracing fields to CaelixRenderOptions (mode .. frame_seed),
+   CAELIX_RENDER_FLAG_SKY_ON_MISS and CaelixGpuTimings::composite_ms, also without a bump. A host
    built against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -379,9 +381,26 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * A renderer draws one scene. caelix_renderer_render records a compute dispatch that traces one
  * primary ray per pixel through the scene's TLAS with an inline ray query (VK_KHR_ray_query), runs
  * the brick DDA on every procedural candidate, and writes the result of the hit into the targets
- * that the host passes (CaelixRenderTargets): a colour image (albedo or a debug view) and the
- * optional geometry targets albedo, normal, depth, motion and view_z. Every target is optional, but
- * at least one must be present.
+ * that the host passes (CaelixRenderTargets): a colour image and the optional geometry targets
+ * albedo, normal, depth, motion and view_z. Every target is optional, but at least one must be
+ * present.
+ *
+ * Modes (CaelixRenderOptions::mode):
+ *   CAELIX_MODE_PRIMARY    the colour target shows a debug view (CaelixDebugView) of the primary hit.
+ *                          One dispatch (trace).
+ *   CAELIX_MODE_PATH_TRACE path-traced lighting at 1 sample per pixel with the shading rules of the
+ *                          Unity path tracer (primary emission, cosine-weighted diffuse bounces,
+ *                          Russian roulette, procedural sky with a sun disk on a miss). Two
+ *                          dispatches: trace (G-buffer, internal radiance targets) and composite
+ *                          (colour = emission + albedo * incident radiance, exposure, sRGB encode for
+ *                          UNORM targets). No denoiser yet: the colour target holds the raw 1 spp
+ *                          estimate.
+ *   CAELIX_MODE_REFERENCE  as CAELIX_MODE_PATH_TRACE, but the composite accumulates the raw frames
+ *                          into an internal RGBA32F image (running mean since the last reset) and
+ *                          writes the mean. Use a static camera and a new frame_seed every frame.
+ * In the two lighting modes the renderer owns internal targets (about 64 bytes per pixel) sized to
+ * the host's targets; they are created at the first lighting render and recreated when the target
+ * size changes.
  *
  * G-buffer mode: a host with its own deferred pipeline passes only the geometry targets (no colour
  * target). The library then writes no lighting at all: per pixel, the material albedo, the world
@@ -449,6 +468,16 @@ typedef struct CaelixCamera {
   float projection[16];
 } CaelixCamera;
 
+/* CaelixRenderOptions::mode */
+typedef enum CaelixRenderMode {
+  CAELIX_MODE_PRIMARY = 0,     /* debug views of the primary hit (CaelixDebugView) */
+  CAELIX_MODE_PATH_TRACE = 1,  /* path-traced lighting, raw 1 sample per pixel */
+  CAELIX_MODE_REFERENCE = 2    /* path-traced lighting, accumulated over frames (reference image) */
+} CaelixRenderMode;
+
+/* Largest CaelixRenderOptions::bounce_count (Unity's path tracer has the same limit). */
+#define CAELIX_MAX_BOUNCES 14u
+
 typedef enum CaelixDebugView {
   CAELIX_VIEW_ALBEDO = 0,  /* material albedo; Lambert-shaded with CAELIX_RENDER_FLAG_SHADING */
   CAELIX_VIEW_NORMAL = 1,  /* world normal * 0.5 + 0.5 */
@@ -459,17 +488,43 @@ typedef enum CaelixDebugView {
 } CaelixDebugView;
 
 /* CaelixRenderOptions::flags */
-#define CAELIX_RENDER_FLAG_SHADING (1u << 0) /* Lambert shading with sun_dir on the albedo view */
+#define CAELIX_RENDER_FLAG_SHADING (1u << 0) /* CAELIX_MODE_PRIMARY only: Lambert shading with sun_dir
+                                                on the albedo view */
+#define CAELIX_RENDER_FLAG_SKY_ON_MISS (1u << 1) /* lighting modes only: the colour target shows the
+                                                    procedural sky where the primary ray misses (alpha
+                                                    stays 0). Without it a miss is (0, 0, 0, 0), for a
+                                                    host that composites its own sky. */
 
+/* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
 typedef struct CaelixRenderOptions {
-  uint32_t debug_view;  /* CaelixDebugView */
+  uint32_t debug_view;  /* CaelixDebugView; read in CAELIX_MODE_PRIMARY, checked in every mode */
   uint32_t flags;       /* CAELIX_RENDER_FLAG_* */
-  float sun_dir[3];     /* world-space direction TOWARD the sun; the library normalizes it */
+  float sun_dir[3];     /* world-space direction TOWARD the sun; the library normalizes it ((0, 1, 0)
+                           when zero). Every mode: the Lambert term of the primary mode and the sun
+                           disk of the lighting modes. */
   float pad;
-  float sky_color[3];   /* colour of rays that hit nothing (every view) */
+  float sky_color[3];   /* CAELIX_MODE_PRIMARY: colour of rays that hit nothing (every view) */
   float pad2;
   float miss_depth;     /* depth target value of a miss: 1.0 for a normal-Z host, 0.0 for reverse Z */
   float miss_view_z;    /* view_z target value of a miss, for example 1e30 */
+
+  /* Lighting (CAELIX_MODE_PATH_TRACE and CAELIX_MODE_REFERENCE). All radiance values are linear RGB. */
+  uint32_t mode;               /* CaelixRenderMode */
+  uint32_t bounce_count;       /* stochastic bounces after the primary hit, 0 .. CAELIX_MAX_BOUNCES
+                                  (Unity default 4). 0 = primary emission only. */
+  uint32_t denoise;            /* reserved for the denoiser (NRD, a later step); ignored now, pass 0 */
+  uint32_t reset_accumulation; /* 1 = restart the CAELIX_MODE_REFERENCE accumulation with this frame
+                                  (also restarted by a mode change, a target size change and the first
+                                  render). Set it when the camera or the scene changed. */
+  float exposure;              /* the composite multiplies the colour (sky included) by it before the
+                                  sRGB encode; 0 is treated as 1 */
+  float sun_radiance[3];       /* radiance of the sun disk */
+  float sun_angular_radius;    /* angular radius of the sun disk in radians; 0 = 0.00873 (0.5 degrees) */
+  float sky_zenith[3];         /* sky radiance straight up */
+  float sky_horizon[3];        /* sky radiance at the horizon */
+  float sky_ground[3];         /* radiance straight down (below the horizon) */
+  uint32_t frame_seed;         /* random seed of the frame: the per-pixel random stream is a function of
+                                  the pixel and this value only. Increment it every frame. */
 } CaelixRenderOptions;
 
 /* The images of one render call. A target is PRESENT when its `image` is nonzero; an absent target
@@ -480,10 +535,15 @@ typedef struct CaelixRenderOptions {
    optimal tiling). It arrives in CaelixTargetImage::layout and is left in VK_IMAGE_LAYOUT_GENERAL.
    Every pixel of a present target is written on every render call, a miss included. */
 typedef struct CaelixRenderTargets {
-  /* Any storage format, typically RGBA8, BGRA8 or RGBA16F. rgb = the debug view of
-     CaelixRenderOptions::debug_view (the albedo view, optionally Lambert shaded, is the lit colour
-     of this version); a miss is the sky colour. alpha = 1 everywhere (opaque, also on a miss, so
-     that a host can present the image directly; the coverage is in the albedo and normal targets). */
+  /* Any storage format, typically RGBA8, BGRA8, RGBA16F or RGBA32F.
+     CAELIX_MODE_PRIMARY: rgb = the debug view of CaelixRenderOptions::debug_view; a miss is
+     sky_color. alpha = 1 everywhere (opaque, also on a miss, so that a host can present the image
+     directly; the coverage is in the albedo and normal targets).
+     Lighting modes: rgb = premultiplied colour (times exposure), a = coverage (1 hit, 0 miss). A miss
+     is the procedural sky in the primary direction with CAELIX_RENDER_FLAG_SKY_ON_MISS (alpha still
+     0), else (0, 0, 0, 0). For a UNORM format (RGBA8, BGRA8, A2B10G10R10, ...) the library encodes
+     rgb linear -> sRGB before the write; float formats receive linear values.
+     A lighting render without a colour target runs the trace only (no composite, no accumulation). */
   CaelixTargetImage color;
   /* R8G8B8A8_UNORM or R16G16B16A16_SFLOAT. rgb = the material albedo as stored in the block (sRGB
      encoded, no shading), a = coverage (1 hit, 0 miss). A miss is (0, 0, 0, 0). */
@@ -509,15 +569,18 @@ typedef struct CaelixRenderTargets {
 
 /* Records the frame's rendering into frame->command_buffer: one barrier per present target from its
    layout to GENERAL (one vkCmdPipelineBarrier2), the trace dispatch (8 x 8 pixels per workgroup)
-   between two timestamps, and one barrier from the kernel's writes to all later commands. Before the
+   between two timestamps, in the lighting modes a barrier and the composite dispatch (8 x 8, also
+   between two timestamps), and one barrier from the writes to all later commands. Before the
    scene's first TLAS build the dispatch traces nothing and writes the miss values. The renderer
    creates one image view per target image and caches it (16 views; the least recently used view
    is destroyed once its last frame is safe). A successful call stores the camera as the previous
    camera of the next call.
    Returns CAELIX_ERROR_INVALID_ARGUMENT for a null argument, no present target, a present target
    without format or size, present targets of different sizes, one image in two targets, a geometry
-   target format outside its list above, an unknown debug view, a frame number not above
-   safe_frame_number, or a ninth frame in flight; CAELIX_ERROR_UNSUPPORTED when a target format
+   target format outside its list above, an unknown debug view, an unknown mode, a bounce_count above
+   CAELIX_MAX_BOUNCES, a frame number not above safe_frame_number, or a ninth frame in flight;
+   CAELIX_ERROR_OUT_OF_MEMORY when the internal targets of the lighting modes cannot be allocated;
+   CAELIX_ERROR_UNSUPPORTED when a target format
    cannot be written as a storage image without a format qualifier. */
 CAELIX_API CaelixResult caelix_renderer_render(CaelixRenderer* renderer, const CaelixFrameDesc* frame,
                                                const CaelixRenderTargets* targets,
@@ -537,6 +600,8 @@ typedef struct CaelixGpuTimings {
   float trace_ms;         /* the trace dispatch of that frame */
   float flush_ms;         /* caelix_scene_flush of that frame; 0 when the flush recorded no work */
   uint64_t frame_number;  /* the frame the values belong to; 0 = none yet */
+  float composite_ms;     /* the composite dispatch of that frame; 0 when it had none (primary mode) */
+  float pad;
 } CaelixGpuTimings;
 
 /* Fills *out. A NULL argument is ignored. All zero when the queue has no timestamp support. */

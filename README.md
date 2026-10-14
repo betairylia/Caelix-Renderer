@@ -46,8 +46,11 @@ fields (`blas_count` .. `as_builds_pending`), four `CaelixBrickInfo` fields
 without a bump. The renderer step removed the temporary `caelix_clear_target`,
 added the renderer API and the feature bit
 `CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT` (bit 9,
-`shaderStorageImageWriteWithoutFormat`), also without a bump. Rebuild hosts
-against the current header.
+`shaderStorageImageWriteWithoutFormat`), also without a bump. The lighting
+step (6a) appended the path-tracing fields to `CaelixRenderOptions` (`mode`
+.. `frame_seed`), `CAELIX_RENDER_FLAG_SKY_ON_MISS`, `CaelixRenderMode`,
+`CAELIX_MAX_BOUNCES` and `CaelixGpuTimings::composite_ms`, also without a
+bump. Rebuild hosts against the current header.
 
 Scene model:
 
@@ -231,14 +234,24 @@ camera, options)` records the frame's rendering. Call it after
 `caelix_scene_flush` of the same frame, with the same `CaelixFrameDesc`: the
 flush builds the TLAS that the render binds.
 
-- Trace kernel `shaders/caelix_trace_primary.hlsl`, `[numthreads(8, 8, 1)]`:
+- Modes (`CaelixRenderOptions::mode`): `CAELIX_MODE_PRIMARY` (debug views of
+  the primary hit, one dispatch), `CAELIX_MODE_PATH_TRACE` (path-traced
+  lighting, raw 1 sample per pixel) and `CAELIX_MODE_REFERENCE` (the same,
+  accumulated over frames). See "Lighting" below.
+- Trace kernel `shaders/caelix_path_trace.hlsl`, `[numthreads(8, 8, 1)]`:
   one primary ray per pixel, `RayQuery<RAY_FLAG_FORCE_OPAQUE>` through the
-  TLAS. For every procedural candidate it reads the group info
-  (`CandidateInstanceID()` = the group index) and the slot row of the dense
-  brick id (`CandidatePrimitiveIndex()`), skips bricks that are not resident,
-  and runs the brick DDA on the record. A hit inside `[TMin, CommittedRayT())`
-  is committed. Then it writes every present target (see "Render targets"
-  below). A miss writes the sky colour and the miss values.
+  TLAS (`TraceScene`, also used by the bounce rays). For every procedural
+  candidate it reads the group info (`CandidateInstanceID()` = the group
+  index) and the slot row of the dense brick id (`CandidatePrimitiveIndex()`),
+  skips bricks that are not resident, and runs the brick DDA on the record. A
+  hit inside `[TMin, CommittedRayT())` is committed. Then it writes every
+  present target (see "Render targets" below). A miss writes the sky colour
+  and the miss values. In the lighting modes it also shades the hit and
+  traces the bounces into the internal targets.
+- Composite kernel `shaders/caelix_composite.hlsl`, `[numthreads(8, 8, 1)]`,
+  lighting modes only: internal targets -> the host's colour target.
+- Shading helpers `shaders/caelix_shading.hlsl`: block colours, the material
+  decode, the random stream, the opaque shading rule and the procedural sky.
 - Brick DDA `shaders/caelix_brick_trace.hlsl`: a copy of Unity's
   `CaelixBrickTrace.hlsl` (2-level occupancy DDA on the 8^3 brick, tight
   bounds from record word 1, transparency by face bits). Every change is
@@ -250,19 +263,24 @@ flush builds the TLAS that the render binds.
   render group macros; `half` = float, `UNITY_BRANCH` -> `CAELIX_BRANCH`.
 - Inputs: one descriptor set (binding 0 the TLAS, bindings 1..6 the colour,
   albedo, normal, depth, motion and view_z targets as storage images without a
-  format qualifier) and one push constant, the device address of a 512-byte
+  format qualifier, bindings 7..13 the internal targets of the lighting modes
+  with fixed formats) and one push constant, the device address of a 512-byte
   `CaelixFrameConstants` block (`shaders/caelix_frame.hlsl`,
   `lib/src/frame_constants.h`): camera, target size, the addresses of the page
   table, slot tables, group infos and entity infos, the record layout, group
   shift, encoding, view, flags, sun and sky, the rows of the host projection,
   the previous render call's camera, the present-target mask, the miss values,
-  and `has_prev_camera` / `has_tlas`. Every binding is `PARTIALLY_BOUND`
+  `has_prev_camera` / `has_tlas`, and the lighting parameters (mode, bounces,
+  seed, accumulation count, exposure, sun and sky, sRGB output, `t_max`). The
+  composite kernel has its own set (binding 0 the colour target, bindings 1..5
+  internal targets) and the same push constant. Every binding is `PARTIALLY_BOUND`
   (`VkDescriptorSetLayoutBindingFlagsCreateInfo`): a render call writes only the
   TLAS (when the scene has one) and the present targets, and the kernel touches
   a binding only when its bit is set. Absent targets and a scene without a TLAS
   therefore need no dummy descriptors.
-- Per-frame resources: a ring of slots (descriptor set + host-visible constants
-  buffer), 3 at first, grown up to 8 when a slot's frame is not safe yet.
+- Per-frame resources: a ring of slots (two descriptor sets + host-visible
+  constants buffer), 3 at first, grown up to 8 when a slot's frame is not safe
+  yet.
 - Image views: one per target image, cached (16; the least recently used view
   is destroyed once its frame is safe). `caelix_renderer_release_target_views`
   destroys all of them; call it before the host destroys target images (a new
@@ -277,16 +295,72 @@ flush builds the TLAS that the render binds.
   emissive rgb4, glass a fixed tint (0.6, 0.8, 1.0), air magenta (a primary
   ray should never report an air boundary). In the block-ID encoding the
   colour is a pastel hash of the id.
-- GPU timings: two timestamps around the dispatch, read back in
+- GPU timings: two timestamps around each dispatch, read back in
   a later render call whose safe frame has reached that frame;
-  `caelix_renderer_get_gpu_timings` returns `trace_ms`, `flush_ms` and the
-  frame they belong to.
+  `caelix_renderer_get_gpu_timings` returns `trace_ms`, `composite_ms` (0 in
+  the primary mode), `flush_ms` and the frame they belong to.
 
 Pixel mapping: pixel (px, py), row 0 = the top row,
 `ndc = ((px + 0.5) / w * 2 - 1, 1 - (py + 0.5) / h * 2)`, direction
 `normalize(right * ndc.x * tan_half_fov_y * aspect + up * ndc.y * tan_half_fov_y + forward)`.
 The camera basis is Unity's (+X right, +Y up, +Z forward); the host's
 `camera.rs` builds it from Unity's `eulerAngles` (see "Running the host").
+
+### Lighting (step 6a)
+
+The lighting modes port the opaque part of Unity's path tracer
+(`CaelixPathTraceCommon.hlsl`: `CaelixShadeVoxelHit` and the bounce loop).
+There is no denoiser yet (NRD comes in step 6b), so `CAELIX_MODE_PATH_TRACE`
+shows the raw 1 spp estimate and `CAELIX_MODE_REFERENCE` the running mean.
+
+- Primary hit: the material (packed: opaque rgb5 / 31, emissive rgb4 / 15 with
+  `emission = albedo * 2^(3 * strength)`; block-ID: the pastel hash colour, no
+  emission) is shaded with Unity's rule: specular chance
+  `lerp(metallic, 1, fresnel * smoothness)` (0 for packed materials, so they
+  are diffuse only), cosine-weighted diffuse direction `normalize(N + unit)`,
+  `k = 1`, origin pushed off 0.002 along N (Unity's `K_RAY_ORIGIN_PUSH_OFF`).
+  Its emission goes to the deterministic target.
+- Bounces: up to `bounce_count` (0..14, Unity default 4) segments of length
+  1e4 (`K_T_MAX`). A miss adds `SkyRadiance(dir) * throughput` and stops; a hit
+  adds `emission * throughput`, multiplies the throughput by the albedo, and
+  Russian roulette on the largest throughput channel may stop the path. The
+  incident radiance goes to the diffuse or the specular target by the lobe of
+  the primary hit; alpha = the hit distance of the first segment (1e4 when it
+  reaches the sky or there is no bounce). NaN or Inf drops the sample; values
+  are clamped to 65504 (FP16).
+- Glass (packed transparent blocks) is shaded as an opaque diffuse surface with
+  the tint (0.6, 0.8, 1.0) until step 6d ports the delta chain.
+- Random numbers: `PcgHash(px ^ (py << 16) ^ (frame_seed * 0x9E3779B9))`,
+  then xorshift32 (Unity samples a blue-noise texture). The host must change
+  `frame_seed` every frame.
+- Sky: above the horizon `lerp(horizon, zenith, sqrt(dir.y))`, below it
+  `lerp(horizon, ground, sqrt(-dir.y))`, plus `sun_radiance` inside the sun
+  disk (`sun_angular_radius`, default 0.5 degrees). The sun is found only by
+  chance (no next-event estimation), as in Unity. A small disk therefore
+  needs a very high radiance to light the scene: a 0.5-degree disk subtends
+  2.4e-4 sr, so a radiance of 20 adds about 0.003 to the irradiance of a lit
+  face, against about 1.5 from the default sky.
+- Composite: `raw = deterministic + albedo * (diffuse + specular)`; reference
+  mode `accum = n == 0 ? raw : lerp(accum, raw, 1 / (n + 1))`; then `* exposure`;
+  a miss is `SkyRadiance(primary direction) * exposure` with
+  `CAELIX_RENDER_FLAG_SKY_ON_MISS`, else 0; alpha = coverage; linear -> sRGB
+  for UNORM colour formats.
+- Accumulation count `n`: 0 after `reset_accumulation`, a mode change, a size
+  change (the internal targets are recreated) and on the first render; +1 per
+  reference render with a colour target.
+- Internal targets (owned by the renderer, `STORAGE | SAMPLED`, layout
+  `GENERAL` after one transition, recreated when the host target size changes;
+  the old ones are destroyed once their last frame is safe):
+
+| Target | Format | Content |
+|---|---|---|
+| `view_z` | R32F | linear view depth; 1e30 on a miss |
+| `normal_roughness` | RGBA16F | world normal, roughness 1 (NRD packing comes with NRD) |
+| `motion` | RGBA16F | motion in pixels (xy), previous view z - view z (z) |
+| `albedo` | RGBA8 | material albedo; a = coverage |
+| `deterministic` | RGBA16F | primary emission |
+| `diff_in`, `spec_in` | RGBA16F | incident radiance; a = first-segment hit distance |
+| `accum` | RGBA32F | reference accumulation |
 
 ### Render targets and G-buffer mode
 
@@ -297,7 +371,7 @@ is written on every render call, a miss included.
 
 | Target | Formats | Content | Miss |
 |---|---|---|---|
-| `color` | any storage format (RGBA8, BGRA8, RGBA16F) | the debug view (albedo, optionally Lambert shaded); alpha 1 everywhere | sky colour, alpha 1 |
+| `color` | any storage format (RGBA8, BGRA8, RGBA16F, RGBA32F) | primary mode: the debug view (albedo, optionally Lambert shaded), alpha 1 everywhere; lighting modes: premultiplied colour, a = coverage (sRGB-encoded for UNORM formats) | primary: sky colour, alpha 1; lighting: the procedural sky (`CAELIX_RENDER_FLAG_SKY_ON_MISS`) or 0, alpha 0 |
 | `albedo` | RGBA8, RGBA16F | material albedo as stored in the block (sRGB), no shading; a = coverage | (0, 0, 0, 0) |
 | `normal` | RGBA16F, RGBA8_UNORM (stored as n * 0.5 + 0.5) | world-space face normal; w = coverage | (0, 0, 0, 0) |
 | `depth` | R32F (storage image, not a depth attachment) | device depth clip.z / clip.w of `CaelixCamera::projection` | `options.miss_depth` |
@@ -339,7 +413,7 @@ demodulates the radiance before the denoiser and modulates it after.
 A render call receives every present target in the layout that its
 `CaelixTargetImage::layout` names, and leaves it in `VK_IMAGE_LAYOUT_GENERAL`:
 one `vkCmdPipelineBarrier2` with one image barrier per present target before
-the dispatch, one after it. The last barrier makes the kernel's writes
+the dispatches, one after them. The last barrier makes the kernels' writes
 available to all later commands. The host transitions the images from
 `GENERAL` for present (or for its own use).
 
@@ -406,7 +480,21 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   camera moves +1 along `right`, -22.17 px after the entity moves +2 along X,
   and 0 again one frame later. A depth-only render works; no target, different
   sizes, one image twice and a wrong format are rejected. The random opaque
-  scene: some pixels hit and none is magenta.
+  scene: some pixels hit and none is magenta. Lighting, energy: a grey floor
+  (albedo 15/31) under an emissive white ceiling (emission 1) 24 blocks above
+  it, black sky, one bounce, camera looking straight down: the reference mode
+  (2048 frames) over the centre 32x32 pixels is within 3 % of a CPU Monte Carlo
+  estimate (albedo times the probability that a cosine direction reaches the
+  ceiling, 200k samples), and one raw 1 spp frame over the centre 128x128
+  pixels within 5 % (every raw pixel is exactly 0 or the albedo). Lighting,
+  modes: with no bounce the red brick is black with alpha 1 and the corner is
+  the CPU sky radiance with alpha 0; the sun disk adds its radiance; exposure
+  scales; without the sky flag a miss is (0, 0, 0, 0); an RGBA8 target gets the
+  sRGB-encoded sky; geometry targets work in a lighting mode without a colour
+  target; an emissive red brick is exactly (1, 0, 0); an unknown mode and 15
+  bounces are rejected. Lighting, accumulation: the first reference frame after
+  a reset equals the raw frame of the same seed bit for bit, the next frames
+  are the mean of the raw frames (relative error below 1e-5).
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -438,12 +526,28 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   degrees. Default: the world's player pose (format version 7), else
   (0, 64, -128) with pitch 15 and yaw 0.
 - `--fov <DEGREES>`: vertical field of view. Default 60.
-- `--view <albedo|normal|depth|group|brick|steps>`: the debug view. Default
-  `albedo`.
-- `--no-shading`: albedo without Lambert shading.
-- `--screenshot <PATH.png>`: write a PNG of the swapchain image. With `--world`
-  it is taken 3 frames after the world is complete on the GPU (every brick
-  uploaded and `as_builds_pending == 0`); without `--world` at frame 10.
+- `--mode <primary|pt|ref>`: the rendering mode. Default `pt` with `--world`,
+  else `primary`.
+- `--view <albedo|normal|depth|group|brick|steps>`: the debug view of the
+  primary mode. Default `albedo`.
+- `--no-shading`: primary mode, albedo without Lambert shading.
+- `--bounces <N>`: lighting modes, stochastic bounces (0..14). Default 4.
+- `--exposure <F>`: lighting modes, colour multiplier. Default 1.
+- `--sun <X,Y,Z>`: direction toward the sun. Default 0.45,0.7,0.55 in the
+  lighting modes, -0.45,0.8,-0.3 (the Lambert direction) in the primary mode.
+- `--sun-radiance <R,G,B>` (default 20,19,18), `--sun-angular-radius <DEGREES>`
+  (default 0.5), `--sky-zenith <R,G,B>` (default 0.2,0.4,0.9),
+  `--sky-horizon <R,G,B>` (default 0.7,0.8,0.95), `--sky-ground <R,G,B>`
+  (default 0.25,0.22,0.2): the procedural sky, linear RGB radiance.
+- `--no-sky-on-miss`: lighting modes, black instead of the sky where the
+  primary ray misses.
+- `--accumulate <N>`: reference mode; the accumulation restarts whenever the
+  camera changes or the world is not complete yet, and `--screenshot` is taken
+  after N accumulated frames. The frame seed is the frame number.
+- `--screenshot <PATH.png>`: write a PNG of the swapchain image (alpha forced
+  to 255). With `--world` it is taken 3 frames after the world is complete on
+  the GPU (every brick uploaded and `as_builds_pending == 0`); without
+  `--world` at frame 10; with `--accumulate` after N accumulated frames.
 - `--exit-after-screenshot`, `--no-input` (ignore keyboard and mouse for deterministic automated runs): exit once the PNG is written.
 
 Camera convention (`caelix-app/src/camera.rs`, Unity's): for yaw θ and pitch φ,
@@ -471,7 +575,7 @@ it adds one scene entity per file entity, then streams the bricks:
   `end_frame` presents. When the swapchain was recreated, the host calls
   `caelix_renderer_release_target_views` first.
 - The window title shows the GPU times once per second
-  (`Caelix Renderer | trace 0.19 ms | flush 0.00 ms | 144 fps`); the same line
+  (`Caelix Renderer | trace 0.49 ms | composite 0.01 ms | flush 0.00 ms | 144 fps`); the same line
   is logged at info level every 120 frames and when a screenshot is written.
   Presentation uses FIFO, so the frame rate is limited by the display.
 - When the decoder has

@@ -165,6 +165,28 @@ The title shows trace, denoise, composite and total ms.
   6.5 ms, in `Artifacts/native-renderer-step6-<date>/`.
 - **6d. Glass.** Port the delta chain and medium extinction, test on the fixture world.
 
+## 6a as built (2026-10-14)
+
+Differences from the plan above, for 6b to pick up:
+
+- `normal_roughness` is RGBA16F (world normal, roughness 1), not R10G10B10A2 with NRD packing;
+  `diff_in` / `spec_in` hold plain radiance and the hit distance in world units (no
+  `REBLUR_FrontEnd_PackRadianceAndNormHitDist` yet). 6b switches both to NRD packing.
+- Coverage is `albedo.a`; there is no separate coverage target.
+- `K_T_MAX` = 1e4 (Unity's value): the length of bounce rays and the "no hit" hit distance.
+  The internal `view_z` of a miss is 1e30.
+- The primary lobe decides the target (`specular_lobe` of the primary shade). Unity's current
+  code routes by the delta-chain flag (`PathBounceIndexIsSpecular`), so an opaque specular sample
+  goes to the diffuse target there; packed materials never sample the specular lobe, so the two
+  agree on every packed world.
+- `sun_dir` is the existing field of `CaelixRenderOptions` (shared with the primary mode's
+  Lambert term). `CaelixGpuTimings` has `composite_ms` and a pad (6b can use it for `denoise_ms`).
+- Sun: with the proposed radiance (20, 19, 18) and a 0.5-degree disk the sun adds about 0.003
+  to the irradiance of a lit face, against about 1.5 from the proposed sky, so the sun is
+  invisible. A sun that lights the scene needs a radiance of about 10^4 at 0.5 degrees, which
+  without next-event estimation is a firefly source that 1024 frames do not converge. Decide
+  for 6c: next-event estimation to the sun, or a larger disk.
+
 ## Open questions for the owner
 
 1. Sun and sky parameters for the comparison. Proposal: sun at Unity's PBR sky default direction

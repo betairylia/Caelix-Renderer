@@ -24,11 +24,16 @@ size_t caelix_abi_c99_touch(void) {
                          0.0f, {0.0f, 0.0f, 1.0f}, 0.0f, 0.577f, 1.0f, 0.1f, 1000.0f,
                          {1.732f, 0.0f, 0.0f, 0.0f, 0.0f, 1.732f, 0.0f, 0.0f,
                           0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.1f, 0.0f}};
-  CaelixRenderOptions options = {CAELIX_VIEW_ALBEDO, CAELIX_RENDER_FLAG_SHADING, {0.0f, 1.0f, 0.0f},
-                                 0.0f, {0.5f, 0.7f, 0.9f}, 0.0f, 0.0f, 1e30f};
+  CaelixRenderOptions options = {CAELIX_VIEW_ALBEDO,
+                                 CAELIX_RENDER_FLAG_SHADING | CAELIX_RENDER_FLAG_SKY_ON_MISS,
+                                 {0.0f, 1.0f, 0.0f}, 0.0f, {0.5f, 0.7f, 0.9f}, 0.0f, 0.0f, 1e30f,
+                                 CAELIX_MODE_PATH_TRACE, CAELIX_MAX_BOUNCES, 0, 1, 1.0f,
+                                 {20.0f, 19.0f, 18.0f}, 0.0f, {0.2f, 0.4f, 0.9f}, {0.7f, 0.8f, 0.95f},
+                                 {0.25f, 0.22f, 0.2f}, 1};
   CaelixRenderTargets targets = {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0},
                                  {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}};
-  CaelixGpuTimings timings = {0.0f, 0.0f, 0};
+  CaelixGpuTimings timings = {0.0f, 0.0f, 0, 0.0f, 0.0f};
+  CaelixRenderMode mode = CAELIX_MODE_REFERENCE;
   CaelixDebugView view = CAELIX_VIEW_STEPS;
   CaelixRenderer* renderer = NULL;
   CaelixEntityId entity = CAELIX_INVALID_ENTITY;
@@ -40,7 +45,8 @@ size_t caelix_abi_c99_touch(void) {
                sizeof(scene_desc) + sizeof(entity_desc) + sizeof(key) + sizeof(frame) +
                sizeof(stats) + sizeof(info) + sizeof(entity) + sizeof(log_callback) +
                sizeof(level) + sizeof(result) + sizeof(camera) + sizeof(options) +
-               sizeof(targets) + sizeof(timings) + sizeof(view) + sizeof(renderer);
+               sizeof(targets) + sizeof(timings) + sizeof(view) + sizeof(renderer) +
+               sizeof(mode);
   /* Take the address of every function so a declaration typo fails to compile. Casts between
      function pointer types are valid C; the pointers are never called. */
   AnyFn functions[23];

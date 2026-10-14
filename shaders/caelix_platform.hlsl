@@ -23,6 +23,10 @@
 // when the attribute is missing and has no command-line switch to stop that, so
 // "unknown" must be stated: CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_color;
 #define CAELIX_FORMAT_UNKNOWN [[vk::image_format("unknown")]]
+// Storage image with a known format qualifier (a SPIR-V image format name such as
+// "rgba16f", "rgba8", "r32f"), so that the kernel can READ it without
+// shaderStorageImageReadWithoutFormat: CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_x;
+#define CAELIX_FORMAT(name) [[vk::image_format(name)]]
 
 // No 16-bit types: `half` is a 32-bit float (Unity on PC does the same). DXC
 // already declares `half` as a built-in type, so these are macros, not typedefs.

@@ -6,7 +6,7 @@ namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/caelix_frame.hlsl; change both
 // together. One per render call, in a host-visible buffer; its device address is
-// the trace kernel's only push constant. 512 bytes. Every field sits at an offset
+// the only push constant of the trace and composite kernels. 512 bytes. Every field sits at an offset
 // that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
 // std430 and scalar layout rules give the same offsets.
 struct FrameConstants {
@@ -43,7 +43,19 @@ struct FrameConstants {
   float miss_view_z;        // 320
   uint32_t has_prev_camera; // 324  0 on the first render call of the renderer
   uint32_t has_tlas;        // 328  0 before the scene's first TLAS build: write the miss values
-  uint32_t pad[45];         // 332
+  uint32_t mode;            // 332  CaelixRenderMode
+  uint32_t bounce_count;    // 336  stochastic bounces, 0..CAELIX_MAX_BOUNCES
+  uint32_t frame_seed;      // 340  CaelixRenderOptions::frame_seed
+  uint32_t accum_count;     // 344  reference mode: frames accumulated before this one (0 = restart)
+  float exposure;           // 348  composite multiply (0 already replaced by 1)
+  float sun_radiance[4];    // 352  w unused
+  float sky_zenith[4];      // 368  w unused
+  float sky_horizon[4];     // 384  w unused
+  float sky_ground[4];      // 400  w unused
+  float sun_cos_radius;     // 416  cos(sun angular radius)
+  uint32_t output_srgb;     // 420  1 = the colour target is UNORM: the composite encodes linear -> sRGB
+  float t_max;              // 424  kTMax: bounce ray length and the "no hit" hit distance
+  uint32_t pad[21];         // 428
 };
 static_assert(sizeof(FrameConstants) == 512);
 static_assert(offsetof(FrameConstants, size) == 64);
@@ -57,6 +69,16 @@ static_assert(offsetof(FrameConstants, prev_forward) == 288);
 static_assert(offsetof(FrameConstants, prev_tan_half_fov_y) == 304);
 static_assert(offsetof(FrameConstants, target_mask) == 312);
 static_assert(offsetof(FrameConstants, has_tlas) == 328);
+static_assert(offsetof(FrameConstants, mode) == 332);
+static_assert(offsetof(FrameConstants, exposure) == 348);
+static_assert(offsetof(FrameConstants, sun_radiance) == 352);
+static_assert(offsetof(FrameConstants, sky_ground) == 400);
+static_assert(offsetof(FrameConstants, sun_cos_radius) == 416);
+static_assert(offsetof(FrameConstants, t_max) == 424);
+
+// Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
+// Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).
+constexpr float kTMax = 1e4f;
 
 // FrameConstants::target_mask: one bit per present target (bit i = descriptor
 // binding i + 1), plus the encoding of the normal target.
@@ -68,7 +90,7 @@ constexpr uint32_t kTargetMotion = 1u << 4;
 constexpr uint32_t kTargetViewZ = 1u << 5;
 constexpr uint32_t kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
 
-// Push constants of the trace kernel: the address of the frame's FrameConstants.
+// Push constants of the trace and composite kernels: the address of the frame's FrameConstants.
 struct TracePush {
   uint64_t frame_constants;
 };

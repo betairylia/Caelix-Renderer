@@ -13,8 +13,11 @@
 namespace caelix {
 namespace {
 
-constexpr uint32_t kWorkgroupSize = 8;  // [numthreads(8, 8, 1)] in caelix_trace_primary.hlsl
+// [numthreads(8, 8, 1)] in caelix_path_trace.hlsl and caelix_composite.hlsl.
+constexpr uint32_t kWorkgroupSize = 8;
 constexpr uint32_t kDebugViewCount = 6;
+constexpr uint32_t kModeCount = 3;
+constexpr float kDefaultSunAngularRadius = 0.00873f;  // 0.5 degrees
 
 const VkImageSubresourceRange kColorRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
@@ -34,42 +37,126 @@ constexpr TargetSpec kTargetSpecs[] = {
     {"view_z", kTargetViewZ, {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT}},
 };
 
+// The internal targets in Renderer::Internal order. The formats match the
+// image_format qualifiers of the kernels.
+struct InternalSpec {
+  const char* name;
+  VkFormat format;
+};
+constexpr InternalSpec kInternalSpecs[] = {
+    {"view_z", VK_FORMAT_R32_SFLOAT},
+    {"normal_roughness", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"motion", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"albedo", VK_FORMAT_R8G8B8A8_UNORM},
+    {"deterministic", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"diff_in", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"spec_in", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"accum", VK_FORMAT_R32G32B32A32_SFLOAT},
+};
+
 bool FormatAccepted(const TargetSpec& spec, VkFormat format) {
   return spec.formats[0] == VK_FORMAT_UNDEFINED || format == spec.formats[0] ||
          format == spec.formats[1];
 }
 
-// One vkCmdPipelineBarrier2 with one image barrier per image: old layout -> GENERAL.
-void TargetBarriers(VkCommandBuffer cmd, uint32_t count, const VkImage* images,
-                    const VkImageLayout* old_layouts, VkPipelineStageFlags2 src_stage,
-                    VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
-                    VkAccessFlags2 dst_access) {
-  VkImageMemoryBarrier2 barriers[std::size(kTargetSpecs)];
-  for (uint32_t i = 0; i < count; ++i) {
-    VkImageMemoryBarrier2& barrier = barriers[i];
+// UNORM colour formats: the composite writes sRGB-encoded values into them.
+bool IsUnormFormat(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+    case VK_FORMAT_R16_UNORM:
+    case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R16G16B16A16_UNORM:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The barriers of one vkCmdPipelineBarrier2: image barriers (any layout -> GENERAL)
+// and at most one global memory barrier.
+class Barriers {
+ public:
+  void Image(VkImage image, VkImageLayout old_layout, VkPipelineStageFlags2 src_stage,
+             VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    VkImageMemoryBarrier2& barrier = images_[image_count_++];
     barrier = VkImageMemoryBarrier2{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     barrier.srcStageMask = src_stage;
     barrier.srcAccessMask = src_access;
     barrier.dstStageMask = dst_stage;
     barrier.dstAccessMask = dst_access;
-    barrier.oldLayout = old_layouts[i];
+    barrier.oldLayout = old_layout;
     barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = images[i];
+    barrier.image = image;
     barrier.subresourceRange = kColorRange;
   }
-  VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-  dependency.imageMemoryBarrierCount = count;
-  dependency.pImageMemoryBarriers = barriers;
-  vkCmdPipelineBarrier2(cmd, &dependency);
-}
+  void Memory(VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+              VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    memory_ = VkMemoryBarrier2{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    memory_.srcStageMask = src_stage;
+    memory_.srcAccessMask = src_access;
+    memory_.dstStageMask = dst_stage;
+    memory_.dstAccessMask = dst_access;
+    has_memory_ = true;
+  }
+  void Record(VkCommandBuffer cmd) const {
+    if (image_count_ == 0 && !has_memory_) {
+      return;
+    }
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.memoryBarrierCount = has_memory_ ? 1u : 0u;
+    dependency.pMemoryBarriers = &memory_;
+    dependency.imageMemoryBarrierCount = image_count_;
+    dependency.pImageMemoryBarriers = images_;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+  }
+
+ private:
+  VkImageMemoryBarrier2 images_[std::size(kTargetSpecs) + std::size(kInternalSpecs)] = {};
+  uint32_t image_count_ = 0;
+  VkMemoryBarrier2 memory_{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+  bool has_memory_ = false;
+};
 
 void Copy3(const float in[3], float out[4]) {
   out[0] = in[0];
   out[1] = in[1];
   out[2] = in[2];
   out[3] = 0.0f;
+}
+
+// A descriptor set layout of `count` bindings, every one PARTIALLY_BOUND, compute
+// stage. `types[i]` is the type of binding i.
+VkDescriptorSetLayout CreateSetLayout(VkDevice device, uint32_t count,
+                                      const VkDescriptorType* types) {
+  VkDescriptorSetLayoutBinding bindings[16];
+  VkDescriptorBindingFlags binding_flags[16];
+  for (uint32_t i = 0; i < count; ++i) {
+    bindings[i] = {i, types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    binding_flags[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+  }
+  VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  flags_info.bindingCount = count;
+  flags_info.pBindingFlags = binding_flags;
+  VkDescriptorSetLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  layout_info.pNext = &flags_info;
+  layout_info.bindingCount = count;
+  layout_info.pBindings = bindings;
+  VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+  const VkResult result = vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &layout);
+  if (result != VK_SUCCESS) {
+    CAELIX_LOGE("vkCreateDescriptorSetLayout failed: %d", static_cast<int>(result));
+    throw VulkanError("vkCreateDescriptorSetLayout failed", result);
+  }
+  return layout;
 }
 
 }  // namespace
@@ -80,45 +167,37 @@ CaelixResult Renderer::Create(Device& device, Scene& scene, std::unique_ptr<Rend
   out.reset();
   std::unique_ptr<Renderer> renderer(new Renderer(device, scene));
   const VkDevice vk_device = device.device();
-
-  // Binding 0 the TLAS, bindings 1..6 the targets. Every binding is PARTIALLY_BOUND
-  // (descriptorBindingPartiallyBound, a device requirement): a render call writes
-  // only the TLAS when there is one and the targets that are present, and the
-  // kernel touches only those.
-  constexpr uint32_t kBindingCount = 1 + kTargetCount;
   static_assert(std::size(kTargetSpecs) == kTargetCount);
-  VkDescriptorSetLayoutBinding bindings[kBindingCount];
-  VkDescriptorBindingFlags binding_flags[kBindingCount];
-  for (uint32_t i = 0; i < kBindingCount; ++i) {
-    bindings[i] = {i,
-                   i == 0 ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
-                          : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                   1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    binding_flags[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-  }
-  VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
-      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-  flags_info.bindingCount = kBindingCount;
-  flags_info.pBindingFlags = binding_flags;
-  VkDescriptorSetLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  layout_info.pNext = &flags_info;
-  layout_info.bindingCount = kBindingCount;
-  layout_info.pBindings = bindings;
-  const VkResult result =
-      vkCreateDescriptorSetLayout(vk_device, &layout_info, nullptr, &renderer->set_layout_);
-  if (result != VK_SUCCESS) {
-    renderer->set_layout_ = VK_NULL_HANDLE;
-    CAELIX_LOGE("vkCreateDescriptorSetLayout failed: %d", static_cast<int>(result));
-    throw VulkanError("vkCreateDescriptorSetLayout failed", result);
-  }
-  const std::vector<uint32_t> spirv = LoadShader("caelix_trace_primary");
-  renderer->trace_ = ComputePipeline(vk_device, spirv, sizeof(TracePush), "caelix_trace_primary",
+  static_assert(std::size(kInternalSpecs) == kInternalCount);
+
+  // Trace set: binding 0 the TLAS, bindings 1..6 the host targets, 7..13 the
+  // internal targets. Every binding is PARTIALLY_BOUND (descriptorBindingPartiallyBound,
+  // a device requirement): a render call writes only the TLAS when there is one,
+  // the targets that are present and the internal targets in the lighting modes,
+  // and the kernel touches only those.
+  constexpr uint32_t kTraceBindingCount = 1 + kTargetCount + kTraceInternalCount;
+  VkDescriptorType trace_types[kTraceBindingCount];
+  std::fill(trace_types, trace_types + kTraceBindingCount, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+  trace_types[0] = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+  renderer->set_layout_ = CreateSetLayout(vk_device, kTraceBindingCount, trace_types);
+  // Composite set: binding 0 the host colour target, 1..5 internal targets.
+  VkDescriptorType composite_types[kCompositeBindingCount];
+  std::fill(composite_types, composite_types + kCompositeBindingCount,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+  renderer->composite_layout_ = CreateSetLayout(vk_device, kCompositeBindingCount, composite_types);
+
+  const std::vector<uint32_t> trace_spirv = LoadShader("caelix_path_trace");
+  renderer->trace_ = ComputePipeline(vk_device, trace_spirv, sizeof(TracePush), "caelix_path_trace",
                                      renderer->set_layout_);
+  const std::vector<uint32_t> composite_spirv = LoadShader("caelix_composite");
+  renderer->composite_ = ComputePipeline(vk_device, composite_spirv, sizeof(TracePush),
+                                         "caelix_composite", renderer->composite_layout_);
   for (uint32_t i = 0; i < kInitialSlots; ++i) {
     renderer->AddSlot();
   }
   renderer->timer_ = GpuTimer(device);
-  CAELIX_LOGI("renderer created: trace kernel caelix_trace_primary, %u frame slots",
+  renderer->composite_timer_ = GpuTimer(device);
+  CAELIX_LOGI("renderer created: kernels caelix_path_trace and caelix_composite, %u frame slots",
               kInitialSlots);
   out = std::move(renderer);
   return CAELIX_OK;
@@ -129,14 +208,20 @@ Renderer::~Renderer() {
   ReleaseTargetViews();
   for (const std::unique_ptr<FrameSlot>& slot : slots_) {
     if (slot->pool != VK_NULL_HANDLE) {
-      vkDestroyDescriptorPool(device, slot->pool, nullptr);  // frees the set too
+      vkDestroyDescriptorPool(device, slot->pool, nullptr);  // frees the sets too
     }
   }
   slots_.clear();
   trace_ = ComputePipeline();
+  composite_ = ComputePipeline();
   if (set_layout_ != VK_NULL_HANDLE) {
     vkDestroyDescriptorSetLayout(device, set_layout_, nullptr);
   }
+  if (composite_layout_ != VK_NULL_HANDLE) {
+    vkDestroyDescriptorSetLayout(device, composite_layout_, nullptr);
+  }
+  // The device is idle (caelix_renderer_destroy contract): internal_ and retired_
+  // are destroyed with the members.
 }
 
 void Renderer::AddSlot() {
@@ -144,10 +229,11 @@ void Renderer::AddSlot() {
   auto slot = std::make_unique<FrameSlot>();
   const VkDescriptorPoolSize sizes[2] = {
       {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kTargetCount},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+       kTargetCount + kTraceInternalCount + kCompositeBindingCount},
   };
   VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  pool_info.maxSets = 1;
+  pool_info.maxSets = 2;
   pool_info.poolSizeCount = 2;
   pool_info.pPoolSizes = sizes;
   VkResult result = vkCreateDescriptorPool(device, &pool_info, nullptr, &slot->pool);
@@ -159,15 +245,19 @@ void Renderer::AddSlot() {
   // Pushed now so that the destructor destroys the pool if a later call throws.
   slots_.push_back(std::move(slot));
   FrameSlot& added = *slots_.back();
+  const VkDescriptorSetLayout layouts[2] = {set_layout_, composite_layout_};
+  VkDescriptorSet sets[2] = {};
   VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
   set_info.descriptorPool = added.pool;
-  set_info.descriptorSetCount = 1;
-  set_info.pSetLayouts = &set_layout_;
-  result = vkAllocateDescriptorSets(device, &set_info, &added.set);
+  set_info.descriptorSetCount = 2;
+  set_info.pSetLayouts = layouts;
+  result = vkAllocateDescriptorSets(device, &set_info, sets);
   if (result != VK_SUCCESS) {
     CAELIX_LOGE("vkAllocateDescriptorSets failed: %d", static_cast<int>(result));
     throw VulkanError("vkAllocateDescriptorSets failed", result);
   }
+  added.set = sets[0];
+  added.composite_set = sets[1];
   VmaAllocationCreateInfo allocation_info{};
   allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
   allocation_info.flags =
@@ -277,6 +367,39 @@ void Renderer::ReleaseTargetViews() {
   views_.clear();
 }
 
+bool Renderer::EnsureInternalTargets(uint32_t width, uint32_t height, uint64_t frame) {
+  GpuImage& first = internal_[0];
+  if (first.valid() && first.width() == width && first.height() == height) {
+    return false;
+  }
+  if (first.valid()) {
+    RetiredImages retired;
+    retired.frame = internal_last_frame_;
+    retired.images = std::move(internal_);
+    retired_.push_back(std::move(retired));
+  }
+  // On a throw the images created so far are destroyed with `fresh`, and the next
+  // lighting render tries again.
+  InternalImages fresh;
+  for (uint32_t i = 0; i < kInternalCount; ++i) {
+    fresh[i] = GpuImage(device_.allocator(), device_.device(), width, height,
+                        kInternalSpecs[i].format,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        kInternalSpecs[i].name);
+  }
+  internal_ = std::move(fresh);
+  internal_last_frame_ = frame;
+  internal_needs_init_ = true;
+  CAELIX_LOGI("renderer: internal targets created at %ux%u", width, height);
+  return true;
+}
+
+void Renderer::FreeRetired(uint64_t safe_frame) {
+  std::erase_if(retired_, [safe_frame](const RetiredImages& retired) {
+    return retired.frame <= safe_frame;
+  });
+}
+
 CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTargets& targets,
                               const CaelixCamera& camera, const CaelixRenderOptions& options) {
   constexpr const char* kFunction = "caelix_renderer_render";
@@ -294,6 +417,16 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     CAELIX_LOGE("%s: unknown debug view %u", kFunction, options.debug_view);
     return CAELIX_ERROR_INVALID_ARGUMENT;
   }
+  if (options.mode >= kModeCount) {
+    CAELIX_LOGE("%s: unknown mode %u", kFunction, options.mode);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  if (options.bounce_count > CAELIX_MAX_BOUNCES) {
+    CAELIX_LOGE("%s: bounce_count %u is above the maximum %u", kFunction, options.bounce_count,
+                CAELIX_MAX_BOUNCES);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  const bool lighting = options.mode != CAELIX_MODE_PRIMARY;
 
   // The present targets (image != 0), in binding order.
   const CaelixTargetImage* const all[kTargetCount] = {&targets.color,  &targets.albedo,
@@ -352,10 +485,21 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   }
   const uint32_t width = all[present[0]]->width;
   const uint32_t height = all[present[0]]->height;
+  const bool has_color = targets.color.image != 0;
+  const bool composite = lighting && has_color;
 
   const VkCommandBuffer cmd = HandleFromU64<VkCommandBuffer>(frame.command_buffer);
   const uint64_t safe = frame.safe_frame_number;
   timer_.Resolve(safe);
+  composite_timer_.Resolve(safe);
+  FreeRetired(safe);
+
+  // Internal targets of the lighting modes (before anything is recorded: the
+  // allocation can throw).
+  bool restart_accumulation = options.reset_accumulation != 0 || options.mode != last_mode_;
+  if (lighting && EnsureInternalTargets(width, height, frame.frame_number)) {
+    restart_accumulation = true;
+  }
 
   FrameSlot* slot = AcquireSlot(frame.frame_number, safe);
   if (slot == nullptr) {
@@ -365,20 +509,32 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     return CAELIX_ERROR_INVALID_ARGUMENT;
   }
 
-  // Descriptors: the slot's previous frame has completed, so its set is free. Only
-  // the TLAS (when the scene has one) and the present targets are written; the
-  // other bindings keep stale or no descriptors, which PARTIALLY_BOUND allows
-  // because the kernel does not touch them (has_tlas, target_mask).
+  // Descriptors: the slot's previous frame has completed, so its sets are free.
+  // Only the TLAS (when the scene has one), the present targets and, in the
+  // lighting modes, the internal targets are written; the other bindings keep
+  // stale or no descriptors, which PARTIALLY_BOUND allows because the kernels do
+  // not touch them (has_tlas, target_mask, mode).
   const VkAccelerationStructureKHR tlas = scene_.tlas();
   VkWriteDescriptorSetAccelerationStructureKHR as_write{
       VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
   as_write.accelerationStructureCount = 1;
   as_write.pAccelerationStructures = &tlas;
-  VkDescriptorImageInfo image_infos[kTargetCount];
-  VkWriteDescriptorSet writes[1 + kTargetCount];
-  VkImage images[kTargetCount];
-  VkImageLayout layouts[kTargetCount];
+  constexpr uint32_t kMaxWrites =
+      1 + kTargetCount + kTraceInternalCount + kCompositeBindingCount;
+  VkDescriptorImageInfo image_infos[kMaxWrites];
+  VkWriteDescriptorSet writes[kMaxWrites];
   uint32_t write_count = 0;
+  const auto write_image = [&](VkDescriptorSet set, uint32_t binding, VkImageView view) {
+    image_infos[write_count] = {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet& write = writes[write_count];
+    write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.dstBinding = binding;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &image_infos[write_count];
+    ++write_count;
+  };
   if (tlas != VK_NULL_HANDLE) {
     VkWriteDescriptorSet& write = writes[write_count++];
     write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -388,19 +544,33 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
   }
+  VkImage images[kTargetCount];
+  VkImageLayout layouts[kTargetCount];
+  VkImageView color_view = VK_NULL_HANDLE;
   for (uint32_t p = 0; p < present_count; ++p) {
     const CaelixTargetImage& target = *all[present[p]];
     images[p] = HandleFromU64<VkImage>(target.image);
     layouts[p] = static_cast<VkImageLayout>(target.layout);
-    image_infos[p] = {VK_NULL_HANDLE, ViewFor(target, frame.frame_number, safe),
-                      VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet& write = writes[write_count++];
-    write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = slot->set;
-    write.dstBinding = 1 + present[p];
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    write.pImageInfo = &image_infos[p];
+    const VkImageView view = ViewFor(target, frame.frame_number, safe);
+    if (present[p] == 0) {
+      color_view = view;
+    }
+    write_image(slot->set, 1 + present[p], view);
+  }
+  if (lighting) {
+    for (uint32_t i = 0; i < kTraceInternalCount; ++i) {
+      write_image(slot->set, 1 + kTargetCount + i, internal_[i].view());
+    }
+    if (composite) {
+      // Composite bindings 1..5.
+      constexpr uint32_t kCompositeInternals[] = {kInternalAlbedo, kInternalDeterministic,
+                                                  kInternalDiff, kInternalSpec, kInternalAccum};
+      static_assert(std::size(kCompositeInternals) + 1 == kCompositeBindingCount);
+      write_image(slot->composite_set, 0, color_view);
+      for (uint32_t i = 0; i < std::size(kCompositeInternals); ++i) {
+        write_image(slot->composite_set, 1 + i, internal_[kCompositeInternals[i]].view());
+      }
+    }
   }
   vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
 
@@ -458,31 +628,102 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   constants.miss_depth = options.miss_depth;
   constants.miss_view_z = options.miss_view_z;
   constants.has_tlas = tlas != VK_NULL_HANDLE ? 1u : 0u;
+  // Lighting.
+  const uint32_t accum_count = restart_accumulation ? 0u : accum_count_;
+  constants.mode = options.mode;
+  constants.bounce_count = options.bounce_count;
+  constants.frame_seed = options.frame_seed;
+  constants.accum_count = accum_count;
+  constants.exposure = options.exposure != 0.0f ? options.exposure : 1.0f;
+  Copy3(options.sun_radiance, constants.sun_radiance);
+  Copy3(options.sky_zenith, constants.sky_zenith);
+  Copy3(options.sky_horizon, constants.sky_horizon);
+  Copy3(options.sky_ground, constants.sky_ground);
+  const float sun_radius =
+      options.sun_angular_radius > 0.0f ? options.sun_angular_radius : kDefaultSunAngularRadius;
+  constants.sun_cos_radius = std::cos(sun_radius);
+  constants.output_srgb = IsUnormFormat(static_cast<VkFormat>(targets.color.format)) ? 1u : 0u;
+  constants.t_max = kTMax;
   std::memcpy(slot->constants.mapped(), &constants, sizeof(constants));
   slot->constants.FlushHostWrites(0, sizeof(constants));
 
-  // Any earlier use of the targets (the host's acquire chains into ALL_COMMANDS)
-  // -> the kernel's writes.
-  TargetBarriers(cmd, present_count, images, layouts, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                 VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+  // Any earlier use of the host targets (the host's acquire chains into
+  // ALL_COMMANDS) -> the kernels' writes. Lighting modes: the internal targets'
+  // first use (UNDEFINED -> GENERAL), else a memory barrier that orders the
+  // previous frame's kernel reads and writes before this frame's.
+  {
+    Barriers before;
+    for (uint32_t p = 0; p < present_count; ++p) {
+      before.Image(images[p], layouts[p], VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                   VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    }
+    if (lighting) {
+      if (internal_needs_init_) {
+        for (uint32_t i = 0; i < kInternalCount; ++i) {
+          before.Image(internal_[i].image(), VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
+      }
+      before.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    }
+    before.Record(cmd);
+  }
+  const TracePush push{slot->constants.address()};
+
+  // Trace.
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace_.pipeline());
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace_.layout(), 0, 1, &slot->set,
                           0, nullptr);
-  const TracePush push{slot->constants.address()};
   vkCmdPushConstants(cmd, trace_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+  const uint32_t groups_x = (width + kWorkgroupSize - 1) / kWorkgroupSize;
+  const uint32_t groups_y = (height + kWorkgroupSize - 1) / kWorkgroupSize;
   timer_.Begin(cmd, frame.frame_number, safe);
-  vkCmdDispatch(cmd, (width + kWorkgroupSize - 1) / kWorkgroupSize,
-                (height + kWorkgroupSize - 1) / kWorkgroupSize, 1);
+  vkCmdDispatch(cmd, groups_x, groups_y, 1);
   timer_.End(cmd);
-  VkImageLayout general[kTargetCount];
-  std::fill(general, general + kTargetCount, VK_IMAGE_LAYOUT_GENERAL);
-  TargetBarriers(cmd, present_count, images, general, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                 VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+
+  // Composite (lighting modes with a colour target).
+  if (composite) {
+    Barriers between;
+    between.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    between.Record(cmd);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, composite_.pipeline());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, composite_.layout(), 0, 1,
+                            &slot->composite_set, 0, nullptr);
+    vkCmdPushConstants(cmd, composite_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                       &push);
+    composite_timer_.Begin(cmd, frame.frame_number, safe);
+    vkCmdDispatch(cmd, groups_x, groups_y, 1);
+    composite_timer_.End(cmd);
+  }
+
+  // The kernels' writes -> all later commands (the host's use of its targets).
+  {
+    Barriers after;
+    for (uint32_t p = 0; p < present_count; ++p) {
+      after.Image(images[p], VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    }
+    after.Record(cmd);
+  }
 
   prev_camera_ = camera;
   has_prev_camera_ = true;
+  last_mode_ = options.mode;
+  if (lighting) {
+    internal_needs_init_ = false;
+    internal_last_frame_ = frame.frame_number;
+    accum_count_ =
+        (options.mode == CAELIX_MODE_REFERENCE && composite) ? accum_count + 1 : accum_count;
+  }
   return CAELIX_OK;
 }
 
@@ -496,6 +737,10 @@ void Renderer::GetTimings(CaelixGpuTimings& out) const {
   float flush_ms = 0.0f;
   if (scene_.FlushMsForFrame(out.frame_number, flush_ms)) {
     out.flush_ms = flush_ms;
+  }
+  float composite_ms = 0.0f;
+  if (composite_timer_.MsForFrame(out.frame_number, composite_ms)) {
+    out.composite_ms = composite_ms;
   }
 }
 

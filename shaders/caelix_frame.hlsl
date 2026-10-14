@@ -1,5 +1,5 @@
-// Per-frame constants of the trace kernels. Mirrors lib/src/frame_constants.h;
-// change both together. The kernel's only push constant is the device address of
+// Per-frame constants of the trace and composite kernels. Mirrors
+// lib/src/frame_constants.h; change both together. The kernel's only push constant is the device address of
 // one CaelixFrameConstants (512 bytes on the CPU side; the tail is padding and is
 // not declared here). Every field sits at an offset that is a multiple of its
 // size, so std430 and scalar layout rules give the same offsets.
@@ -42,6 +42,18 @@ struct CaelixFrameConstants {
   float miss_view_z;        // 320
   uint has_prev_camera;     // 324  0 on the first render call of the renderer
   uint has_tlas;            // 328  0 before the scene's first TLAS build
+  uint mode;                // 332  kMode*
+  uint bounce_count;        // 336  stochastic bounces, 0..14
+  uint frame_seed;          // 340
+  uint accum_count;         // 344  reference mode: frames accumulated before this one (0 = restart)
+  float exposure;           // 348  composite multiply
+  float4 sun_radiance;      // 352  w unused
+  float4 sky_zenith;        // 368  w unused
+  float4 sky_horizon;       // 384  w unused
+  float4 sky_ground;        // 400  w unused
+  float sun_cos_radius;     // 416  cos(sun angular radius)
+  uint output_srgb;         // 420  1 = the colour target is UNORM: encode linear -> sRGB
+  float t_max;              // 424  bounce ray length and the "no hit" hit distance (1e4)
 };
 
 struct CaelixTracePush {
@@ -56,8 +68,14 @@ static const uint kViewGroup = 3;
 static const uint kViewBrick = 4;
 static const uint kViewSteps = 5;
 
+// CaelixRenderMode
+static const uint kModePrimary = 0;
+static const uint kModePathTrace = 1;
+static const uint kModeReference = 2;
+
 // CaelixRenderOptions::flags
 static const uint kRenderFlagShading = 1u << 0;
+static const uint kRenderFlagSkyOnMiss = 1u << 1;
 
 // CaelixFrameConstants::target_mask: bit i = the target at descriptor binding i + 1.
 static const uint kTargetColor = 1u << 0;
@@ -67,5 +85,13 @@ static const uint kTargetDepth = 1u << 3;
 static const uint kTargetMotion = 1u << 4;
 static const uint kTargetViewZ = 1u << 5;
 static const uint kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
+
+// The primary ray direction of pixel `pixel` (row 0 = the top row), CaelixCamera's pinhole mapping.
+float3 CaelixPrimaryDirection(CaelixFrameConstants fc, uint2 pixel) {
+  const float2 ndc = float2((float(pixel.x) + 0.5f) / float(fc.size.x) * 2.0f - 1.0f,
+                            1.0f - (float(pixel.y) + 0.5f) / float(fc.size.y) * 2.0f);
+  return normalize(fc.right.xyz * (ndc.x * fc.tan_half_fov_y * fc.aspect) +
+                   fc.up.xyz * (ndc.y * fc.tan_half_fov_y) + fc.forward.xyz);
+}
 
 #endif  // CAELIX_FRAME_HLSL
