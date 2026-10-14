@@ -161,10 +161,9 @@ CaelixResult Device::Adopt(const CaelixDeviceAdoptDesc& desc, std::unique_ptr<De
   if (!CheckRequirements(device->physical_device_, req)) {
     return CAELIX_ERROR_UNSUPPORTED;
   }
-  CAELIX_LOGW(
-      "device requirements are SUPPORTED by the physical device; Vulkan cannot report which "
-      "features the host actually ENABLED, so a feature the host did not enable shows up as a "
-      "validation error later");
+  // Vulkan cannot report which features the host actually ENABLED on an adopted device, so a
+  // feature the host forgot shows up as a validation error later, not here.
+  CAELIX_LOGI("device requirements are supported by the physical device");
 
   VmaAllocatorCreateInfo allocator_info{};
   allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
