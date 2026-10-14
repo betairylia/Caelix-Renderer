@@ -1,4 +1,4 @@
-//! Debug UI: four egui windows (Stats, Render, Camera, Entities) in egui's default style, drawn by
+//! Debug UI: five egui windows (Stats, Render, Camera, Entities, Test) in egui's default style, drawn by
 //! `caelix-vk` as an overlay on the swapchain image after the library has written it.
 //!
 //! egui-winit turns the window events into egui input; this module holds the egui context and
@@ -12,6 +12,7 @@ use winit::window::Window;
 
 use crate::camera::{self, Camera};
 use crate::settings::{Mode, RenderSettings, View};
+use crate::testscene::{EditPattern, TestScene};
 use crate::world::EntityEntry;
 
 /// Size of the window titles (egui's Heading text style), in points. egui's default is 18; the
@@ -65,6 +66,27 @@ impl EntityRow {
         }
     }
 
+    /// A row for an entity that the host created itself (the test entity).
+    pub fn synthetic(
+        scene_id: CaelixEntityId,
+        guid: &str,
+        position: [f32; 3],
+        rotation: [f32; 4],
+        bricks: u64,
+    ) -> Self {
+        Self {
+            scene_id,
+            guid: guid.into(),
+            bricks,
+            original_position: position,
+            original_rotation: rotation,
+            position,
+            euler: camera::euler_from_quat(rotation),
+            rotation,
+            dirty: false,
+        }
+    }
+
     pub fn set_euler(&mut self, euler: [f32; 3]) {
         self.euler = euler;
         self.rotation = camera::quat_from_euler(euler[0], euler[1], euler[2]);
@@ -88,6 +110,8 @@ pub struct Panel<'a> {
     /// Free camera speed in units per second.
     pub speed: &'a mut f32,
     pub entities: &'a mut [EntityRow],
+    /// The test entity and its edits (Test window).
+    pub test: &'a mut TestScene,
     /// Output: the "Reset accumulation" button was pressed.
     pub reset_accumulation: bool,
     /// Output: the "Screenshot" button was pressed.
@@ -108,10 +132,12 @@ pub struct Ui {
     pub visible: bool,
     /// `--ui-demo`: every window and section starts open.
     demo: bool,
+    /// The Test window starts open (`--test-entity`, `--test-edits`).
+    test_open: bool,
 }
 
 impl Ui {
-    pub fn new(window: &Window, visible: bool, demo: bool) -> Self {
+    pub fn new(window: &Window, visible: bool, demo: bool, test_open: bool) -> Self {
         let ctx = egui::Context::default();
         // egui's default style with two changes (owner's choice): no window or popup shadows, and
         // smaller window titles (the title uses the Heading text style, 18 by default).
@@ -131,7 +157,7 @@ impl Ui {
             None,
             None,
         );
-        Self { ctx, winit, visible, demo }
+        Self { ctx, winit, visible, demo, test_open }
     }
 
     /// Feeds a window event to egui (only while the UI is visible).
@@ -154,8 +180,8 @@ impl Ui {
     /// Runs one egui pass with the debug windows and tessellates it.
     pub fn run(&mut self, window: &Window, panel: &mut Panel<'_>) -> UiFrame {
         let raw_input = self.winit.take_egui_input(window);
-        let demo = self.demo;
-        let output = self.ctx.run_ui(raw_input, |root| debug_windows(root.ctx(), panel, demo));
+        let (demo, test_open) = (self.demo, self.test_open);
+        let output = self.ctx.run_ui(raw_input, |root| debug_windows(root.ctx(), panel, demo, test_open));
         self.winit.handle_platform_output(window, output.platform_output);
         let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
         UiFrame { textures_delta: output.textures_delta, primitives, pixels_per_point: output.pixels_per_point }
@@ -166,11 +192,11 @@ fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 20) as f64
 }
 
-/// Four separate egui windows: Stats at the top left, Camera at the bottom left (with `--ui-demo`,
+/// Five separate egui windows: Stats at the top left, Camera at the bottom left (with `--ui-demo`,
 /// where Stats is fully open, at the bottom centre), Render at the top right, Entities at the top
-/// centre. Each is draggable and collapsible
-/// (title bar); egui keeps the positions after the first frame.
-fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, demo: bool) {
+/// centre, Test at the bottom right (collapsed unless `test_open`). Each is draggable and
+/// collapsible (title bar); egui keeps the positions after the first frame.
+fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, demo: bool, test_open: bool) {
     let screen = ctx.content_rect();
     let margin = 8.0;
     egui::Window::new("Stats")
@@ -195,6 +221,11 @@ fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, demo: bool) {
         .default_pos([screen.center().x, screen.min.y + margin])
         .default_open(demo)
         .show(ctx, |ui| entities_window(ui, panel.entities, demo));
+    egui::Window::new("Test")
+        .pivot(egui::Align2::RIGHT_BOTTOM)
+        .default_pos([screen.max.x - margin, screen.max.y - margin])
+        .default_open(test_open || demo)
+        .show(ctx, |ui| test_window(ui, panel));
 }
 
 /// Two-column grid of label / value rows.
@@ -486,6 +517,91 @@ fn entities_list(ui: &mut egui::Ui, entities: &mut [EntityRow], demo: bool) {
                 });
             });
     }
+}
+
+/// The test entity (enable, pause, orbit, spin), its timed edits and the scene stats that matter
+/// for them.
+fn test_window(ui: &mut egui::Ui, panel: &mut Panel<'_>) {
+    let test = &mut *panel.test;
+    CollapsingHeader::new("Entity").default_open(true).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut test.enabled, "enabled")
+                .on_hover_text("adds the box in front of the camera (or at --test-entity-at); off removes it");
+            ui.checkbox(&mut test.paused, "paused");
+        });
+        Grid::new("test_entity").num_columns(2).show(ui, |ui| {
+            ui.label("orbit radius");
+            ui.add(Slider::new(&mut test.orbit_radius, 0.0..=100.0));
+            ui.end_row();
+            ui.label("orbit speed");
+            ui.add(Slider::new(&mut test.orbit_speed, -360.0..=360.0).suffix(" deg/s"));
+            ui.end_row();
+            ui.label("spin speed");
+            ui.add(Slider::new(&mut test.spin_speed, -360.0..=360.0).suffix(" deg/s"));
+            ui.end_row();
+        });
+        ui.horizontal(|ui| {
+            if ui.add_enabled(test.entity().is_some(), egui::Button::new("Reset to start")).clicked() {
+                test.reset_requested = true;
+            }
+            match test.entity() {
+                Some(id) => {
+                    let c = test.centre();
+                    ui.label(format!(
+                        "scene id {id}, t {:.2} s, centre ({:.1}, {:.1}, {:.1})",
+                        test.time(),
+                        c[0],
+                        c[1],
+                        c[2]
+                    ))
+                }
+                None => ui.label("no test entity"),
+            };
+        });
+    });
+    CollapsingHeader::new("Edits").default_open(true).show(ui, |ui| {
+        ui.checkbox(&mut test.edits_enabled, "enabled").on_hover_text("creates the test entity when it is absent");
+        Grid::new("test_edits").num_columns(2).show(ui, |ui| {
+            ui.label("interval");
+            ui.add(Slider::new(&mut test.interval, 1..=120).suffix(" frames"));
+            ui.end_row();
+            ui.label("pattern");
+            ComboBox::from_id_salt("test_pattern").selected_text(test.pattern.label()).show_ui(ui, |ui| {
+                for pattern in EditPattern::ALL {
+                    ui.selectable_value(&mut test.pattern, pattern, pattern.label());
+                }
+            });
+            ui.end_row();
+        });
+        if ui.add_enabled(test.entity().is_some(), egui::Button::new("Step once")).clicked() {
+            test.step_once = true;
+        }
+        value_grid(
+            ui,
+            "test_counts",
+            &[
+                ("ticks", test.ticks.to_string()),
+                ("bricks uploaded", test.uploads.to_string()),
+                ("bricks removed", test.removes.to_string()),
+                ("uploads queued", test.pending_uploads().to_string()),
+                ("entity bricks", test.brick_count().to_string()),
+            ],
+        );
+    });
+    CollapsingHeader::new("Stats").default_open(true).show(ui, |ui| {
+        let r = &test.rates;
+        value_grid(
+            ui,
+            "test_stats",
+            &[
+                ("flush (newest)", format!("{:.3} ms", panel.stats.timings.flush_ms)),
+                ("flush (1 s mean / max)", format!("{:.3} / {:.3} ms", r.flush_ms_mean, r.flush_ms_max)),
+                ("AS builds", format!("{:.1} /s", r.as_builds_per_s)),
+                ("AS builds pending", panel.stats.scene.as_builds_pending.to_string()),
+                ("bricks finalized", format!("{:.1} /s", r.finalized_per_s)),
+            ],
+        );
+    });
 }
 
 #[cfg(test)]

@@ -75,6 +75,7 @@ static const uint kViewBrick = 4;
 static const uint kViewSteps = 5;
 static const uint kViewNrdValidation = 6;  // path trace mode: NRD's validation layer
 static const uint kViewNrdDiff = 7;        // path trace mode: denoised diffuse radiance
+static const uint kViewMotion = 8;         // path trace mode: the motion vector of the primary hit
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

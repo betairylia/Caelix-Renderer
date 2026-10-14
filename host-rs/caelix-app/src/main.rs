@@ -11,9 +11,13 @@
 //! (`--mode pt`, `--no-denoise` for the raw image) or the accumulated reference
 //! (`--mode ref`). Debug windows (egui, `ui.rs`, F1) are drawn over the image by
 //! `caelix-vk` after the render; a screenshot is copied before them.
+//!
+//! `--test-entity` and `--test-edits` add a synthetic moving box and timed brick edits
+//! (`testscene.rs`, Test window) to judge the motion vectors and NRD.
 
 mod camera;
 mod settings;
+mod testscene;
 mod ui;
 mod world;
 
@@ -37,6 +41,7 @@ use winit::window::{Window, WindowId};
 
 use camera::Camera;
 use settings::{same_options, Mode, RenderSettings, View};
+use testscene::{EditPattern, TestScene};
 
 /// Free camera: default speed in world units (blocks) per second.
 const DEFAULT_SPEED: f32 = 100.0;
@@ -141,7 +146,7 @@ struct Args {
     /// Rendering mode. Default: `pt` with --world, else `primary`.
     #[arg(long, value_enum)]
     mode: Option<Mode>,
-    /// Primary mode: the debug view (albedo .. steps); pt mode: nrd-validation, nrd-diff.
+    /// Primary mode: the debug view (albedo .. steps); pt mode: nrd-validation, nrd-diff, motion.
     #[arg(long, value_enum, default_value_t = View::Albedo)]
     view: View,
     /// Pt mode: no NRD denoising (the raw 1 sample per pixel image).
@@ -218,6 +223,40 @@ struct Args {
     /// yaw of 15 degrees (for captures of the debug UI).
     #[arg(long, conflicts_with_all = ["no_ui", "no_input"])]
     ui_demo: bool,
+    /// Test aid: write frame-<frame number>.png into --screenshot-dir every N frames, starting
+    /// --warmup frames (at least 3) after the world is complete (without --world at frame 10).
+    #[arg(long, value_name = "N")]
+    screenshot_every: Option<u64>,
+    /// Add a synthetic test entity (a hollow 24^3 box with coloured faces, emissive corners and a
+    /// hole in its +Z face) that orbits and spins, to judge motion vectors and NRD (Test window).
+    #[arg(long)]
+    test_entity: bool,
+    /// Orbit centre of the test entity. Default: 120 units in front of the start camera, 10
+    /// units below the eye.
+    #[arg(long, value_name = "X,Y,Z", value_parser = parse_vec3, allow_hyphen_values = true)]
+    test_entity_at: Option<[f32; 3]>,
+    /// The test entity starts paused (no transform change, motion vectors 0).
+    #[arg(long)]
+    test_paused: bool,
+    /// Orbit radius of the test entity in world units.
+    #[arg(long, value_name = "UNITS", default_value_t = 20.0)]
+    test_orbit_radius: f32,
+    /// Orbit speed of the test entity in degrees per second.
+    #[arg(long, value_name = "DEG_PER_S", default_value_t = 30.0, allow_hyphen_values = true)]
+    test_orbit_speed: f32,
+    /// Spin (yaw) speed of the test entity in degrees per second; the pitch turns at 0.37 times it.
+    #[arg(long, value_name = "DEG_PER_S", default_value_t = 45.0, allow_hyphen_values = true)]
+    test_spin_speed: f32,
+    /// Timed brick edits on the test entity (adds the test entity when --test-entity is absent).
+    #[arg(long)]
+    test_edits: bool,
+    /// Frames between two test edits (1..120).
+    #[arg(long, value_name = "N", default_value_t = 10)]
+    test_edit_interval: u32,
+    /// Test edit pattern: wave (brick columns under the box are uploaded and removed) or flicker
+    /// (the emissive corners are replaced).
+    #[arg(long, value_enum, default_value_t = EditPattern::Wave)]
+    test_edit_pattern: EditPattern,
 }
 
 /// Everything that lives while the window exists. Drop order matters: Drop
@@ -266,6 +305,8 @@ enum ReadbackOwner {
     Cli,
     /// The debug UI's Screenshot button: the PNG path.
     Ui(PathBuf),
+    /// --screenshot-every: the PNG path.
+    Every(PathBuf),
 }
 
 /// Screenshot progress.
@@ -302,8 +343,12 @@ struct App {
     /// The options of the previous frame (reference accumulation restarts when they change).
     last_options: Option<CaelixRenderOptions>,
     accumulation: Accumulation,
-    /// The scene entities as the debug UI edits them (empty without --world).
+    /// The scene entities as the debug UI edits them (the world's, then the test entity).
     entities: Vec<ui::EntityRow>,
+    /// The test entity and its edits (--test-entity, --test-edits, Test window).
+    test: TestScene,
+    /// --screenshot-every: the presented-frame count of the first capture.
+    every_base: Option<u64>,
     /// The debug UI's Screenshot button was pressed; the copy is recorded when no readback is pending.
     ui_screenshot_requested: bool,
     /// Receiver of the readback that `readback_now` recorded; `None` when nothing is pending.
@@ -351,7 +396,8 @@ impl App {
             None
         } else {
             context.init_overlay().context("cannot create the egui overlay")?;
-            Some(ui::Ui::new(&window, !self.args.no_ui, self.args.ui_demo))
+            let test_open = self.args.test_entity || self.args.test_edits;
+            Some(ui::Ui::new(&window, !self.args.no_ui, self.args.ui_demo, test_open))
         };
 
         let handles = context.adopt_handles();
@@ -479,6 +525,7 @@ impl App {
                     camera: &mut self.camera,
                     speed: &mut self.input.speed,
                     entities: &mut self.entities,
+                    test: &mut self.test,
                     reset_accumulation: false,
                     screenshot: false,
                 };
@@ -488,6 +535,9 @@ impl App {
                     self.ui_screenshot_requested = true;
                 }
             }
+            // Test entity: added or removed, animated (its row becomes dirty when the pose changed)
+            // and edited, before the transforms are sent.
+            let test_edited = self.test.update(state.scene, dt, &self.camera, &mut self.entities)?;
             let mut entity_moved = false;
             for entity in self.entities.iter_mut().filter(|e| e.dirty) {
                 entity.dirty = false;
@@ -511,6 +561,8 @@ impl App {
             if result != CaelixResult_CAELIX_OK {
                 bail!("caelix_scene_recycle({}) failed: CaelixResult {result}", frame.safe_frame_number);
             }
+            // The test entity's few bricks go first, so a loading world cannot starve them.
+            self.test.upload_pending(state.scene)?;
             let uploaded = match state.loader.as_mut() {
                 Some(loader) => loader.upload(state.scene, frame.frame_number)?,
                 None => false,
@@ -530,12 +582,16 @@ impl App {
                 );
             }
             if let Some(loader) = state.loader.as_mut() {
-                if let world::LoadOutcome::Mismatch = loader.after_flush(state.scene, uploaded, frame.frame_number) {
+                let test_bricks = self.test.bricks_in_scene();
+                if let world::LoadOutcome::Mismatch =
+                    loader.after_flush(state.scene, uploaded, frame.frame_number, test_bricks)
+                {
                     self.load_mismatch = true;
                 }
             }
             // The world is complete on the GPU after this frame's flush.
             let world_ready = state.loader.as_ref().is_none_or(|loader| loader.is_ready());
+            self.test.after_flush(&scene_stats(state.scene), &gpu_timings(state.renderer), world_ready);
 
             let targets = CaelixRenderTargets {
                 color: CaelixTargetImage {
@@ -565,7 +621,8 @@ impl App {
             self.last_options = Some(options);
             let reset_accumulation = ui_reset
                 || !world_ready
-                || (self.settings.mode == Mode::Ref && (camera_changed || options_changed || entity_moved));
+                || (self.settings.mode == Mode::Ref
+                    && (camera_changed || options_changed || entity_moved || test_edited));
             self.accumulation.frames = if reset_accumulation { 1 } else { self.accumulation.frames + 1 };
             options.reset_accumulation = u32::from(reset_accumulation);
             // SAFETY: the command buffer is recording after this frame's flush; the image is
@@ -609,16 +666,15 @@ impl App {
                 } else {
                     log::info!("screenshot requested at frame {}", frame.frame_number);
                 }
+            } else if every_due(&self.args, &mut self.every_base, self.frames_presented, world_ready)
+                && state.context.readback_now(&frame)?
+            {
+                let path = screenshot_dir(&self.args).join(format!("frame-{}.png", frame.frame_number));
+                log::info!("screenshot (every) requested at frame {}", frame.frame_number);
+                self.readback_owner = Some(ReadbackOwner::Every(path));
             } else if self.ui_screenshot_requested && state.context.readback_now(&frame)? {
                 self.ui_screenshot_requested = false;
-                let dir = match &self.args.screenshot_dir {
-                    Some(dir) => dir.clone(),
-                    None => std::env::current_exe()
-                        .ok()
-                        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-                        .unwrap_or_default(),
-                };
-                let path = dir.join(format!("screenshot-{}.png", frame.frame_number));
+                let path = screenshot_dir(&self.args).join(format!("screenshot-{}.png", frame.frame_number));
                 self.screenshot_note = format!("writing {}", path.display());
                 self.readback_owner = Some(ReadbackOwner::Ui(path));
             }
@@ -652,6 +708,10 @@ impl App {
                             event_loop.exit();
                             return Ok(());
                         }
+                    }
+                    ReadbackOwner::Every(path) => {
+                        write_png(&path, &pixels, width, height)?;
+                        log::info!("screenshot written: {} ({width}x{height})", path.display());
                     }
                     ReadbackOwner::Ui(path) => {
                         // A failed write is reported in the Render window, not fatal.
@@ -712,6 +772,9 @@ impl App {
         }
         if self.frames_presented > 0 && self.frames_presented.is_multiple_of(LOG_EVERY_FRAMES) {
             log::info!("{}", timing_line(state.renderer, self.timing.fps));
+            if self.test.entity().is_some() {
+                log::info!("{}", self.test.summary(&self.test.rates, &scene_stats(state.scene)));
+            }
         }
 
         if let Some(at) = self.args.resize_at {
@@ -857,10 +920,56 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // The test entity's numbers of the whole run (since the world was complete).
+        if let (Some(state), Some(_)) = (self.state.as_ref(), self.test.entity()) {
+            let stats = scene_stats(state.scene);
+            match self.test.run_rates(&stats) {
+                Some((rates, seconds)) => log::info!(
+                    "{} (run of {seconds:.1} s since the world was complete)",
+                    self.test.summary(&rates, &stats)
+                ),
+                None => log::info!(
+                    "{} (last 1 s window; the world never completed)",
+                    self.test.summary(&self.test.rates, &stats)
+                ),
+            }
+        }
         // wait idle, caelix_renderer_destroy, caelix_scene_destroy, caelix_device_destroy, then
         // the context (State::drop).
         self.state = None;
     }
+}
+
+/// Directory of the debug UI's and --screenshot-every's PNGs: --screenshot-dir, else the
+/// directory of the executable.
+fn screenshot_dir(args: &Args) -> PathBuf {
+    match &args.screenshot_dir {
+        Some(dir) => dir.clone(),
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .unwrap_or_default(),
+    }
+}
+
+/// --screenshot-every: a capture is due in this frame. The first one is --warmup frames (at
+/// least 3) after the world is complete (without a world, after frame 10), then every N.
+fn every_due(args: &Args, every_base: &mut Option<u64>, frames_presented: u64, world_ready: bool) -> bool {
+    let Some(every) = args.screenshot_every.filter(|&n| n > 0) else {
+        return false;
+    };
+    if every_base.is_none() {
+        let ready = if args.world.is_some() {
+            world_ready
+        } else {
+            frames_presented + 1 >= SCREENSHOT_FRAME_WITHOUT_WORLD
+        };
+        if ready {
+            *every_base = Some(frames_presented + args.warmup.max(SCREENSHOT_EXTRA_FRAMES));
+        }
+    }
+    every_base
+        .is_some_and(|base| frames_presented >= base && (frames_presented - base).is_multiple_of(every))
 }
 
 fn gpu_timings(renderer: *const CaelixRenderer) -> CaelixGpuTimings {
@@ -1017,7 +1126,7 @@ fn main() -> anyhow::Result<()> {
     if args.accumulate.is_some() && mode != Mode::Ref {
         bail!("--accumulate needs --mode ref");
     }
-    if matches!(args.view, View::NrdValidation | View::NrdDiff) && mode != Mode::Pt {
+    if matches!(args.view, View::NrdValidation | View::NrdDiff | View::Motion) && mode != Mode::Pt {
         bail!("--view {:?} needs --mode pt", args.view);
     }
     log::info!(
@@ -1053,6 +1162,22 @@ fn main() -> anyhow::Result<()> {
         sky_ground: args.sky_ground,
     };
 
+    if !(1..=120).contains(&args.test_edit_interval) {
+        bail!("--test-edit-interval {} is outside 1..120", args.test_edit_interval);
+    }
+    let mut test = TestScene::new(
+        args.test_entity_at,
+        args.test_paused,
+        args.test_orbit_radius,
+        args.test_orbit_speed,
+        args.test_spin_speed,
+        args.test_edits,
+        args.test_edit_interval,
+        args.test_edit_pattern,
+    );
+    // The entity is added by the first frame's update, with the start camera.
+    test.enabled = args.test_entity || args.test_edits;
+
     let event_loop = EventLoop::new().context("cannot create the event loop")?;
     let fov = args.fov;
     let mut app = App {
@@ -1061,6 +1186,8 @@ fn main() -> anyhow::Result<()> {
         last_options: None,
         accumulation: Accumulation { last_camera: None, frames: 0 },
         entities: Vec::new(),
+        test,
+        every_base: None,
         ui_screenshot_requested: false,
         readback_owner: None,
         screenshot_note: String::new(),

@@ -24,10 +24,12 @@ pub enum View {
     NrdValidation,
     /// Path trace mode: the denoised diffuse radiance without the albedo.
     NrdDiff,
+    /// Path trace mode: the motion vector of the primary hit (grey = no motion, +-32 px saturate).
+    Motion,
 }
 
 impl View {
-    pub const ALL: [View; 8] = [
+    pub const ALL: [View; 9] = [
         View::Albedo,
         View::Normal,
         View::Depth,
@@ -36,6 +38,7 @@ impl View {
         View::Steps,
         View::NrdValidation,
         View::NrdDiff,
+        View::Motion,
     ];
 
     pub fn raw(self) -> u32 {
@@ -48,6 +51,7 @@ impl View {
             View::Steps => CaelixDebugView_CAELIX_VIEW_STEPS as u32,
             View::NrdValidation => CaelixDebugView_CAELIX_VIEW_NRD_VALIDATION as u32,
             View::NrdDiff => CaelixDebugView_CAELIX_VIEW_NRD_DIFF as u32,
+            View::Motion => CaelixDebugView_CAELIX_VIEW_MOTION as u32,
         }
     }
 
@@ -61,6 +65,7 @@ impl View {
             View::Steps => "steps",
             View::NrdValidation => "nrd validation (pt)",
             View::NrdDiff => "nrd diff (pt)",
+            View::Motion => "motion (pt)",
         }
     }
 }

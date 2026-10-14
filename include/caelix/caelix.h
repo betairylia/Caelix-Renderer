@@ -49,7 +49,8 @@ extern "C" {
    NEE step added CAELIX_RENDER_FLAG_SUN_NEE (a new flag bit, no struct change). The NRD step (6b)
    added CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT, the debug views CAELIX_VIEW_NRD_*,
    CaelixNrdInfo and caelix_renderer_get_nrd_info, renamed CaelixGpuTimings::pad to denoise_ms
-   (same layout) and made CaelixRenderOptions::denoise active, also without a bump. A host
+   (same layout) and made CaelixRenderOptions::denoise active, also without a bump. The motion
+   view step added CAELIX_VIEW_MOTION (a new enum value, no struct change). A host
    built against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -501,13 +502,19 @@ typedef enum CaelixDebugView {
   CAELIX_VIEW_GROUP = 3,   /* hash colour of the render group of the hit */
   CAELIX_VIEW_BRICK = 4,   /* hash colour of the brick of the hit (group and dense brick id) */
   CAELIX_VIEW_STEPS = 5,   /* heat map of the procedural candidates of the ray, 0 .. 64 */
-  /* Views 6 and 7 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo view for
+  /* Views 6, 7 and 8 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo view for
      them, CAELIX_MODE_REFERENCE ignores debug_view). */
   CAELIX_VIEW_NRD_VALIDATION = 6, /* NRD's validation layer (CommonSettings::enableValidation) blended
                                      over the image by its alpha (after the sRGB encode); the normal
                                      image when the frame was not denoised */
-  CAELIX_VIEW_NRD_DIFF = 7        /* the denoised diffuse radiance without the albedo (the raw diffuse
+  CAELIX_VIEW_NRD_DIFF = 7,       /* the denoised diffuse radiance without the albedo (the raw diffuse
                                      radiance when the frame was not denoised), exposure applied */
+  CAELIX_VIEW_MOTION = 8          /* the motion vector of the primary hit (the motion target's value):
+                                     rgb = (saturate(motion.x / 32 * 0.5 + 0.5),
+                                     saturate(motion.y / 32 * 0.5 + 0.5), 0.5 * coverage), alpha =
+                                     coverage, written as is (no exposure, no sRGB encode). A hit
+                                     without motion is grey (0.5, 0.5, 0.5), a miss (0.5, 0.5, 0);
+                                     +-32 px saturate. */
 } CaelixDebugView;
 
 /* CaelixRenderOptions::flags */
@@ -529,7 +536,7 @@ typedef enum CaelixDebugView {
 /* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
 typedef struct CaelixRenderOptions {
   uint32_t debug_view;  /* CaelixDebugView; read in CAELIX_MODE_PRIMARY (views 0..5) and
-                           CAELIX_MODE_PATH_TRACE (views 6, 7), checked in every mode */
+                           CAELIX_MODE_PATH_TRACE (views 6, 7, 8), checked in every mode */
   uint32_t flags;       /* CAELIX_RENDER_FLAG_* */
   float sun_dir[3];     /* world-space direction TOWARD the sun; the library normalizes it ((0, 1, 0)
                            when zero). Every mode: the Lambert term of the primary mode and the sun

@@ -305,7 +305,7 @@ flush builds the TLAS that the render binds.
   the previous render call's camera, the present-target mask, the miss values,
   `has_prev_camera` / `has_tlas`, and the lighting parameters (mode, bounces,
   seed, accumulation count, exposure, sun and sky, sRGB output, `t_max`). The
-  composite kernel has its own set (binding 0 the colour target, bindings 1..6
+  composite kernel has its own set (binding 0 the colour target, bindings 1..7
   internal targets) and the same push constant. Every binding is `PARTIALLY_BOUND`
   (`VkDescriptorSetLayoutBindingFlagsCreateInfo`): a render call writes only the
   TLAS (when the scene has one) and the present targets, and the kernel touches
@@ -468,7 +468,13 @@ renderer drives it without NRI through `NrdExecutor` (`lib/src/render/nrd_execut
   never denoises again (`CaelixNrdInfo::failed`).
 - Debug views (path trace mode): `CAELIX_VIEW_NRD_VALIDATION` (NRD's
   validation layer blended over the image), `CAELIX_VIEW_NRD_DIFF` (the
-  denoised diffuse radiance without the albedo).
+  denoised diffuse radiance without the albedo), `CAELIX_VIEW_MOTION` (the
+  motion vector of the primary hit, from the internal motion target, composite
+  binding 7: rgb = `(saturate(mv / 32 * 0.5 + 0.5), 0.5 * coverage)`, alpha =
+  coverage, no exposure, no sRGB encode; a hit without motion is grey 0.5, a
+  miss is (0.5, 0.5, 0), +-32 px saturate). The motion is per frame: at 144 fps
+  an entity that moves 10 units/s at 120 units distance moves about 0.6 px, so
+  slow motion is only a few UNORM steps away from grey.
 - Device: NRD's shaders declare `StorageImageReadWithoutFormat` (feature bit
   10), `StorageImageWriteWithoutFormat`, `StorageImageExtendedFormats` and
   `GroupNonUniformQuad` (quad intrinsics in compute: `Device::Adopt` checks the
@@ -608,8 +614,10 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   within 1e-5 for a normal-Z and a reverse-Z infinite projection; at the corner
   the miss values; coverage agrees across the targets; motion is exactly 0 on
   the first render, below 1e-3 px with the same camera, +11.085 px after the
-  camera moves +1 along `right`, -22.17 px after the entity moves +2 along X,
-  and 0 again one frame later. A depth-only render works; no target, different
+  camera moves +1 along `right`, -22.17 px after the entity moves +2 along X
+  (that frame renders in the path trace mode with `CAELIX_VIEW_MOTION`: the
+  colour target is (39, 128, 128) +-1 at the centre and (128, 128, 0) +-1 on a
+  miss), and 0 again one frame later. A depth-only render works; no target, different
   sizes, one image twice and a wrong format are rejected. The random opaque
   scene: some pixels hit and none is magenta. Lighting, energy: a grey floor
   (albedo 15/31) under an emissive white ceiling (emission 1) 24 blocks above
@@ -680,10 +688,10 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
 - `--fov <DEGREES>`: vertical field of view. Default 60.
 - `--mode <primary|pt|ref>`: the rendering mode. Default `pt` with `--world`,
   else `primary`.
-- `--view <albedo|normal|depth|group|brick|steps|nrd-validation|nrd-diff>`:
+- `--view <albedo|normal|depth|group|brick|steps|nrd-validation|nrd-diff|motion>`:
   the debug view; the first six in the primary mode, `nrd-validation` (NRD's
-  validation layer) and `nrd-diff` (the denoised diffuse radiance) in `pt`
-  mode. Default `albedo`.
+  validation layer), `nrd-diff` (the denoised diffuse radiance) and `motion`
+  (the motion vector, see "Denoising") in `pt` mode. Default `albedo`.
 - `--no-denoise`: `pt` mode without NRD (the raw 1 spp image). Default: NRD on.
 - `--size <WxH>`: inner size of the window. Default 1280x720.
 - `--warmup <N>`: `pt` mode, take `--screenshot` N frames after the world is
@@ -723,6 +731,56 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
 - `--ui-demo`: every debug window and section starts open, and at frame 60
   entity 0 is turned to a yaw of 15 degrees (for captures of the debug UI).
   Conflicts with `--no-ui` and `--no-input`.
+- `--screenshot-every <N>` (test aid): write `frame-<frame number>.png` to
+  `--screenshot-dir` every N frames, starting `--warmup` frames (at least 3)
+  after the world is complete (without `--world`, after frame 10). Use it with
+  `--frames` to get frames N apart, for example to look for ghosting.
+- `--test-entity`: add the synthetic test entity (see "Test entity and brick
+  edits"). `--test-entity-at <X,Y,Z>`: its orbit centre (default: 120 units in
+  front of the start camera along `forward`, 10 units below the eye).
+  `--test-paused`: it starts paused. `--test-orbit-radius <UNITS>` (default
+  20), `--test-orbit-speed <DEG_PER_S>` (default 30), `--test-spin-speed
+  <DEG_PER_S>` (default 45).
+- `--test-edits`: timed brick edits on the test entity (adds it when
+  `--test-entity` is absent). `--test-edit-interval <N>` (frames, 1..120,
+  default 10), `--test-edit-pattern <wave|flicker>` (default `wave`).
+
+### Test entity and brick edits
+
+`host-rs/caelix-app/src/testscene.rs`, Test window. A tool to judge the motion
+vectors and NRD under a moving entity and under brick edits over time.
+
+- The entity: a hollow box of 24^3 blocks with 2-block walls. Its entity-local
+  origin is the box centre: the box covers blocks -12..=11 on every axis, that
+  is bricks -2..=1 (4 per axis, because 3 bricks of 8 cannot be centred on a
+  brick corner); the 8 inner bricks are air and are not uploaded, so it has 56
+  bricks. Faces (packed opaque rgb5): +X red, -X green, +Y blue, -Y yellow,
+  +Z cyan, -Z magenta. A 4x4 hole (x, y in -2..=1) goes through the +Z wall.
+  The 2x2x2 corner cubes of the four top corners are emissive white (strength
+  1).
+- Animation, every frame before the flush: `t += min(dt, 0.1)` unless paused;
+  position = centre + radius * (cos(t * orbit), 0, sin(t * orbit)), rotation =
+  yaw(t * spin) * pitch(t * spin * 0.37). The pose goes into the entity's row
+  of the Entities window and is sent with `caelix_scene_set_entity_transform`
+  only when it differs from the pose sent last. A paused entity gets no call,
+  so the next flush makes the previous transform equal to the current one and
+  its motion vectors are 0.
+- Edits, every `interval` frames (or "Step once"): `wave` = one-brick columns
+  at y = -3 (keys x -4..=4, z -1..=1, under the box); a column is up while
+  `(x + z - phase) mod 6 < 3`, the phase advances by 1 per tick, falling
+  columns are removed (`caelix_scene_remove_bricks`) and rising ones uploaded
+  (solid orange). `flicker` = the four corner bricks are uploaded again with
+  the emissive cubes off (dark grey) or on: a replace, no add or remove.
+  Uploads go through a queue that waits for staging ring space; a remove drops
+  a queued upload of the same key. The world loader's brick count check
+  excludes the test entity's bricks.
+- In reference mode a pose change or an edit restarts the accumulation.
+- Logs: the test line every 120 frames, and at exit the run totals since the
+  world was complete (AS builds per second, finalized bricks per second, flush
+  ms mean and max). Measured 2026-10-14 on the 8K citadel (release, RTX 5080):
+  a moving entity costs one TLAS build per frame, flush about 0.15 ms; the
+  wave adds about 60 builds/s and 240 finalized bricks/s at interval 10
+  (`Artifacts/native-renderer-motion-20261014/`).
 
 In the window, press `P` to log the current camera as a
 `--pose ... --fov ...` line.
@@ -735,7 +793,7 @@ rendered image. `F1` shows and hides it. Crates: `egui` 0.36.2 and
 and `egui-ash-renderer` 0.13.0 (dynamic rendering, default allocator) in
 `caelix-vk` (rendering, `overlay.rs`). `caelix-app` stays free of `ash`.
 
-Four separate egui windows in egui's default style (two changes: no window
+Five separate egui windows in egui's default style (two changes: no window
 and popup shadows, window titles at 15.5 points instead of 18). Each window
 can be dragged and collapsed, and each has collapsible sections:
 
@@ -766,7 +824,16 @@ can be dragged and collapsed, and each has collapsible sections:
   change calls `caelix_scene_set_entity_transform` before the frame's flush;
   "Reset" sends the file's transform (the original quaternion). In reference
   mode an entity change, a camera change or an option change restarts the
-  accumulation; in path trace mode NRD follows the motion.
+  accumulation; in path trace mode NRD follows the motion. The test entity has
+  a row too (GUID `test-box (synthetic)`); its animation overwrites edits
+  unless it is paused.
+- **Test** (bottom right, collapsed unless `--test-entity` or `--test-edits`):
+  Entity (enabled = the entity is in the scene, added in front of the current
+  camera or at `--test-entity-at`, removed when off; paused; orbit radius,
+  orbit speed, spin speed; "Reset to start"), Edits (enabled, interval 1..120
+  frames, pattern, "Step once", ticks, bricks uploaded and removed, queued
+  uploads), Stats (flush ms newest and 1 s mean / max, AS builds per second,
+  AS builds pending, finalized bricks per second).
 
 Input: egui sees every window event first. While the pointer is over a
 window (or egui drags a widget) the mouse look and the scroll wheel are

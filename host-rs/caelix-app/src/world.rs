@@ -258,9 +258,17 @@ impl WorldLoader {
     }
 
     /// Call after the frame's `caelix_scene_flush`. `uploaded` is the result of this
-    /// frame's `upload`. Logs the summary once when the load has completed, and one
-    /// more line when every acceleration structure is up to date after the load.
-    pub fn after_flush(&mut self, scene: *const CaelixScene, uploaded: bool, frame_number: u64) -> LoadOutcome {
+    /// frame's `upload`; `other_bricks` = resident bricks of entities that are not from the
+    /// file (the test entity), excluded from the brick count check. Logs the summary once when
+    /// the load has completed, and one more line when every acceleration structure is up to
+    /// date after the load.
+    pub fn after_flush(
+        &mut self,
+        scene: *const CaelixScene,
+        uploaded: bool,
+        frame_number: u64,
+        other_bricks: u64,
+    ) -> LoadOutcome {
         if uploaded {
             self.upload_end = Some(Instant::now());
         }
@@ -271,7 +279,7 @@ impl WorldLoader {
         if !self.complete {
             self.complete = true;
             self.complete_frame = frame_number;
-            outcome = self.log_summary(scene);
+            outcome = self.log_summary(scene, other_bricks);
         }
         let stats = scene_stats(scene);
         if stats.as_builds_pending == 0 {
@@ -367,7 +375,7 @@ impl WorldLoader {
         }
     }
 
-    fn log_summary(&self, scene: *const CaelixScene) -> LoadOutcome {
+    fn log_summary(&self, scene: *const CaelixScene, other_bricks: u64) -> LoadOutcome {
         let stats = scene_stats(scene);
         let decode_secs = self.decode_time.map_or(0.0, |t| t.as_secs_f64());
         let upload_secs = match (self.upload_start, self.upload_end) {
@@ -431,9 +439,12 @@ impl WorldLoader {
             }
         }
 
-        if stats.bricks_resident != self.bricks_received {
+        if other_bricks > 0 {
+            log::info!("{other_bricks} of the resident bricks belong to entities that are not from the file");
+        }
+        if stats.bricks_resident.wrapping_sub(other_bricks) != self.bricks_received {
             log::error!(
-                "bricks_resident {} differs from the {} bricks the decoder produced",
+                "bricks_resident {} (minus {other_bricks} bricks of other entities) differs from the {} bricks                  the decoder produced",
                 stats.bricks_resident,
                 self.bricks_received
             );

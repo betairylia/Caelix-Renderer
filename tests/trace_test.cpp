@@ -614,8 +614,24 @@ TEST_CASE("geometry targets: albedo, normal, depth, motion, view_z") {
     REQUIRE(caelix_scene_set_entity_transform(rig.scene, rig.entity, position, rotation) ==
             CAELIX_OK);
   }
-  Render(rig, renderer, all, moved, Options(CAELIX_VIEW_ALBEDO));
+  //    This frame renders in the path trace mode (no bounce) with the motion view, so
+  //    the colour target (RGBA8) shows the motion: rgb = (motion.xy / 32 * 0.5 + 0.5,
+  //    0.5 * coverage), no sRGB encode. Centre: red = (-22.17 / 32) * 0.5 + 0.5 = 0.154.
+  CaelixRenderOptions motion_view = Options(CAELIX_VIEW_MOTION);
+  motion_view.mode = CAELIX_MODE_PATH_TRACE;
+  motion_view.bounce_count = 0;
+  Render(rig, renderer, all, moved, motion_view);
   CHECK(Stats(rig.scene).as_builds_pending == 0);
+  PrintPixel("motion view centre", color.at(cx, cy));
+  PrintPixel("motion view corner", color.at(0, 0));
+  CHECK(std::abs(static_cast<int>(color.at(cx, cy)[0]) - 39) <= 1);
+  CHECK(std::abs(static_cast<int>(color.at(cx, cy)[1]) - 128) <= 1);
+  CHECK(std::abs(static_cast<int>(color.at(cx, cy)[2]) - 128) <= 1);
+  CHECK(color.at(cx, cy)[3] == 255);
+  CHECK(std::abs(static_cast<int>(color.at(0, 0)[0]) - 128) <= 1);
+  CHECK(std::abs(static_cast<int>(color.at(0, 0)[1]) - 128) <= 1);
+  CHECK(color.at(0, 0)[2] == 0);
+  CHECK(color.at(0, 0)[3] == 0);
   const float view_z2 = view_z.F32(cx, cy, 0);
   const float entity_expected =
       -2.0f * static_cast<float>(kSize) / (2.0f * moved.tan_half_fov_y * moved.aspect * view_z2);

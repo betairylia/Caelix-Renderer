@@ -27,7 +27,7 @@ class Scene;
 // every binding PARTIALLY_BOUND, so absent targets and a missing TLAS are simply
 // not written). In the lighting modes the composite kernel
 // (shaders/render/caelix_composite.hlsl, its own set: binding 0 the host colour target,
-// bindings 1..6 internal targets) writes the colour target. In the path trace
+// bindings 1..7 internal targets) writes the colour target. In the path trace
 // mode with denoising, NRD (NrdExecutor, REBLUR_DIFFUSE_SPECULAR) runs between
 // the two and the composite reads its outputs instead of the raw radiance; the
 // executor is created at the first denoised render and recreated (history lost)
@@ -76,7 +76,7 @@ class Renderer {
     kInternalCount
   };
   static constexpr uint32_t kTraceInternalCount = kInternalAccum;  // bindings 7..13
-  static constexpr uint32_t kCompositeBindingCount = 7;
+  static constexpr uint32_t kCompositeBindingCount = 8;
 
   struct FrameSlot {
     uint32_t index = 0;  // position in slots_ (the NRD executor's frame slot)

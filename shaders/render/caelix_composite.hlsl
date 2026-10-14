@@ -13,11 +13,15 @@
 //   colour target is a UNORM format (output_srgb).
 //   kModePathTrace, debug view kViewNrdValidation, denoised frame: NRD's validation
 //   layer (binding 6, RGBA8, a = opacity) is blended over the encoded colour.
+//   kModePathTrace, debug view kViewMotion: the motion of the primary hit (binding 7,
+//   pixels) as rgb = (saturate(motion.xy / 32 * 0.5 + 0.5), 0.5 * coverage), alpha =
+//   coverage, without exposure and without the sRGB encode: a hit without motion is
+//   grey (0.5, 0.5, 0.5), a miss (0.5, 0.5, 0).
 //
 // Descriptors (set 0): binding 0 the host colour target (no format qualifier,
-// write only), bindings 1..6 the internal targets albedo (a = coverage),
-// deterministic, diffuse, specular, the reference accumulation and NRD's
-// validation layer. The push constant is the device address of the frame
+// write only), bindings 1..7 the internal targets albedo (a = coverage),
+// deterministic, diffuse, specular, the reference accumulation, NRD's
+// validation layer and the motion. The push constant is the device address of the frame
 // constants (same block as the trace).
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_record.hlsl"
@@ -34,6 +38,10 @@ CAELIX_BINDING(3, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_diff;
 CAELIX_BINDING(4, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_spec;
 CAELIX_BINDING(5, 0) CAELIX_FORMAT("rgba32f") RWTexture2D<float4> g_int_accum;
 CAELIX_BINDING(6, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_validation;
+CAELIX_BINDING(7, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_motion;
+
+// kViewMotion: motion (pixels) that maps to full red or green.
+static const float kMotionViewRange = 32.0f;
 
 float3 LinearToSrgb(float3 c) {
   c = saturate(c);
@@ -53,6 +61,14 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   const float4 albedo = g_int_albedo[pixel];
   const bool hit = albedo.a > 0.5f;
   const bool path_trace = fc.mode == kModePathTrace;
+  CAELIX_BRANCH
+  if (path_trace && fc.debug_view == kViewMotion) {
+    const float2 motion = g_int_motion[pixel].xy;
+    const float coverage = hit ? 1.0f : 0.0f;
+    const float2 shown = saturate(motion / kMotionViewRange * 0.5f + 0.5f);
+    g_color[pixel] = float4(shown, 0.5f * coverage, coverage);
+    return;
+  }
 
   float3 color = float3(0.0f, 0.0f, 0.0f);
   if (hit) {

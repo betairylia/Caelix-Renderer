@@ -17,7 +17,7 @@ namespace {
 
 // [numthreads(8, 8, 1)] in caelix_path_trace.hlsl and caelix_composite.hlsl.
 constexpr uint32_t kWorkgroupSize = 8;
-constexpr uint32_t kDebugViewCount = 8;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_NRD_DIFF
+constexpr uint32_t kDebugViewCount = 9;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_MOTION
 constexpr uint32_t kModeCount = 3;
 constexpr float kDefaultSunAngularRadius = 0.00873f;  // 0.5 degrees
 
@@ -436,12 +436,14 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
 
   // Composite (lighting modes with a colour target). Bindings 3 and 4 hold NRD's
   // outputs when this frame was denoised, else the raw radiance.
+  // Binding 7 is the motion of the primary hit (CAELIX_VIEW_MOTION).
   if (composite) {
     write_count = 0;
     write_image(slot->composite_set, 0, color_view);
     const uint32_t composite_internals[] = {
         kInternalAlbedo, kInternalDeterministic, denoised ? kInternalDiffOut : kInternalDiff,
-        denoised ? kInternalSpecOut : kInternalSpec, kInternalAccum, kInternalValidation};
+        denoised ? kInternalSpecOut : kInternalSpec, kInternalAccum, kInternalValidation,
+        kInternalMotion};
     static_assert(std::size(composite_internals) + 1 == kCompositeBindingCount);
     for (uint32_t i = 0; i < std::size(composite_internals); ++i) {
       write_image(slot->composite_set, 1 + i, internal_[composite_internals[i]].view());
