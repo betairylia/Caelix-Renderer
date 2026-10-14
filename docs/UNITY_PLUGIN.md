@@ -20,6 +20,19 @@ Caelix/Runtime/Rendering/Native/   C#: CaelixNativeRenderer (component), CaelixN
 Two DLLs, not one: `caelix_renderer.dll` keeps its C ABI unchanged and the Rust host keeps
 loading it; `caelix_unity.dll` is the only code that knows Unity.
 
+## Finding (2026-10-15): Unity 6000.5 Vulkan has no ray tracing of its own
+
+`supportsRayTracing` and `supportsInlineRayTracing` are false on Vulkan, Unity creates its
+instance as Vulkan 1.1 and leaves the driver's `VK_KHR_acceleration_structure` /
+`VK_KHR_ray_query` / `VK_KHR_buffer_device_address` disabled, and Unity.dll carries none of
+those extension names. The existing Caelix renderers therefore cannot draw on Vulkan. Owner
+decision: the Editor stays on Vulkan; comparisons with the Unity renderers flip the API to
+D3D12 and restart. For the plugin this means the intercept wraps BOTH `vkCreateInstance`
+(raise `VkApplicationInfo::apiVersion` to 1.3 so the core 1.2/1.3 entry points volk loads
+exist) and `vkCreateDevice` (append our extensions and chain our features2 structs; keep
+everything Unity asked for). The plugin's `.dll.meta` must set the PluginImporter
+"Load on startup" (`isPreloaded`) so `UnityPluginLoad` runs before Unity's device exists.
+
 ## Device: intercept, then adopt
 
 `UnityPluginLoad` fetches `IUnityGraphicsVulkanV2` and calls `InterceptInitialization` before
@@ -118,8 +131,6 @@ sun and sky.
 
 ## Open questions for the owner
 
-1. Native plugin loading time: if Unity initializes Vulkan before loading package plugins,
-   `InterceptInitialization` is too late and we need the `-force-vulkan-layers`-style route or
-   a `[InitializeOnLoad]` preload. P1 answers this; no decision needed before.
+1. (answered) Loading time: "Load on startup" on the plugin importer; P1 verifies it.
 2. Should the plugin's targets be camera-sized or allow a render scale now (for the later
    upscalers)? Proposal: camera-sized in P1-P3; a scale factor is one line later.
