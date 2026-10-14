@@ -195,3 +195,65 @@ Differences from the plan above, for 6b to pick up:
 2. Jitter and a colour resolve are deferred to a later upscaling step. Agree?
 3. Reference accumulation uses the raw 1 spp signal with the same RNG stream. 1024 frames at
    0.3 ms each is about half a second of GPU time per pose; fine.
+
+## Sun NEE as built (2026-10-14)
+
+The 6a open point "next-event estimation or a larger disk" is decided: next-event estimation.
+
+- Flag `CAELIX_RENDER_FLAG_SUN_NEE` (bit 2; the host sets it by default, `--no-sun-nee` clears
+  it). The library skips NEE when `sun_radiance` is 0, so a sun-off frame costs nothing extra.
+  Frame constants: `sun_cos_radius` (416) and the new `sun_solid_angle` (428) =
+  `2 pi (1 - cos r)`, computed in double as `4 pi sin^2(r / 2)` (the float `1 - cos r` of a
+  0.5-degree disk keeps only 3 significant digits). The shader takes `1 - cos r` back from it.
+- Where: every vertex that sampled the diffuse lobe AND has a next segment: the primary hit
+  when `bounce_count >= 1`, a bounce hit while `bounce_index <= bounce_count`. NEE stands in
+  for exactly the sun light that the next BSDF segment would have found, so the expected value
+  equals the NEE-off value at the same `bounce_count`, and `bounce_count = 0` stays "primary
+  emission only".
+- Estimator: `L` uniform in the sun cone (pdf `1 / omega`), shadow ray from the pushed-off
+  origin, `TMax = 1e30`, `RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH` (the first candidate whose
+  DDA hits in range is committed and the loop breaks). Unoccluded:
+  `sun_radiance * omega * dot(N, L) / pi`, times the throughput that already holds the
+  vertex's albedo (1 / k at the primary: demodulated), added before Russian roulette.
+- No double counting: the segment that leaves an NEE vertex uses `SkyRadianceNoSun`; a segment
+  that leaves a specular-lobe vertex (no NEE there) uses `SkyRadiance` with the disk. This is
+  more general than "skip NEE for a specular primary": it holds at every vertex. Packed worlds
+  never sample the specular lobe. A primary miss (composite, sky on miss) always shows the disk.
+- Random numbers: NEE has its own stream `InitRandom(pixel, frame_seed ^ 0x68E31DA4)`. The BSDF
+  path consumes the same numbers with NEE on or off, so NEE on/off frames are correlated (useful
+  for comparisons) and a sun-off frame is bit-identical to 6a. Checked on the citadel overview:
+  `--no-sun-nee --sun-radiance 20,19,18` (the 6a settings) reproduces 6a's
+  `citadel-overview-ref.png` byte for byte; the new default (sun off, NEE on) is byte-identical
+  to sun off with NEE off and differs from 6a's image only by 6a's chance-found radiance-20 sun
+  (99.1 % of the pixels equal, at most 13 levels, mean -0.02 levels).
+- Hit distance for NRD: unchanged (the first BSDF segment); the shadow ray is not a segment.
+- Host defaults: sun radiance (0, 0, 0) = sun off (owner decision: the Unity comparison is
+  sky light only). Suggested sun: `--sun-radiance 2e4,1.9e4,1.8e4` at 0.5 degrees: irradiance
+  (4.79, 4.55, 4.31) on a surface facing the sun, luminance 4.58, about 3.1x the default sky's
+  irradiance on an up-facing surface (`pi (0.2 horizon + 0.8 zenith)` = (0.94, 1.51, 2.86),
+  luminance 1.48). The default sun direction is 44.6 degrees above the horizon, so flat ground
+  gets 0.70 of it. With exposure 1 bright sand then reaches about 1.0 and a few pixels clip;
+  exposure about 0.7 keeps the highlights.
+
+Tests (`caelix_trace_test`, "lighting: sun next-event estimation ..."; grey floor, albedo
+123/255 after the RGBA8 albedo target, black sky, sun straight up, R = 1000, r = 2 degrees,
+omega = 3.8276e-3 sr; expected `albedo R omega (1 + cos r) / 2 / pi` = 0.58749):
+
+| Check | Measured | Expected | Ratio |
+|---|---|---|---|
+| NEE, 4 bounces, reference 256 frames, centre 64x64 mean | 0.58729 | 0.58749 | 0.99965 (largest pixel error 0.043 %) |
+| NEE off, 1 bounce, reference 4096 frames | 0.58294 | 0.58749 | 0.99226 (0.99260 to NEE; limit 10 %) |
+| NEE, 1 bounce (double-count guard) | 0.58729 | test 1 | 1.00000 |
+| NEE, 0 bounces | 0 | 0 | |
+| floor under a 16^3 block 8 above it, 1 bounce | 0 (max 0) | 0 | |
+| floor far from the block | 0.58729 | test 1 | 1.00000 |
+
+The 0.035 % deficit of the NEE value is the FP16 diffuse target (spacing 2^-10 near 1.2).
+
+Timings (`pt`, 4 bounces, 1280x720, RTX 5080, release, FIFO 144 Hz, median of 13 one-second
+log samples, suggested sun on): overview 0.53 ms without NEE, 0.69 ms with NEE (+30 %); detail
+0.63 ms without, 0.86 ms with (+37 %). Less than the expected 2x: shadow rays stop at the first
+hit, and back-facing samples trace nothing. The 6a run of the same settings measured 0.49 and
+0.57 ms (another session; FIFO leaves the GPU partly idle).
+
+Images: `Artifacts/native-renderer-step6a-20261014/*-nee.png`.

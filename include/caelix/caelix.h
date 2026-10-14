@@ -45,7 +45,8 @@ extern "C" {
    CaelixRenderOptions::miss_depth / miss_view_z and the albedo, normal, depth, motion and view_z
    targets of CaelixRenderTargets, and made the colour target optional, also without a bump. The
    lighting step (6a) appended the path-tracing fields to CaelixRenderOptions (mode .. frame_seed),
-   CAELIX_RENDER_FLAG_SKY_ON_MISS and CaelixGpuTimings::composite_ms, also without a bump. A host
+   CAELIX_RENDER_FLAG_SKY_ON_MISS and CaelixGpuTimings::composite_ms, also without a bump. The sun
+   NEE step added CAELIX_RENDER_FLAG_SUN_NEE (a new flag bit, no struct change). A host
    built against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -390,7 +391,8 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  *                          One dispatch (trace).
  *   CAELIX_MODE_PATH_TRACE path-traced lighting at 1 sample per pixel with the shading rules of the
  *                          Unity path tracer (primary emission, cosine-weighted diffuse bounces,
- *                          Russian roulette, procedural sky with a sun disk on a miss). Two
+ *                          Russian roulette, procedural sky with a sun disk on a miss, optional
+ *                          next-event estimation of the sun: CAELIX_RENDER_FLAG_SUN_NEE). Two
  *                          dispatches: trace (G-buffer, internal radiance targets) and composite
  *                          (colour = emission + albedo * incident radiance, exposure, sRGB encode for
  *                          UNORM targets). No denoiser yet: the colour target holds the raw 1 spp
@@ -494,6 +496,14 @@ typedef enum CaelixDebugView {
                                                     procedural sky where the primary ray misses (alpha
                                                     stays 0). Without it a miss is (0, 0, 0, 0), for a
                                                     host that composites its own sky. */
+#define CAELIX_RENDER_FLAG_SUN_NEE (1u << 2) /* lighting modes only: next-event estimation of the sun.
+                                                Every diffuse path vertex that has a next segment
+                                                samples a direction in the sun cone and traces a
+                                                shadow ray; the rays sampled from such a vertex see
+                                                the sky without the sun disk (no double counting).
+                                                Primary misses still show the disk. Without it the
+                                                sun is found only by chance (the sky includes the
+                                                disk for every ray). */
 
 /* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
 typedef struct CaelixRenderOptions {
@@ -518,7 +528,9 @@ typedef struct CaelixRenderOptions {
                                   render). Set it when the camera or the scene changed. */
   float exposure;              /* the composite multiplies the colour (sky included) by it before the
                                   sRGB encode; 0 is treated as 1 */
-  float sun_radiance[3];       /* radiance of the sun disk */
+  float sun_radiance[3];       /* radiance of the sun disk (constant over the disk). The irradiance
+                                  of a surface facing the sun is sun_radiance * 2 pi (1 - cos r),
+                                  r = sun_angular_radius: about 2.39e-4 * sun_radiance at 0.5 degrees */
   float sun_angular_radius;    /* angular radius of the sun disk in radians; 0 = 0.00873 (0.5 degrees) */
   float sky_zenith[3];         /* sky radiance straight up */
   float sky_horizon[3];        /* sky radiance at the horizon */

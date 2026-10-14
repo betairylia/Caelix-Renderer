@@ -55,7 +55,8 @@ struct FrameConstants {
   float sun_cos_radius;     // 416  cos(sun angular radius)
   uint32_t output_srgb;     // 420  1 = the colour target is UNORM: the composite encodes linear -> sRGB
   float t_max;              // 424  kTMax: bounce ray length and the "no hit" hit distance
-  uint32_t pad[21];         // 428
+  float sun_solid_angle;    // 428  2 pi (1 - sun_cos_radius): solid angle of the sun cone (NEE pdf 1 / it)
+  uint32_t pad[20];         // 432
 };
 static_assert(sizeof(FrameConstants) == 512);
 static_assert(offsetof(FrameConstants, size) == 64);
@@ -75,6 +76,7 @@ static_assert(offsetof(FrameConstants, sun_radiance) == 352);
 static_assert(offsetof(FrameConstants, sky_ground) == 400);
 static_assert(offsetof(FrameConstants, sun_cos_radius) == 416);
 static_assert(offsetof(FrameConstants, t_max) == 424);
+static_assert(offsetof(FrameConstants, sun_solid_angle) == 428);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

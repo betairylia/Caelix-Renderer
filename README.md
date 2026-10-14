@@ -335,11 +335,25 @@ shows the raw 1 spp estimate and `CAELIX_MODE_REFERENCE` the running mean.
   `frame_seed` every frame.
 - Sky: above the horizon `lerp(horizon, zenith, sqrt(dir.y))`, below it
   `lerp(horizon, ground, sqrt(-dir.y))`, plus `sun_radiance` inside the sun
-  disk (`sun_angular_radius`, default 0.5 degrees). The sun is found only by
-  chance (no next-event estimation), as in Unity. A small disk therefore
-  needs a very high radiance to light the scene: a 0.5-degree disk subtends
-  2.4e-4 sr, so a radiance of 20 adds about 0.003 to the irradiance of a lit
-  face, against about 1.5 from the default sky.
+  disk (`sun_angular_radius` r, default 0.5 degrees). The disk subtends
+  `omega = 2 pi (1 - cos r)` (2.39e-4 sr at 0.5 degrees), so a surface facing
+  the sun receives the irradiance `sun_radiance * omega`.
+- Sun next-event estimation (`CAELIX_RENDER_FLAG_SUN_NEE`, the host's
+  default; skipped when `sun_radiance` is 0): every vertex that sampled the
+  diffuse lobe and has a next segment (the primary hit when
+  `bounce_count >= 1`, a bounce hit while segments remain) samples a direction
+  `L` uniform in the sun cone (`cos theta = 1 - u1 (1 - cos r)`,
+  `phi = 2 pi u2`) and traces a shadow ray (`TraceShadow`: the first DDA hit in
+  range ends the ray query). Unoccluded, it adds
+  `sun_radiance * omega * dot(N, L) / pi * throughput` (demodulated, like the
+  bounces; before Russian roulette). The segment that leaves such a vertex sees
+  the sky WITHOUT the disk, a segment that leaves a specular-lobe vertex (no
+  NEE there) sees it, so the sun is counted once per path. A primary miss
+  always shows the disk. NEE draws from its own random stream
+  (`InitRandom(pixel, frame_seed ^ 0x68E31DA4)`), so the BSDF path consumes the
+  same random numbers with NEE on or off. Without the flag the sun is found
+  only by chance (6a behaviour, as in Unity): a small disk then needs a very
+  high radiance, which does not converge.
 - Composite: `raw = deterministic + albedo * (diffuse + specular)`; reference
   mode `accum = n == 0 ? raw : lerp(accum, raw, 1 / (n + 1))`; then `* exposure`;
   a miss is `SkyRadiance(primary direction) * exposure` with
@@ -494,7 +508,15 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   target; an emissive red brick is exactly (1, 0, 0); an unknown mode and 15
   bounces are rejected. Lighting, accumulation: the first reference frame after
   a reset equals the raw frame of the same seed bit for bit, the next frames
-  are the mean of the raw frames (relative error below 1e-5).
+  are the mean of the raw frames (relative error below 1e-5). Lighting, sun
+  NEE: the grey floor without ceiling, black sky, sun straight up with
+  radiance 1000 and radius 2 degrees: NEE (4 bounces, 256 reference frames)
+  is within 1 % of `albedo * R * omega * (1 + cos r) / 2 / pi` on every centre
+  pixel; NEE off (1 bounce, 4096 frames) agrees with NEE within 10 %; NEE with
+  1 bounce equals NEE with 4 (no double counting through the bounce ray);
+  0 bounces adds nothing; under a 16^3 block 8 blocks above the floor the
+  floor is exactly 0 (1 bounce), far from it the value of the open floor; a
+  primary miss still shows the sun disk with NEE on.
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -535,12 +557,18 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
 - `--exposure <F>`: lighting modes, colour multiplier. Default 1.
 - `--sun <X,Y,Z>`: direction toward the sun. Default 0.45,0.7,0.55 in the
   lighting modes, -0.45,0.8,-0.3 (the Lambert direction) in the primary mode.
-- `--sun-radiance <R,G,B>` (default 20,19,18), `--sun-angular-radius <DEGREES>`
-  (default 0.5), `--sky-zenith <R,G,B>` (default 0.2,0.4,0.9),
+- `--sun-radiance <R,G,B>` (default 0,0,0 = sun off, sky light only;
+  suggested `2e4,1.9e4,1.8e4` for the default 0.5-degree disk: `omega` =
+  2.3925e-4 sr, so the irradiance on a surface facing the sun is
+  (4.79, 4.55, 4.31), luminance 4.58, about 3.1x the default sky's 1.48 on an
+  up-facing surface, `pi * (0.2 * horizon + 0.8 * zenith)` =
+  (0.94, 1.51, 2.86)), `--sun-angular-radius <DEGREES>` (default 0.5), `--sky-zenith <R,G,B>` (default 0.2,0.4,0.9),
   `--sky-horizon <R,G,B>` (default 0.7,0.8,0.95), `--sky-ground <R,G,B>`
   (default 0.25,0.22,0.2): the procedural sky, linear RGB radiance.
 - `--no-sky-on-miss`: lighting modes, black instead of the sky where the
   primary ray misses.
+- `--no-sun-nee`: lighting modes, no sun next-event estimation (the 6a
+  behaviour: the sun is found only by the bounce rays).
 - `--accumulate <N>`: reference mode; the accumulation restarts whenever the
   camera changes or the world is not complete yet, and `--screenshot` is taken
   after N accumulated frames. The frame seed is the frame number.

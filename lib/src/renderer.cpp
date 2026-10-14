@@ -642,6 +642,10 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   const float sun_radius =
       options.sun_angular_radius > 0.0f ? options.sun_angular_radius : kDefaultSunAngularRadius;
   constants.sun_cos_radius = std::cos(sun_radius);
+  // 2 pi (1 - cos r), written as 4 pi sin^2(r / 2) in double: 1 - cos r of a float cancels for
+  // a small disk (0.5 degrees: 1 - cos r = 3.8e-5, float spacing near 1 is 6e-8).
+  const double half_sin = std::sin(0.5 * static_cast<double>(sun_radius));
+  constants.sun_solid_angle = static_cast<float>(4.0 * 3.14159265358979323846 * half_sin * half_sin);
   constants.output_srgb = IsUnormFormat(static_cast<VkFormat>(targets.color.format)) ? 1u : 0u;
   constants.t_max = kTMax;
   std::memcpy(slot->constants.mapped(), &constants, sizeof(constants));

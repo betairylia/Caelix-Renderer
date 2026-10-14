@@ -16,6 +16,8 @@
 //                   internal G-buffer (view_z, normal_roughness, motion, albedo)
 //                   is written for the composite and the denoiser of a later
 //                   step. The colour target is written by caelix_composite.hlsl.
+//                   With kRenderFlagSunNee every diffuse vertex also samples the
+//                   sun cone and traces a shadow ray (TracePath, SunNextEvent).
 //
 // Inputs: the push constant is the device address of the frame constants; the
 // scene's tables (page table, slot rows, group infos, entity infos) are read
@@ -104,6 +106,32 @@ struct TraceResult {
   float3 object_hit;     // entity-local block coordinates of the hit
 };
 
+// The brick DDA on one procedural candidate (group, dense id) of a ray query:
+// returns the DDA's t (object space = world distance, scale 1) and its attribute;
+// attrib.matID_faceNormal == 0 means no hit (or the brick is not resident).
+float TraceCandidate(CaelixFrameConstants fc, uint group, uint id, float3 object_origin,
+                     float3 object_direction, float t_current, out AttributeData attrib) {
+  attrib.matID_faceNormal = 0u;
+  // GroupInfo: coord (words 0..2), entity, slot_row_base (word 4), ...
+  const uint64_t info = fc.group_infos + uint64_t(group) * 32;
+  const uint4 w0 = CAELIX_LOAD_U32x4(info);
+  const uint slot_row_base = CAELIX_LOAD_U32(info + 16);
+  const uint4 row = CAELIX_LOAD_U32x4(fc.slot_tables + (uint64_t(slot_row_base) + id) * kSlotRowBytes);
+  if (SlotRowState(row.x) != kSlotStateResident || row.z == kInvalidRecord) {
+    return t_current;
+  }
+  g_recordBase = RecordAddress(fc, row.z);
+  // Entity-local block coordinate of the brick's corner (same formula as the
+  // finalize kernel's AABB origin).
+  const uint shift = fc.group_shift;
+  const int mask = int((1u << shift) - 1u);
+  const uint pos = SlotRowPos(row.x);
+  const int3 brick = int3(int(pos) & mask, int(pos >> shift) & mask, int(pos >> (2 * shift)) & mask);
+  const float3 brick_origin = float3((int3(w0.xyz) * int(1u << shift) + brick) * 8);
+  return CaelixTraceBrickPrimitiveCore(0, object_origin, object_direction, t_current, brick_origin,
+                                       attrib);
+}
+
 // Traces `ray` through the TLAS: every procedural candidate runs the brick DDA on
 // its record, and a DDA hit inside [TMin, CommittedRayT()) is committed. Before
 // the scene's first TLAS build binding 0 holds no valid descriptor
@@ -123,8 +151,6 @@ TraceResult TraceScene(CaelixFrameConstants fc, RayDesc ray) {
     RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     q.TraceRayInline(g_tlas, RAY_FLAG_NONE, 0xFF, ray);
 
-    const uint shift = fc.group_shift;
-    const int mask = int((1u << shift) - 1u);
     while (q.Proceed()) {
       if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) {
         continue;
@@ -132,25 +158,9 @@ TraceResult TraceScene(CaelixFrameConstants fc, RayDesc ray) {
       ++r.candidates;
       const uint group = q.CandidateInstanceID();
       const uint id = q.CandidatePrimitiveIndex();
-      // GroupInfo: coord (words 0..2), entity, slot_row_base (word 4), ...
-      const uint64_t info = fc.group_infos + uint64_t(group) * 32;
-      const uint4 w0 = CAELIX_LOAD_U32x4(info);
-      const uint slot_row_base = CAELIX_LOAD_U32(info + 16);
-      const uint4 row = CAELIX_LOAD_U32x4(fc.slot_tables + (uint64_t(slot_row_base) + id) * kSlotRowBytes);
-      if (SlotRowState(row.x) != kSlotStateResident || row.z == kInvalidRecord) {
-        continue;
-      }
-      g_recordBase = RecordAddress(fc, row.z);
-      // Entity-local block coordinate of the brick's corner (same formula as the
-      // finalize kernel's AABB origin).
-      const uint pos = SlotRowPos(row.x);
-      const int3 brick = int3(int(pos) & mask, int(pos >> shift) & mask, int(pos >> (2 * shift)) & mask);
-      const float3 brick_origin = float3((int3(w0.xyz) * int(1u << shift) + brick) * 8);
-
       AttributeData attrib;
-      const float t = CaelixTraceBrickPrimitiveCore(0, q.CandidateObjectRayOrigin(),
-                                                    q.CandidateObjectRayDirection(), q.CommittedRayT(),
-                                                    brick_origin, attrib);
+      const float t = TraceCandidate(fc, group, id, q.CandidateObjectRayOrigin(),
+                                     q.CandidateObjectRayDirection(), q.CommittedRayT(), attrib);
       // Nothing rejects a t outside [TMin, TCurrent] for us, so the test is done here.
       if (attrib.matID_faceNormal != 0u && t >= ray.TMin && t < q.CommittedRayT()) {
         q.CommitProceduralPrimitiveHit(t);
@@ -172,13 +182,75 @@ TraceResult TraceScene(CaelixFrameConstants fc, RayDesc ray) {
   return r;
 }
 
+// Shadow ray: true when a voxel lies on `ray` inside [TMin, TMax). The first
+// candidate whose DDA reports a hit in range is committed and ends the search
+// (RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH); no closest-hit data is needed.
+bool TraceShadow(CaelixFrameConstants fc, RayDesc ray) {
+  bool occluded = false;
+  CAELIX_BRANCH
+  if (fc.has_tlas != 0u) {
+    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+    q.TraceRayInline(g_tlas, RAY_FLAG_NONE, 0xFF, ray);
+    while (q.Proceed()) {
+      if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) {
+        continue;
+      }
+      AttributeData attrib;
+      const float t = TraceCandidate(fc, q.CandidateInstanceID(), q.CandidatePrimitiveIndex(),
+                                     q.CandidateObjectRayOrigin(), q.CandidateObjectRayDirection(),
+                                     q.CommittedRayT(), attrib);
+      if (attrib.matID_faceNormal != 0u && t >= ray.TMin && t < q.CommittedRayT()) {
+        q.CommitProceduralPrimitiveHit(t);
+        occluded = true;
+        break;
+      }
+    }
+  }
+  return occluded;
+}
+
+// Sun next-event estimation at a diffuse path vertex with world normal `normal`
+// and pushed-off position `origin`: one direction L uniform in the sun cone (pdf
+// 1 / omega) and a shadow ray. Returns the demodulated incident radiance of the
+// Lambert lobe, sun_radiance * omega * dot(N, L) / pi when L is unoccluded, else 0
+// (the albedo of the vertex is in the caller's throughput, as for the bounces).
+float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout uint rng) {
+  const float3 L = SampleSunDirection(fc, rng);
+  const float cos_l = dot(normal, L);
+  if (!(cos_l > 0.0f)) {
+    return float3(0.0f, 0.0f, 0.0f);
+  }
+  RayDesc shadow;
+  shadow.Origin = origin;
+  shadow.Direction = L;
+  shadow.TMin = 0.0f;
+  shadow.TMax = kRayTMax;
+  if (TraceShadow(fc, shadow)) {
+    return float3(0.0f, 0.0f, 0.0f);
+  }
+  return fc.sun_radiance.xyz * (fc.sun_solid_angle * cos_l * (1.0f / K_PI));
+}
+
 // The path tracer at one primary hit (Unity CaelixPathTraceMain, "Further
 // Bounces", opaque surfaces only): shades the primary hit, then traces up to
 // bounce_count stochastic segments. Returns the primary shade result; `stochastic`
 // receives (incident radiance, hit distance of the first segment).
+//
+// Sun NEE (kRenderFlagSunNee with a nonzero sun radiance): every vertex that
+// sampled the diffuse lobe AND has a next segment (the primary when
+// bounce_count >= 1, a bounce hit while bounce_index <= bounce_count) adds
+// SunNextEvent * throughput (throughput including that vertex's albedo, before
+// Russian roulette). So NEE replaces exactly the sun contribution that the next
+// BSDF segment would have found, and the expected value does not change. The
+// segment that leaves such a vertex sees the sky without the sun disk; a segment
+// that leaves a specular-lobe vertex (no NEE there) still sees the disk, so the sun
+// is counted once on every path. NEE draws from its own random stream, so the BSDF
+// path consumes the same random numbers with NEE on or off.
 CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult primary,
                             out float4 stochastic) {
   uint rng = InitRandom(pixel, fc.frame_seed);
+  uint nee_rng = InitRandom(pixel, fc.frame_seed ^ 0x68E31DA4u);
+  const bool nee = (fc.flags & kRenderFlagSunNee) != 0u && any(fc.sun_radiance.xyz > 0.0f);
   const uint primary_block = (primary.attrib >> 16) & 0xFFFFu;
   const CaelixShadeResult primary_shade =
       ShadeVoxelHit(primary_block, ray.Origin + ray.Direction * primary.T, ray.Direction,
@@ -190,6 +262,14 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
   // hit) in world units; t_max when there is no bounce or it reaches the sky.
   float first_segment_t = fc.t_max;
   bool first_segment = true;
+
+  // NEE at the primary vertex (demodulated: throughput 1 / k).
+  bool segment_sees_sun = true;
+  CAELIX_BRANCH
+  if (nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u) {
+    radiance += SunNextEvent(fc, primary_shade.bounce_origin, primary.normal, nee_rng) * throughput;
+    segment_sees_sun = false;
+  }
 
   RayDesc bounce;
   bounce.Origin = primary_shade.bounce_origin;
@@ -205,7 +285,8 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
   for (; bounce_index <= fc.bounce_count;) {
     const TraceResult hit = TraceScene(fc, bounce);
     if (!hit.hit) {
-      radiance += SkyRadiance(fc, bounce.Direction) * throughput;
+      radiance += (segment_sees_sun ? SkyRadiance(fc, bounce.Direction)
+                                    : SkyRadianceNoSun(fc, bounce.Direction)) * throughput;
       break;
     }
     if (first_segment) {
@@ -219,6 +300,13 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
 
     radiance += shade.emission * throughput;
     throughput *= shade.albedo / max(0.001f, shade.k);
+
+    segment_sees_sun = true;
+    CAELIX_BRANCH
+    if (nee && !shade.specular_lobe && bounce_index <= fc.bounce_count) {
+      radiance += SunNextEvent(fc, shade.bounce_origin, hit.normal, nee_rng) * throughput;
+      segment_sees_sun = false;
+    }
 
     // Russian roulette: dark paths stop early. A zero throughput must stop here,
     // or 0 * (1 / 0) below gives NaN.

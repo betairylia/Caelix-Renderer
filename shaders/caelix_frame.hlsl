@@ -54,6 +54,7 @@ struct CaelixFrameConstants {
   float sun_cos_radius;     // 416  cos(sun angular radius)
   uint output_srgb;         // 420  1 = the colour target is UNORM: encode linear -> sRGB
   float t_max;              // 424  bounce ray length and the "no hit" hit distance (1e4)
+  float sun_solid_angle;    // 428  2 pi (1 - sun_cos_radius): solid angle of the sun cone
 };
 
 struct CaelixTracePush {
@@ -76,6 +77,7 @@ static const uint kModeReference = 2;
 // CaelixRenderOptions::flags
 static const uint kRenderFlagShading = 1u << 0;
 static const uint kRenderFlagSkyOnMiss = 1u << 1;
+static const uint kRenderFlagSunNee = 1u << 2;
 
 // CaelixFrameConstants::target_mask: bit i = the target at descriptor binding i + 1.
 static const uint kTargetColor = 1u << 0;

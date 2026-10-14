@@ -3,7 +3,9 @@
 // target and the optional geometry targets albedo, normal, depth, motion and
 // view_z), which are read back and checked pixel by pixel. The lighting modes are
 // checked against a CPU Monte Carlo estimate (an emissive ceiling over a grey
-// floor), the procedural sky, primary emission and the reference accumulation.
+// floor), the procedural sky, primary emission and the reference accumulation;
+// sun next-event estimation against the analytic irradiance of the sun cone, the
+// sun found by bounce sampling only, and a shadow under a floating block.
 // Uses the public C ABI only.
 #include "test_scenes.h"
 
@@ -984,6 +986,12 @@ TEST_CASE("lighting: modes, sky on miss, primary emission, sRGB output, argument
     float near_sky[3];
     SkyRadiance(near_dir, near_sky);
     CHECK(std::abs(color.F32(8, 0, 0) - near_sky[0]) < 1e-4f);
+    // With sun NEE the bounce rays lose the disk, but a primary miss still shows it.
+    sun.flags |= CAELIX_RENDER_FLAG_SUN_NEE;
+    Render(rig, renderer, set, camera, sun);
+    for (uint32_t c = 0; c < 3; ++c) {
+      CHECK(std::abs(color.F32(0, 0, c) - (corner_sky[c] + 50.0f)) < 1e-3f);
+    }
   }
 
   // Exposure scales the colour, the sky included.
@@ -1159,6 +1167,192 @@ TEST_CASE("lighting: reference accumulation is the running mean of the raw frame
   options.reset_accumulation = 1;
   Render(rig, renderer, set, camera, options);
   CHECK(std::memcmp(color.bytes.data(), raw[1].data(), floats * sizeof(float)) == 0);
+
+  REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+  caelix_renderer_release_target_views(renderer);
+  caelix_renderer_destroy(renderer);
+  DestroyTarget(rig.gpu, color);
+  CloseRig(rig);
+}
+
+namespace {
+
+// Sun NEE tests: a grey floor (the energy test's floor, no ceiling), black sky, the
+// sun straight up with radiance 1000 and an angular radius of 2 degrees.
+constexpr float kNeeSunRadiance = 1000.0f;
+constexpr double kNeeSunRadiusDegrees = 2.0;
+
+void UploadFloor(Rig& rig) {
+  World world;
+  Brick floor{};
+  floor.fill(kGreyFloor);
+  for (int32_t z = 0; z < 8; ++z) {
+    for (int32_t x = 0; x < 8; ++x) {
+      world.bricks[{x, -1, z}] = floor;
+    }
+  }
+  Upload(rig, world, KeysOf(world));
+  DrainBuilds(rig);
+}
+
+// LookDown() moved to (x, height, z).
+CaelixCamera LookDownFrom(float x, float height, float z) {
+  CaelixCamera camera = LookDown();
+  camera.position[0] = x;
+  camera.position[1] = height;
+  camera.position[2] = z;
+  return camera;
+}
+
+CaelixRenderOptions SunOptions(uint32_t mode, uint32_t bounces, uint32_t seed, bool nee) {
+  CaelixRenderOptions options = LightOptions(mode, bounces, seed);
+  options.flags = nee ? CAELIX_RENDER_FLAG_SUN_NEE : 0u;
+  const float black[3] = {0.0f, 0.0f, 0.0f};
+  Set3(options.sky_zenith, black);
+  Set3(options.sky_horizon, black);
+  Set3(options.sky_ground, black);
+  options.sun_dir[0] = 0.0f;
+  options.sun_dir[1] = 1.0f;
+  options.sun_dir[2] = 0.0f;
+  options.sun_radiance[0] = options.sun_radiance[1] = options.sun_radiance[2] = kNeeSunRadiance;
+  options.sun_angular_radius = static_cast<float>(kNeeSunRadiusDegrees * 3.14159265358979323846 / 180.0);
+  return options;
+}
+
+// Reference mode over `frames` frames (seeds seed0 ..), the colour read back after the last.
+void RenderReference(Rig& rig, CaelixRenderer* renderer, TargetSet& set, const CaelixCamera& camera,
+                     uint32_t bounces, bool nee, uint32_t frames, uint32_t seed0) {
+  for (uint32_t i = 0; i < frames; ++i) {
+    CaelixRenderOptions options = SunOptions(CAELIX_MODE_REFERENCE, bounces, seed0 + i, nee);
+    options.reset_accumulation = i == 0 ? 1u : 0u;
+    Render(rig, renderer, set, camera, options, i + 1 == frames);
+  }
+}
+
+// Largest |value - expected| / expected of channel 0 over the centre `size` x `size` pixels.
+double CentreMaxRelativeError(const Target& target, uint32_t size, double expected) {
+  const uint32_t x0 = (target.width - size) / 2;
+  const uint32_t y0 = (target.height - size) / 2;
+  double worst = 0.0;
+  for (uint32_t y = y0; y < y0 + size; ++y) {
+    for (uint32_t x = x0; x < x0 + size; ++x) {
+      worst = std::max(worst, std::abs(target.F32(x, y, 0) - expected) / expected);
+    }
+  }
+  return worst;
+}
+
+// Largest channel-0 value over the centre `size` x `size` pixels.
+float CentreMax(const Target& target, uint32_t size) {
+  const uint32_t x0 = (target.width - size) / 2;
+  const uint32_t y0 = (target.height - size) / 2;
+  float worst = 0.0f;
+  for (uint32_t y = y0; y < y0 + size; ++y) {
+    for (uint32_t x = x0; x < x0 + size; ++x) {
+      worst = std::max(worst, target.F32(x, y, 0));
+    }
+  }
+  return worst;
+}
+
+}  // namespace
+
+TEST_CASE("lighting: sun next-event estimation: energy, no double counting, shadow") {
+  Rig rig;
+  OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+  UploadFloor(rig);
+  CaelixRenderer* renderer = nullptr;
+  REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+  Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+  TargetSet set;
+  set.t[kColor] = &color;
+
+  // Expected floor radiance toward the camera: albedo * R * omega * E[cos] / pi, with
+  // omega = 2 pi (1 - cos r) and E[cos] = (1 + cos r) / 2 for L uniform in the cone
+  // (the floor normal is the sun direction). The composite multiplies by the RGBA8
+  // albedo target (15/31 quantized to 123/255).
+  const double radius = kNeeSunRadiusDegrees * 3.14159265358979323846 / 180.0;
+  const double omega = 2.0 * 3.14159265358979323846 * (1.0 - std::cos(radius));
+  const double mean_cos = 0.5 * (1.0 + std::cos(radius));
+  const double albedo = std::round(15.0 / 31.0 * 255.0) / 255.0;
+  const double irradiance_over_pi = kNeeSunRadiance * omega / 3.14159265358979323846;
+  const double expected = albedo * irradiance_over_pi * mean_cos;
+  std::printf("sun NEE: omega %.6g sr, R omega / pi %.5f, albedo %.5f, E[cos] %.6f, expected %.5f\n",
+              omega, irradiance_over_pi, albedo, mean_cos, expected);
+  const CaelixCamera camera = LookDown();
+
+  // 1a. NEE on, 4 bounces (the host default), reference 256 frames: every sample
+  //     sees the sun, so the result is almost noise-free.
+  RenderReference(rig, renderer, set, camera, 4, true, 256, 5000);
+  const double nee_mean = CentreMean(color, 64, 0);
+  const double nee_worst = CentreMaxRelativeError(color, 64, expected);
+  std::printf("sun NEE, 4 bounces, reference 256 frames: centre 64x64 mean %.5f (ratio %.5f), "
+              "largest pixel error %.5f\n",
+              nee_mean, nee_mean / expected, nee_worst);
+  CHECK(std::abs(nee_mean / expected - 1.0) < 0.01);
+  CHECK(nee_worst < 0.01);
+  CHECK(std::abs(CentreMean(color, 64, 1) - nee_mean) < 1e-6);
+  CHECK(std::abs(CentreMean(color, 64, 2) - nee_mean) < 1e-6);
+
+  // 1b. NEE off, 1 bounce, reference 4096 frames: the sun is found only by the
+  //     cosine-sampled bounce (probability sin^2 r = 0.12 percent), the same
+  //     expected value with much more noise.
+  RenderReference(rig, renderer, set, camera, 1, false, 4096, 20000);
+  const double bsdf_mean = CentreMean(color, 64, 0);
+  std::printf("sun NEE off, 1 bounce, reference 4096 frames: centre 64x64 mean %.5f (ratio %.5f to "
+              "the expected value, %.5f to NEE)\n",
+              bsdf_mean, bsdf_mean / expected, bsdf_mean / nee_mean);
+  CHECK(std::abs(bsdf_mean / nee_mean - 1.0) < 0.10);
+
+  // 3. Double-count guard: NEE on with 1 bounce. The bounce ray from the NEE vertex
+  //    sees the sky without the sun disk (black here), so the result is test 1.
+  RenderReference(rig, renderer, set, camera, 1, true, 256, 9000);
+  const double one_bounce_mean = CentreMean(color, 64, 0);
+  std::printf("sun NEE, 1 bounce, reference 256 frames: centre 64x64 mean %.5f (ratio %.5f to 4 "
+              "bounces, %.5f to the expected value)\n",
+              one_bounce_mean, one_bounce_mean / nee_mean, one_bounce_mean / expected);
+  CHECK(std::abs(one_bounce_mean / nee_mean - 1.0) < 0.01);
+  CHECK(std::abs(one_bounce_mean / expected - 1.0) < 0.01);
+  // bounce_count 0 is primary emission only: no NEE either.
+  Render(rig, renderer, set, camera, SunOptions(CAELIX_MODE_PATH_TRACE, 0, 3, true));
+  CHECK(CentreMax(color, 64) == 0.0f);
+
+  // 2. Shadow: a 16x16x16 opaque block 8 voxels above the floor centre (blocks
+  //    x, z in [24, 40), y in [8, 24)). One bounce, so that light reflected by the
+  //    block's underside cannot reach the floor below it.
+  {
+    World world;
+    Brick block{};
+    block.fill(kGreyFloor);
+    for (int32_t z = 3; z <= 4; ++z) {
+      for (int32_t y = 1; y <= 2; ++y) {
+        for (int32_t x = 3; x <= 4; ++x) {
+          world.bricks[{x, y, z}] = block;
+        }
+      }
+    }
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+  }
+  // Under the block: camera at height 6 (below the block) over the floor centre;
+  // the centre 64x64 pixels cover +-0.4 blocks around (32, 32), deep in the umbra.
+  RenderReference(rig, renderer, set, LookDownFrom(32.0f, 6.0f, 32.0f), 1, true, 64, 30000);
+  const double shadow_mean = CentreMean(color, 64, 0);
+  const float shadow_max = CentreMax(color, 64);
+  // Far from the block: around (8, 8), outside the block's footprint and penumbra.
+  RenderReference(rig, renderer, set, LookDownFrom(8.0f, 6.0f, 8.0f), 1, true, 64, 31000);
+  const double lit_mean = CentreMean(color, 64, 0);
+  std::printf("sun NEE shadow: under the block centre 64x64 mean %.6f max %.6f; far from it mean "
+              "%.5f (ratio %.5f to test 1)\n",
+              shadow_mean, shadow_max, lit_mean, lit_mean / nee_mean);
+  CHECK(shadow_max == 0.0f);
+  CHECK(std::abs(lit_mean / nee_mean - 1.0) < 0.01);
+  CHECK(color.F32(kSize / 2, kSize / 2, 3) == 1.0f);  // coverage
+
+  CaelixGpuTimings timings{};
+  caelix_renderer_get_gpu_timings(renderer, &timings);
+  std::printf("sun NEE timings: trace %.4f ms, composite %.4f ms\n", timings.trace_ms,
+              timings.composite_ms);
 
   REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
   caelix_renderer_release_target_views(renderer);

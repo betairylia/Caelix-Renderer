@@ -186,8 +186,10 @@ struct Args {
     /// lighting modes; in the primary mode the Lambert direction -0.45,0.8,-0.3.
     #[arg(long, value_name = "X,Y,Z", value_parser = parse_vec3, allow_hyphen_values = true)]
     sun: Option<[f32; 3]>,
-    /// Lighting modes: linear RGB radiance of the sun disk.
-    #[arg(long, value_name = "R,G,B", value_parser = parse_vec3, default_value = "20,19,18")]
+    /// Lighting modes: linear RGB radiance of the sun disk. Default 0 = sun off (sky light only).
+    /// Suggested 2e4,1.9e4,1.8e4 for a 0.5-degree disk: an irradiance of about 4.8,4.5,4.3 on a
+    /// surface facing the sun, about 3x the default sky's (by luminance).
+    #[arg(long, value_name = "R,G,B", value_parser = parse_vec3, default_value = "0,0,0")]
     sun_radiance: [f32; 3],
     /// Lighting modes: angular radius of the sun disk in degrees.
     #[arg(long, value_name = "DEGREES", default_value_t = 0.5)]
@@ -204,6 +206,10 @@ struct Args {
     /// Lighting modes: the window shows black instead of the sky where the primary ray misses.
     #[arg(long)]
     no_sky_on_miss: bool,
+    /// Lighting modes: no next-event estimation of the sun (the sun is then found only by the
+    /// bounce rays, as in step 6a).
+    #[arg(long)]
+    no_sun_nee: bool,
     /// Reference mode: take the --screenshot after N accumulated frames. The accumulation
     /// restarts whenever the camera changes or the world is not complete yet.
     #[arg(long, value_name = "N")]
@@ -472,6 +478,9 @@ impl App {
             }
             if lighting && !self.args.no_sky_on_miss {
                 flags |= CAELIX_RENDER_FLAG_SKY_ON_MISS;
+            }
+            if lighting && !self.args.no_sun_nee {
+                flags |= CAELIX_RENDER_FLAG_SUN_NEE;
             }
             let default_sun = if lighting { LIGHTING_SUN_DIR } else { PRIMARY_SUN_DIR };
             let options = CaelixRenderOptions {
@@ -821,10 +830,12 @@ fn main() -> anyhow::Result<()> {
         bail!("--accumulate needs --mode ref");
     }
     log::info!(
-        "mode {mode:?}, bounces {}, exposure {}, sky on miss {}",
+        "mode {mode:?}, bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, sun NEE {}",
         args.bounces,
         args.exposure,
-        !args.no_sky_on_miss
+        !args.no_sky_on_miss,
+        args.sun_radiance,
+        !args.no_sun_nee
     );
 
     let event_loop = EventLoop::new().context("cannot create the event loop")?;
