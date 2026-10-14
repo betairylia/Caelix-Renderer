@@ -27,7 +27,10 @@ function(caelix_add_shaders target out_var)
     -T cs_6_6 -E main -spirv -fspv-target-env=vulkan1.3 -HV 2021 -O3
     # Shader warnings fail the build, like /W4 warnings in review.
     -WX
-    -I ${PROJECT_SOURCE_DIR}/shaders)
+    -I ${PROJECT_SOURCE_DIR}/shaders
+    # NRD.hlsli + NRDConfig.hlsli (cmake/Dependencies.cmake). DXC predefines
+    # __hlsl_dx_compiler, which NRD.hlsli uses to select its DXC branch.
+    -I ${CAELIX_NRD_SHADER_INCLUDE_DIR})
 
   set(spv_files)
   set(embed_list)

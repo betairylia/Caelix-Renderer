@@ -33,8 +33,10 @@ size_t caelix_abi_c99_touch(void) {
   CaelixRenderTargets targets = {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0},
                                  {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}};
   CaelixGpuTimings timings = {0.0f, 0.0f, 0, 0.0f, 0.0f};
+  CaelixNrdInfo nrd_info = {4, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  CaelixDeviceFeatureBits read_bit = CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT;
   CaelixRenderMode mode = CAELIX_MODE_REFERENCE;
-  CaelixDebugView view = CAELIX_VIEW_STEPS;
+  CaelixDebugView view = CAELIX_VIEW_NRD_DIFF;
   CaelixRenderer* renderer = NULL;
   CaelixEntityId entity = CAELIX_INVALID_ENTITY;
   CaelixLogCallback log_callback = NULL;
@@ -46,10 +48,10 @@ size_t caelix_abi_c99_touch(void) {
                sizeof(stats) + sizeof(info) + sizeof(entity) + sizeof(log_callback) +
                sizeof(level) + sizeof(result) + sizeof(camera) + sizeof(options) +
                sizeof(targets) + sizeof(timings) + sizeof(view) + sizeof(renderer) +
-               sizeof(mode);
+               sizeof(mode) + sizeof(nrd_info) + sizeof(read_bit);
   /* Take the address of every function so a declaration typo fails to compile. Casts between
      function pointer types are valid C; the pointers are never called. */
-  AnyFn functions[23];
+  AnyFn functions[24];
   functions[0] = (AnyFn)caelix_get_version;
   functions[1] = (AnyFn)caelix_version_string;
   functions[2] = (AnyFn)caelix_set_log_callback;
@@ -73,6 +75,7 @@ size_t caelix_abi_c99_touch(void) {
   functions[20] = (AnyFn)caelix_renderer_release_target_views;
   functions[21] = (AnyFn)caelix_renderer_get_gpu_timings;
   functions[22] = (AnyFn)caelix_get_device_requirements;
+  functions[23] = (AnyFn)caelix_renderer_get_nrd_info;
   sum += sizeof(functions) + (create != NULL ? 1u : 0u) + (functions[22] != NULL ? 1u : 0u);
   sum += (size_t)key.x + (size_t)frame.frame_number + (size_t)info.resident;
   return sum;

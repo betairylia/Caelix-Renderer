@@ -173,6 +173,7 @@ struct CaelixShadeResult {
   float3 bounce_direction;
   bool specular_lobe;  // the bounce sampled the specular lobe
   float k;             // lobe probability divisor (1, as in Unity)
+  float roughness;     // NRD's linear roughness of the specular lobe: 1 - smoothness
 };
 
 // Unity CaelixShadeVoxelHit, opaque branch: albedo and emission of the block,
@@ -200,6 +201,7 @@ CaelixShadeResult ShadeVoxelHit(uint block, float3 hit_position, float3 ray_dire
   shade.bounce_origin = hit_position + K_RAY_ORIGIN_PUSH_OFF * normal;
   shade.bounce_direction = lerp(diffuse_dir, specular_dir, do_specular);
   shade.specular_lobe = do_specular > 0.5f;
+  shade.roughness = 1.0f - material.smoothness;
   return shade;
 }
 

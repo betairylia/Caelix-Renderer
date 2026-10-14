@@ -46,7 +46,10 @@ extern "C" {
    targets of CaelixRenderTargets, and made the colour target optional, also without a bump. The
    lighting step (6a) appended the path-tracing fields to CaelixRenderOptions (mode .. frame_seed),
    CAELIX_RENDER_FLAG_SKY_ON_MISS and CaelixGpuTimings::composite_ms, also without a bump. The sun
-   NEE step added CAELIX_RENDER_FLAG_SUN_NEE (a new flag bit, no struct change). A host
+   NEE step added CAELIX_RENDER_FLAG_SUN_NEE (a new flag bit, no struct change). The NRD step (6b)
+   added CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT, the debug views CAELIX_VIEW_NRD_*,
+   CaelixNrdInfo and caelix_renderer_get_nrd_info, renamed CaelixGpuTimings::pad to denoise_ms
+   (same layout) and made CaelixRenderOptions::denoise active, also without a bump. A host
    built against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -104,7 +107,9 @@ typedef enum CaelixDeviceFeatureBits {
   CAELIX_FEATURE_RAY_QUERY               = 1u << 6, /* VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery */
   CAELIX_FEATURE_SHADER_INT64            = 1u << 7, /* VkPhysicalDeviceFeatures::shaderInt64 */
   CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT     = 1u << 8, /* VkPhysicalDeviceVulkan12Features::scalarBlockLayout */
-  CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT = 1u << 9 /* VkPhysicalDeviceFeatures::shaderStorageImageWriteWithoutFormat */
+  CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT = 1u << 9, /* VkPhysicalDeviceFeatures::shaderStorageImageWriteWithoutFormat */
+  CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT = 1u << 10  /* VkPhysicalDeviceFeatures::shaderStorageImageReadWithoutFormat
+                                                                   (NRD's temporal stabilization and validation passes) */
 } CaelixDeviceFeatureBits;
 
 typedef struct CaelixDeviceRequirements {
@@ -130,7 +135,10 @@ typedef struct CaelixDeviceAdoptDesc {
 typedef struct CaelixDevice CaelixDevice;  /* opaque */
 
 /* Adopts the host's device. Checks that the physical device supports every requirement of
-   caelix_get_device_requirements; a missing item is logged and returns CAELIX_ERROR_UNSUPPORTED.
+   caelix_get_device_requirements, and that its subgroups support quad operations in compute shaders
+   (VkPhysicalDeviceVulkan11Properties: subgroupSupportedStages has COMPUTE, subgroupSupportedOperations
+   has QUAD; NRD's shaders use QuadReadAcrossX/Y; a property, nothing to enable). A missing item is
+   logged and returns CAELIX_ERROR_UNSUPPORTED.
    The library loads Vulkan through `get_instance_proc_addr`, so it uses the host's loader and
    layers. One adopted device per process at a time.
    The host keeps ownership of every Vulkan object in the desc and must keep them alive until caelix_device_destroy. */
@@ -395,21 +403,27 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  *                          next-event estimation of the sun: CAELIX_RENDER_FLAG_SUN_NEE). Two
  *                          dispatches: trace (G-buffer, internal radiance targets) and composite
  *                          (colour = emission + albedo * incident radiance, exposure, sRGB encode for
- *                          UNORM targets). No denoiser yet: the colour target holds the raw 1 spp
- *                          estimate.
+ *                          UNORM targets). With CaelixRenderOptions::denoise = 1 (and a colour
+ *                          target) NVIDIA NRD (REBLUR_DIFFUSE_SPECULAR) denoises the diffuse and
+ *                          specular radiance between the two dispatches; with 0 the colour target
+ *                          holds the raw 1 spp estimate.
  *   CAELIX_MODE_REFERENCE  as CAELIX_MODE_PATH_TRACE, but the composite accumulates the raw frames
  *                          into an internal RGBA32F image (running mean since the last reset) and
  *                          writes the mean. Use a static camera and a new frame_seed every frame.
- * In the two lighting modes the renderer owns internal targets (about 64 bytes per pixel) sized to
+ *                          Never denoised.
+ * In the two lighting modes the renderer owns internal targets (about 80 bytes per pixel) sized to
  * the host's targets; they are created at the first lighting render and recreated when the target
- * size changes.
+ * size changes. The NRD instance (its own pools, see caelix_renderer_get_nrd_info) is created at the
+ * first denoised render and recreated (history lost) when the target size changes: NRD has no
+ * resize. Its 14 compute pipelines are created again too, a one-time CPU cost per size change.
  *
  * G-buffer mode: a host with its own deferred pipeline passes only the geometry targets (no colour
  * target). The library then writes no lighting at all: per pixel, the material albedo, the world
  * normal, the device depth of the host's projection, the screen-space motion vector and the linear
  * view depth, with coverage (1 on a hit, 0 on a miss) in the alpha channel of albedo and normal.
  *
- * Mapping to NVIDIA NRD (the denoiser of a later step consumes the same targets):
+ * Mapping to NVIDIA NRD (the renderer's own NRD instance uses internal copies of these targets; a
+ * host with its own NRD integration can use the host targets the same way):
  *   view_z -> IN_VIEWZ (positive linear view depth; give NRD the same view and projection).
  *   motion -> IN_MV with CommonSettings::motionVectorScale = (1 / width, 1 / height) and
  *             isMotionVectorInWorldSpace = false: NRD's uvPrev = uv + mv * scale matches
@@ -486,7 +500,14 @@ typedef enum CaelixDebugView {
   CAELIX_VIEW_DEPTH = 2,   /* grey (t - near_z) / (far_z - near_z), clamped to [0, 1] */
   CAELIX_VIEW_GROUP = 3,   /* hash colour of the render group of the hit */
   CAELIX_VIEW_BRICK = 4,   /* hash colour of the brick of the hit (group and dense brick id) */
-  CAELIX_VIEW_STEPS = 5    /* heat map of the procedural candidates of the ray, 0 .. 64 */
+  CAELIX_VIEW_STEPS = 5,   /* heat map of the procedural candidates of the ray, 0 .. 64 */
+  /* Views 6 and 7 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo view for
+     them, CAELIX_MODE_REFERENCE ignores debug_view). */
+  CAELIX_VIEW_NRD_VALIDATION = 6, /* NRD's validation layer (CommonSettings::enableValidation) blended
+                                     over the image by its alpha (after the sRGB encode); the normal
+                                     image when the frame was not denoised */
+  CAELIX_VIEW_NRD_DIFF = 7        /* the denoised diffuse radiance without the albedo (the raw diffuse
+                                     radiance when the frame was not denoised), exposure applied */
 } CaelixDebugView;
 
 /* CaelixRenderOptions::flags */
@@ -507,7 +528,8 @@ typedef enum CaelixDebugView {
 
 /* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
 typedef struct CaelixRenderOptions {
-  uint32_t debug_view;  /* CaelixDebugView; read in CAELIX_MODE_PRIMARY, checked in every mode */
+  uint32_t debug_view;  /* CaelixDebugView; read in CAELIX_MODE_PRIMARY (views 0..5) and
+                           CAELIX_MODE_PATH_TRACE (views 6, 7), checked in every mode */
   uint32_t flags;       /* CAELIX_RENDER_FLAG_* */
   float sun_dir[3];     /* world-space direction TOWARD the sun; the library normalizes it ((0, 1, 0)
                            when zero). Every mode: the Lambert term of the primary mode and the sun
@@ -522,10 +544,16 @@ typedef struct CaelixRenderOptions {
   uint32_t mode;               /* CaelixRenderMode */
   uint32_t bounce_count;       /* stochastic bounces after the primary hit, 0 .. CAELIX_MAX_BOUNCES
                                   (Unity default 4). 0 = primary emission only. */
-  uint32_t denoise;            /* reserved for the denoiser (NRD, a later step); ignored now, pass 0 */
-  uint32_t reset_accumulation; /* 1 = restart the CAELIX_MODE_REFERENCE accumulation with this frame
-                                  (also restarted by a mode change, a target size change and the first
-                                  render). Set it when the camera or the scene changed. */
+  uint32_t denoise;            /* CAELIX_MODE_PATH_TRACE with a colour target: 1 = NRD denoises the
+                                  frame (REBLUR_DIFFUSE_SPECULAR), 0 = raw 1 spp. Ignored in the other
+                                  modes. */
+  uint32_t reset_accumulation; /* 1 = restart the CAELIX_MODE_REFERENCE accumulation, and drop the NRD
+                                  history (accumulation mode RESTART), with this frame. Both are also
+                                  restarted by a mode change, a target size change and the first
+                                  render; the NRD history also after a frame without denoising.
+                                  Reference mode: set it when the camera or the scene changed. Path
+                                  trace mode: NRD follows camera and entity motion through the motion
+                                  vectors; set it only for a cut (a teleport, a new scene). */
   float exposure;              /* the composite multiplies the colour (sky included) by it before the
                                   sRGB encode; 0 is treated as 1 */
   float sun_radiance[3];       /* radiance of the sun disk (constant over the disk). The irradiance
@@ -591,9 +619,15 @@ typedef struct CaelixRenderTargets {
    without format or size, present targets of different sizes, one image in two targets, a geometry
    target format outside its list above, an unknown debug view, an unknown mode, a bounce_count above
    CAELIX_MAX_BOUNCES, a frame number not above safe_frame_number, or a ninth frame in flight;
-   CAELIX_ERROR_OUT_OF_MEMORY when the internal targets of the lighting modes cannot be allocated;
-   CAELIX_ERROR_UNSUPPORTED when a target format
-   cannot be written as a storage image without a format qualifier. */
+   CAELIX_ERROR_OUT_OF_MEMORY when the internal targets of the lighting modes or the NRD instance
+   cannot be allocated (nothing is recorded); CAELIX_ERROR_UNSUPPORTED when a target format
+   cannot be written as a storage image without a format qualifier.
+   Denoising (CaelixRenderOptions::denoise): between the trace and the composite the call records
+   NRD's dispatches (about 30 per frame, each after a global compute-to-compute memory barrier)
+   between two timestamps. When NRD itself reports an error (instance creation, settings, dispatch
+   list), the error is logged, the frame is recorded without denoising (raw 1 spp in the colour
+   target) and this call returns CAELIX_ERROR_VULKAN; every later call of this renderer renders
+   without denoising and returns CAELIX_OK (CaelixNrdInfo::failed is 1). */
 CAELIX_API CaelixResult caelix_renderer_render(CaelixRenderer* renderer, const CaelixFrameDesc* frame,
                                                const CaelixRenderTargets* targets,
                                                const CaelixCamera* camera,
@@ -613,12 +647,33 @@ typedef struct CaelixGpuTimings {
   float flush_ms;         /* caelix_scene_flush of that frame; 0 when the flush recorded no work */
   uint64_t frame_number;  /* the frame the values belong to; 0 = none yet */
   float composite_ms;     /* the composite dispatch of that frame; 0 when it had none (primary mode) */
-  float pad;
+  float denoise_ms;       /* NRD's dispatches of that frame; 0 when it was not denoised */
 } CaelixGpuTimings;
 
 /* Fills *out. A NULL argument is ignored. All zero when the queue has no timestamp support. */
 CAELIX_API void caelix_renderer_get_gpu_timings(const CaelixRenderer* renderer,
                                                 CaelixGpuTimings* out);
+
+/* The NRD library and the renderer's NRD instance. The instance fields are 0 until the first
+   denoised render created the instance; they describe the newest instance (a target size change
+   replaces it). */
+typedef struct CaelixNrdInfo {
+  uint32_t version_major;            /* NRD library version (nrd::GetLibraryDesc) */
+  uint32_t version_minor;
+  uint32_t version_build;
+  uint32_t width, height;            /* size of the instance; 0 = no instance yet */
+  uint32_t pipeline_count;           /* compute pipelines of the instance */
+  uint32_t permanent_texture_count;  /* NRD's permanent pool (history, kept between frames) */
+  uint32_t transient_texture_count;  /* NRD's transient pool (scratch within a frame) */
+  uint64_t permanent_bytes;          /* GPU memory of the permanent pool images */
+  uint64_t transient_bytes;          /* GPU memory of the transient pool images */
+  uint32_t dispatch_count;           /* NRD dispatches of the newest denoised frame */
+  uint32_t failed;                   /* 1 after an NRD error: the renderer no longer denoises */
+} CaelixNrdInfo;
+
+/* Fills *out. Returns CAELIX_ERROR_INVALID_ARGUMENT (logged) for a NULL argument. */
+CAELIX_API CaelixResult caelix_renderer_get_nrd_info(const CaelixRenderer* renderer,
+                                                     CaelixNrdInfo* out);
 
 /* Reserved for later (not declared yet):
  *   caelix_scene_upload_brick_summaries - per-brick summaries for bricks that are known but not

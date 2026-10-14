@@ -48,3 +48,7 @@ caelix_add_gpu_test(caelix_as_test as_test.cpp)
 
 # Primary ray trace kernel: rendered images read back and checked.
 caelix_add_gpu_test(caelix_trace_test trace_test.cpp)
+
+# NRD denoising through the renderer: executor creation and resize, denoised image
+# against a reference, history reset, debug views.
+caelix_add_gpu_test(caelix_nrd_test nrd_test.cpp)

@@ -61,6 +61,8 @@ pub struct Features {
     pub scalar_block_layout: bool,
     /// VkPhysicalDeviceFeatures::shaderStorageImageWriteWithoutFormat.
     pub storage_image_write_without_format: bool,
+    /// VkPhysicalDeviceFeatures::shaderStorageImageReadWithoutFormat.
+    pub storage_image_read_without_format: bool,
 }
 
 /// Raw handles for a library that adopts this device. All as u64 / pointer, no ash types.

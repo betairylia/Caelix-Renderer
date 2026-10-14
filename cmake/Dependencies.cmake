@@ -30,7 +30,35 @@ FetchContent_Declare(unordered_dense
   GIT_SHALLOW    TRUE
   SYSTEM)
 
-FetchContent_MakeAvailable(volk VulkanMemoryAllocator unordered_dense)
+# NVIDIA Real-Time Denoisers (NRD): static library target `NRD` (C++17), with its
+# SPIR-V shaders embedded (built by NRD's own ShaderMake step with the Vulkan SDK's
+# DXC; SHADERMAKE_FIND_DXC OFF stops ShaderMake from downloading a second DXC). The
+# library links it PRIVATE (lib/src/nrd_executor.*). The kernels include
+# NRD.hlsli and the NRDConfig.hlsli that NRD's configure step writes next to it
+# (<nrd_SOURCE_DIR>/Shaders, see cmake/Shaders.cmake). Normal encoding 2
+# (R10G10B10A2, oct-packed) and roughness encoding 1 (linear) are NRD's defaults
+# and are baked into both NRD's shaders and ours. NRD needs CMake 3.30. License:
+# third_party/NOTICES.md.
+set(NRD_STATIC_LIBRARY ON CACHE BOOL "" FORCE)
+set(NRD_EMBEDS_SPIRV_SHADERS ON CACHE BOOL "" FORCE)
+set(NRD_EMBEDS_DXIL_SHADERS OFF CACHE BOOL "" FORCE)
+set(NRD_EMBEDS_DXBC_SHADERS OFF CACHE BOOL "" FORCE)
+set(NRD_NORMAL_ENCODING "2" CACHE STRING "" FORCE)
+set(NRD_ROUGHNESS_ENCODING "1" CACHE STRING "" FORCE)
+set(SHADERMAKE_FIND_DXC OFF CACHE BOOL "" FORCE)
+# NRD's REBLUR passes use quad intrinsics in compute shaders (better image quality).
+# Device::Adopt then requires subgroup quad operations in the compute stage. OFF
+# builds NRD without them, for a device that lacks that support.
+option(CAELIX_NRD_QUAD_INTRINSICS "Build NRD with quad intrinsics (needs subgroup quad ops in compute)" ON)
+set(NRD_SUPPORTS_QUAD_INTRINSICS ${CAELIX_NRD_QUAD_INTRINSICS} CACHE BOOL "" FORCE)
+FetchContent_Declare(nrd
+  GIT_REPOSITORY https://github.com/NVIDIA-RTX/NRD.git
+  GIT_TAG        v4.18.0
+  GIT_SHALLOW    TRUE)
+
+FetchContent_MakeAvailable(volk VulkanMemoryAllocator unordered_dense nrd)
+# The directory of NRD.hlsli and the generated NRDConfig.hlsli (DXC include path).
+set(CAELIX_NRD_SHADER_INCLUDE_DIR ${nrd_SOURCE_DIR}/Shaders)
 
 # Test-only dependencies. The library never links them.
 if(CAELIX_BUILD_TESTS)

@@ -21,8 +21,9 @@ GpuImage::GpuImage(VmaAllocator allocator, VkDevice device, uint32_t width, uint
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   VmaAllocationCreateInfo allocation_info{};
   allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+  VmaAllocationInfo info{};
   VkResult result =
-      vmaCreateImage(allocator, &image_info, &allocation_info, &image_, &allocation_, nullptr);
+      vmaCreateImage(allocator, &image_info, &allocation_info, &image_, &allocation_, &info);
   if (result != VK_SUCCESS) {
     CAELIX_LOGE("vmaCreateImage failed for %s: %d (%ux%u, VkFormat %d)", name,
                 static_cast<int>(result), width, height, static_cast<int>(format));
@@ -35,6 +36,7 @@ GpuImage::GpuImage(VmaAllocator allocator, VkDevice device, uint32_t width, uint
   format_ = format;
   width_ = width;
   height_ = height;
+  allocation_bytes_ = info.size;
 
   VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   view_info.image = image_;
@@ -60,7 +62,8 @@ GpuImage::GpuImage(GpuImage&& other) noexcept
       view_(std::exchange(other.view_, VK_NULL_HANDLE)),
       format_(std::exchange(other.format_, VK_FORMAT_UNDEFINED)),
       width_(std::exchange(other.width_, 0)),
-      height_(std::exchange(other.height_, 0)) {}
+      height_(std::exchange(other.height_, 0)),
+      allocation_bytes_(std::exchange(other.allocation_bytes_, 0)) {}
 
 GpuImage& GpuImage::operator=(GpuImage&& other) noexcept {
   if (this != &other) {
@@ -73,6 +76,7 @@ GpuImage& GpuImage::operator=(GpuImage&& other) noexcept {
     format_ = std::exchange(other.format_, VK_FORMAT_UNDEFINED);
     width_ = std::exchange(other.width_, 0);
     height_ = std::exchange(other.height_, 0);
+    allocation_bytes_ = std::exchange(other.allocation_bytes_, 0);
   }
   return *this;
 }
@@ -92,6 +96,7 @@ void GpuImage::Reset() {
   format_ = VK_FORMAT_UNDEFINED;
   width_ = 0;
   height_ = 0;
+  allocation_bytes_ = 0;
 }
 
 }  // namespace caelix

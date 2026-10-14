@@ -55,6 +55,11 @@ struct CaelixFrameConstants {
   uint output_srgb;         // 420  1 = the colour target is UNORM: encode linear -> sRGB
   float t_max;              // 424  bounce ray length and the "no hit" hit distance (1e4)
   float sun_solid_angle;    // 428  2 pi (1 - sun_cos_radius): solid angle of the sun cone
+  uint denoised;            // 432  1 = NRD ran this frame (composite: validation view)
+  uint pad0;                // 436
+  uint pad1;                // 440
+  uint pad2;                // 444
+  float4 hit_dist_params;   // 448  REBLUR hit distance normalization A, B, C (w unused)
 };
 
 struct CaelixTracePush {
@@ -68,6 +73,8 @@ static const uint kViewDepth = 2;
 static const uint kViewGroup = 3;
 static const uint kViewBrick = 4;
 static const uint kViewSteps = 5;
+static const uint kViewNrdValidation = 6;  // path trace mode: NRD's validation layer
+static const uint kViewNrdDiff = 7;        // path trace mode: denoised diffuse radiance
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

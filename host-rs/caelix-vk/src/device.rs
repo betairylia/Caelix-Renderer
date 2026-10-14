@@ -189,7 +189,7 @@ fn check_device(
     unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
     let core = features2.features;
 
-    let checks: [(bool, vk::Bool32, &str); 13] = [
+    let checks: [(bool, vk::Bool32, &str); 14] = [
         (features.buffer_device_address, v12.buffer_device_address, "bufferDeviceAddress"),
         (features.descriptor_indexing, v12.runtime_descriptor_array, "runtimeDescriptorArray"),
         (
@@ -218,6 +218,11 @@ fn check_device(
             features.storage_image_write_without_format,
             core.shader_storage_image_write_without_format,
             "shaderStorageImageWriteWithoutFormat",
+        ),
+        (
+            features.storage_image_read_without_format,
+            core.shader_storage_image_read_without_format,
+            "shaderStorageImageReadWithoutFormat",
         ),
     ];
     for (required, supported, name) in checks {
@@ -287,7 +292,8 @@ pub(crate) fn create_device(
     let mut ray_query = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
     let core = vk::PhysicalDeviceFeatures::default()
         .shader_int64(features.shader_int64)
-        .shader_storage_image_write_without_format(features.storage_image_write_without_format);
+        .shader_storage_image_write_without_format(features.storage_image_write_without_format)
+        .shader_storage_image_read_without_format(features.storage_image_read_without_format);
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .features(core)
         .push_next(&mut v12)

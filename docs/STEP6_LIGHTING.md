@@ -257,3 +257,56 @@ hit, and back-facing samples trace nothing. The 6a run of the same settings meas
 0.57 ms (another session; FIFO leaves the GPU partly idle).
 
 Images: `Artifacts/native-renderer-step6a-20261014/*-nee.png`.
+
+## 6b as built (2026-10-14)
+
+NRD v4.18.0 runs in `CAELIX_MODE_PATH_TRACE` with `CaelixRenderOptions::denoise = 1`
+(`lib/src/nrd_executor.*`, integration in `Renderer::Render`; README "Denoising (step 6b)").
+Differences from the plan above:
+
+- **Device requirements.** The embedded SPIR-V (dumped from `PipelineDesc::computeShaderSPIRV`,
+  `spirv-dis`) declares `Shader`, `StorageImageWriteWithoutFormat` (all 14 pipelines),
+  `StorageImageReadWithoutFormat` (temporal stabilization, validation), `StorageImageExtendedFormats`
+  (temporal accumulation) and `GroupNonUniformQuad` (history fix, blur, both post-blurs). No
+  `Float16`, `Int16`, 16-bit storage, `DerivativeControl` or `DerivativeGroupQuads*`: DXC 1.8 emits
+  `QuadReadAcrossX/Y` in compute without a derivative-group execution mode, so
+  `VK_KHR_compute_shader_derivatives` is not needed (and would change nothing). Added: feature bit
+  10 `CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT`, and a `Device::Adopt` check of the
+  subgroup properties (QUAD operations in the COMPUTE stage). `CAELIX_NRD_QUAD_INTRINSICS=OFF`
+  (CMake) builds NRD without quad intrinsics and drops that check.
+- **NRD.hlsli** needs only the include path: DXC predefines `__hlsl_dx_compiler`, which selects
+  NRD.hlsli's DXC branch, and NRDConfig.hlsli (written by NRD's configure step next to NRD.hlsli in
+  `<nrd>/Shaders`) carries the encodings. No define, no warning under `-WX`.
+- **Executor details.** One pipeline layout for all pipelines (the descriptor pool desc's maxima).
+  Set 1 (samplers + dynamic UBO) is written once for the whole constant ring, not per frame slot.
+  Pool images stay in `GENERAL`. A conservative global barrier before every dispatch. The first frame
+  of an instance uses `CLEAR_AND_RESTART` (24 extra clear dispatches; uninitialized pool memory may
+  hold NaN bit patterns), later restarts `RESTART`. 8 dispatches per frame normally.
+- **Composite descriptors** are written after the NRD dispatches are recorded, so a frame whose
+  NRD call fails still composites the raw radiance.
+- **`denoisingRange` = 1e6**, not the camera far plane (`far_z` is only the depth view's range).
+- **Hit distance**: 0 when there is no segment (`bounce_count = 0`), as NRD wants for "no sample";
+  t_max (normalizes to 1) when the first segment reaches the sky.
+
+Results (`Artifacts/native-renderer-step6b-20261014/`, RTX 5080, release, sky light only, 4 bounces,
+64 warm-up frames): PSNR against the 6a 1024-frame references 40.3 dB (overview) and 38.4 dB
+(detail); raw 1 spp 18.7 dB and 15.5 dB. NRD GPU time 0.23 / 0.33 ms at 1280x720 and
+0.99 / 1.43 ms at 2560x1440 (overview / detail; trace 0.53 / 0.64 and 1.83 / 2.56 ms).
+
+Findings for 6c and later:
+
+1. **Hard sun shadows are blurred.** The sun's NEE term is part of the diffuse signal; REBLUR's
+   pre-pass (30 px) and blur (30 px) radii follow the hit distance of the bounce ray, not the shadow
+   ray, so a sharp sun shadow is softened in every frame and stays biased after convergence
+   (`caelix_nrd_test`, floor + block, sun 2 degrees: raw / NRD RMSE ratio 2.1 at 320x240, 3.1 at
+   640x480, 3.9 at 1280x720; with both radii at 10 px it is 3.4 at 320x240). NVIDIA's design
+   denoises direct sun shadows separately (SIGMA) and keeps them out of REBLUR's input. Decide with
+   the owner before the sun is turned on for real scenes.
+2. **Slight darkening**: the converged NRD output is 1.7 % (sun) to 2.9 % (sky only) below the
+   reference mean on the test scene; 0.1 % on the citadel images. Not investigated (anti-firefly
+   and the history clamps are the usual suspects).
+3. **Frame-rate dependence**: NRD scales some accumulation behaviour by the measured frame time
+   (`timeDeltaBetweenFrames`, clamped 0.25x..4x of 60 fps). The tests render at several hundred
+   fps; the host at 144 Hz.
+4. Barriers are global per dispatch; per-resource read-after-write barriers could let
+   independent passes overlap (worth measuring at 1440p, where NRD is 1 to 1.4 ms).

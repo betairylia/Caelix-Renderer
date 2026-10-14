@@ -5,6 +5,10 @@ library (`caelix_renderer`) that exposes a small C ABI (`include/caelix/caelix.h
 A Rust standalone host (`host-rs/`) links the library through bindgen-generated
 bindings. A Unity native plugin that uses the same C ABI comes later.
 
+The library contains NVIDIA Real-Time Denoisers (NRD, compiled in). Its license
+obligations (credits line, NVIDIA marks, distribution) are summarized in
+[`third_party/NOTICES.md`](third_party/NOTICES.md); read it before you ship a build.
+
 ## Architecture
 
 The host owns the Vulkan instance, the device and the swapchain. The library
@@ -50,7 +54,12 @@ added the renderer API and the feature bit
 step (6a) appended the path-tracing fields to `CaelixRenderOptions` (`mode`
 .. `frame_seed`), `CAELIX_RENDER_FLAG_SKY_ON_MISS`, `CaelixRenderMode`,
 `CAELIX_MAX_BOUNCES` and `CaelixGpuTimings::composite_ms`, also without a
-bump. Rebuild hosts against the current header.
+bump. The NRD step (6b) added `CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT`
+(bit 10), the debug views `CAELIX_VIEW_NRD_VALIDATION` / `CAELIX_VIEW_NRD_DIFF`,
+`CaelixNrdInfo` and `caelix_renderer_get_nrd_info`, renamed
+`CaelixGpuTimings::pad` to `denoise_ms` (same layout) and made
+`CaelixRenderOptions::denoise` active, also without a bump. Rebuild hosts
+against the current header.
 
 Scene model:
 
@@ -250,6 +259,9 @@ flush builds the TLAS that the render binds.
   traces the bounces into the internal targets.
 - Composite kernel `shaders/caelix_composite.hlsl`, `[numthreads(8, 8, 1)]`,
   lighting modes only: internal targets -> the host's colour target.
+- NRD (`lib/src/nrd_executor.*`, path trace mode with `denoise = 1`): NRD's
+  own compute dispatches between the trace and the composite (see "Denoising
+  (step 6b)" below).
 - Shading helpers `shaders/caelix_shading.hlsl`: block colours, the material
   decode, the random stream, the opaque shading rule and the procedural sky.
 - Brick DDA `shaders/caelix_brick_trace.hlsl`: a copy of Unity's
@@ -272,7 +284,7 @@ flush builds the TLAS that the render binds.
   the previous render call's camera, the present-target mask, the miss values,
   `has_prev_camera` / `has_tlas`, and the lighting parameters (mode, bounces,
   seed, accumulation count, exposure, sun and sky, sRGB output, `t_max`). The
-  composite kernel has its own set (binding 0 the colour target, bindings 1..5
+  composite kernel has its own set (binding 0 the colour target, bindings 1..6
   internal targets) and the same push constant. Every binding is `PARTIALLY_BOUND`
   (`VkDescriptorSetLayoutBindingFlagsCreateInfo`): a render call writes only the
   TLAS (when the scene has one) and the present targets, and the kernel touches
@@ -297,8 +309,9 @@ flush builds the TLAS that the render binds.
   colour is a pastel hash of the id.
 - GPU timings: two timestamps around each dispatch, read back in
   a later render call whose safe frame has reached that frame;
-  `caelix_renderer_get_gpu_timings` returns `trace_ms`, `composite_ms` (0 in
-  the primary mode), `flush_ms` and the frame they belong to.
+  `caelix_renderer_get_gpu_timings` returns `trace_ms`, `denoise_ms` (0 for
+  a frame without NRD), `composite_ms` (0 in the primary mode), `flush_ms` and
+  the frame they belong to.
 
 Pixel mapping: pixel (px, py), row 0 = the top row,
 `ndc = ((px + 0.5) / w * 2 - 1, 1 - (py + 0.5) / h * 2)`, direction
@@ -310,8 +323,9 @@ The camera basis is Unity's (+X right, +Y up, +Z forward); the host's
 
 The lighting modes port the opaque part of Unity's path tracer
 (`CaelixPathTraceCommon.hlsl`: `CaelixShadeVoxelHit` and the bounce loop).
-There is no denoiser yet (NRD comes in step 6b), so `CAELIX_MODE_PATH_TRACE`
-shows the raw 1 spp estimate and `CAELIX_MODE_REFERENCE` the running mean.
+`CAELIX_MODE_PATH_TRACE` shows the 1 spp estimate (denoised by NRD with
+`denoise = 1`, see "Denoising (step 6b)") and `CAELIX_MODE_REFERENCE` the running
+mean of the raw estimate.
 
 - Primary hit: the material (packed: opaque rgb5 / 31, emissive rgb4 / 15 with
   `emission = albedo * 2^(3 * strength)`; block-ID: the pastel hash colour, no
@@ -325,9 +339,14 @@ shows the raw 1 spp estimate and `CAELIX_MODE_REFERENCE` the running mean.
   adds `emission * throughput`, multiplies the throughput by the albedo, and
   Russian roulette on the largest throughput channel may stop the path. The
   incident radiance goes to the diffuse or the specular target by the lobe of
-  the primary hit; alpha = the hit distance of the first segment (1e4 when it
-  reaches the sky or there is no bounce). NaN or Inf drops the sample; values
-  are clamped to 65504 (FP16).
+  the primary hit, packed for NRD REBLUR
+  (`REBLUR_FrontEnd_PackRadianceAndNormHitDist`: YCoCg radiance, alpha = the
+  hit distance of the first segment normalized by
+  `REBLUR_FrontEnd_GetNormHitDist` with A, B, C = 3, 0.1, 20 at the primary
+  view z, roughness 1 for the diffuse lobe; 1e4 before normalization when the
+  segment reaches the sky, 0 when there is no segment). The lobe that was not
+  sampled gets 0 radiance and 0 hit distance. NaN or Inf drops the sample;
+  values are clamped to 65504 (FP16).
 - Glass (packed transparent blocks) is shaded as an opaque diffuse surface with
   the tint (0.6, 0.8, 1.0) until step 6d ports the delta chain.
 - Random numbers: `PcgHash(px ^ (py << 16) ^ (frame_seed * 0x9E3779B9))`,
@@ -354,7 +373,10 @@ shows the raw 1 spp estimate and `CAELIX_MODE_REFERENCE` the running mean.
   same random numbers with NEE on or off. Without the flag the sun is found
   only by chance (6a behaviour, as in Unity): a small disk then needs a very
   high radiance, which does not converge.
-- Composite: `raw = deterministic + albedo * (diffuse + specular)`; reference
+- Composite: diffuse and specular are unpacked with
+  `REBLUR_BackEnd_UnpackRadianceAndNormHitDist` (NRD's outputs when the frame
+  was denoised, else the raw packed inputs); `raw = deterministic + albedo *
+  (diffuse + specular)`; reference
   mode `accum = n == 0 ? raw : lerp(accum, raw, 1 / (n + 1))`; then `* exposure`;
   a miss is `SkyRadiance(primary direction) * exposure` with
   `CAELIX_RENDER_FLAG_SKY_ON_MISS`, else 0; alpha = coverage; linear -> sRGB
@@ -368,13 +390,80 @@ shows the raw 1 spp estimate and `CAELIX_MODE_REFERENCE` the running mean.
 
 | Target | Format | Content |
 |---|---|---|
-| `view_z` | R32F | linear view depth; 1e30 on a miss |
-| `normal_roughness` | RGBA16F | world normal, roughness 1 (NRD packing comes with NRD) |
-| `motion` | RGBA16F | motion in pixels (xy), previous view z - view z (z) |
+| `view_z` | R32F | linear view depth; 1e30 on a miss (NRD `IN_VIEWZ`) |
+| `normal_roughness` | RGB10A2 | `NRD_FrontEnd_PackNormalAndRoughness(N, 1 - smoothness, 0)` (`IN_NORMAL_ROUGHNESS`) |
+| `motion` | RGBA16F | motion in pixels (xy), previous view z - view z (z) (`IN_MV`) |
 | `albedo` | RGBA8 | material albedo; a = coverage |
 | `deterministic` | RGBA16F | primary emission |
-| `diff_in`, `spec_in` | RGBA16F | incident radiance; a = first-segment hit distance |
+| `diff_in`, `spec_in` | RGBA16F | REBLUR-packed incident radiance and normalized hit distance (`IN_DIFF/SPEC_RADIANCE_HITDIST`) |
 | `accum` | RGBA32F | reference accumulation |
+| `diff_out`, `spec_out` | RGBA16F | NRD's outputs (`OUT_DIFF/SPEC_RADIANCE_HITDIST`) |
+| `validation` | RGBA8 | NRD's validation layer (`OUT_VALIDATION`) |
+
+### Denoising (step 6b)
+
+`CaelixRenderOptions::denoise = 1` in `CAELIX_MODE_PATH_TRACE` (with a colour
+target) runs NVIDIA NRD v4.18.0, denoiser `REBLUR_DIFFUSE_SPECULAR`, between the
+trace and the composite. NRD is a static library with embedded SPIR-V; the
+renderer drives it without NRI through `NrdExecutor` (`lib/src/nrd_executor.*`):
+
+- From `nrd::GetInstanceDesc` / `GetLibraryDesc` (nothing hard-coded): one
+  pipeline layout shared by NRD's 14 pipelines, set 0 = 18 sampled images from
+  binding 20 and 7 storage images from binding 3 (all `PARTIALLY_BOUND`),
+  set 1 = the two immutable samplers (bindings 0, 1: nearest and linear clamp)
+  and one `UNIFORM_BUFFER_DYNAMIC` (binding 2). NRD's pools are one image each
+  (13 permanent, 8 transient for this denoiser; 39 + 26 MiB at 1280x720, 158 +
+  105 MiB at 2560x1440), `SAMPLED | STORAGE`, moved to `GENERAL` once and kept
+  there (no layout tracking; free on NVIDIA).
+- Constants: a host-visible ring of 960-byte blocks (912 rounded up to the
+  uniform offset alignment), `setsMaxNum` (36) blocks per frame slot, written
+  only when a dispatch's data differs from the previous dispatch's. Set 1 is
+  written once and bound with a dynamic offset per dispatch.
+- Per frame: one descriptor pool per renderer frame slot, reset and filled
+  with one set 0 per dispatch; every dispatch follows one global
+  compute-to-compute memory barrier (conservative: finer per-resource barriers
+  would let independent passes overlap). 8 dispatches per frame (classify
+  tiles, hit distance reconstruction, pre-pass, temporal accumulation, history
+  fix, blur, post-blur, temporal stabilization), 9 with the validation layer,
+  32 on the first frame of an instance (the pool clears of
+  `CLEAR_AND_RESTART`).
+- `CommonSettings`: world-to-view = rows right, up, forward of `CaelixCamera`
+  (column-major, column vectors), view-to-clip = `CaelixCamera::projection`,
+  the previous render call's pair, `motionVectorScale = (1/w, 1/h, 1)` (motion
+  in pixels, z = view z delta), no jitter, `denoisingRange = 1e6` (the worlds
+  are at most 8192 units across; a miss has view z 1e30),
+  `disocclusionThreshold = 0.01`, `frameIndex` +1 per denoised frame,
+  `accumulationMode` `CLEAR_AND_RESTART` on an instance's first frame,
+  `RESTART` after `reset_accumulation` or a frame without denoising, else
+  `CONTINUE`; `timeDeltaBetweenFrames` from a steady clock.
+- `ReblurSettings`: NRD's defaults, plus `hitDistanceParameters` (3, 0.1, 20)
+  (the same as the trace kernel), `enableAntiFirefly = true`,
+  `hitDistanceReconstructionMode = AREA_3X3`, `maxAccumulatedFrameNum = 30`.
+- NRD has no resize: a target size change creates a new instance (new pools,
+  14 pipelines again, history lost); the old one is destroyed once its last
+  frame is safe.
+- An NRD error (`nrd::Result`) is logged; the frame is recorded without
+  denoising and that render call returns `CAELIX_ERROR_VULKAN`; the renderer
+  never denoises again (`CaelixNrdInfo::failed`).
+- Debug views (path trace mode): `CAELIX_VIEW_NRD_VALIDATION` (NRD's
+  validation layer blended over the image), `CAELIX_VIEW_NRD_DIFF` (the
+  denoised diffuse radiance without the albedo).
+- Device: NRD's shaders declare `StorageImageReadWithoutFormat` (feature bit
+  10), `StorageImageWriteWithoutFormat`, `StorageImageExtendedFormats` and
+  `GroupNonUniformQuad` (quad intrinsics in compute: `Device::Adopt` checks the
+  subgroup properties; CMake option `CAELIX_NRD_QUAD_INTRINSICS=OFF` builds NRD
+  without them). No 16-bit types, no compute derivatives (no
+  `DerivativeGroupQuads` execution mode), so `VK_KHR_compute_shader_derivatives`
+  is not required.
+
+Measured 2026-10-14 (RTX 5080, release, citadel, sky light only): denoise
+0.23 ms (overview) and 0.33 ms (detail) at 1280x720, 0.99 ms and 1.43 ms at
+2560x1440; denoised images 40.3 dB (overview) and 38.4 dB (detail) PSNR against
+the 1024-frame references, raw 1 spp 18.7 dB and 15.5 dB. Known limitation:
+the sun's direct light (NEE) is part of the diffuse signal, and REBLUR blurs
+hard sun shadows (its pre-pass and blur radii, 30 pixels, do not see the
+shadow; NVIDIA's answer is a separate shadow denoiser, SIGMA). Images and
+numbers: `Artifacts/native-renderer-step6b-20261014/`.
 
 ### Render targets and G-buffer mode
 
@@ -414,7 +503,8 @@ left on the screen, so `motion.x = +width / (2 * tan_half_fov_y * aspect * z)`
 call of a renderer has no previous camera and writes 0; so does a point that
 was behind the previous camera.
 
-Mapping to NVIDIA NRD (the denoiser step consumes the same targets): `view_z`
+Mapping to NVIDIA NRD (the renderer's own NRD instance uses internal copies of
+these targets; a host with its own NRD integration can use these): `view_z`
 is `IN_VIEWZ`; `motion` is `IN_MV` with `motionVectorScale = (1 / width,
 1 / height)` and `isMotionVectorInWorldSpace = false` (NRD computes
 `uvPrev = uv + mv * scale`, the same convention, top-left origin); `normal`
@@ -434,8 +524,10 @@ available to all later commands. The host transitions the images from
 ## Build
 
 Requirements: Visual Studio 2022 (MSVC and its bundled LLVM/libclang),
-CMake 3.28 or newer, the Vulkan SDK (`VULKAN_SDK` set; its DXC compiles the
-shaders, tested with DXC 1.8 from SDK 1.4.304.1), and a Rust MSVC toolchain.
+CMake 3.30 or newer (NRD's CMakeLists needs it), the Vulkan SDK (`VULKAN_SDK`
+set; its DXC compiles our shaders and NRD's, tested with DXC 1.8 from SDK
+1.4.304.1), and a Rust MSVC toolchain. Keep the build directory path short:
+NRD's shader build (ShaderMake) fails on very long paths.
 
 ```
 cmake --preset vs2022
@@ -444,8 +536,12 @@ cd host-rs && cargo run -p caelix-app
 ```
 
 The first CMake configure fetches the pinned dependencies (volk,
-VulkanMemoryAllocator, unordered_dense, and for the tests Catch2 and
-vk-bootstrap) into `build/_deps/`.
+VulkanMemoryAllocator, unordered_dense, NRD v4.18.0 with its ShaderMake and
+MathLib, and for the tests Catch2 and vk-bootstrap) into `build/_deps/`. NRD
+builds as a static library with its SPIR-V embedded (about 16 s on the first
+build); our kernels include its `NRD.hlsli` (DXC `-I <nrd>/Shaders`, where
+NRD's configure also writes `NRDConfig.hlsli` with the normal and roughness
+encodings).
 
 ## Tests
 
@@ -517,6 +613,19 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   0 bounces adds nothing; under a 16^3 block 8 blocks above the floor the
   floor is exactly 0 (1 bounce), far from it the value of the open floor; a
   primary miss still shows the sun disk with NEE on.
+- `caelix_nrd_test`: NRD through the renderer. At 320x240 the first denoised
+  render creates the instance (14 pipelines, 13 permanent and 8 transient pool
+  textures, `denoise_ms > 0`); another size replaces it, and the first size once
+  more. Quality, at 1280x720 (NRD's radii are in pixels): the floor with the
+  16^3 block of the NEE test, sun radiance 1000 at 2 degrees from
+  (0.4, 1, -0.3), the test sky, 4 bounces, a static camera in front of and
+  above the block; the 64th denoised frame against a 1024-frame reference over
+  the hit pixels: RMSE below a third of the raw 1 spp frame's (measured 0.0219
+  vs 0.0862, 33.2 vs 21.3 dB PSNR at peak 1) and mean within 5 % (measured
+  -1.7 %). Reset: the first frame after `reset_accumulation` changes 4x more
+  against the converged frame than one converged frame against the next, and
+  64 frames later the error is back within 10 %. The validation and diffuse
+  debug views render. No validation message in any case.
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -550,8 +659,16 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
 - `--fov <DEGREES>`: vertical field of view. Default 60.
 - `--mode <primary|pt|ref>`: the rendering mode. Default `pt` with `--world`,
   else `primary`.
-- `--view <albedo|normal|depth|group|brick|steps>`: the debug view of the
-  primary mode. Default `albedo`.
+- `--view <albedo|normal|depth|group|brick|steps|nrd-validation|nrd-diff>`:
+  the debug view; the first six in the primary mode, `nrd-validation` (NRD's
+  validation layer) and `nrd-diff` (the denoised diffuse radiance) in `pt`
+  mode. Default `albedo`.
+- `--no-denoise`: `pt` mode without NRD (the raw 1 spp image). Default: NRD on.
+- `--size <WxH>`: inner size of the window. Default 1280x720.
+- `--warmup <N>`: `pt` mode, take `--screenshot` N frames after the world is
+  complete (at least 3), so that NRD's history is warm (64 for the artifacts).
+  In `pt` mode the NRD history restarts only while the world is loading;
+  camera motion is followed through the motion vectors.
 - `--no-shading`: primary mode, albedo without Lambert shading.
 - `--bounces <N>`: lighting modes, stochastic bounces (0..14). Default 4.
 - `--exposure <F>`: lighting modes, colour multiplier. Default 1.
@@ -603,8 +720,11 @@ it adds one scene entity per file entity, then streams the bricks:
   `end_frame` presents. When the swapchain was recreated, the host calls
   `caelix_renderer_release_target_views` first.
 - The window title shows the GPU times once per second
-  (`Caelix Renderer | trace 0.49 ms | composite 0.01 ms | flush 0.00 ms | 144 fps`); the same line
+  (`Caelix Renderer | trace 0.53 ms | denoise 0.23 ms | composite 0.01 ms | flush 0.00 ms | 144 fps`); the same line
   is logged at info level every 120 frames and when a screenshot is written.
+  At the second frame of the renderer's NRD instance the host logs one NRD line
+  (`caelix_renderer_get_nrd_info`: version, size, pipelines, pool textures and
+  MiB, dispatches per frame).
   Presentation uses FIFO, so the frame rate is limited by the display.
 - When the decoder has
   finished and every brick is uploaded, the host logs one summary (entities,

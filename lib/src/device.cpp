@@ -19,7 +19,7 @@ constexpr uint32_t kRequiredFeatureFlags =
     CAELIX_FEATURE_SYNCHRONIZATION2 | CAELIX_FEATURE_DYNAMIC_RENDERING |
     CAELIX_FEATURE_TIMELINE_SEMAPHORE | CAELIX_FEATURE_ACCELERATION_STRUCTURE |
     CAELIX_FEATURE_RAY_QUERY | CAELIX_FEATURE_SHADER_INT64 | CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT |
-    CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT;
+    CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT | CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT;
 
 const char* VkResultName(VkResult result) {
   switch (result) {
@@ -117,6 +117,9 @@ bool CheckRequirements(VkPhysicalDevice physical_device, const CaelixDeviceRequi
       {CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
        features.features.shaderStorageImageWriteWithoutFormat,
        "shaderStorageImageWriteWithoutFormat"},
+      {CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT,
+       features.features.shaderStorageImageReadWithoutFormat,
+       "shaderStorageImageReadWithoutFormat"},
   };
   for (const FeatureCheck& check : checks) {
     if ((req.feature_flags & check.flag) != 0 && check.supported != VK_TRUE) {
@@ -124,6 +127,25 @@ bool CheckRequirements(VkPhysicalDevice physical_device, const CaelixDeviceRequi
       ok = false;
     }
   }
+
+#if CAELIX_NRD_QUAD_INTRINSICS
+  // NRD's shaders (REBLUR HistoryFix, Blur, PostBlur) use QuadReadAcrossX/Y in compute shaders
+  // (SPIR-V capability GroupNonUniformQuad). A property of the device, nothing to enable. Their
+  // SPIR-V declares no DerivativeGroupQuads execution mode, so VK_KHR_compute_shader_derivatives is
+  // not needed.
+  VkPhysicalDeviceVulkan11Properties vk11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+  VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+  properties2.pNext = &vk11;
+  vkGetPhysicalDeviceProperties2(physical_device, &properties2);
+  if ((vk11.subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0 ||
+      (vk11.subgroupSupportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) == 0) {
+    CAELIX_LOGE("device requirement missing: subgroup quad operations in compute shaders "
+                "(subgroupSupportedStages 0x%x, subgroupSupportedOperations 0x%x); build the "
+                "library with CAELIX_NRD_QUAD_INTRINSICS=OFF for such a device",
+                vk11.subgroupSupportedStages, vk11.subgroupSupportedOperations);
+    ok = false;
+  }
+#endif
   return ok;
 }
 

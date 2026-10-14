@@ -30,6 +30,8 @@ class GpuImage {
   VkFormat format() const { return format_; }
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
+  // Size of the image's memory allocation in bytes.
+  VkDeviceSize allocation_bytes() const { return allocation_bytes_; }
 
   void Reset();
 
@@ -42,6 +44,7 @@ class GpuImage {
   VkFormat format_ = VK_FORMAT_UNDEFINED;
   uint32_t width_ = 0;
   uint32_t height_ = 0;
+  VkDeviceSize allocation_bytes_ = 0;
 };
 
 }  // namespace caelix

@@ -15,6 +15,8 @@ add_library(caelix_renderer SHARED
   src/hash_map.h
   src/log.cpp
   src/log.h
+  src/nrd_executor.cpp
+  src/nrd_executor.h
   src/pipeline.cpp
   src/pipeline.h
   src/record_layout.h
@@ -47,7 +49,8 @@ target_compile_definitions(caelix_renderer PRIVATE
   CAELIX_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
   CAELIX_VERSION_MINOR=${PROJECT_VERSION_MINOR}
   CAELIX_VERSION_PATCH=${PROJECT_VERSION_PATCH}
-  CAELIX_VERSION_STRING="${PROJECT_VERSION}")
+  CAELIX_VERSION_STRING="${PROJECT_VERSION}"
+  CAELIX_NRD_QUAD_INTRINSICS=$<BOOL:${CAELIX_NRD_QUAD_INTRINSICS}>)
 # Strict warnings for our own code only; fetched dependencies keep their defaults.
 if(MSVC)
   target_compile_options(caelix_renderer PRIVATE /W4)
@@ -57,7 +60,8 @@ endif()
 target_link_libraries(caelix_renderer PRIVATE
   volk::volk
   GPUOpen::VulkanMemoryAllocator
-  unordered_dense::unordered_dense)
+  unordered_dense::unordered_dense
+  NRD)
 
 # Kernels (HLSL -> SPIR-V, embedded). See cmake/Shaders.cmake.
 caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV

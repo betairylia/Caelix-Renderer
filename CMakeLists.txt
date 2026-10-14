@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.28)
+# 3.30: NRD's own CMakeLists (fetched, cmake/Dependencies.cmake) requires it.
+cmake_minimum_required(VERSION 3.30)
 project(CaelixRenderer VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

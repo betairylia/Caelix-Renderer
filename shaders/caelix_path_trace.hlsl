@@ -12,10 +12,12 @@
 //                   deterministic target, and up to bounce_count stochastic
 //                   segments gather the incident radiance into the diffuse OR
 //                   the specular target (by the lobe chosen at the primary hit),
-//                   with the hit distance of the first segment in alpha. The
-//                   internal G-buffer (view_z, normal_roughness, motion, albedo)
-//                   is written for the composite and the denoiser of a later
-//                   step. The colour target is written by caelix_composite.hlsl.
+//                   packed for NRD REBLUR (REBLUR_FrontEnd_PackRadianceAndNormHitDist:
+//                   YCoCg radiance, normalized hit distance of the first segment in
+//                   alpha). The internal G-buffer (view_z, normal_roughness packed by
+//                   NRD_FrontEnd_PackNormalAndRoughness, motion, albedo) is written
+//                   for the composite and for NRD. The colour target is written by
+//                   caelix_composite.hlsl.
 //                   With kRenderFlagSunNee every diffuse vertex also samples the
 //                   sun cone and traces a shadow ray (TracePath, SunNextEvent).
 //
@@ -39,6 +41,9 @@
 #include "caelix_block.hlsl"
 #include "caelix_brick_trace.hlsl"
 #include "caelix_shading.hlsl"
+// NRD's front-end packing (normal + roughness, radiance + normalized hit distance);
+// NRDConfig.hlsli next to it fixes the encodings NRD was built with.
+#include "NRD.hlsli"
 
 CAELIX_PUSH_CONSTANTS(CaelixTracePush, g_push);
 CAELIX_BINDING(0, 0) RaytracingAccelerationStructure g_tlas;
@@ -50,7 +55,7 @@ CAELIX_BINDING(5, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_motion;
 CAELIX_BINDING(6, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_view_z;
 // Internal targets of the lighting modes (lib/src/renderer.h, InternalTargets).
 CAELIX_BINDING(7, 0) CAELIX_FORMAT("r32f") RWTexture2D<float4> g_int_view_z;
-CAELIX_BINDING(8, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_normal_roughness;
+CAELIX_BINDING(8, 0) CAELIX_FORMAT("rgb10a2") RWTexture2D<float4> g_int_normal_roughness;
 CAELIX_BINDING(9, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_motion;
 CAELIX_BINDING(10, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_albedo;
 CAELIX_BINDING(11, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_deterministic;
@@ -259,8 +264,9 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
   float3 radiance = float3(0.0f, 0.0f, 0.0f);
   float3 throughput = 1.0f / max(0.001f, primary_shade.k);
   // Hit distance of the first stochastic segment (primary surface -> first bounce
-  // hit) in world units; t_max when there is no bounce or it reaches the sky.
-  float first_segment_t = fc.t_max;
+  // hit) in world units; t_max when it reaches the sky, 0 when there is no segment
+  // (bounce_count 0).
+  float first_segment_t = fc.bounce_count >= 1u ? fc.t_max : 0.0f;
   bool first_segment = true;
 
   // NEE at the primary vertex (demodulated: throughput 1 / k).
@@ -432,16 +438,19 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   if (lighting) {
     const uint2 pixel = thread_id.xy;
     g_int_view_z[pixel] = float4(hit ? view_z : kInternalMissViewZ, 0.0f, 0.0f, 0.0f);
-    // Roughness 1: every packed material is diffuse (NRD packing comes with the denoiser).
-    g_int_normal_roughness[pixel] = hit ? float4(normal, 1.0f) : float4(0.0f, 0.0f, 0.0f, 0.0f);
     g_int_motion[pixel] = float4(motion, motion_view_z, 0.0f);
 
     float3 material_albedo = float3(0.0f, 0.0f, 0.0f);
     float3 deterministic = float3(0.0f, 0.0f, 0.0f);
-    // The lobe that the primary hit did not sample gets 0 radiance and 0 hit
-    // distance; a miss gets 0 in both (the composite draws the sky).
+    // NRD packing. The lobe that the primary hit did not sample gets 0 radiance and
+    // 0 hit distance (NRD's "invalid" sample, reconstructed by
+    // HitDistanceReconstructionMode); a miss gets 0 in both (the composite draws the
+    // sky; view z 1e30 is outside the denoising range). The hit distance is
+    // normalized with REBLUR's A, B, C at the primary view z: roughness 1 for the
+    // diffuse lobe, the material roughness for the specular one.
     float4 diffuse = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 specular = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 normal_roughness = float4(0.0f, 0.0f, 0.0f, 0.0f);
     CAELIX_BRANCH
     if (hit) {
       float4 stochastic;
@@ -449,12 +458,18 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
       material_albedo = shade.albedo;
       // Primary emission is deterministic: nothing was sampled to obtain it.
       deterministic = shade.emission;
+      normal_roughness = NRD_FrontEnd_PackNormalAndRoughness(normal, shade.roughness, 0.0f);
+      const float lobe_roughness = shade.specular_lobe ? shade.roughness : 1.0f;
+      const float norm_hit_dist =
+          REBLUR_FrontEnd_GetNormHitDist(stochastic.a, view_z, fc.hit_dist_params.xyz, lobe_roughness);
+      const float4 packed = REBLUR_FrontEnd_PackRadianceAndNormHitDist(stochastic.rgb, norm_hit_dist, true);
       if (shade.specular_lobe) {
-        specular = stochastic;
+        specular = packed;
       } else {
-        diffuse = stochastic;
+        diffuse = packed;
       }
     }
+    g_int_normal_roughness[pixel] = normal_roughness;
     // Coverage is albedo.a.
     g_int_albedo[pixel] = float4(material_albedo, coverage);
     g_int_deterministic[pixel] = float4(SanitizeRadiance(deterministic), coverage);

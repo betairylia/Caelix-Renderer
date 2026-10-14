@@ -7,8 +7,9 @@
 //! With `--world`, a `.cxw` file is decoded on a background thread and streamed
 //! into a `CaelixScene` (see `world.rs`). Every frame: recycle, upload, flush the
 //! scene, then `caelix_renderer_render` traces the scene into the swapchain image:
-//! a debug view (`--mode primary`), the path-traced 1 spp image (`--mode pt`) or
-//! the accumulated reference (`--mode ref`).
+//! a debug view (`--mode primary`), the path-traced 1 spp image denoised by NRD
+//! (`--mode pt`, `--no-denoise` for the raw image) or the accumulated reference
+//! (`--mode ref`).
 
 mod camera;
 mod world;
@@ -68,6 +69,10 @@ enum View {
     Group,
     Brick,
     Steps,
+    /// Path trace mode: NRD's validation layer over the image.
+    NrdValidation,
+    /// Path trace mode: the denoised diffuse radiance without the albedo.
+    NrdDiff,
 }
 
 impl View {
@@ -79,6 +84,8 @@ impl View {
             View::Group => CaelixDebugView_CAELIX_VIEW_GROUP as u32,
             View::Brick => CaelixDebugView_CAELIX_VIEW_BRICK as u32,
             View::Steps => CaelixDebugView_CAELIX_VIEW_STEPS as u32,
+            View::NrdValidation => CaelixDebugView_CAELIX_VIEW_NRD_VALIDATION as u32,
+            View::NrdDiff => CaelixDebugView_CAELIX_VIEW_NRD_DIFF as u32,
         }
     }
 }
@@ -114,6 +121,19 @@ fn parse_vec3(text: &str) -> Result<[f32; 3], String> {
         [x, y, z] => Ok([x, y, z]),
         _ => Err(format!("expected 3 comma-separated numbers x,y,z, got {}", values.len())),
     }
+}
+
+/// Parses "WxH" into a width and a height (both nonzero).
+fn parse_size(text: &str) -> Result<(u32, u32), String> {
+    let (w, h) = text
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("expected WIDTHxHEIGHT, got '{text}'"))?;
+    let w: u32 = w.trim().parse().map_err(|e| format!("width '{w}': {e}"))?;
+    let h: u32 = h.trim().parse().map_err(|e| format!("height '{h}': {e}"))?;
+    if w == 0 || h == 0 {
+        return Err(format!("the size must be nonzero, got {w}x{h}"));
+    }
+    Ok((w, h))
 }
 
 /// A camera pose in Unity's terms.
@@ -170,9 +190,19 @@ struct Args {
     /// Rendering mode. Default: `pt` with --world, else `primary`.
     #[arg(long, value_enum)]
     mode: Option<Mode>,
-    /// Primary mode: the debug view.
+    /// Primary mode: the debug view (albedo .. steps); pt mode: nrd-validation, nrd-diff.
     #[arg(long, value_enum, default_value_t = View::Albedo)]
     view: View,
+    /// Pt mode: no NRD denoising (the raw 1 sample per pixel image).
+    #[arg(long)]
+    no_denoise: bool,
+    /// Inner size of the window in pixels, WIDTHxHEIGHT.
+    #[arg(long, value_name = "WxH", value_parser = parse_size, default_value = "1280x720")]
+    size: (u32, u32),
+    /// Pt mode: take the --screenshot N frames after the world is complete (at least 3), so the
+    /// denoiser history is warm. The NRD history restarts while the world is loading.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    warmup: u64,
     /// Primary mode: albedo without Lambert shading.
     #[arg(long)]
     no_shading: bool,
@@ -307,6 +337,9 @@ struct App {
     timing: Timing,
     /// Set when the loaded scene does not hold every decoded brick.
     load_mismatch: bool,
+    /// Frames rendered since the renderer reported an NRD instance (the info line is logged at the
+    /// second one, whose dispatch count no longer includes the first frame's pool clears).
+    nrd_frames: u32,
     error: Option<anyhow::Error>,
 }
 
@@ -316,7 +349,7 @@ impl App {
             .create_window(
                 Window::default_attributes()
                     .with_title("Caelix Renderer")
-                    .with_inner_size(PhysicalSize::new(1280, 720)),
+                    .with_inner_size(PhysicalSize::new(self.args.size.0, self.args.size.1)),
             )
             .context("cannot create the window")?;
         let size = window.inner_size();
@@ -466,10 +499,12 @@ impl App {
             };
             let aspect = frame.width as f32 / frame.height.max(1) as f32;
             let camera = self.camera.to_caelix(aspect, DEPTH_NEAR, DEPTH_FAR);
-            // Reference mode: restart while the camera moves or the scene still changes.
+            // Reference mode: restart while the camera moves or the scene still changes. Pt mode:
+            // NRD follows the camera through the motion vectors; its history restarts only while
+            // the world is still loading.
             let camera_changed = self.accumulation.last_camera.is_none_or(|last| !same_camera(&last, &camera));
             self.accumulation.last_camera = Some(camera);
-            let reset_accumulation = camera_changed || !world_ready;
+            let reset_accumulation = if self.mode == Mode::Ref { camera_changed || !world_ready } else { !world_ready };
             self.accumulation.frames = if reset_accumulation { 1 } else { self.accumulation.frames + 1 };
             let lighting = self.mode != Mode::Primary;
             let mut flags = 0;
@@ -495,7 +530,7 @@ impl App {
                 miss_view_z: 1e30,
                 mode: self.mode.raw(),
                 bounce_count: self.args.bounces,
-                denoise: 0,
+                denoise: u32::from(self.mode == Mode::Pt && !self.args.no_denoise),
                 reset_accumulation: u32::from(reset_accumulation),
                 exposure: self.args.exposure,
                 sun_radiance: self.args.sun_radiance,
@@ -533,6 +568,7 @@ impl App {
                     };
                     if ready {
                         let extra = if state.loader.is_some() { SCREENSHOT_EXTRA_FRAMES } else { 0 };
+                        let extra = if self.mode == Mode::Pt { extra.max(self.args.warmup) } else { extra };
                         self.screenshot = Screenshot::RequestAt(self.frames_presented + extra);
                     }
                 }
@@ -568,6 +604,37 @@ impl App {
                     event_loop.exit();
                     return Ok(());
                 }
+            }
+        }
+
+        // NRD: one info line at the second frame of the renderer's NRD instance (or at an NRD error).
+        if self.nrd_frames < 2 {
+            // SAFETY: CaelixNrdInfo is a plain C struct of integers; all zero is a valid value.
+            let mut info: CaelixNrdInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: the renderer is live and info is writable.
+            if unsafe { caelix_renderer_get_nrd_info(state.renderer, &mut info) } == CaelixResult_CAELIX_OK
+                && (info.width != 0 || info.failed != 0)
+            {
+                self.nrd_frames += 1;
+            }
+            if self.nrd_frames == 2 || (info.failed != 0 && self.nrd_frames == 1) {
+                self.nrd_frames = 2;
+                log::info!(
+                    "NRD {}.{}.{}: REBLUR_DIFFUSE_SPECULAR at {}x{}, {} pipelines, {} permanent textures ({:.1} MiB), \
+                     {} transient textures ({:.1} MiB), {} dispatches per frame{}",
+                    info.version_major,
+                    info.version_minor,
+                    info.version_build,
+                    info.width,
+                    info.height,
+                    info.pipeline_count,
+                    info.permanent_texture_count,
+                    info.permanent_bytes as f64 / (1024.0 * 1024.0),
+                    info.transient_texture_count,
+                    info.transient_bytes as f64 / (1024.0 * 1024.0),
+                    info.dispatch_count,
+                    if info.failed != 0 { ", FAILED (denoising disabled)" } else { "" }
+                );
             }
         }
 
@@ -703,15 +770,15 @@ impl ApplicationHandler for App {
     }
 }
 
-/// "Caelix Renderer | trace 1.23 ms | composite 0.05 ms | flush 0.45 ms | 144 fps"
+/// "Caelix Renderer | trace 1.23 ms | denoise 0.40 ms | composite 0.05 ms | flush 0.45 ms | 144 fps"
 fn timing_line(renderer: *const CaelixRenderer, fps: f64) -> String {
     let mut timings =
-        CaelixGpuTimings { trace_ms: 0.0, flush_ms: 0.0, frame_number: 0, composite_ms: 0.0, pad: 0.0 };
+        CaelixGpuTimings { trace_ms: 0.0, flush_ms: 0.0, frame_number: 0, composite_ms: 0.0, denoise_ms: 0.0 };
     // SAFETY: the renderer is live and timings is writable.
     unsafe { caelix_renderer_get_gpu_timings(renderer, &mut timings) };
     format!(
-        "Caelix Renderer | trace {:.2} ms | composite {:.2} ms | flush {:.2} ms | {:.0} fps",
-        timings.trace_ms, timings.composite_ms, timings.flush_ms, fps
+        "Caelix Renderer | trace {:.2} ms | denoise {:.2} ms | composite {:.2} ms | flush {:.2} ms | {:.0} fps",
+        timings.trace_ms, timings.denoise_ms, timings.composite_ms, timings.flush_ms, fps
     )
 }
 
@@ -796,6 +863,9 @@ fn device_requirements() -> caelix_vk::DeviceRequirements {
             storage_image_write_without_format: has(
                 CaelixDeviceFeatureBits_CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
             ),
+            storage_image_read_without_format: has(
+                CaelixDeviceFeatureBits_CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT,
+            ),
         },
     }
 }
@@ -829,13 +899,20 @@ fn main() -> anyhow::Result<()> {
     if args.accumulate.is_some() && mode != Mode::Ref {
         bail!("--accumulate needs --mode ref");
     }
+    if matches!(args.view, View::NrdValidation | View::NrdDiff) && mode != Mode::Pt {
+        bail!("--view {:?} needs --mode pt", args.view);
+    }
     log::info!(
-        "mode {mode:?}, bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, sun NEE {}",
+        "mode {mode:?}, bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, sun NEE {}, denoise {}, \
+         window {}x{}",
         args.bounces,
         args.exposure,
         !args.no_sky_on_miss,
         args.sun_radiance,
-        !args.no_sun_nee
+        !args.no_sun_nee,
+        mode == Mode::Pt && !args.no_denoise,
+        args.size.0,
+        args.size.1
     );
 
     let event_loop = EventLoop::new().context("cannot create the event loop")?;
@@ -853,6 +930,7 @@ fn main() -> anyhow::Result<()> {
         screenshot: Screenshot::Waiting,
         timing: Timing { window_start: Instant::now(), window_frames: 0, fps: 0.0 },
         load_mismatch: false,
+        nrd_frames: 0,
         error: None,
     };
     let run_result = event_loop.run_app(&mut app);

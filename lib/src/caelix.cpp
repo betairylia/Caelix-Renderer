@@ -406,4 +406,14 @@ CAELIX_API void caelix_renderer_get_gpu_timings(const CaelixRenderer* renderer,
   renderer->impl->GetTimings(*out);
 }
 
+CAELIX_API CaelixResult caelix_renderer_get_nrd_info(const CaelixRenderer* renderer,
+                                                     CaelixNrdInfo* out) {
+  if (renderer == nullptr || renderer->impl == nullptr || out == nullptr) {
+    CAELIX_LOGE("caelix_renderer_get_nrd_info: null argument");
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  renderer->impl->GetNrdInfo(*out);
+  return CAELIX_OK;
+}
+
 }  // extern "C"

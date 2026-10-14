@@ -6,20 +6,52 @@
 #include "shader_loader.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iterator>
+#include <span>
 
 namespace caelix {
 namespace {
 
 // [numthreads(8, 8, 1)] in caelix_path_trace.hlsl and caelix_composite.hlsl.
 constexpr uint32_t kWorkgroupSize = 8;
-constexpr uint32_t kDebugViewCount = 6;
+constexpr uint32_t kDebugViewCount = 8;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_NRD_DIFF
 constexpr uint32_t kModeCount = 3;
 constexpr float kDefaultSunAngularRadius = 0.00873f;  // 0.5 degrees
 
 const VkImageSubresourceRange kColorRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+// The renderer's one NRD denoiser (REBLUR_DIFFUSE_SPECULAR).
+constexpr nrd::Identifier kReblurIdentifier = 1;
+// CommonSettings::denoisingRange: pixels with a larger view z are not denoised.
+// The worlds are at most 8192 units across (the 8K citadel), so 1e6 keeps every
+// hit in range, and the miss view z (1e30) far out of it.
+constexpr float kDenoisingRange = 1e6f;
+
+// REBLUR's hit distance normalization (A, B, C), NRD's defaults (3, 0.1, 20): the
+// trace kernel's REBLUR_FrontEnd_GetNormHitDist and ReblurSettings use the same.
+nrd::ReblurHitDistanceParameters HitDistanceParameters() { return nrd::ReblurHitDistanceParameters{}; }
+
+// NRD's world-to-view matrix of `camera`: column-major, column vectors
+// (view = M * world), rows right, up, forward (the camera's view space, +z forward,
+// left-handed like the projection), translation -dot(axis, position).
+void WorldToView(const CaelixCamera& camera, float m[16]) {
+  const float* axes[3] = {camera.right, camera.up, camera.forward};
+  for (uint32_t row = 0; row < 3; ++row) {
+    const float* axis = axes[row];
+    m[0 * 4 + row] = axis[0];
+    m[1 * 4 + row] = axis[1];
+    m[2 * 4 + row] = axis[2];
+    m[3 * 4 + row] = -(axis[0] * camera.position[0] + axis[1] * camera.position[1] +
+                       axis[2] * camera.position[2]);
+  }
+  m[3] = 0.0f;
+  m[7] = 0.0f;
+  m[11] = 0.0f;
+  m[15] = 1.0f;
+}
 
 // The targets of CaelixRenderTargets in descriptor binding order (binding = index + 1).
 // `formats` lists the accepted formats; all VK_FORMAT_UNDEFINED = any storage format.
@@ -45,13 +77,16 @@ struct InternalSpec {
 };
 constexpr InternalSpec kInternalSpecs[] = {
     {"view_z", VK_FORMAT_R32_SFLOAT},
-    {"normal_roughness", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"normal_roughness", VK_FORMAT_A2B10G10R10_UNORM_PACK32},
     {"motion", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"albedo", VK_FORMAT_R8G8B8A8_UNORM},
     {"deterministic", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"diff_in", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"spec_in", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"accum", VK_FORMAT_R32G32B32A32_SFLOAT},
+    {"diff_out", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"spec_out", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"validation", VK_FORMAT_R8G8B8A8_UNORM},
 };
 
 bool FormatAccepted(const TargetSpec& spec, VkFormat format) {
@@ -197,6 +232,7 @@ CaelixResult Renderer::Create(Device& device, Scene& scene, std::unique_ptr<Rend
   }
   renderer->timer_ = GpuTimer(device);
   renderer->composite_timer_ = GpuTimer(device);
+  renderer->denoise_timer_ = GpuTimer(device);
   CAELIX_LOGI("renderer created: kernels caelix_path_trace and caelix_composite, %u frame slots",
               kInitialSlots);
   out = std::move(renderer);
@@ -227,6 +263,7 @@ Renderer::~Renderer() {
 void Renderer::AddSlot() {
   const VkDevice device = device_.device();
   auto slot = std::make_unique<FrameSlot>();
+  slot->index = static_cast<uint32_t>(slots_.size());
   const VkDescriptorPoolSize sizes[2] = {
       {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -398,6 +435,9 @@ void Renderer::FreeRetired(uint64_t safe_frame) {
   std::erase_if(retired_, [safe_frame](const RetiredImages& retired) {
     return retired.frame <= safe_frame;
   });
+  std::erase_if(retired_nrd_, [safe_frame](const RetiredDenoiser& retired) {
+    return retired.frame <= safe_frame;
+  });
 }
 
 CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTargets& targets,
@@ -492,13 +532,19 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   const uint64_t safe = frame.safe_frame_number;
   timer_.Resolve(safe);
   composite_timer_.Resolve(safe);
+  denoise_timer_.Resolve(safe);
   FreeRetired(safe);
 
-  // Internal targets of the lighting modes (before anything is recorded: the
-  // allocation can throw).
+  // Internal targets of the lighting modes and the NRD executor (before anything is
+  // recorded: the allocations can throw).
   bool restart_accumulation = options.reset_accumulation != 0 || options.mode != last_mode_;
   if (lighting && EnsureInternalTargets(width, height, frame.frame_number)) {
     restart_accumulation = true;
+  }
+  bool nrd_error = false;
+  NrdExecutor* denoiser = nullptr;
+  if (options.mode == CAELIX_MODE_PATH_TRACE && options.denoise != 0 && composite && !nrd_failed_) {
+    denoiser = EnsureDenoiser(width, height, nrd_error);
   }
 
   FrameSlot* slot = AcquireSlot(frame.frame_number, safe);
@@ -509,11 +555,23 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     return CAELIX_ERROR_INVALID_ARGUMENT;
   }
 
+  // NRD settings of this frame (an NRD error here: no denoising, raw output).
+  if (denoiser != nullptr) {
+    const bool restart = options.reset_accumulation != 0 || !nrd_history_valid_;
+    if (!ConfigureDenoiser(*denoiser, camera, options, width, height, restart)) {
+      nrd_failed_ = true;
+      nrd_error = true;
+      denoiser = nullptr;
+    }
+  }
+
   // Descriptors: the slot's previous frame has completed, so its sets are free.
   // Only the TLAS (when the scene has one), the present targets and, in the
   // lighting modes, the internal targets are written; the other bindings keep
   // stale or no descriptors, which PARTIALLY_BOUND allows because the kernels do
-  // not touch them (has_tlas, target_mask, mode).
+  // not touch them (has_tlas, target_mask, mode). The composite set is written
+  // after the NRD dispatches are recorded: it reads NRD's outputs only when they
+  // were.
   const VkAccelerationStructureKHR tlas = scene_.tlas();
   VkWriteDescriptorSetAccelerationStructureKHR as_write{
       VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
@@ -561,20 +619,10 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     for (uint32_t i = 0; i < kTraceInternalCount; ++i) {
       write_image(slot->set, 1 + kTargetCount + i, internal_[i].view());
     }
-    if (composite) {
-      // Composite bindings 1..5.
-      constexpr uint32_t kCompositeInternals[] = {kInternalAlbedo, kInternalDeterministic,
-                                                  kInternalDiff, kInternalSpec, kInternalAccum};
-      static_assert(std::size(kCompositeInternals) + 1 == kCompositeBindingCount);
-      write_image(slot->composite_set, 0, color_view);
-      for (uint32_t i = 0; i < std::size(kCompositeInternals); ++i) {
-        write_image(slot->composite_set, 1 + i, internal_[kCompositeInternals[i]].view());
-      }
-    }
   }
   vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
 
-  // Frame constants.
+  // Frame constants (written to the slot's buffer below, before the submit).
   FrameConstants constants{};
   Copy3(camera.position, constants.position);
   Copy3(camera.right, constants.right);
@@ -648,8 +696,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   constants.sun_solid_angle = static_cast<float>(4.0 * 3.14159265358979323846 * half_sin * half_sin);
   constants.output_srgb = IsUnormFormat(static_cast<VkFormat>(targets.color.format)) ? 1u : 0u;
   constants.t_max = kTMax;
-  std::memcpy(slot->constants.mapped(), &constants, sizeof(constants));
-  slot->constants.FlushHostWrites(0, sizeof(constants));
+  // The kernels' REBLUR_FrontEnd_GetNormHitDist uses the same A, B, C as the denoiser.
+  const nrd::ReblurHitDistanceParameters hit_distance = HitDistanceParameters();
+  constants.hit_dist_params[0] = hit_distance.A;
+  constants.hit_dist_params[1] = hit_distance.B;
+  constants.hit_dist_params[2] = hit_distance.C;
 
   // Any earlier use of the host targets (the host's acquire chains into
   // ALL_COMMANDS) -> the kernels' writes. Lighting modes: the internal targets'
@@ -672,7 +723,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         }
       }
       before.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
@@ -691,8 +743,50 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   vkCmdDispatch(cmd, groups_x, groups_y, 1);
   timer_.End(cmd);
 
-  // Composite (lighting modes with a colour target).
+  // NRD (path trace mode with denoising). Its first dispatch waits for the trace's
+  // writes, its last barrier orders its outputs before the composite.
+  bool denoised = false;
+  if (denoiser != nullptr) {
+    NrdExecutor::Bindings bindings;
+    bindings.view_z = internal_[kInternalViewZ].view();
+    bindings.normal_roughness = internal_[kInternalNormalRoughness].view();
+    bindings.motion = internal_[kInternalMotion].view();
+    bindings.diff_in = internal_[kInternalDiff].view();
+    bindings.spec_in = internal_[kInternalSpec].view();
+    bindings.diff_out = internal_[kInternalDiffOut].view();
+    bindings.spec_out = internal_[kInternalSpecOut].view();
+    bindings.validation = internal_[kInternalValidation].view();
+    const nrd::Identifier identifier = kReblurIdentifier;
+    const bool timed = denoise_timer_.Begin(cmd, frame.frame_number, safe);
+    denoised = denoiser->Denoise(cmd, slot->index, bindings, std::span(&identifier, 1));
+    if (timed) {
+      denoise_timer_.End(cmd);
+    }
+    if (!denoised) {
+      nrd_failed_ = true;
+      nrd_error = true;
+    }
+    nrd_last_frame_ = frame.frame_number;
+  }
+  nrd_history_valid_ = denoised;
+  constants.denoised = denoised ? 1u : 0u;
+  std::memcpy(slot->constants.mapped(), &constants, sizeof(constants));
+  slot->constants.FlushHostWrites(0, sizeof(constants));
+
+  // Composite (lighting modes with a colour target). Bindings 3 and 4 hold NRD's
+  // outputs when this frame was denoised, else the raw radiance.
   if (composite) {
+    write_count = 0;
+    write_image(slot->composite_set, 0, color_view);
+    const uint32_t composite_internals[] = {
+        kInternalAlbedo, kInternalDeterministic, denoised ? kInternalDiffOut : kInternalDiff,
+        denoised ? kInternalSpecOut : kInternalSpec, kInternalAccum, kInternalValidation};
+    static_assert(std::size(composite_internals) + 1 == kCompositeBindingCount);
+    for (uint32_t i = 0; i < std::size(composite_internals); ++i) {
+      write_image(slot->composite_set, 1 + i, internal_[composite_internals[i]].view());
+    }
+    vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
+
     Barriers between;
     between.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -728,7 +822,102 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     accum_count_ =
         (options.mode == CAELIX_MODE_REFERENCE && composite) ? accum_count + 1 : accum_count;
   }
-  return CAELIX_OK;
+  // An NRD error is reported once, by the call in which it happened; the frame is
+  // recorded (raw output) all the same.
+  return nrd_error ? CAELIX_ERROR_VULKAN : CAELIX_OK;
+}
+
+NrdExecutor* Renderer::EnsureDenoiser(uint32_t width, uint32_t height, bool& error) {
+  if (nrd_ != nullptr && nrd_->width() == width && nrd_->height() == height) {
+    return nrd_.get();
+  }
+  if (nrd_ != nullptr) {
+    retired_nrd_.push_back(RetiredDenoiser{nrd_last_frame_, std::move(nrd_)});
+  }
+  const nrd::DenoiserDesc denoiser{kReblurIdentifier, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR};
+  try {
+    nrd_ = std::make_unique<NrdExecutor>(device_, width, height, std::span(&denoiser, 1));
+  } catch (const NrdError& e) {
+    CAELIX_LOGE("caelix_renderer_render: NRD: %s; denoising is disabled for this renderer",
+                e.what());
+    nrd_failed_ = true;
+    error = true;
+    return nullptr;
+  }
+  nrd_clear_ = true;
+  nrd_history_valid_ = false;
+  nrd_frame_index_ = 0;
+  nrd_last_time_ = {};
+  return nrd_.get();
+}
+
+bool Renderer::ConfigureDenoiser(NrdExecutor& executor, const CaelixCamera& camera,
+                                 const CaelixRenderOptions& options, uint32_t width,
+                                 uint32_t height, bool restart) {
+  const CaelixCamera& prev = has_prev_camera_ ? prev_camera_ : camera;
+  nrd::CommonSettings common{};
+  WorldToView(camera, common.worldToViewMatrix);
+  WorldToView(prev, common.worldToViewMatrixPrev);
+  std::memcpy(common.viewToClipMatrix, camera.projection, sizeof(common.viewToClipMatrix));
+  std::memcpy(common.viewToClipMatrixPrev, prev.projection, sizeof(common.viewToClipMatrixPrev));
+  // The trace writes motion in pixels (xy) and viewZprev - viewZ (z).
+  common.motionVectorScale[0] = 1.0f / static_cast<float>(width);
+  common.motionVectorScale[1] = 1.0f / static_cast<float>(height);
+  common.motionVectorScale[2] = 1.0f;
+  common.isMotionVectorInWorldSpace = false;
+  common.cameraJitter[0] = common.cameraJitter[1] = 0.0f;
+  common.cameraJitterPrev[0] = common.cameraJitterPrev[1] = 0.0f;
+  common.resourceSize[0] = common.resourceSizePrev[0] = common.rectSize[0] =
+      common.rectSizePrev[0] = static_cast<uint16_t>(width);
+  common.resourceSize[1] = common.resourceSizePrev[1] = common.rectSize[1] =
+      common.rectSizePrev[1] = static_cast<uint16_t>(height);
+  common.denoisingRange = kDenoisingRange;
+  common.disocclusionThreshold = 0.01f;
+  common.frameIndex = nrd_frame_index_;
+  common.accumulationMode = nrd_clear_ ? nrd::AccumulationMode::CLEAR_AND_RESTART
+                            : restart  ? nrd::AccumulationMode::RESTART
+                                       : nrd::AccumulationMode::CONTINUE;
+  common.enableValidation = options.debug_view == CAELIX_VIEW_NRD_VALIDATION;
+  const auto now = std::chrono::steady_clock::now();
+  if (nrd_last_time_ != std::chrono::steady_clock::time_point{}) {
+    common.timeDeltaBetweenFrames =
+        std::chrono::duration<float, std::milli>(now - nrd_last_time_).count();
+  }  // else 0: NRD measures the time itself
+  nrd_last_time_ = now;
+  if (!executor.SetCommonSettings(common)) {
+    return false;
+  }
+  nrd::ReblurSettings reblur{};
+  reblur.hitDistanceParameters = HitDistanceParameters();
+  reblur.enableAntiFirefly = true;
+  reblur.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
+  reblur.maxAccumulatedFrameNum = 30;
+  if (!executor.SetReblurSettings(kReblurIdentifier, reblur)) {
+    return false;
+  }
+  nrd_clear_ = false;
+  ++nrd_frame_index_;
+  return true;
+}
+
+void Renderer::GetNrdInfo(CaelixNrdInfo& out) const {
+  out = CaelixNrdInfo{};
+  const nrd::LibraryDesc& library = NrdExecutor::lib();
+  out.version_major = library.versionMajor;
+  out.version_minor = library.versionMinor;
+  out.version_build = library.versionBuild;
+  out.failed = nrd_failed_ ? 1u : 0u;
+  if (nrd_ == nullptr) {
+    return;
+  }
+  out.width = nrd_->width();
+  out.height = nrd_->height();
+  out.pipeline_count = nrd_->desc().pipelinesNum;
+  out.permanent_texture_count = nrd_->permanent_count();
+  out.transient_texture_count = nrd_->transient_count();
+  out.permanent_bytes = nrd_->permanent_bytes();
+  out.transient_bytes = nrd_->transient_bytes();
+  out.dispatch_count = nrd_->last_dispatch_count();
 }
 
 void Renderer::GetTimings(CaelixGpuTimings& out) const {
@@ -745,6 +934,10 @@ void Renderer::GetTimings(CaelixGpuTimings& out) const {
   float composite_ms = 0.0f;
   if (composite_timer_.MsForFrame(out.frame_number, composite_ms)) {
     out.composite_ms = composite_ms;
+  }
+  float denoise_ms = 0.0f;
+  if (denoise_timer_.MsForFrame(out.frame_number, denoise_ms)) {
+    out.denoise_ms = denoise_ms;
   }
 }
 
