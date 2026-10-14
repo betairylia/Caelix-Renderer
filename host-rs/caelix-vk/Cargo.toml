@@ -1,0 +1,12 @@
+[package]
+name = "caelix-vk"
+version = "0.1.0"
+edition = "2021"
+description = "Vulkan device, swapchain and frame loop of the standalone host. The only crate that uses ash."
+
+[dependencies]
+ash = { version = "0.38.0", features = ["linked"] }
+ash-window = "0.13.0"
+log = "0.4.34"
+raw-window-handle = "0.6.2"
+thiserror = "2.0.21"
