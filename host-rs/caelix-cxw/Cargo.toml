@@ -1,0 +1,11 @@
+[package]
+name = "caelix-cxw"
+version = "0.1.0"
+edition = "2021"
+description = "Reader for Caelix .cxw world files: memory-mapped, raw-deflate sector payloads, parallel decode."
+
+[dependencies]
+flate2 = "1.1.10"
+memmap2 = "0.9.11"
+rayon = "1.12.0"
+thiserror = "2.0.21"

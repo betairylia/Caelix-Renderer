@@ -2,8 +2,20 @@ add_library(caelix_renderer SHARED
   src/caelix.cpp
   src/device.cpp
   src/device.h
+  src/gpu_buffer.cpp
+  src/gpu_buffer.h
+  src/hash_map.h
   src/log.cpp
   src/log.h
+  src/record_layout.h
+  src/record_pool.cpp
+  src/record_pool.h
+  src/scene.cpp
+  src/scene.h
+  src/slot_table_pool.cpp
+  src/slot_table_pool.h
+  src/staging_ring.cpp
+  src/staging_ring.h
   src/vk_common.h
   src/vma.cpp)
 set_target_properties(caelix_renderer PROPERTIES OUTPUT_NAME caelix_renderer)
@@ -25,4 +37,5 @@ else()
 endif()
 target_link_libraries(caelix_renderer PRIVATE
   volk::volk
-  GPUOpen::VulkanMemoryAllocator)
+  GPUOpen::VulkanMemoryAllocator
+  unordered_dense::unordered_dense)

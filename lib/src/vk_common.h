@@ -37,4 +37,14 @@ T HandleFromU64(uint64_t value) {
   }
 }
 
+// The inverse of HandleFromU64: a Vulkan handle as the raw uint64_t of the C ABI.
+template <typename T>
+uint64_t HandleToU64(T handle) {
+  if constexpr (std::is_pointer_v<T>) {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+  } else {
+    return static_cast<uint64_t>(handle);
+  }
+}
+
 }  // namespace caelix

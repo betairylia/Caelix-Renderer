@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["caelix-sys", "caelix-app", "caelix-vk"]
+members = ["caelix-sys", "caelix-app", "caelix-vk", "caelix-cxw"]
