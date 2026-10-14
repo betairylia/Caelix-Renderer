@@ -122,11 +122,14 @@ kernel writes the host target. Reference mode skips it (accumulation averages bo
 `--bounces-transparent N`, a `materials.json` loader for block-ID worlds (`--materials path`),
 UI controls for both. The fixture pose from the step-5 artifact README frames the glass strip.
 
-## Open questions for the owner
+## Owner decisions (2026-10-14)
 
-1. Smooth metal mirror reflection in the delta chain: Unity parity first (no reflection), then
-   add it as an option? Or add it from the start?
-2. The checkerboard split halves the effective sample rate on glass pixels and the cross resolve
-   softens them by one pixel. Unity accepted this. The alternative is Fresnel-weighted stochastic
-   choice everywhere, which is noisier but sharper under NRD. Proposal: port the split as Unity
-   has it, measure on the fixture, decide after.
+1. Smooth metal mirrors: Unity parity. The delta chain stops at an opaque surface; mirrors
+   reflect through the stochastic specular lobe and NRD's specular channel, as Unity does. A
+   deterministic mirror path is a later quality option.
+2. First-interface choice: start with the plain Fresnel-weighted stochastic choice at every
+   interface (no checkerboard, no cross resolve, less code). Measure on the fixture under NRD. The
+   known risk is that a glass pixel's G-buffer flips between the reflected and the refracted
+   surface each frame and REBLUR's history resets on glass (boiling, flashing, validation view
+   shows disocclusion). If that happens, port the checkerboard split and cross resolve as the fix.
+   Section 3 therefore applies only in that case.
