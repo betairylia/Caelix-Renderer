@@ -15,11 +15,21 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/$<CONFIG>)
 # Builds the headless tests (tests/) and fetches their test-only dependencies
 # (Catch2, vk-bootstrap). The library itself never depends on them.
 option(CAELIX_BUILD_TESTS "Build the Caelix tests" ON)
+# Builds the Unity native plugin (plugin/unity/, docs/UNITY_PLUGIN.md). Needs Unity's plugin API
+# headers (UNITY_PLUGIN_API_DIR).
+if(WIN32)
+  option(CAELIX_BUILD_UNITY_PLUGIN "Build the Unity native plugin caelix_unity" ON)
+else()
+  option(CAELIX_BUILD_UNITY_PLUGIN "Build the Unity native plugin caelix_unity" OFF)
+endif()
 
 find_package(Vulkan REQUIRED)   # headers only; loader goes through volk later
 include(cmake/Dependencies.cmake)
 include(cmake/Shaders.cmake)
 add_subdirectory(lib)
+if(CAELIX_BUILD_UNITY_PLUGIN)
+  add_subdirectory(plugin/unity)
+endif()
 if(CAELIX_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
