@@ -10,18 +10,34 @@ else()
   target_compile_options(caelix_abi_c99 PRIVATE -Wall -Wextra -pedantic)
 endif()
 
-# Scene smoke test: a Vulkan 1.3 device (vk-bootstrap, validation layers when
-# installed) and the whole upload -> flush -> GPU readback path.
-add_executable(caelix_scene_smoke scene_smoke.cpp)
-target_compile_definitions(caelix_scene_smoke PRIVATE VK_NO_PROTOTYPES)
-if(MSVC)
-  target_compile_options(caelix_scene_smoke PRIVATE /W4)
-else()
-  target_compile_options(caelix_scene_smoke PRIVATE -Wall -Wextra)
-endif()
-target_link_libraries(caelix_scene_smoke PRIVATE
+# Shared Vulkan setup of the GPU tests: a Vulkan 1.3 device (vk-bootstrap,
+# validation layers when installed), readback buffers, the frame loop.
+add_library(caelix_test_device STATIC test_device.cpp test_device.h)
+target_compile_definitions(caelix_test_device PUBLIC VK_NO_PROTOTYPES)
+target_link_libraries(caelix_test_device PUBLIC
   caelix_renderer
   volk::volk
   vk-bootstrap::vk-bootstrap
-  Catch2::Catch2WithMain)
-add_test(NAME caelix_scene_smoke COMMAND caelix_scene_smoke)
+  Catch2::Catch2)
+
+function(caelix_add_gpu_test name)
+  add_executable(${name} ${ARGN})
+  if(MSVC)
+    target_compile_options(${name} PRIVATE /W4)
+  else()
+    target_compile_options(${name} PRIVATE -Wall -Wextra)
+  endif()
+  target_link_libraries(${name} PRIVATE caelix_test_device Catch2::Catch2WithMain)
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+if(MSVC)
+  target_compile_options(caelix_test_device PRIVATE /W4)
+else()
+  target_compile_options(caelix_test_device PRIVATE -Wall -Wextra)
+endif()
+
+# Scene smoke test: the whole upload -> flush -> GPU readback path.
+caelix_add_gpu_test(caelix_scene_smoke scene_smoke.cpp)
+
+# Finalize kernel against a CPU reference, by GPU readback.
+caelix_add_gpu_test(caelix_finalize_test finalize_test.cpp)

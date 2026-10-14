@@ -36,7 +36,10 @@ extern "C" {
   #define CAELIX_API __attribute__((visibility("default")))
 #endif
 
-/* Bumped on every breaking change of this header. */
+/* Bumped on every breaking change of this header. Exception: version 2 is still in development;
+   the finalize step appended fields to CaelixSceneDesc (encoding, default 0), CaelixSceneStats and
+   CaelixBrickInfo without a bump. A host built against an older version-2 header must be rebuilt
+   (the library writes the larger output structs). */
 #define CAELIX_ABI_VERSION 2u
 
 typedef struct CaelixVersion {
@@ -161,8 +164,25 @@ CAELIX_API CaelixResult caelix_clear_target(CaelixDevice* device, uint64_t comma
  * (1 << group_shift)^3 bricks; every group has its own slot table with dense
  * brick ids.
  *
- * Lossless rule: a record always holds the raw block values that the host
- * uploaded. Later kernels only add derived data next to them.
+ * Finalization: caelix_scene_flush runs the "finalize" kernel over every brick uploaded since the
+ * previous flush and every resident neighbour (6-neighbourhood) of an uploaded or removed brick. It
+ * fills the record header (coarse occupancy, tight bounds, micro occupancy), adds face bits to
+ * transparent voxels of the payload and writes the brick's AABB row. A brick is finalized at the
+ * flush after its upload (or, when the staging ring is full, at a later flush); the host must not
+ * read records or AABB rows before that flush has completed on the GPU.
+ *
+ * Lossless rule: the payload keeps the uploaded block values. Opaque values stay unchanged;
+ * transparent values (no opaque bit) get face bits in the bits above their id, so
+ * raw = opaque ? value : (value & id_mask) recovers the uploaded value, and finalizing a brick
+ * again gives the same record. Uploaded transparent values must carry no bits above the id mask.
+ *
+ * Block encodings (CaelixSceneDesc::encoding):
+ *   0 packed scene colour: opaque when (value & 0xC000) != 0; transparent id = value & 0xFF,
+ *     face bits at bits 8..13.
+ *   1 block-ID: opaque when (value & 0x8000) != 0; transparent id = value & 0x1FF, face bits at
+ *     bits 9..14.
+ * Face bit d (order +X, -X, +Y, -Y, +Z, -Z) of a transparent voxel is set when its neighbour in
+ * direction d is not opaque and has a different id. Air (id 0) next to glass gets face bits too.
  *
  * Record pool pages never move: a record keeps its page and offset until the
  * brick is removed.
@@ -183,6 +203,9 @@ typedef struct CaelixSceneDesc {
                                   CAELIX_ERROR_UNSUPPORTED (dense brick ids are 16-bit). */
   uint32_t block_bytes;        /* bytes per block value. 0 = 2. Only 2 is implemented in this version;
                                   4 returns CAELIX_ERROR_UNSUPPORTED. */
+  uint32_t encoding;           /* block encoding for finalization: 0 = packed scene colour (the
+                                  default, what Caelix worlds use), 1 = block-ID. Other values
+                                  return CAELIX_ERROR_INVALID_ARGUMENT. See the encodings above. */
 } CaelixSceneDesc;
 
 /* Creates an empty scene on an adopted device. `desc` may be NULL (all defaults).
@@ -243,9 +266,10 @@ typedef struct CaelixFrameDesc {
 } CaelixFrameDesc;
 
 /* Records into the command buffer all copies from staging to the pools for everything uploaded or
-   removed since the previous flush, with barriers: one before the copies (all earlier commands ->
-   transfer) and one after (transfer -> all later commands). Recycles staging spans whose
-   frame <= safe. With nothing to copy it records nothing. A frame_number that is not greater than
+   removed since the previous flush, then the finalize kernel over the changed bricks and their
+   neighbours, with barriers: one before the copies (all earlier commands -> transfer), transfer ->
+   compute before the kernel, and one at the end (transfer and compute -> all later commands).
+   Recycles staging spans whose frame <= safe. With nothing to do it records nothing. A frame_number that is not greater than
    the previous flush's, or a safe_frame_number >= frame_number, returns
    CAELIX_ERROR_INVALID_ARGUMENT. */
 CAELIX_API CaelixResult caelix_scene_flush(CaelixScene* scene, const CaelixFrameDesc* desc);
@@ -257,18 +281,24 @@ CAELIX_API CaelixResult caelix_scene_flush(CaelixScene* scene, const CaelixFrame
    no effect. */
 CAELIX_API CaelixResult caelix_scene_recycle(CaelixScene* scene, uint64_t safe_frame_number);
 
+/* Fields are only appended. The last four fields were added to ABI version 2 by the finalize step. */
 typedef struct CaelixSceneStats {
   uint32_t entities, groups;                               /* live entities and render groups */
   uint64_t bricks_resident, bricks_known;                  /* with a GPU record; with a slot */
   uint64_t record_bytes, slot_table_bytes, staging_bytes;  /* GPU allocation sizes */
   uint64_t uploaded_bricks_total, pending_bricks;          /* pending = staged, not yet flushed */
   uint64_t record_pages;
+  uint64_t finalized_bricks_total;  /* finalize kernel invocations (bricks) recorded so far */
+  uint64_t reverse_table_bytes;     /* GPU allocation sizes of the finalize lookup tables: */
+  uint64_t aabb_bytes;              /*   reverse tables, AABB rows, group grids */
+  uint64_t grid_bytes;
 } CaelixSceneStats;
 
 /* Fills *out. A NULL argument is ignored. */
 CAELIX_API void caelix_scene_get_stats(const CaelixScene* scene, CaelixSceneStats* out);
 
-/* Inspection and debug aid: where the GPU record and the slot table row of a brick live. The GPU
+/* Inspection and debug aid: where the GPU record, the slot table row and the AABB row of a brick
+   live. The GPU
    contents match the last flush; the buffers can change at the next upload or flush (the slot table
    grows by reallocation), so use the handles only until then. An unknown brick reports
    resident = 0 and 0 in every other field.
@@ -285,6 +315,10 @@ typedef struct CaelixBrickInfo {
   uint64_t record_page_offset_bytes;  /* byte offset of the record inside its page */
   uint64_t slot_table_buffer;         /* VkBuffer that holds every slot table of the scene */
   uint64_t slot_row_offset_bytes;     /* byte offset of the brick's slot table row */
+  uint64_t aabb_buffer;               /* VkBuffer that holds every AABB row of the scene */
+  uint64_t aabb_row_offset_bytes;     /* byte offset of the brick's AABB row (24 bytes: float min[3],
+                                         float max[3], entity-local block coordinates, all NaN
+                                         when the brick has no occupied voxel) */
 } CaelixBrickInfo;
 
 CAELIX_API CaelixResult caelix_scene_query_brick(const CaelixScene* scene, CaelixEntityId entity,

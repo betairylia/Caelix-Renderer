@@ -138,6 +138,7 @@ impl App {
             records_per_page: 0,
             group_shift: self.args.group_shift,
             block_bytes: 0,
+            encoding: 0, // packed scene colour
         };
         // SAFETY: the device is adopted; scene_desc and the out pointer are valid for the call.
         let result = unsafe { caelix_scene_create(state.caelix_device, &scene_desc, &mut state.scene) };

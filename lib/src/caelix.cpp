@@ -8,6 +8,7 @@
 #include "scene.h"
 #include "vk_common.h"
 
+#include <exception>
 #include <memory>
 #include <new>
 
@@ -37,6 +38,9 @@ CaelixResult TranslateException(const char* function) {
   } catch (const std::bad_alloc&) {
     CAELIX_LOGE("%s: out of memory", function);
     return CAELIX_ERROR_OUT_OF_MEMORY;
+  } catch (const std::exception& error) {
+    CAELIX_LOGE("%s: %s", function, error.what());
+    return CAELIX_ERROR_VULKAN;
   } catch (...) {
     CAELIX_LOGE("%s: unexpected exception", function);
     return CAELIX_ERROR_VULKAN;

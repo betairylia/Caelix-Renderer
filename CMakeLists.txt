@@ -17,6 +17,7 @@ option(CAELIX_BUILD_TESTS "Build the Caelix tests" ON)
 
 find_package(Vulkan REQUIRED)   # headers only; loader goes through volk later
 include(cmake/Dependencies.cmake)
+include(cmake/Shaders.cmake)
 add_subdirectory(lib)
 if(CAELIX_BUILD_TESTS)
   enable_testing()

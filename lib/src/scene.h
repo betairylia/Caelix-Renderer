@@ -1,10 +1,13 @@
 #pragma once
 #include "caelix/caelix.h"
 #include "device.h"
+#include "finalize.h"
 #include "gpu_buffer.h"
 #include "hash_map.h"
+#include "pipeline.h"
 #include "record_layout.h"
 #include "record_pool.h"
+#include "row_pool.h"
 #include "slot_table_pool.h"
 #include "staging_ring.h"
 
@@ -19,12 +22,15 @@ struct BrickSlotCpu {
   uint32_t pos = 0;
   uint8_t state = kSlotFree;
   uint32_t record_index = RecordPool::kInvalidIndex;
+  // == Scene::finalize_epoch_ while the brick is queued in Scene::dirty_; dedupes
+  // the queue. 0 = not queued (epochs start at 1).
+  uint32_t finalize_epoch = 0;
 };
 
 // A render group: (1 << group_shift)^3 bricks of one entity with dense 16-bit
-// brick ids. The ids index the group's slot table rows.
+// brick ids. The ids index the group's slot table rows and AABB rows.
 struct Group {
-  static constexpr uint16_t kNoId = 0xFFFF;
+  static constexpr uint16_t kNoId = kNoBrickId;
 
   CaelixEntityId entity = CAELIX_INVALID_ENTITY;
   int32_t gx = 0, gy = 0, gz = 0;
@@ -33,11 +39,20 @@ struct Group {
   std::vector<BrickSlotCpu> slots;   // by id, size = high water
   std::vector<uint16_t> free_ids;    // LIFO
   SlotRange slot_rows;               // capacity is a power of two >= slots.size()
+  RowRange aabb_rows;                // AABB rows, same capacity as slot_rows
+  // The AABB range whose rows the GPU holds. It differs from aabb_rows after a
+  // growth until the next flush copies the rows over (invalid = new group).
+  RowRange aabb_gpu_rows;
+  RowRange reverse_range;            // bricks_per_group u16 entries: position -> id
   uint32_t brick_count = 0;          // ids in use
   bool alive = false;
   bool full_rewrite = false;         // all rows restaged at the next flush (the range moved)
   bool in_dirty_list = false;        // listed in Scene::dirty_groups_; survives free and reuse
+  bool info_dirty = false;           // the GroupInfo row is restaged at the next flush
+  bool reverse_fill = false;         // the reverse range is new: filled with 0xFFFF first
   std::vector<uint16_t> dirty_ids;   // rows to restage (ignored when full_rewrite)
+  std::vector<uint32_t> reverse_dirty_words;  // reverse table u32 words (pos >> 1) to restage
+  std::vector<uint16_t> nan_ids;     // freed ids whose AABB row becomes NaN
 };
 
 struct Entity {
@@ -46,6 +61,21 @@ struct Entity {
   float rotation[4] = {0, 0, 0, 1};
   ankerl::unordered_dense::map<uint64_t, uint32_t> groups;  // packed group key -> group index
   bool alive = false;
+
+  // Group grid: a dense array of group indices (kNoGroup = none) over the group
+  // coordinates [grid_min, grid_min + grid_dims). Dims are powers of two and grow
+  // geometrically; the grid is rebuilt (and fully restaged) when it grows.
+  int32_t grid_min[3] = {};
+  int32_t grid_dims[3] = {};         // 0 = no grid yet
+  RowRange grid_range;               // in Scene::grids_
+  std::vector<uint32_t> grid;        // CPU copy of the cells
+  bool has_bounds = false;           // bounds of every group placed since the entity was added
+  int32_t bounds_min[3] = {};
+  int32_t bounds_max[3] = {};
+  bool grid_fill = false;            // the grid range is new: filled, then every used cell restaged
+  std::vector<uint32_t> grid_dirty_cells;
+  bool info_dirty = false;           // the EntityInfo row is restaged at the next flush
+  bool in_dirty_list = false;        // listed in Scene::dirty_entities_
 };
 
 class Scene {
@@ -80,52 +110,123 @@ class Scene {
     uint64_t group_key;
     uint32_t pos;
   };
+  struct Placed {
+    uint32_t record;
+    uint32_t group_index;
+    uint16_t id;
+  };
   struct PendingCopy {
     VkDeviceSize src_offset;
     VkBuffer dst;
     VkDeviceSize dst_offset;
     VkDeviceSize size;
   };
+  struct PendingFill {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+    uint32_t value;
+  };
   struct DeferredBuffer {
     uint64_t frame;  // destroy when the safe frame is >= this
     GpuBuffer buffer;
+  };
+  struct RangeToFree {
+    RowPool* pool;
+    RowRange range;
+  };
+  struct DirtyBrick {
+    uint32_t group_index;
+    uint16_t id;
+  };
+  struct GridShape {
+    int32_t min[3];
+    int32_t dims[3];
+    uint64_t cells;
   };
 
   explicit Scene(Device& device);
 
   static bool KeyInRange(const CaelixBrickKey& key);
   Location Locate(const CaelixBrickKey& key) const;
-  // Finds or creates the slot of a brick and gives it a record. Returns the
-  // record index. GPU allocations come first, so a VulkanError leaves the scene
-  // unchanged.
-  uint32_t PlaceBrick(CaelixEntityId entity, const Location& loc);
-  uint32_t CreateGroup(CaelixEntityId entity, const Location& loc, SlotRange rows);
+  // Finds or creates the slot of a brick and gives it a record. GPU allocations
+  // come first, so a VulkanError leaves the scene unchanged.
+  Placed PlaceBrick(CaelixEntityId entity, const Location& loc);
+  uint32_t CreateGroup(CaelixEntityId entity, const Location& loc, SlotRange slot_rows,
+                       RowRange aabb_rows, RowRange reverse_range);
   void ReleaseGroup(uint32_t group_index);
+  void ListGroup(uint32_t group_index);
+  void ListEntity(CaelixEntityId entity);
   void MarkDirty(uint32_t group_index, uint16_t id);
+  void MarkReverseDirty(Group& group, uint32_t pos);
+  void FreeAfterFlush(RowPool& pool, RowRange range);
+
+  // Group grid of an entity.
+  bool GridContains(const Entity& entity, int32_t gx, int32_t gy, int32_t gz) const;
+  GridShape GrownGridShape(const Entity& entity, int32_t gx, int32_t gy, int32_t gz) const;
+  // Rebuilds the CPU grid with a new shape and range (no GPU allocation).
+  void RebuildGrid(Entity& entity, const GridShape& shape, RowRange range);
+  uint32_t GridCell(const Entity& entity, int32_t gx, int32_t gy, int32_t gz) const;
+  void SetGridCell(Entity& entity, int32_t gx, int32_t gy, int32_t gz, uint32_t value);
+
+  // Finalize queue.
+  void QueueFinalize(uint32_t group_index, uint16_t id);
+  // Queues the resident face neighbours of `key`. `group_index` is the live group
+  // that contains `key` (its neighbours inside it need no lookup), or 0xFFFFFFFF.
+  void QueueNeighbors(CaelixEntityId entity, const CaelixBrickKey& key, uint32_t group_index);
+
   void WriteRecord(uint8_t* dst, uint32_t pos, const uint8_t* blocks) const;
-  // Writes the dirty rows of one group into staging and appends their copies.
-  // Returns false (and changes nothing) when the ring has no room.
-  bool StageRows(Group& group);
+  // AABB range moves and fills of a group (no staging space needed).
+  void PrepareGroupAabbs(Group& group);
+  // Writes the dirty rows of one group (slot rows, info row, reverse words, NaN
+  // rows) into staging and appends their copies. Returns false (and changes
+  // nothing) when the ring has no room.
+  bool StageGroup(uint32_t group_index, Group& group);
+  bool StageEntity(CaelixEntityId id, Entity& entity);
+  bool StagePageTable();
+  // Builds the dispatch list from dirty_. Returns the number of entries staged.
+  uint32_t StageDirtyList();
+  bool EnsureNanRow();
   void RecordCopies(VkCommandBuffer cmd);
 
   Device& device_;
   RecordLayout layout_;
   uint32_t group_shift_ = 4;
   uint32_t bricks_per_group_ = 0;
+  uint32_t encoding_ = 0;
 
   std::vector<Entity> entities_;
   std::vector<uint32_t> free_entities_;
   std::vector<Group> groups_;
   std::vector<uint32_t> free_groups_;
   std::vector<uint32_t> dirty_groups_;
+  std::vector<CaelixEntityId> dirty_entities_;
 
   RecordPool records_;
   SlotTablePool slot_tables_;
+  RowPool aabbs_;           // 24 B rows
+  RowPool reverse_tables_;  // u16 rows
+  RowPool grids_;           // u32 rows
+  GrowableBuffer group_infos_;   // GroupInfo by group index
+  GrowableBuffer entity_infos_;  // EntityInfo by entity id
+  GrowableBuffer page_table_;    // uint64_t page device address by page
+  GrowableBuffer dirty_buffer_;  // DirtyEntry list of the current flush
+  uint32_t pages_staged_ = 0;
   StagingRing staging_;
+  ComputePipeline finalize_;
 
   std::vector<PendingCopy> pending_;
-  std::vector<SlotRange> ranges_to_free_after_flush_;
+  std::vector<PendingFill> fills_;
+  std::vector<VkBufferCopy> aabb_moves_;  // inside aabbs_.buffer()
+  std::vector<RangeToFree> ranges_to_free_after_flush_;
   std::vector<DeferredBuffer> deferred_buffers_;
+
+  std::vector<DirtyBrick> dirty_;
+  uint32_t finalize_epoch_ = 1;
+  // The 24 B NaN row of the open flush window in the staging ring (copied to every
+  // freed AABB row); valid only while nan_row_valid_.
+  VkDeviceSize nan_row_offset_ = 0;
+  bool nan_row_valid_ = false;
 
   uint64_t last_frame_ = 0;
   bool has_flushed_ = false;
@@ -137,6 +238,7 @@ class Scene {
   uint64_t bricks_known_ = 0;
   uint64_t uploaded_bricks_total_ = 0;
   uint64_t pending_bricks_ = 0;
+  uint64_t finalized_bricks_total_ = 0;
 };
 
 }  // namespace caelix

@@ -1,22 +1,10 @@
 // Headless smoke test of the scene path: upload -> flush -> GPU pools, checked by
 // reading records back from the GPU. Uses the PUBLIC C ABI only; vk-bootstrap
-// creates the instance and the device the way a host would.
-#include <volk.h>
-
-#if defined(_MSC_VER)
-#pragma warning(push, 0)
-#endif
-#include <VkBootstrap.h>
-#include <catch2/catch_test_macros.hpp>
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
-
-#include "caelix/caelix.h"
+// creates the instance and the device the way a host would (tests/test_device.h).
+#include "test_device.h"
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -26,242 +14,9 @@
 #include <tuple>
 #include <vector>
 
+using namespace test;
+
 namespace {
-
-// ---------------------------------------------------------------------------
-// Message counters
-
-std::atomic<int> g_validation_errors{0};
-std::atomic<int> g_validation_warnings{0};
-std::atomic<int> g_validation_ignored{0};
-std::atomic<int> g_library_errors{0};
-std::atomic<int> g_library_warnings{0};
-
-VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                             VkDebugUtilsMessageTypeFlagsEXT /*types*/,
-                                             const VkDebugUtilsMessengerCallbackDataEXT* data,
-                                             void* /*user_data*/) {
-  const char* message = data != nullptr && data->pMessage != nullptr ? data->pMessage : "";
-  const char* id = data != nullptr && data->pMessageIdName != nullptr ? data->pMessageIdName : "";
-  // Implicit layers of other software (Overwolf) and the loader's notes about them
-  // are not this project's problem.
-  if (std::strstr(message, "VK_LAYER_OW_") != nullptr || std::strstr(id, "VK_LAYER_OW_") != nullptr ||
-      std::strstr(message, "uses API version 1.2") != nullptr) {
-    ++g_validation_ignored;
-    std::printf("[vulkan ignored] %s\n", message);
-    return VK_FALSE;
-  }
-  if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
-    ++g_validation_errors;
-    std::printf("[vulkan ERROR] %s: %s\n", id, message);
-  } else if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
-    ++g_validation_warnings;
-    std::printf("[vulkan WARNING] %s: %s\n", id, message);
-  }
-  std::fflush(stdout);
-  return VK_FALSE;
-}
-
-void LibraryLog(CaelixLogLevel level, const char* message, void* /*user_data*/) {
-  static const char* const kNames[] = {"debug", "info", "warning", "ERROR"};
-  if (level == CAELIX_LOG_ERROR) {
-    ++g_library_errors;
-  } else if (level == CAELIX_LOG_WARNING) {
-    ++g_library_warnings;
-  }
-  if (level != CAELIX_LOG_DEBUG) {
-    std::printf("[caelix %s] %s\n", kNames[level], message);
-    std::fflush(stdout);
-  }
-}
-
-// Runs `body` and requires that it logs exactly `expected` library errors.
-template <typename Body>
-void ExpectLibraryErrors(int expected, Body body) {
-  const int before = g_library_errors.load();
-  body();
-  REQUIRE(g_library_errors.load() - before == expected);
-  g_library_errors -= expected;
-}
-
-// ---------------------------------------------------------------------------
-// Vulkan setup
-
-struct Gpu {
-  vkb::Instance instance;
-  vkb::Device device;
-  VkQueue queue = VK_NULL_HANDLE;
-  uint32_t queue_family = 0;
-  VkCommandPool pool = VK_NULL_HANDLE;
-  VkFence fence = VK_NULL_HANDLE;
-};
-
-void CreateGpu(Gpu& gpu) {
-  REQUIRE(volkInitialize() == VK_SUCCESS);
-  const vkb::SystemInfo system = vkb::SystemInfo::get_system_info(vkGetInstanceProcAddr).value();
-  std::printf("validation layer available: %s, debug utils available: %s\n",
-              system.validation_layers_available ? "yes" : "no",
-              system.debug_utils_available ? "yes" : "no");
-
-  vkb::InstanceBuilder instance_builder(vkGetInstanceProcAddr);
-  instance_builder.set_app_name("caelix_scene_smoke")
-      .require_api_version(1, 3, 0)
-      .set_headless(true)
-      .request_validation_layers(true)
-      .set_debug_messenger_severity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-                                    VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
-      .set_debug_callback(DebugCallback);
-  auto instance = instance_builder.build();
-  if (!instance) {
-    FAIL("vkb instance: " << instance.error().message());
-  }
-  gpu.instance = instance.value();
-  volkLoadInstanceOnly(gpu.instance.instance);
-
-  CaelixDeviceRequirements requirements{};
-  caelix_get_device_requirements(&requirements);
-  REQUIRE(requirements.api_version >= VK_MAKE_API_VERSION(0, 1, 3, 0));
-
-  // Translate the library's feature bits to Vulkan feature structs.
-  const uint32_t flags = requirements.feature_flags;
-  const uint32_t known = CAELIX_FEATURE_BUFFER_DEVICE_ADDRESS | CAELIX_FEATURE_DESCRIPTOR_INDEXING |
-                         CAELIX_FEATURE_SYNCHRONIZATION2 | CAELIX_FEATURE_DYNAMIC_RENDERING |
-                         CAELIX_FEATURE_TIMELINE_SEMAPHORE | CAELIX_FEATURE_ACCELERATION_STRUCTURE |
-                         CAELIX_FEATURE_RAY_QUERY | CAELIX_FEATURE_SHADER_INT64 |
-                         CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT;
-  REQUIRE((flags & ~known) == 0);  // a new bit needs a translation here
-  VkPhysicalDeviceFeatures f10{};
-  VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-  VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-  VkPhysicalDeviceAccelerationStructureFeaturesKHR acceleration{
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
-  VkPhysicalDeviceRayQueryFeaturesKHR ray_query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
-  if (flags & CAELIX_FEATURE_BUFFER_DEVICE_ADDRESS) f12.bufferDeviceAddress = VK_TRUE;
-  if (flags & CAELIX_FEATURE_DESCRIPTOR_INDEXING) {
-    f12.runtimeDescriptorArray = VK_TRUE;
-    f12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
-    f12.descriptorBindingPartiallyBound = VK_TRUE;
-    f12.descriptorBindingVariableDescriptorCount = VK_TRUE;
-  }
-  if (flags & CAELIX_FEATURE_SYNCHRONIZATION2) f13.synchronization2 = VK_TRUE;
-  if (flags & CAELIX_FEATURE_DYNAMIC_RENDERING) f13.dynamicRendering = VK_TRUE;
-  if (flags & CAELIX_FEATURE_TIMELINE_SEMAPHORE) f12.timelineSemaphore = VK_TRUE;
-  if (flags & CAELIX_FEATURE_ACCELERATION_STRUCTURE) acceleration.accelerationStructure = VK_TRUE;
-  if (flags & CAELIX_FEATURE_RAY_QUERY) ray_query.rayQuery = VK_TRUE;
-  if (flags & CAELIX_FEATURE_SHADER_INT64) f10.shaderInt64 = VK_TRUE;
-  if (flags & CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT) f12.scalarBlockLayout = VK_TRUE;
-
-  vkb::PhysicalDeviceSelector selector(gpu.instance);
-  selector.set_minimum_version(1, 3)
-      .require_present(false)
-      .set_required_features(f10)
-      .set_required_features_12(f12)
-      .set_required_features_13(f13);
-  for (uint32_t i = 0; i < requirements.device_extension_count; ++i) {
-    selector.add_required_extension(requirements.device_extensions[i]);
-  }
-  if (flags & CAELIX_FEATURE_ACCELERATION_STRUCTURE) selector.add_required_extension_features(acceleration);
-  if (flags & CAELIX_FEATURE_RAY_QUERY) selector.add_required_extension_features(ray_query);
-  auto physical = selector.select();
-  if (!physical) {
-    FAIL("vkb physical device: " << physical.error().message());
-  }
-  std::printf("physical device: %s\n", physical.value().name.c_str());
-
-  auto device = vkb::DeviceBuilder(physical.value()).build();
-  if (!device) {
-    FAIL("vkb device: " << device.error().message());
-  }
-  gpu.device = device.value();
-  volkLoadDevice(gpu.device.device);
-  gpu.queue = gpu.device.get_queue(vkb::QueueType::graphics).value();
-  gpu.queue_family = gpu.device.get_queue_index(vkb::QueueType::graphics).value();
-
-  VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-  pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-  pool_info.queueFamilyIndex = gpu.queue_family;
-  REQUIRE(vkCreateCommandPool(gpu.device.device, &pool_info, nullptr, &gpu.pool) == VK_SUCCESS);
-  VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-  REQUIRE(vkCreateFence(gpu.device.device, &fence_info, nullptr, &gpu.fence) == VK_SUCCESS);
-}
-
-void DestroyGpu(Gpu& gpu) {
-  vkDestroyFence(gpu.device.device, gpu.fence, nullptr);
-  vkDestroyCommandPool(gpu.device.device, gpu.pool, nullptr);
-  vkb::destroy_device(gpu.device);
-  vkb::destroy_instance(gpu.instance);
-}
-
-// Records `body` into a fresh command buffer, submits it and waits for it.
-template <typename Body>
-void SubmitAndWait(Gpu& gpu, Body body) {
-  VkCommandBufferAllocateInfo allocate_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  allocate_info.commandPool = gpu.pool;
-  allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  allocate_info.commandBufferCount = 1;
-  VkCommandBuffer cmd = VK_NULL_HANDLE;
-  REQUIRE(vkAllocateCommandBuffers(gpu.device.device, &allocate_info, &cmd) == VK_SUCCESS);
-  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  REQUIRE(vkBeginCommandBuffer(cmd, &begin) == VK_SUCCESS);
-  body(cmd);
-  REQUIRE(vkEndCommandBuffer(cmd) == VK_SUCCESS);
-  VkCommandBufferSubmitInfo cmd_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
-  cmd_info.commandBuffer = cmd;
-  VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-  submit.commandBufferInfoCount = 1;
-  submit.pCommandBufferInfos = &cmd_info;
-  REQUIRE(vkQueueSubmit2(gpu.queue, 1, &submit, gpu.fence) == VK_SUCCESS);
-  REQUIRE(vkWaitForFences(gpu.device.device, 1, &gpu.fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS);
-  REQUIRE(vkResetFences(gpu.device.device, 1, &gpu.fence) == VK_SUCCESS);
-  REQUIRE(vkResetCommandPool(gpu.device.device, gpu.pool, 0) == VK_SUCCESS);
-  vkFreeCommandBuffers(gpu.device.device, gpu.pool, 1, &cmd);
-}
-
-// A host-visible, coherent buffer for reading records back.
-struct Readback {
-  VkBuffer buffer = VK_NULL_HANDLE;
-  VkDeviceMemory memory = VK_NULL_HANDLE;
-  const uint32_t* words = nullptr;
-};
-
-void CreateReadback(Gpu& gpu, VkDeviceSize size, Readback& out) {
-  const VkDevice device = gpu.device.device;
-  VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-  buffer_info.size = size;
-  buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-  buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  REQUIRE(vkCreateBuffer(device, &buffer_info, nullptr, &out.buffer) == VK_SUCCESS);
-  VkMemoryRequirements requirements{};
-  vkGetBufferMemoryRequirements(device, out.buffer, &requirements);
-  VkPhysicalDeviceMemoryProperties memory_properties{};
-  vkGetPhysicalDeviceMemoryProperties(gpu.device.physical_device.physical_device, &memory_properties);
-  const VkMemoryPropertyFlags wanted =
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  uint32_t type = UINT32_MAX;
-  for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
-    if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
-        (memory_properties.memoryTypes[i].propertyFlags & wanted) == wanted) {
-      type = i;
-      break;
-    }
-  }
-  REQUIRE(type != UINT32_MAX);
-  VkMemoryAllocateInfo allocate_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  allocate_info.allocationSize = requirements.size;
-  allocate_info.memoryTypeIndex = type;
-  REQUIRE(vkAllocateMemory(device, &allocate_info, nullptr, &out.memory) == VK_SUCCESS);
-  REQUIRE(vkBindBufferMemory(device, out.buffer, out.memory, 0) == VK_SUCCESS);
-  void* mapped = nullptr;
-  REQUIRE(vkMapMemory(device, out.memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS);
-  out.words = static_cast<const uint32_t*>(mapped);
-}
-
-void DestroyReadback(Gpu& gpu, Readback& readback) {
-  vkUnmapMemory(gpu.device.device, readback.memory);
-  vkDestroyBuffer(gpu.device.device, readback.buffer, nullptr);
-  vkFreeMemory(gpu.device.device, readback.memory, nullptr);
-}
 
 // ---------------------------------------------------------------------------
 // Synthetic bricks and the host-side model
@@ -352,26 +107,8 @@ void PrintStats(const char* label, const CaelixSceneStats& s) {
   std::fflush(stdout);
 }
 
-// Frame bookkeeping of the test host: every submit is waited for, so the frame
-// before the current one is always complete.
-struct Frames {
-  uint64_t next = 1;
-};
-
-void FlushFrame(Gpu& gpu, CaelixScene* scene, Frames& frames) {
-  const uint64_t frame = frames.next++;
-  SubmitAndWait(gpu, [&](VkCommandBuffer cmd) {
-    CaelixFrameDesc desc{};
-    desc.command_buffer = reinterpret_cast<uint64_t>(cmd);
-    desc.frame_number = frame;
-    desc.safe_frame_number = frame - 1;
-    REQUIRE(caelix_scene_flush(scene, &desc) == CAELIX_OK);
-  });
-  // The frame has completed: its staging space can be reused right away.
-  REQUIRE(caelix_scene_recycle(scene, frame) == CAELIX_OK);
-}
-
-// Copies the records of `bricks` from the pools to the host and checks every word.
+// Copies the records of `bricks` from the pools to the host and checks the position
+// and every payload word.
 void VerifyRecords(Gpu& gpu, const CaelixScene* scene, const Model& model,
                    const std::vector<BrickId>& bricks) {
   Readback readback;
@@ -391,15 +128,7 @@ void VerifyRecords(Gpu& gpu, const CaelixScene* scene, const Model& model,
       vkCmdCopyBuffer(cmd, reinterpret_cast<VkBuffer>(infos[i].record_page_buffer),
                       readback.buffer, 1, &region);
     }
-    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
-    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    dependency.memoryBarrierCount = 1;
-    dependency.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &dependency);
+    CopyToHostBarrier(cmd);
   });
 
   for (size_t b = 0; b < bricks.size(); ++b) {
@@ -408,10 +137,9 @@ void VerifyRecords(Gpu& gpu, const CaelixScene* scene, const Model& model,
     const uint32_t* record = readback.words + b * kRecordWords;
     INFO("brick entity " << std::get<0>(bricks[b]) << " key (" << key.x << ", " << key.y << ", "
                          << key.z << ") version " << version);
-    REQUIRE(record[0] == GroupLocalPos(key));  // pos in bits 0..15, coarse occupancy 0
-    for (uint32_t w = 1; w < 18; ++w) {
-      REQUIRE(record[w] == 0);
-    }
+    // Position in bits 0..15. The finalize kernel owns the rest of the header
+    // (checked by caelix_finalize_test); the payload of opaque blocks stays raw.
+    REQUIRE((record[0] & 0xFFFFu) == GroupLocalPos(key));
     for (uint32_t z = 0; z < 8; ++z) {
       for (uint32_t y = 0; y < 8; ++y) {
         for (uint32_t x = 0; x < 8; x += 2) {
@@ -449,15 +177,7 @@ void VerifySlotRows(Gpu& gpu, const CaelixScene* scene, const std::vector<BrickI
       vkCmdCopyBuffer(cmd, reinterpret_cast<VkBuffer>(infos[i].slot_table_buffer), readback.buffer,
                       1, &region);
     }
-    VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
-    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    dependency.memoryBarrierCount = 1;
-    dependency.pMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &dependency);
+    CopyToHostBarrier(cmd);
   });
   for (size_t i = 0; i < bricks.size(); ++i) {
     const CaelixBrickKey key{std::get<1>(bricks[i]), std::get<2>(bricks[i]), std::get<3>(bricks[i])};
@@ -494,18 +214,10 @@ TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]") {
   REQUIRE(version.abi == 2);
 
   Gpu gpu;
-  CreateGpu(gpu);
+  CreateGpu(gpu, "caelix_scene_smoke");
 
   // 1. Adopt the device; create the scene.
-  CaelixDeviceAdoptDesc adopt{};
-  adopt.get_instance_proc_addr = reinterpret_cast<void*>(vkGetInstanceProcAddr);
-  adopt.instance = reinterpret_cast<uint64_t>(gpu.instance.instance);
-  adopt.physical_device = reinterpret_cast<uint64_t>(gpu.device.physical_device.physical_device);
-  adopt.device = reinterpret_cast<uint64_t>(gpu.device.device);
-  adopt.graphics_queue = reinterpret_cast<uint64_t>(gpu.queue);
-  adopt.graphics_queue_family = gpu.queue_family;
-  CaelixDevice* device = nullptr;
-  REQUIRE(caelix_device_adopt(&adopt, &device) == CAELIX_OK);
+  CaelixDevice* device = AdoptDevice(gpu);
 
   CaelixSceneDesc scene_desc{};
   scene_desc.staging_bytes = 8ull << 20;
@@ -513,7 +225,7 @@ TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]") {
   CaelixScene* scene = nullptr;
   REQUIRE(caelix_scene_create(device, &scene_desc, &scene) == CAELIX_OK);
 
-  ExpectLibraryErrors(3, [&] {
+  ExpectLibraryErrors(4, [&] {
     CaelixScene* bad = nullptr;
     CaelixSceneDesc d{};
     d.staging_bytes = 1 << 20;
@@ -524,6 +236,9 @@ TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]") {
     d = CaelixSceneDesc{};
     d.group_shift = 6;
     REQUIRE(caelix_scene_create(device, &d, &bad) == CAELIX_ERROR_UNSUPPORTED);
+    d = CaelixSceneDesc{};
+    d.encoding = 2;
+    REQUIRE(caelix_scene_create(device, &d, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
     REQUIRE(bad == nullptr);
   });
 
@@ -806,13 +521,5 @@ TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]") {
   caelix_device_destroy(device);
   DestroyGpu(gpu);
   caelix_set_log_callback(nullptr, nullptr);
-
-  std::printf("validation messages: %d errors, %d warnings, %d ignored; library: %d unexpected "
-              "errors, %d warnings\n",
-              g_validation_errors.load(), g_validation_warnings.load(), g_validation_ignored.load(),
-              g_library_errors.load(), g_library_warnings.load());
-  REQUIRE(g_validation_errors.load() == 0);
-  REQUIRE(g_validation_warnings.load() == 0);
-  REQUIRE(g_library_errors.load() == 0);
-  REQUIRE(g_library_warnings.load() == 0);
+  RequireNoMessages();
 }
