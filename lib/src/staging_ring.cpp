@@ -14,7 +14,7 @@ StagingRing::StagingRing(VmaAllocator allocator, VkDevice device, uint64_t capac
 
 bool StagingRing::TryAllocate(uint64_t bytes, uint64_t alignment, Purpose purpose, Span& out) {
   const uint64_t limit =
-      purpose == Purpose::kRecords ? capacity_ - kRowReserveBytes : capacity_;
+      purpose == Purpose::kRecords ? capacity_ - RowReserveBytes(capacity_) : capacity_;
   if (bytes == 0 || bytes > limit) {
     return false;
   }

@@ -6,6 +6,7 @@ description = "Standalone Rust host for the Caelix native renderer."
 
 [dependencies]
 anyhow = "1.0.104"
+caelix-cxw = { path = "../caelix-cxw" }
 caelix-sys = { path = "../caelix-sys" }
 caelix-vk = { path = "../caelix-vk" }
 clap = { version = "4.6.7", features = ["derive"] }

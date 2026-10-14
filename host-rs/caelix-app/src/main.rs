@@ -3,8 +3,14 @@
 //! The host owns the window, the Vulkan device and the swapchain (`caelix-vk`).
 //! The library adopts the device and records into the host's command buffer
 //! through the C ABI (`caelix-sys`). This crate contains no Vulkan code.
+//!
+//! With `--world`, a `.cxw` file is decoded on a background thread and streamed
+//! into a `CaelixScene` (see `world.rs`); the scene is flushed once per frame.
+
+mod world;
 
 use std::ffi::{c_char, c_void, CStr};
+use std::path::PathBuf;
 use std::ptr;
 use std::time::Instant;
 
@@ -31,12 +37,24 @@ struct Args {
     /// so the swapchain recreation path runs without user input.
     #[arg(long, value_name = "N", hide = true)]
     resize_at: Option<u64>,
+    /// A .cxw world to decode and stream into the scene.
+    #[arg(long, value_name = "PATH")]
+    world: Option<PathBuf>,
+    /// Size of the scene's staging ring in MiB (at least 4).
+    #[arg(long, value_name = "N", default_value_t = 64)]
+    staging_mib: u64,
+    /// Render group edge in bricks = 1 << N (1..5).
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    group_shift: u32,
 }
 
 /// Everything that lives while the window exists. Drop order matters: Drop
-/// releases the library's device first, then the fields drop in declaration
-/// order (Vulkan context, then window).
+/// stops the decoder, waits for the device, destroys the scene and the
+/// library's device, then the fields drop in declaration order (Vulkan
+/// context, then window).
 struct State {
+    loader: Option<world::WorldLoader>,
+    scene: *mut CaelixScene,
     caelix_device: *mut CaelixDevice,
     context: caelix_vk::Context,
     window: Window,
@@ -44,7 +62,14 @@ struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        if let Some(loader) = self.loader.as_mut() {
+            loader.stop();
+        }
         self.context.wait_idle();
+        // SAFETY: the device is idle; the scene pointer came from caelix_scene_create or is
+        // null (ignored), and the scene is destroyed before its device.
+        unsafe { caelix_scene_destroy(self.scene) };
+        log::debug!("caelix scene destroyed");
         // SAFETY: the device is idle and the pointer came from caelix_device_adopt.
         unsafe { caelix_device_destroy(self.caelix_device) };
         log::debug!("caelix device destroyed");
@@ -57,6 +82,8 @@ struct App {
     start: Instant,
     frames_presented: u64,
     resize_requested: bool,
+    /// Set when the loaded scene does not hold every decoded brick.
+    load_mismatch: bool,
     error: Option<anyhow::Error>,
 }
 
@@ -96,7 +123,37 @@ impl App {
         if result != CaelixResult_CAELIX_OK || caelix_device.is_null() {
             bail!("caelix_device_adopt failed: CaelixResult {result}");
         }
-        Ok(State { caelix_device, context, window })
+        log::debug!("{} frames in flight", context.frames_in_flight());
+        // From here on, an error drops `state`, which releases what exists so far.
+        let mut state = State {
+            loader: None,
+            scene: ptr::null_mut(),
+            caelix_device,
+            context,
+            window,
+        };
+
+        let scene_desc = CaelixSceneDesc {
+            staging_bytes: self.args.staging_mib << 20,
+            records_per_page: 0,
+            group_shift: self.args.group_shift,
+            block_bytes: 0,
+        };
+        // SAFETY: the device is adopted; scene_desc and the out pointer are valid for the call.
+        let result = unsafe { caelix_scene_create(state.caelix_device, &scene_desc, &mut state.scene) };
+        if result != CaelixResult_CAELIX_OK || state.scene.is_null() {
+            bail!("caelix_scene_create failed: CaelixResult {result}");
+        }
+        log::info!(
+            "scene created: staging {} MiB, group shift {}",
+            self.args.staging_mib,
+            self.args.group_shift
+        );
+
+        if let Some(path) = self.args.world.as_deref() {
+            state.loader = Some(world::WorldLoader::open(state.scene, path)?);
+        }
+        Ok(state)
     }
 
     fn draw(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
@@ -104,6 +161,35 @@ impl App {
             return Ok(());
         };
         if let Some(frame) = state.context.begin_frame()? {
+            // SAFETY: the scene is live; the frame's slot fence confirmed safe_frame_number.
+            let result = unsafe { caelix_scene_recycle(state.scene, frame.safe_frame_number) };
+            if result != CaelixResult_CAELIX_OK {
+                bail!("caelix_scene_recycle({}) failed: CaelixResult {result}", frame.safe_frame_number);
+            }
+            let uploaded = match state.loader.as_mut() {
+                Some(loader) => loader.upload(state.scene, frame.frame_number)?,
+                None => false,
+            };
+            let frame_desc = CaelixFrameDesc {
+                command_buffer: frame.command_buffer,
+                frame_number: frame.frame_number,
+                safe_frame_number: frame.safe_frame_number,
+            };
+            // SAFETY: the command buffer is recording on the graphics queue.
+            let result = unsafe { caelix_scene_flush(state.scene, &frame_desc) };
+            if result != CaelixResult_CAELIX_OK {
+                bail!(
+                    "caelix_scene_flush(frame {}, safe {}) failed: CaelixResult {result}",
+                    frame.frame_number,
+                    frame.safe_frame_number
+                );
+            }
+            if let Some(loader) = state.loader.as_mut() {
+                if let world::LoadOutcome::Mismatch = loader.after_flush(state.scene, uploaded) {
+                    self.load_mismatch = true;
+                }
+            }
+
             let target = CaelixTargetImage {
                 image: frame.image,
                 format: frame.format,
@@ -134,6 +220,9 @@ impl App {
         }
         if let Some(limit) = self.args.frames {
             if self.frames_presented >= limit {
+                if let Some(loader) = state.loader.as_ref() {
+                    loader.log_incomplete();
+                }
                 log::info!("{} frames presented, exiting", self.frames_presented);
                 event_loop.exit();
                 return Ok(());
@@ -288,6 +377,7 @@ fn main() -> anyhow::Result<()> {
         start: Instant::now(),
         frames_presented: 0,
         resize_requested: false,
+        load_mismatch: false,
         error: None,
     };
     let run_result = event_loop.run_app(&mut app);
@@ -296,8 +386,11 @@ fn main() -> anyhow::Result<()> {
     // SAFETY: disables library logging before the process tears down.
     unsafe { caelix_set_log_callback(None, ptr::null_mut()) };
     run_result.map_err(|e| anyhow!("event loop error: {e}"))?;
-    match app.error {
-        Some(error) => Err(error),
-        None => Ok(()),
+    if let Some(error) = app.error {
+        return Err(error);
     }
+    if app.load_mismatch {
+        bail!("the scene does not hold every decoded brick (see the error above)");
+    }
+    Ok(())
 }

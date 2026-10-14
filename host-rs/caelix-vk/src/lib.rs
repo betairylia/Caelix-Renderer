@@ -8,6 +8,8 @@
 //! Frame contract:
 //! 1. [`Context::begin_frame`] returns a [`Frame`]: a command buffer in the
 //!    recording state and the acquired swapchain image in `UNDEFINED` layout.
+//!    The frame carries its number (1, 2, 3, ...) and the newest frame number
+//!    that has completed on the GPU (`safe_frame_number`, 0 = none).
 //! 2. The caller records its work. The work must leave the image in
 //!    `VK_IMAGE_LAYOUT_GENERAL`.
 //! 3. [`Context::end_frame`] transitions the image to `PRESENT_SRC_KHR`, submits
@@ -82,6 +84,13 @@ pub struct Frame {
     pub height: u32,
     /// `VkImageLayout`: always `VK_IMAGE_LAYOUT_UNDEFINED`; contents are discarded each frame.
     pub layout: u32,
+    /// Number of this frame. Starts at 1 and increases by 1 for every `begin_frame` that
+    /// returns a frame.
+    pub frame_number: u64,
+    /// Every frame with a number <= this has completed on the GPU: it is the frame that
+    /// previously used this frame slot, whose fence `begin_frame` just waited for. 0 when the
+    /// slot was not used yet. Always less than `frame_number`.
+    pub safe_frame_number: u64,
 }
 
 /// Errors of this crate. Vulkan results are carried by name, so no `ash` type
@@ -108,6 +117,9 @@ struct FrameSync {
     command_buffer: vk::CommandBuffer,
     in_flight: vk::Fence,
     image_available: vk::Semaphore,
+    /// Number of the frame last submitted from this slot (0 = none). `in_flight` signals
+    /// when that frame completes.
+    submitted_frame: u64,
 }
 
 /// Instance, device, swapchain and frame loop.
@@ -128,6 +140,10 @@ pub struct Context {
     render_finished: Vec<vk::Semaphore>,
     frames: Vec<FrameSync>,
     frame_index: usize,
+    /// Number of the next frame that `begin_frame` returns.
+    next_frame_number: u64,
+    /// Number of the frame between begin_frame and end_frame.
+    recording_frame: u64,
     width: u32,
     height: u32,
     needs_recreate: bool,
@@ -197,6 +213,8 @@ impl Context {
             render_finished: Vec::new(),
             frames: Vec::new(),
             frame_index: 0,
+            next_frame_number: 1,
+            recording_frame: 0,
             width,
             height,
             needs_recreate: false,
@@ -217,6 +235,11 @@ impl Context {
             graphics_queue: self.queue.as_raw(),
             graphics_queue_family: self.queue_family,
         }
+    }
+
+    /// Number of frames the CPU may record ahead of the GPU (frame slots).
+    pub fn frames_in_flight(&self) -> usize {
+        FRAMES_IN_FLIGHT
     }
 
     /// Marks the swapchain for recreation on the next `begin_frame`.
@@ -296,15 +319,25 @@ impl Context {
                 .map_err(vk_error("vkBeginCommandBuffer"))?;
         }
         self.acquired = Some(image_index);
+        // The fence wait above confirmed the frame that last used this slot. Frame numbers
+        // only grow, so it is older than the frame returned now.
+        let safe_frame_number = sync.submitted_frame;
+        let command_buffer = sync.command_buffer.as_raw();
+        let frame_number = self.next_frame_number;
+        debug_assert!(safe_frame_number < frame_number);
+        self.next_frame_number += 1;
+        self.recording_frame = frame_number;
 
         let extent = self.swapchain.extent();
         Ok(Some(Frame {
-            command_buffer: sync.command_buffer.as_raw(),
+            command_buffer,
             image: self.swapchain.image(image_index).as_raw(),
             format: self.swapchain.format().as_raw() as u32,
             width: extent.width,
             height: extent.height,
             layout: vk::ImageLayout::UNDEFINED.as_raw() as u32,
+            frame_number,
+            safe_frame_number,
         }))
     }
 
@@ -312,9 +345,11 @@ impl Context {
     /// buffer, submits it and presents.
     pub fn end_frame(&mut self, frame: Frame) -> Result<(), Error> {
         let image_index = self.acquired.take().ok_or(Error::NoFrameInFlight)?;
+        let recording_frame = self.recording_frame;
         let sync = &self.frames[self.frame_index];
         let image = self.swapchain.image(image_index);
         debug_assert_eq!(frame.command_buffer, sync.command_buffer.as_raw());
+        debug_assert_eq!(frame.frame_number, recording_frame);
         debug_assert_eq!(frame.image, image.as_raw());
         let render_finished = self.render_finished[image_index as usize];
 
@@ -360,6 +395,7 @@ impl Context {
                 .queue_submit2(self.queue, &[submit], sync.in_flight)
                 .map_err(vk_error("vkQueueSubmit2"))?;
         }
+        self.frames[self.frame_index].submitted_frame = recording_frame;
 
         let swapchains = [self.swapchain.handle()];
         let image_indices = [image_index];
@@ -406,6 +442,7 @@ impl Context {
                     command_buffer: vk::CommandBuffer::null(),
                     in_flight: vk::Fence::null(),
                     image_available: vk::Semaphore::null(),
+                    submitted_frame: 0,
                 });
                 let sync = self.frames.last_mut().expect("just pushed");
                 sync.command_buffer = self

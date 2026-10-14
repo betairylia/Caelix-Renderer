@@ -115,6 +115,45 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
 - `--resize-at <N>` (hidden test aid): after N presented frames, request a
   960x540 window size once, so the swapchain recreation path runs without user
   input.
+- `--world <PATH>`: a `.cxw` world to stream into the scene. Without it the
+  scene stays empty.
+- `--staging-mib <N>`: size of the scene's staging ring in MiB
+  (`CaelixSceneDesc::staging_bytes`). Default 64, minimum 4.
+- `--group-shift <N>`: render group edge in bricks = `1 << N`. Default 4
+  (16^3). The library implements 1..5.
+
+The host creates one `CaelixScene` after it adopts the device. With `--world`
+it adds one scene entity per file entity, then streams the bricks:
+
+- One background thread runs `CxwFile::decode_all` (parallel on the rayon pool)
+  and sends each decoded sector through a bounded channel of 32 sectors. When
+  the channel is full, the decoder blocks, so it cannot run far ahead of the
+  uploads.
+- Every frame, after `begin_frame`: `caelix_scene_recycle(safe)`, then upload
+  sectors from the channel with `caelix_scene_upload_bricks` until the channel
+  is empty or `consumed < count` (the staging ring is full; the rest of that
+  sector waits for the next frame), then exactly one `caelix_scene_flush` into
+  the frame's command buffer. Frame numbers start at 1; `safe_frame_number` is
+  the frame that last used the frame slot whose fence `begin_frame` waited for.
+- The window keeps showing the temporary clear colour. When the decoder has
+  finished and every brick is uploaded, the host logs one summary (entities,
+  groups, resident bricks, record pages, GPU memory, decode and upload time,
+  upload frames, bricks/s, the full `CaelixSceneStats`) and queries the first
+  key of the first 3 decoded sectors with `caelix_scene_query_brick`. When
+  `bricks_resident` differs from the number of decoded bricks, it logs an error
+  and exits with a non-zero code.
+- `--frames N` exits after N frames even when the load is not complete (with a
+  warning). At exit the host drops the channel receiver and joins the decoder
+  thread. `decode_all` cannot be cancelled: it decodes the remaining sectors and
+  drops them.
+
+Expected numbers for `VoxelTestScenes/epic-citadel.8192.packed.cxw` (release,
+RTX 5080, 64 MiB staging): 3837 sectors, 1 entity, 3837 groups, 1,095,051
+resident bricks in 5 record pages (1370 MiB of record pages, 32 MiB of slot
+tables). The upload takes about 0.3 s over 37 frames, 19 of which upload (the
+ring holds one frame's records until that frame is safe), about 3.5 M bricks/s.
+That is the decoder's own speed: decode and upload overlap completely. Peak
+working set of the process is about 0.6 GB.
 
 Debug builds enable `VK_LAYER_KHRONOS_validation` when it is installed; its
 messages are logged with target `vulkan`. Library messages use target `caelix`.

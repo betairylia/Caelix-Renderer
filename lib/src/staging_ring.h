@@ -15,13 +15,17 @@ namespace caelix {
 // CloseFrame(frame) tags it with the frame number of the flush that copies it.
 // Recycle(safe) releases tagged spans whose frame <= safe, oldest first.
 //
-// The last kRowReserveBytes are reserved for slot table rows: record uploads
-// (Purpose::kRecords) may fill only capacity - kRowReserveBytes, row writes
-// (Purpose::kRows) may fill all of it. So a flush can always stage the rows of
-// the bricks that filled the ring.
+// The last RowReserveBytes() are reserved for slot table rows: record uploads
+// (Purpose::kRecords) may fill only capacity - reserve, row writes
+// (Purpose::kRows) may fill all of it. The reserve scales with the capacity:
+// every record that fits (1096 B) may need one 16 B row, i.e. capacity / 68.5;
+// capacity / 64 covers that, plus 1 MiB of slack for full group rewrites.
 class StagingRing {
  public:
-  static constexpr uint64_t kRowReserveBytes = 1ull << 20;
+  static constexpr uint64_t kRowReserveSlackBytes = 1ull << 20;
+  static uint64_t RowReserveBytes(uint64_t capacity) {
+    return capacity / 64 + kRowReserveSlackBytes;
+  }
 
   enum class Purpose { kRecords, kRows };
 
