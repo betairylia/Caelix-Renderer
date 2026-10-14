@@ -18,7 +18,8 @@ constexpr uint32_t kRequiredFeatureFlags =
     CAELIX_FEATURE_BUFFER_DEVICE_ADDRESS | CAELIX_FEATURE_DESCRIPTOR_INDEXING |
     CAELIX_FEATURE_SYNCHRONIZATION2 | CAELIX_FEATURE_DYNAMIC_RENDERING |
     CAELIX_FEATURE_TIMELINE_SEMAPHORE | CAELIX_FEATURE_ACCELERATION_STRUCTURE |
-    CAELIX_FEATURE_RAY_QUERY | CAELIX_FEATURE_SHADER_INT64 | CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT;
+    CAELIX_FEATURE_RAY_QUERY | CAELIX_FEATURE_SHADER_INT64 | CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT |
+    CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT;
 
 const char* VkResultName(VkResult result) {
   switch (result) {
@@ -113,6 +114,9 @@ bool CheckRequirements(VkPhysicalDevice physical_device, const CaelixDeviceRequi
       {CAELIX_FEATURE_RAY_QUERY, ray_query.rayQuery, "rayQuery"},
       {CAELIX_FEATURE_SHADER_INT64, features.features.shaderInt64, "shaderInt64"},
       {CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT, vk12.scalarBlockLayout, "scalarBlockLayout"},
+      {CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
+       features.features.shaderStorageImageWriteWithoutFormat,
+       "shaderStorageImageWriteWithoutFormat"},
   };
   for (const FeatureCheck& check : checks) {
     if ((req.feature_flags & check.flag) != 0 && check.supported != VK_TRUE) {
@@ -196,6 +200,21 @@ CaelixResult Device::Adopt(const CaelixDeviceAdoptDesc& desc, std::unique_ptr<De
   vkGetPhysicalDeviceProperties2(device->physical_device_, &properties);
   as_properties.pNext = nullptr;
   device->as_properties_ = as_properties;
+  device->timestamp_period_ns_ = properties.properties.limits.timestampPeriod;
+
+  // Timestamps of the graphics queue (GPU timings). 0 valid bits = no timestamp support.
+  uint32_t family_count = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(device->physical_device_, &family_count, nullptr);
+  std::vector<VkQueueFamilyProperties> families(family_count);
+  vkGetPhysicalDeviceQueueFamilyProperties(device->physical_device_, &family_count,
+                                           families.data());
+  if (desc.graphics_queue_family < family_count) {
+    device->timestamp_valid_bits_ = families[desc.graphics_queue_family].timestampValidBits;
+  }
+  if (device->timestamp_valid_bits_ == 0) {
+    CAELIX_LOGW("queue family %u has no timestamp support: GPU timings are not available",
+                desc.graphics_queue_family);
+  }
   CAELIX_LOGI("adopted device: %s, driver %s %s (0x%08x), Vulkan %u.%u.%u, queue family %u",
               properties.properties.deviceName, vk12_properties.driverName,
               vk12_properties.driverInfo, properties.properties.driverVersion,

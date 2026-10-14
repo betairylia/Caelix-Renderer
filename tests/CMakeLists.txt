@@ -45,3 +45,6 @@ caelix_add_gpu_test(caelix_finalize_test finalize_test.cpp)
 
 # Acceleration structures (BLAS per group, TLAS): validation, property queries, stats.
 caelix_add_gpu_test(caelix_as_test as_test.cpp)
+
+# Primary ray trace kernel: rendered images read back and checked.
+caelix_add_gpu_test(caelix_trace_test trace_test.cpp)

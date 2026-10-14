@@ -33,6 +33,10 @@ class Device {
   const VkPhysicalDeviceAccelerationStructurePropertiesKHR& as_properties() const {
     return as_properties_;
   }
+  // Nanoseconds per timestamp tick (VkPhysicalDeviceLimits::timestampPeriod).
+  float timestamp_period_ns() const { return timestamp_period_ns_; }
+  // timestampValidBits of the graphics queue family; 0 = no timestamps.
+  uint32_t timestamp_valid_bits() const { return timestamp_valid_bits_; }
 
  private:
   Device() = default;
@@ -45,6 +49,8 @@ class Device {
   VmaAllocator allocator_ = VK_NULL_HANDLE;
   VkPhysicalDeviceAccelerationStructurePropertiesKHR as_properties_{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+  float timestamp_period_ns_ = 1.0f;
+  uint32_t timestamp_valid_bits_ = 0;
 };
 
 }  // namespace caelix

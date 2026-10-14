@@ -5,6 +5,7 @@
 #include "device.h"
 #include "gpu_buffer.h"
 #include "log.h"
+#include "renderer.h"
 #include "scene.h"
 #include "vk_common.h"
 
@@ -20,6 +21,11 @@ struct CaelixDevice {
 // The opaque handle behind CaelixScene*.
 struct CaelixScene {
   std::unique_ptr<caelix::Scene> impl;
+};
+
+// The opaque handle behind CaelixRenderer*.
+struct CaelixRenderer {
+  std::unique_ptr<caelix::Renderer> impl;
 };
 
 namespace {
@@ -62,58 +68,6 @@ bool CheckEntity(const caelix::Scene& scene, CaelixEntityId entity, const char* 
     return false;
   }
   return true;
-}
-
-CaelixResult ClearTarget(CaelixDevice* device, uint64_t command_buffer,
-                         const CaelixTargetImage* target, const float rgba[4]) {
-  if (device == nullptr || device->impl == nullptr || command_buffer == 0 ||
-      target == nullptr || rgba == nullptr || target->image == 0) {
-    CAELIX_LOGE("caelix_clear_target: null argument");
-    return CAELIX_ERROR_INVALID_ARGUMENT;
-  }
-  const VkCommandBuffer cmd = caelix::HandleFromU64<VkCommandBuffer>(command_buffer);
-  const VkImage image = caelix::HandleFromU64<VkImage>(target->image);
-  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
-                                      VK_REMAINING_ARRAY_LAYERS};
-
-  // Any layout -> TRANSFER_DST_OPTIMAL. The source scope is ALL_COMMANDS, so it
-  // chains with whatever the host did before (a semaphore wait, an earlier pass).
-  VkImageMemoryBarrier2 to_transfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-  to_transfer.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-  to_transfer.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-  to_transfer.dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-  to_transfer.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  to_transfer.oldLayout = static_cast<VkImageLayout>(target->layout);
-  to_transfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  to_transfer.image = image;
-  to_transfer.subresourceRange = range;
-
-  VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-  dependency.imageMemoryBarrierCount = 1;
-  dependency.pImageMemoryBarriers = &to_transfer;
-  vkCmdPipelineBarrier2(cmd, &dependency);
-
-  VkClearColorValue color{};
-  color.float32[0] = rgba[0];
-  color.float32[1] = rgba[1];
-  color.float32[2] = rgba[2];
-  color.float32[3] = rgba[3];
-  vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
-
-  // TRANSFER_DST_OPTIMAL -> GENERAL, the layout contract of every render call.
-  // The destination scope is ALL_COMMANDS; the host adds its own barrier for present.
-  VkImageMemoryBarrier2 to_general = to_transfer;
-  to_general.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-  to_general.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-  to_general.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-  to_general.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-  to_general.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-  to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-  dependency.pImageMemoryBarriers = &to_general;
-  vkCmdPipelineBarrier2(cmd, &dependency);
-  return CAELIX_OK;
 }
 
 }  // namespace
@@ -177,20 +131,6 @@ CAELIX_API void caelix_device_destroy(CaelixDevice* device) {
     delete device;
   } catch (...) {
     CAELIX_LOGE("caelix_device_destroy: unexpected exception");
-  }
-}
-
-CAELIX_API CaelixResult caelix_clear_target(CaelixDevice* device, uint64_t command_buffer,
-                                            const CaelixTargetImage* target,
-                                            const float rgba[4]) {
-  try {
-    return ClearTarget(device, command_buffer, target, rgba);
-  } catch (const std::bad_alloc&) {
-    CAELIX_LOGE("caelix_clear_target: out of memory");
-    return CAELIX_ERROR_OUT_OF_MEMORY;
-  } catch (...) {
-    CAELIX_LOGE("caelix_clear_target: unexpected exception");
-    return CAELIX_ERROR_VULKAN;
   }
 }
 
@@ -392,6 +332,78 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
   }
   scene->impl->GetTlas(*out_handle, *out_address);
   return CAELIX_OK;
+}
+
+CAELIX_API CaelixResult caelix_renderer_create(CaelixDevice* device, CaelixScene* scene,
+                                               CaelixRenderer** out_renderer) {
+  constexpr const char* kFunction = "caelix_renderer_create";
+  if (out_renderer == nullptr) {
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  *out_renderer = nullptr;
+  if (device == nullptr || device->impl == nullptr || scene == nullptr ||
+      scene->impl == nullptr) {
+    CAELIX_LOGE("%s: device or scene is null", kFunction);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  if (&scene->impl->device() != device->impl.get()) {
+    CAELIX_LOGE("%s: the scene belongs to another device", kFunction);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  try {
+    std::unique_ptr<caelix::Renderer> impl;
+    const CaelixResult result = caelix::Renderer::Create(*device->impl, *scene->impl, impl);
+    if (result != CAELIX_OK) {
+      return result;
+    }
+    *out_renderer = new CaelixRenderer{std::move(impl)};
+    return CAELIX_OK;
+  } catch (...) {
+    return TranslateException(kFunction);
+  }
+}
+
+CAELIX_API void caelix_renderer_destroy(CaelixRenderer* renderer) {
+  try {
+    delete renderer;
+  } catch (...) {
+    CAELIX_LOGE("caelix_renderer_destroy: unexpected exception");
+  }
+}
+
+CAELIX_API CaelixResult caelix_renderer_render(CaelixRenderer* renderer, const CaelixFrameDesc* frame,
+                                               const CaelixRenderTargets* targets,
+                                               const CaelixCamera* camera,
+                                               const CaelixRenderOptions* options) {
+  constexpr const char* kFunction = "caelix_renderer_render";
+  if (renderer == nullptr || renderer->impl == nullptr) {
+    CAELIX_LOGE("%s: renderer is null", kFunction);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  if (frame == nullptr || targets == nullptr || camera == nullptr || options == nullptr) {
+    CAELIX_LOGE("%s: null argument", kFunction);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  try {
+    return renderer->impl->Render(*frame, *targets, *camera, *options);
+  } catch (...) {
+    return TranslateException(kFunction);
+  }
+}
+
+CAELIX_API void caelix_renderer_release_target_views(CaelixRenderer* renderer) {
+  if (renderer == nullptr || renderer->impl == nullptr) {
+    return;
+  }
+  renderer->impl->ReleaseTargetViews();
+}
+
+CAELIX_API void caelix_renderer_get_gpu_timings(const CaelixRenderer* renderer,
+                                                CaelixGpuTimings* out) {
+  if (renderer == nullptr || renderer->impl == nullptr || out == nullptr) {
+    return;
+  }
+  renderer->impl->GetTimings(*out);
 }
 
 }  // extern "C"

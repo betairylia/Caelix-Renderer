@@ -17,10 +17,10 @@
  * (caelix_device_adopt) and records its work into command buffers that the
  * host provides. The library never submits or presents.
  *
- * Thread rule: calls on one object (a CaelixDevice, a CaelixScene) are
- * externally synchronized by the host. The library does not lock: the host must
- * not call two functions on the same scene (or on a scene and its device) at the
- * same time from different threads.
+ * Thread rule: calls on one object (a CaelixDevice, a CaelixScene, a
+ * CaelixRenderer) are externally synchronized by the host. The library does not
+ * lock: the host must not call two functions on the same scene (or on a scene,
+ * its renderer and its device) at the same time from different threads.
  */
 #include <stdint.h>
 #ifdef __cplusplus
@@ -39,8 +39,10 @@ extern "C" {
 /* Bumped on every breaking change of this header. Exception: version 2 is still in development;
    the finalize step and the acceleration structure step appended fields to CaelixSceneDesc
    (encoding, scratch_bytes; 0 = default), CaelixSceneStats and CaelixBrickInfo, and added
-   caelix_scene_get_tlas, without a bump. A host built against an older version-2 header must be
-   rebuilt (the library reads and writes the larger structs). */
+   caelix_scene_get_tlas, without a bump. The renderer step removed caelix_clear_target and added
+   the renderer API (caelix_renderer_*) and CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT, also
+   without a bump. A host built against an older version-2 header must be rebuilt (the library
+   reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
 typedef struct CaelixVersion {
@@ -95,7 +97,8 @@ typedef enum CaelixDeviceFeatureBits {
   CAELIX_FEATURE_ACCELERATION_STRUCTURE  = 1u << 5, /* VkPhysicalDeviceAccelerationStructureFeaturesKHR::accelerationStructure */
   CAELIX_FEATURE_RAY_QUERY               = 1u << 6, /* VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery */
   CAELIX_FEATURE_SHADER_INT64            = 1u << 7, /* VkPhysicalDeviceFeatures::shaderInt64 */
-  CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT     = 1u << 8  /* VkPhysicalDeviceVulkan12Features::scalarBlockLayout */
+  CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT     = 1u << 8, /* VkPhysicalDeviceVulkan12Features::scalarBlockLayout */
+  CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT = 1u << 9 /* VkPhysicalDeviceFeatures::shaderStorageImageWriteWithoutFormat */
 } CaelixDeviceFeatureBits;
 
 typedef struct CaelixDeviceRequirements {
@@ -134,6 +137,8 @@ CAELIX_API void caelix_device_destroy(CaelixDevice* device);
  * Render targets
  * ------------------------------------------------------------------------- */
 
+/* An image that the library writes (see CaelixRenderTargets). The host owns it; the library only
+   creates and caches image views of it (see caelix_renderer_release_target_views). */
 typedef struct CaelixTargetImage {
   uint64_t image;   /* VkImage */
   uint32_t format;  /* VkFormat */
@@ -141,14 +146,6 @@ typedef struct CaelixTargetImage {
   uint32_t height;
   uint32_t layout;  /* VkImageLayout of the image when the library starts recording */
 } CaelixTargetImage;
-
-/* TEMPORARY, removed when the renderer lands: records into `command_buffer` (a VkCommandBuffer in the
-   recording state, owned by the host) a clear of `target` to `rgba`. On return the image is in
-   VK_IMAGE_LAYOUT_GENERAL. This is the layout contract every later render call keeps: the library
-   leaves the target in GENERAL; the host transitions it for present.
-   The target image needs VK_IMAGE_USAGE_TRANSFER_DST_BIT. */
-CAELIX_API CaelixResult caelix_clear_target(CaelixDevice* device, uint64_t command_buffer,
-                                            const CaelixTargetImage* target, const float rgba[4]);
 
 /* ---------------------------------------------------------------------------
  * Scene: voxel bricks on the GPU
@@ -289,8 +286,9 @@ typedef struct CaelixFrameDesc {
    neighbours, then the acceleration structure builds (BLASes, then the TLAS), with barriers: one
    before the copies (all earlier commands -> all commands), transfer -> compute before the kernel,
    transfer and compute -> all later commands after it, BLAS builds -> TLAS build, and TLAS build ->
-   all later commands. Recycles staging spans and acceleration structures whose frame <= safe. With
-   nothing to do it records nothing. A frame_number that is not greater than the previous flush's,
+   all later commands. When it records work, two timestamp queries bracket it (reported as
+   CaelixGpuTimings::flush_ms). Recycles staging spans and acceleration structures whose
+   frame <= safe. With nothing to do it records nothing. A frame_number that is not greater than the previous flush's,
    or a safe_frame_number >= frame_number, returns CAELIX_ERROR_INVALID_ARGUMENT. When an
    acceleration structure cannot be allocated, the flush records everything else, the builds stay
    pending, and it returns CAELIX_ERROR_OUT_OF_MEMORY. */
@@ -372,12 +370,124 @@ CAELIX_API CaelixResult caelix_scene_query_brick(const CaelixScene* scene, Caeli
 CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t* out_handle,
                                               uint64_t* out_address);
 
+/* ---------------------------------------------------------------------------
+ * Renderer: traces a scene into the host's images
+ *
+ * A renderer draws one scene. caelix_renderer_render records a compute dispatch that traces one
+ * primary ray per pixel through the scene's TLAS with an inline ray query (VK_KHR_ray_query), runs
+ * the brick DDA on every procedural candidate, and writes the albedo of the hit (or a debug view)
+ * into the colour target.
+ *
+ * Frame contract: call caelix_renderer_render AFTER caelix_scene_flush of the same frame, into the
+ * same command buffer and with the same CaelixFrameDesc: the flush builds the TLAS that the render
+ * binds, and the TLAS handle can change at any flush. The renderer keeps its per-frame resources
+ * (descriptor set, constants, timestamp queries) in a ring of 3 slots that grows to at most 8
+ * frames in flight; a slot is reused only when its frame is <= safe_frame_number.
+ *
+ * Layout contract: the colour target is received in CaelixTargetImage::layout and left in
+ * VK_IMAGE_LAYOUT_GENERAL. The last barrier of the render call makes its writes available to all
+ * later commands (ALL_COMMANDS, memory read and write); the host transitions the image from
+ * GENERAL for present or for its own use.
+ * ------------------------------------------------------------------------- */
+
+typedef struct CaelixRenderer CaelixRenderer;  /* opaque */
+
+/* Creates a renderer for `scene` (which must belong to `device`). The renderer keeps references to
+   both: destroy it before the scene and the device. */
+CAELIX_API CaelixResult caelix_renderer_create(CaelixDevice* device, CaelixScene* scene,
+                                               CaelixRenderer** out_renderer);
+/* Destroys the renderer and its GPU objects (pipeline, descriptor pools, constants, timestamp
+   queries, cached image views). NULL is ignored. The device must be idle. */
+CAELIX_API void caelix_renderer_destroy(CaelixRenderer* renderer);
+
+/* The camera of one render call, in world space. The voxel world is Y up and uses Unity's
+   convention: +X right, +Y up, +Z forward. right, up and forward must form an orthonormal basis.
+   Pixel (px, py), row 0 = the TOP row of the image, traces the ray from `position` in direction
+     ndc = ((px + 0.5) / width * 2 - 1, 1 - (py + 0.5) / height * 2)
+     dir = normalize(right * ndc.x * tan_half_fov_y * aspect + up * ndc.y * tan_half_fov_y + forward) */
+typedef struct CaelixCamera {
+  float position[3];
+  float pad0;
+  float right[3];
+  float pad1;
+  float up[3];
+  float pad2;
+  float forward[3];
+  float pad3;
+  float tan_half_fov_y;  /* tangent of half the VERTICAL field of view */
+  float aspect;          /* width / height */
+  float near_z, far_z;   /* distance range of the depth debug view only (no clipping) */
+} CaelixCamera;
+
+typedef enum CaelixDebugView {
+  CAELIX_VIEW_ALBEDO = 0,  /* material albedo; Lambert-shaded with CAELIX_RENDER_FLAG_SHADING */
+  CAELIX_VIEW_NORMAL = 1,  /* world normal * 0.5 + 0.5 */
+  CAELIX_VIEW_DEPTH = 2,   /* grey (t - near_z) / (far_z - near_z), clamped to [0, 1] */
+  CAELIX_VIEW_GROUP = 3,   /* hash colour of the render group of the hit */
+  CAELIX_VIEW_BRICK = 4,   /* hash colour of the brick of the hit (group and dense brick id) */
+  CAELIX_VIEW_STEPS = 5    /* heat map of the procedural candidates of the ray, 0 .. 64 */
+} CaelixDebugView;
+
+/* CaelixRenderOptions::flags */
+#define CAELIX_RENDER_FLAG_SHADING (1u << 0) /* Lambert shading with sun_dir on the albedo view */
+
+typedef struct CaelixRenderOptions {
+  uint32_t debug_view;  /* CaelixDebugView */
+  uint32_t flags;       /* CAELIX_RENDER_FLAG_* */
+  float sun_dir[3];     /* world-space direction TOWARD the sun; the library normalizes it */
+  float pad;
+  float sky_color[3];   /* colour of rays that hit nothing (every view) */
+  float pad2;
+} CaelixRenderOptions;
+
+/* The images of one render call. Depth, normal and motion targets are added in a later step; the
+   struct exists so that hosts fill it from day one. */
+typedef struct CaelixRenderTargets {
+  /* Required. Usage: STORAGE (written by the kernel as a storage image without a format qualifier,
+     so the format must support VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) and
+     TRANSFER_DST (before the scene's first TLAS build the image is cleared to the sky colour).
+     Written in VK_IMAGE_LAYOUT_GENERAL and left in GENERAL. */
+  CaelixTargetImage color;
+} CaelixRenderTargets;
+
+/* Records the frame's rendering into frame->command_buffer: a barrier from the target's layout to
+   GENERAL, the trace dispatch (8 x 8 pixels per workgroup) between two timestamps, and a barrier
+   from the kernel's writes to all later commands. Before the scene's first TLAS build it clears
+   the target to the sky colour instead of the dispatch. The renderer creates one image view per
+   target image and caches it (16 views; the least recently used view is destroyed once its last
+   frame is safe).
+   Returns CAELIX_ERROR_INVALID_ARGUMENT for a null argument, a target without image or size, an
+   unknown debug view, a frame number not above safe_frame_number, or a ninth frame in flight;
+   CAELIX_ERROR_UNSUPPORTED when the target format cannot be written as a storage image without a
+   format qualifier. */
+CAELIX_API CaelixResult caelix_renderer_render(CaelixRenderer* renderer, const CaelixFrameDesc* frame,
+                                               const CaelixRenderTargets* targets,
+                                               const CaelixCamera* camera,
+                                               const CaelixRenderOptions* options);
+
+/* Destroys every cached image view. Call it before the host destroys target images, for example
+   when it recreates its swapchain: a new image can get the handle of a destroyed one, and the
+   cache would then hand out a view of the destroyed image. Every frame that used the views must
+   have completed (for example after vkDeviceWaitIdle). NULL is ignored. */
+CAELIX_API void caelix_renderer_release_target_views(CaelixRenderer* renderer);
+
+/* GPU times of the newest frame whose timestamps were read back. The renderer reads them in a
+   render call whose safe_frame_number has reached that frame, so the values trail the current
+   frame by the number of frames in flight. */
+typedef struct CaelixGpuTimings {
+  float trace_ms;         /* the trace dispatch (or the sky clear) of that frame */
+  float flush_ms;         /* caelix_scene_flush of that frame; 0 when the flush recorded no work */
+  uint64_t frame_number;  /* the frame the values belong to; 0 = none yet */
+} CaelixGpuTimings;
+
+/* Fills *out. A NULL argument is ignored. All zero when the queue has no timestamp support. */
+CAELIX_API void caelix_renderer_get_gpu_timings(const CaelixRenderer* renderer,
+                                                CaelixGpuTimings* out);
+
 /* Reserved for later (not declared yet):
  *   caelix_scene_upload_brick_summaries - per-brick summaries for bricks that are known but not
  *                                         resident (slot state "summary-only").
  *   caelix_scene_poll_brick_requests    - bricks that the GPU asked for (slot state "requested").
- *   caelix_renderer_render              - records the frame's rendering into the host's command
- *                                         buffer.
  */
 
 #ifdef __cplusplus

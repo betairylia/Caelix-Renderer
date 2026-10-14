@@ -15,7 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _};
-use caelix_cxw::{CxwFile, DecodedSector, BLOCKS_IN_BRICK};
+use caelix_cxw::{CxwFile, DecodedSector, PlayerPose, BLOCKS_IN_BRICK};
 use caelix_sys::*;
 
 // The decoder's keys are passed to the library without a copy.
@@ -71,6 +71,8 @@ pub struct WorldLoader {
     upload_end: Option<Instant>,
     /// (file entity, first key) of the first decoded sectors with bricks.
     probes: Vec<(usize, [i32; 3])>,
+    /// The world record's player pose (format version 7 and later).
+    player_pose: Option<PlayerPose>,
 }
 
 impl WorldLoader {
@@ -80,6 +82,7 @@ impl WorldLoader {
         let file = CxwFile::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let world = file.world();
         log::info!("world {}: format version {}", path.display(), world.version);
+        let player_pose = world.player_pose;
         match world.player_pose {
             Some(p) => log::info!("player pose: position {:?} rotation {:?}", p.position, p.rotation),
             None => log::info!("player pose: none"),
@@ -140,7 +143,19 @@ impl WorldLoader {
             upload_start: None,
             upload_end: None,
             probes: Vec::new(),
+            player_pose,
         })
+    }
+
+    /// True once every brick is uploaded and every acceleration structure was up
+    /// to date after a flush that followed the load: the scene is complete on the GPU.
+    pub fn is_ready(&self) -> bool {
+        self.as_ready
+    }
+
+    /// The file's player pose, if it has one.
+    pub fn player_pose(&self) -> Option<PlayerPose> {
+        self.player_pose
     }
 
     /// Uploads decoded bricks until the staging ring is full or the channel is empty.

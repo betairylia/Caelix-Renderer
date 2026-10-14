@@ -85,7 +85,8 @@ void CreateGpu(Gpu& gpu, const char* app_name) {
                          CAELIX_FEATURE_SYNCHRONIZATION2 | CAELIX_FEATURE_DYNAMIC_RENDERING |
                          CAELIX_FEATURE_TIMELINE_SEMAPHORE | CAELIX_FEATURE_ACCELERATION_STRUCTURE |
                          CAELIX_FEATURE_RAY_QUERY | CAELIX_FEATURE_SHADER_INT64 |
-                         CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT;
+                         CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT |
+                         CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT;
   REQUIRE((flags & ~known) == 0);  // a new bit needs a translation here
   VkPhysicalDeviceFeatures f10{};
   VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -107,6 +108,9 @@ void CreateGpu(Gpu& gpu, const char* app_name) {
   if (flags & CAELIX_FEATURE_RAY_QUERY) ray_query.rayQuery = VK_TRUE;
   if (flags & CAELIX_FEATURE_SHADER_INT64) f10.shaderInt64 = VK_TRUE;
   if (flags & CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT) f12.scalarBlockLayout = VK_TRUE;
+  if (flags & CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT) {
+    f10.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+  }
 
   vkb::PhysicalDeviceSelector selector(gpu.instance);
   selector.set_minimum_version(1, 3)

@@ -6,20 +6,23 @@
 
 namespace caelix {
 
-// A compute pipeline whose only inputs are push constants: the kernels read and
-// write every buffer through buffer device addresses, so there are no descriptor
-// sets. Move-only; the destructor destroys the pipeline and its layout. The
+// A compute pipeline whose inputs are push constants and, optionally, one
+// descriptor set: the kernels read and write every buffer through buffer device
+// addresses, so only resources that have no address (acceleration structures,
+// images) need a descriptor set. Move-only; the destructor destroys the pipeline
+// and its layout (not the descriptor set layout, which the caller owns). The
 // caller is responsible for GPU lifetime: destroy it only when no pending GPU
 // work uses it.
 class ComputePipeline {
  public:
   ComputePipeline() = default;
   // Creates the shader module (entry point "main"), the layout with one push
-  // constant range of `push_bytes` (compute stage) and the pipeline. The module
-  // is only needed for pipeline creation and is destroyed right after it.
+  // constant range of `push_bytes` (compute stage) and, when `set_layout` is not
+  // null, that descriptor set layout as set 0, and the pipeline. The module is
+  // only needed for pipeline creation and is destroyed right after it.
   // Throws VulkanError.
   ComputePipeline(VkDevice device, std::span<const uint32_t> spirv, uint32_t push_bytes,
-                  const char* name);
+                  const char* name, VkDescriptorSetLayout set_layout = VK_NULL_HANDLE);
   ~ComputePipeline();
   ComputePipeline(ComputePipeline&& other) noexcept;
   ComputePipeline& operator=(ComputePipeline&& other) noexcept;
@@ -28,6 +31,8 @@ class ComputePipeline {
 
   bool valid() const { return pipeline_ != VK_NULL_HANDLE; }
   uint32_t push_bytes() const { return push_bytes_; }
+  VkPipeline pipeline() const { return pipeline_; }
+  VkPipelineLayout layout() const { return layout_; }
 
   // Binds the pipeline, pushes `size` bytes (must equal push_bytes()) and
   // dispatches `groups` x 1 x 1 workgroups.

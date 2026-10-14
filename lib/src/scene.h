@@ -4,6 +4,7 @@
 #include "device.h"
 #include "finalize.h"
 #include "gpu_buffer.h"
+#include "gpu_timer.h"
 #include "hash_map.h"
 #include "pipeline.h"
 #include "record_layout.h"
@@ -126,6 +127,23 @@ class Scene {
   bool EntityAlive(CaelixEntityId entity) const {
     return entity < entities_.size() && entities_[entity].alive;
   }
+
+  // What the renderer binds and reads. The addresses and the TLAS can change at
+  // every flush (pool growth, TLAS rebuild into a new block): read them after the
+  // flush of the frame that uses them.
+  Device& device() const { return device_; }
+  VkAccelerationStructureKHR tlas() const { return tlas_handle_; }
+  VkDeviceAddress page_table_address() const { return page_table_.address(); }
+  VkDeviceAddress slot_tables_address() const { return slot_tables_.address(); }
+  VkDeviceAddress group_infos_address() const { return group_infos_.address(); }
+  VkDeviceAddress entity_infos_address() const { return entity_infos_.address(); }
+  uint32_t records_per_page_shift() const;
+  uint32_t record_bytes() const { return layout_.record_bytes; }
+  uint32_t group_shift() const { return group_shift_; }
+  uint32_t encoding() const { return encoding_; }
+  // GPU time of the flush of `frame`, once that frame is safe. False when the
+  // flush recorded no work, was not measured, or is not resolved yet.
+  bool FlushMsForFrame(uint64_t frame, float& ms) const { return flush_timer_.MsForFrame(frame, ms); }
 
  private:
   struct Location {
@@ -255,6 +273,7 @@ class Scene {
   uint32_t pages_staged_ = 0;
   StagingRing staging_;
   ComputePipeline finalize_;
+  GpuTimer flush_timer_;  // brackets the work that a flush records
 
   // Acceleration structures.
   BlockAllocator as_pool_;

@@ -29,8 +29,9 @@ In `host-rs/`:
 `CAELIX_ABI_VERSION` is 2. Version 2 adds the scene API (`caelix_scene_*`):
 entities, raw brick upload and removal, a per-frame flush, stats and a brick
 query for inspection. The flush runs the finalize kernel and builds the
-acceleration structures (see below). There is no rendering yet. All calls on
-one scene (or on a scene and its device) are externally synchronized by the
+acceleration structures (see below). The renderer API (`caelix_renderer_*`,
+see "Renderer") traces the scene into the host's image. All calls on one scene
+(or on a scene, its renderer and its device) are externally synchronized by the
 host.
 
 Version 2 is still in development: the finalize step appended fields to
@@ -42,7 +43,11 @@ version bump. The acceleration structure step appended
 fields (`blas_count` .. `as_builds_pending`), four `CaelixBrickInfo` fields
 (`blas_address`, `blas_handle`, `entity_info_buffer`,
 `entity_info_offset_bytes`) and the function `caelix_scene_get_tlas`, also
-without a bump. Rebuild hosts against the current header.
+without a bump. The renderer step removed the temporary `caelix_clear_target`,
+added the renderer API and the feature bit
+`CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT` (bit 9,
+`shaderStorageImageWriteWithoutFormat`), also without a bump. Rebuild hosts
+against the current header.
 
 Scene model:
 
@@ -119,8 +124,7 @@ because every `vkCmdCopyBuffer` region has a fixed GPU cost.
 
 Each flush builds the acceleration structures after the finalize kernel
 (`Scene::PlanAccelerationStructures` and `RecordAccelerationStructureBuilds` in
-`lib/src/scene.cpp`). There is no trace kernel yet; the next step adds the
-ray query renderer that binds the TLAS.
+`lib/src/scene.cpp`). The renderer binds the TLAS (see "Renderer").
 
 - BLAS per render group: procedural AABB geometry
   (`VK_GEOMETRY_TYPE_AABBS_KHR`, `VK_GEOMETRY_OPAQUE_BIT_KHR`) over the
@@ -193,9 +197,13 @@ HLSL in `shaders/` is compiled at build time by DXC (`$VULKAN_SDK/Bin/dxc.exe`,
 an edit of an included header rebuilds the kernels that include it. The SPIR-V
 does not depend on the C++ configuration. `shaders/caelix_platform.hlsl` is the
 only file with DXC-specific syntax (buffer device address loads and stores,
-push constants, attributes); a Slang port replaces this header.
+push constants, descriptor bindings, attributes); a Slang port replaces this
+header. Storage images that are written without a format qualifier need
+`CAELIX_FORMAT_UNKNOWN` (`[[vk::image_format("unknown")]]`): without it DXC 1.8
+infers the format from the element type (`RWTexture2D<float4>` becomes
+`Rgba32f`), and it has no command-line switch to stop that.
 
-At scene creation the library loads each kernel by name. When the environment
+At scene creation (and renderer creation) the library loads each kernel by name. When the environment
 variable `CAELIX_SHADER_DIR` names a directory that contains `<name>.spv`, that
 file is used instead of the embedded array (logged at info level as
 `shader <name> loaded from <path>`), so a shader can be changed without
@@ -211,10 +219,73 @@ when that frame is safe. `caelix_scene_recycle(safe)` releases them without a fl
 that waits for a frame and then uploads before the next flush. Destroy every
 scene before `caelix_device_destroy`, with the device idle.
 
+When a flush records work, it brackets that work with two timestamp queries
+(`lib/src/gpu_timer.h`); the time is reported as `flush_ms` by
+`caelix_renderer_get_gpu_timings` (0 for a flush that recorded nothing).
+
+### Renderer
+
+`caelix_renderer_create(device, scene)` creates a renderer for one scene
+(`lib/src/renderer.cpp`). `caelix_renderer_render(renderer, frame, targets,
+camera, options)` records the frame's rendering. Call it after
+`caelix_scene_flush` of the same frame, with the same `CaelixFrameDesc`: the
+flush builds the TLAS that the render binds.
+
+- Trace kernel `shaders/caelix_trace_primary.hlsl`, `[numthreads(8, 8, 1)]`:
+  one primary ray per pixel, `RayQuery<RAY_FLAG_FORCE_OPAQUE>` through the
+  TLAS. For every procedural candidate it reads the group info
+  (`CandidateInstanceID()` = the group index) and the slot row of the dense
+  brick id (`CandidatePrimitiveIndex()`), skips bricks that are not resident,
+  and runs the brick DDA on the record. A hit inside `[TMin, CommittedRayT())`
+  is committed. Then it writes the albedo (or a debug view) to the colour
+  target. A miss writes the sky colour.
+- Brick DDA `shaders/caelix_brick_trace.hlsl`: a copy of Unity's
+  `CaelixBrickTrace.hlsl` (2-level occupancy DDA on the 8^3 brick, tight
+  bounds from record word 1, transparency by face bits). Every change is
+  marked `// NATIVE:`: no Unity includes (`caelix_block.hlsl` decodes the
+  block by the scene's encoding at run time); the record loads read through
+  the record's device address (`g_recordBase`, set per candidate, `brickBase`
+  0); `CaelixTraceBrickPrimitiveCore` takes the brick origin in entity-local
+  block coordinates as a parameter instead of deriving it from word 0 and the
+  render group macros; `half` = float, `UNITY_BRANCH` -> `CAELIX_BRANCH`.
+- Inputs: one descriptor set (binding 0 the TLAS, binding 1 the colour target
+  as a storage image without a format qualifier) and one push constant, the
+  device address of a 256-byte `CaelixFrameConstants` block
+  (`shaders/caelix_frame.hlsl`, `lib/src/frame_constants.h`): camera, target
+  size, the addresses of the page table, slot tables, group infos and entity
+  infos, the record layout, group shift, encoding, view, flags, sun and sky.
+- Per-frame resources: a ring of slots (descriptor set + host-visible constants
+  buffer), 3 at first, grown up to 8 when a slot's frame is not safe yet.
+- Image views: one per target image, cached (16; the least recently used view
+  is destroyed once its frame is safe). `caelix_renderer_release_target_views`
+  destroys all of them; call it before the host destroys target images (a new
+  image can reuse the handle of a destroyed one).
+- Before the scene's first TLAS build, the render clears the target to the sky
+  colour (`vkCmdClearColorImage`), so the target needs `STORAGE` and
+  `TRANSFER_DST` usage.
+- Debug views (`CaelixRenderOptions::debug_view`): albedo (optionally Lambert
+  shaded with `sun_dir`), world normal, depth (`near_z`..`far_z`), hash colour
+  of the group, hash colour of the brick, and a heat map of the procedural
+  candidates per ray (0..64). Albedo in the packed encoding: opaque rgb5,
+  emissive rgb4, glass a fixed tint (0.6, 0.8, 1.0), air magenta (a primary
+  ray should never report an air boundary). In the block-ID encoding the
+  colour is a pastel hash of the id.
+- GPU timings: two timestamps around the dispatch (or the clear), read back in
+  a later render call whose safe frame has reached that frame;
+  `caelix_renderer_get_gpu_timings` returns `trace_ms`, `flush_ms` and the
+  frame they belong to.
+
+Pixel mapping: pixel (px, py), row 0 = the top row,
+`ndc = ((px + 0.5) / w * 2 - 1, 1 - (py + 0.5) / h * 2)`, direction
+`normalize(right * ndc.x * tan_half_fov_y * aspect + up * ndc.y * tan_half_fov_y + forward)`.
+The camera basis is Unity's (+X right, +Y up, +Z forward); the host's
+`camera.rs` builds it from Unity's `eulerAngles` (see "Running the host").
+
 ### Layout contract
 
 A render call receives the target image in the layout that
 `CaelixTargetImage::layout` names, and leaves it in `VK_IMAGE_LAYOUT_GENERAL`.
+Its last barrier makes the kernel's writes available to all later commands.
 The host transitions it from `GENERAL` for present (or for its own use).
 
 ## Build
@@ -263,6 +334,14 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   rebuild is safe; a 4 MiB scratch budget with 2000 one-brick groups spreads
   the builds over two flushes; a transform change rebuilds only the TLAS and
   the entity info row shows the old rows as `prev` for exactly one flush.
+- `caelix_trace_test`: the trace kernel, by readback of a 256x256 RGBA8 storage
+  image. Before any brick the render clears to the sky colour. One pure-red
+  opaque brick at key (0, 0, 0), camera at (4, 4, -20) looking +Z: the centre
+  pixel is red, the corners are sky, the normal view shows (0.5, 0.5, 0) (the
+  -Z face), the brick view and the step view are not sky at the centre, every
+  other view runs without validation messages, `caelix_renderer_get_gpu_timings`
+  reports a resolved frame with `trace_ms > 0`, and an unknown debug view is
+  rejected. The random opaque scene: some pixels hit and none is magenta.
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -289,6 +368,25 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   (`CaelixSceneDesc::staging_bytes`). Default 64, minimum 4.
 - `--group-shift <N>`: render group edge in bricks = `1 << N`. Default 4
   (16^3). The library implements 1..5.
+- `--pose <X,Y,Z,PITCH,YAW>`: initial camera pose in Unity's terms: position,
+  `eulerAngles.x` (pitch, positive looks down) and `eulerAngles.y` (yaw), in
+  degrees. Default: the world's player pose (format version 7), else
+  (0, 64, -128) with pitch 15 and yaw 0.
+- `--fov <DEGREES>`: vertical field of view. Default 60.
+- `--view <albedo|normal|depth|group|brick|steps>`: the debug view. Default
+  `albedo`.
+- `--no-shading`: albedo without Lambert shading.
+- `--screenshot <PATH.png>`: write a PNG of the swapchain image. With `--world`
+  it is taken 3 frames after the world is complete on the GPU (every brick
+  uploaded and `as_builds_pending == 0`); without `--world` at frame 10.
+- `--exit-after-screenshot`: exit once the PNG is written.
+
+Camera convention (`caelix-app/src/camera.rs`, Unity's): for yaw θ and pitch φ,
+`forward = (sin θ cos φ, -sin φ, cos θ cos φ)`, `right = (cos θ, 0, -sin θ)`,
+`up = (sin θ sin φ, cos φ, cos θ sin φ)`. Free camera: W/S/A/D move along
+forward and right, Q/E move down and up along world Y, Shift multiplies the
+speed by 8, the mouse looks around while the right button is held (0.1 degree
+per pixel), and the scroll wheel scales the speed (default 100 units/s).
 
 The host creates one `CaelixScene` after it adopts the device. With `--world`
 it adds one scene entity per file entity, then streams the bricks:
@@ -303,7 +401,15 @@ it adds one scene entity per file entity, then streams the bricks:
   sector waits for the next frame), then exactly one `caelix_scene_flush` into
   the frame's command buffer. Frame numbers start at 1; `safe_frame_number` is
   the frame that last used the frame slot whose fence `begin_frame` waited for.
-- The window keeps showing the temporary clear colour. When the decoder has
+  Then `caelix_renderer_render` traces the scene into the swapchain image
+  (the swapchain has `STORAGE`, `TRANSFER_DST` and `TRANSFER_SRC` usage), and
+  `end_frame` presents. When the swapchain was recreated, the host calls
+  `caelix_renderer_release_target_views` first.
+- The window title shows the GPU times once per second
+  (`Caelix Renderer | trace 0.19 ms | flush 0.00 ms | 144 fps`); the same line
+  is logged at info level every 120 frames and when a screenshot is written.
+  Presentation uses FIFO, so the frame rate is limited by the display.
+- When the decoder has
   finished and every brick is uploaded, the host logs one summary (entities,
   groups, resident bricks, record pages, GPU memory, decode and upload time,
   upload frames, bricks/s, the acceleration structure stats, the full

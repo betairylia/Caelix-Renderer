@@ -13,10 +13,13 @@
 //! 2. The caller records its work. The work must leave the image in
 //!    `VK_IMAGE_LAYOUT_GENERAL`.
 //! 3. [`Context::end_frame`] transitions the image to `PRESENT_SRC_KHR`, submits
-//!    and presents.
+//!    and presents. After [`Context::request_readback`], the next `end_frame` also
+//!    copies the image to a host buffer; [`Context::take_readback`] returns the
+//!    pixels once that frame has completed.
 
 mod debug;
 mod device;
+mod readback;
 mod swapchain;
 
 use std::ffi::{c_void, CString};
@@ -56,6 +59,8 @@ pub struct Features {
     pub ray_query: bool,
     pub shader_int64: bool,
     pub scalar_block_layout: bool,
+    /// VkPhysicalDeviceFeatures::shaderStorageImageWriteWithoutFormat.
+    pub storage_image_write_without_format: bool,
 }
 
 /// Raw handles for a library that adopts this device. All as u64 / pointer, no ash types.
@@ -149,6 +154,13 @@ pub struct Context {
     needs_recreate: bool,
     /// Swapchain image index between begin_frame and end_frame.
     acquired: Option<u32>,
+    /// Every frame with a number <= this has completed (fences waited so far).
+    completed_frame: u64,
+    /// Incremented every time the swapchain is recreated.
+    swapchain_generation: u64,
+    /// The next end_frame copies the image to a host buffer.
+    readback_requested: bool,
+    readback: Option<readback::PendingReadback>,
 }
 
 impl Context {
@@ -219,6 +231,10 @@ impl Context {
             height,
             needs_recreate: false,
             acquired: None,
+            completed_frame: 0,
+            swapchain_generation: 0,
+            readback_requested: false,
+            readback: None,
         };
         context.create_frame_sync()?;
         context.ensure_render_finished_semaphores()?;
@@ -240,6 +256,36 @@ impl Context {
     /// Number of frames the CPU may record ahead of the GPU (frame slots).
     pub fn frames_in_flight(&self) -> usize {
         FRAMES_IN_FLIGHT
+    }
+
+    /// Incremented every time the swapchain is recreated (its images are new). A
+    /// library that caches views of the images must drop them when this changes.
+    pub fn swapchain_generation(&self) -> u64 {
+        self.swapchain_generation
+    }
+
+    /// Asks the next `end_frame` to copy its image into a host buffer (one
+    /// request at a time; ignored while a copy is pending).
+    pub fn request_readback(&mut self) {
+        if self.readback.is_none() {
+            self.readback_requested = true;
+        }
+    }
+
+    /// The pixels of the requested readback, once its frame has completed (about
+    /// `frames_in_flight` frames after the request): RGBA8, top row first, with
+    /// width and height. `None` while nothing is ready.
+    pub fn take_readback(&mut self) -> Result<Option<(Vec<u8>, u32, u32)>, Error> {
+        match &self.readback {
+            Some(pending) if pending.frame <= self.completed_frame => {
+                let pending = self.readback.take().expect("checked above");
+                let result = pending.read(&self.device);
+                pending.destroy(&self.device);
+                let pixels = result?;
+                Ok(Some((pixels, pending.width, pending.height)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Marks the swapchain for recreation on the next `begin_frame`.
@@ -268,6 +314,7 @@ impl Context {
         // SAFETY: the fence belongs to this device.
         unsafe { self.device.wait_for_fences(&[in_flight], true, u64::MAX) }
             .map_err(vk_error("vkWaitForFences"))?;
+        self.completed_frame = self.completed_frame.max(self.frames[self.frame_index].submitted_frame);
 
         if self.needs_recreate || !self.swapchain.is_valid() {
             self.recreate_swapchain()?;
@@ -381,13 +428,41 @@ impl Context {
             .command_buffer_infos(&command_buffers)
             .signal_semaphore_infos(&signal);
 
+        // A requested readback replaces the GENERAL -> PRESENT barrier with
+        // GENERAL -> TRANSFER_SRC, the copy, and TRANSFER_SRC -> PRESENT.
+        let mut copy = None;
+        if self.readback_requested {
+            self.readback_requested = false;
+            let extent = self.swapchain.extent();
+            match readback::rgba8_order(self.swapchain.format()) {
+                Some(bgra) => {
+                    copy = Some(readback::PendingReadback::new(
+                        &self.instance,
+                        &self.device,
+                        self.physical_device,
+                        extent.width,
+                        extent.height,
+                        bgra,
+                        recording_frame,
+                    )?);
+                }
+                None => log::warn!(
+                    "readback skipped: swapchain format {:?} is not RGBA8 or BGRA8",
+                    self.swapchain.format()
+                ),
+            }
+        }
+
         // SAFETY: the command buffer is in the recording state (begin_frame), and
         // every handle belongs to this device.
         unsafe {
-            self.device.cmd_pipeline_barrier2(
-                sync.command_buffer,
-                &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_present)),
-            );
+            match &copy {
+                Some(pending) => pending.record(&self.device, sync.command_buffer, image),
+                None => self.device.cmd_pipeline_barrier2(
+                    sync.command_buffer,
+                    &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_present)),
+                ),
+            }
             self.device
                 .end_command_buffer(sync.command_buffer)
                 .map_err(vk_error("vkEndCommandBuffer"))?;
@@ -396,6 +471,9 @@ impl Context {
                 .map_err(vk_error("vkQueueSubmit2"))?;
         }
         self.frames[self.frame_index].submitted_frame = recording_frame;
+        if copy.is_some() {
+            self.readback = copy;
+        }
 
         let swapchains = [self.swapchain.handle()];
         let image_indices = [image_index];
@@ -495,6 +573,7 @@ impl Context {
         )?;
         self.ensure_render_finished_semaphores()?;
         self.needs_recreate = false;
+        self.swapchain_generation += 1;
         Ok(())
     }
 }
@@ -506,6 +585,9 @@ impl Drop for Context {
         // destroyed in reverse creation order; the debug messenger goes last
         // before the instance so it reports every destruction.
         unsafe {
+            if let Some(pending) = self.readback.take() {
+                pending.destroy(&self.device);
+            }
             for semaphore in self.render_finished.drain(..) {
                 self.device.destroy_semaphore(semaphore, None);
             }

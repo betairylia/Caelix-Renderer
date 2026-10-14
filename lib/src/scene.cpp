@@ -256,6 +256,7 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
   const std::vector<uint32_t> finalize_spirv = LoadShader("caelix_finalize");
   scene->finalize_ = ComputePipeline(vk_device, finalize_spirv, sizeof(FinalizePush),
                                      "caelix_finalize");
+  scene->flush_timer_ = GpuTimer(device);
   CAELIX_LOGI("scene created: staging %llu bytes, %u records per page (%llu bytes), group %u^3 "
               "bricks, record %u bytes, %s encoding, build scratch %llu bytes",
               static_cast<unsigned long long>(staging_bytes), records_per_page,
@@ -1169,6 +1170,7 @@ void Scene::Recycle(uint64_t safe_frame) {
   safe_frame_ = std::max(safe_frame_, safe_frame);
   staging_.Recycle(safe_frame_);
   as_pool_.Recycle(safe_frame_);
+  flush_timer_.Resolve(safe_frame_);
   std::erase_if(deferred_buffers_,
                 [this](const DeferredBuffer& deferred) { return deferred.frame <= safe_frame_; });
 }
@@ -1321,6 +1323,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
   if (!pending_.empty() || !growth.empty() || !fills_.empty() || !aabb_moves_.empty() ||
       dispatch_count > 0 || as_planned) {
     staging_.FlushHostWrites();
+    flush_timer_.Begin(cmd, frame, safe_frame_);
 
     // 6. Earlier commands complete before this flush writes: shader reads of reused
     //    records and rows, and traversal of acceleration structures and builds of
@@ -1370,8 +1373,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
       push.entity_infos = entity_infos_.address();
       push.group_grids = grids_.address();
       push.aabb_pool = aabbs_.address();
-      push.records_per_page_shift = static_cast<uint32_t>(
-          std::countr_zero(static_cast<uint32_t>(records_.page_bytes() / layout_.record_bytes)));
+      push.records_per_page_shift = records_per_page_shift();
       push.record_bytes = layout_.record_bytes;
       push.group_shift = group_shift_;
       push.encoding = encoding_;
@@ -1397,6 +1399,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
     if (as_planned) {
       RecordAccelerationStructureBuilds(cmd);
     }
+    flush_timer_.End(cmd);
   }
 
   // 12. Close the window.
@@ -1868,6 +1871,11 @@ CaelixResult Scene::QueryBrick(CaelixEntityId entity_id, CaelixBrickKey key,
   out.entity_info_buffer = HandleToU64(entity_infos_.buffer());
   out.entity_info_offset_bytes = static_cast<uint64_t>(entity_id) * sizeof(EntityInfo);
   return CAELIX_OK;
+}
+
+uint32_t Scene::records_per_page_shift() const {
+  return static_cast<uint32_t>(
+      std::countr_zero(static_cast<uint32_t>(records_.page_bytes() / layout_.record_bytes)));
 }
 
 void Scene::GetTlas(uint64_t& handle, uint64_t& address) const {

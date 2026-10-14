@@ -8,7 +8,8 @@
 namespace caelix {
 
 ComputePipeline::ComputePipeline(VkDevice device, std::span<const uint32_t> spirv,
-                                 uint32_t push_bytes, const char* name)
+                                 uint32_t push_bytes, const char* name,
+                                 VkDescriptorSetLayout set_layout)
     : device_(device), push_bytes_(push_bytes) {
   VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
   module_info.codeSize = spirv.size_bytes();
@@ -24,6 +25,8 @@ ComputePipeline::ComputePipeline(VkDevice device, std::span<const uint32_t> spir
   VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   layout_info.pushConstantRangeCount = push_bytes_ > 0 ? 1u : 0u;
   layout_info.pPushConstantRanges = &range;
+  layout_info.setLayoutCount = set_layout != VK_NULL_HANDLE ? 1u : 0u;
+  layout_info.pSetLayouts = &set_layout;
   result = vkCreatePipelineLayout(device_, &layout_info, nullptr, &layout_);
   if (result != VK_SUCCESS) {
     vkDestroyShaderModule(device_, module, nullptr);

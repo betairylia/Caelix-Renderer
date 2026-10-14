@@ -103,14 +103,17 @@ impl Swapchain {
                 result: "no surface formats".into(),
             })?;
 
-        if !caps.supported_usage_flags.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+        // TRANSFER_DST: the renderer clears the image before the scene has a TLAS.
+        // TRANSFER_SRC: screenshots (Context::request_readback).
+        let transfer = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
+        if !caps.supported_usage_flags.contains(transfer) {
             return Err(Error::Vulkan {
                 call: "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
-                result: "surface does not support TRANSFER_DST usage".into(),
+                result: "surface does not support TRANSFER_DST and TRANSFER_SRC usage".into(),
             });
         }
-        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST;
-        // STORAGE is for the compute kernel that will write the swapchain image.
+        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | transfer;
+        // STORAGE: the trace kernel writes the swapchain image.
         let format_properties = unsafe {
             instance.get_physical_device_format_properties(physical_device, surface_format.format)
         };

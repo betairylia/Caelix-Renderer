@@ -20,6 +20,14 @@ size_t caelix_abi_c99_touch(void) {
   CaelixFrameDesc frame = {0, 1, 0};
   CaelixSceneStats stats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   CaelixBrickInfo info = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  CaelixCamera camera = {{0.0f, 0.0f, 0.0f}, 0.0f, {1.0f, 0.0f, 0.0f}, 0.0f, {0.0f, 1.0f, 0.0f},
+                         0.0f, {0.0f, 0.0f, 1.0f}, 0.0f, 0.577f, 1.0f, 0.1f, 1000.0f};
+  CaelixRenderOptions options = {CAELIX_VIEW_ALBEDO, CAELIX_RENDER_FLAG_SHADING, {0.0f, 1.0f, 0.0f},
+                                 0.0f, {0.5f, 0.7f, 0.9f}, 0.0f};
+  CaelixRenderTargets targets = {{0, 0, 0, 0, 0}};
+  CaelixGpuTimings timings = {0.0f, 0.0f, 0};
+  CaelixDebugView view = CAELIX_VIEW_STEPS;
+  CaelixRenderer* renderer = NULL;
   CaelixEntityId entity = CAELIX_INVALID_ENTITY;
   CaelixLogCallback log_callback = NULL;
   CaelixLogLevel level = CAELIX_LOG_INFO;
@@ -28,17 +36,18 @@ size_t caelix_abi_c99_touch(void) {
   size_t sum = sizeof(version) + sizeof(requirements) + sizeof(adopt) + sizeof(target) +
                sizeof(scene_desc) + sizeof(entity_desc) + sizeof(key) + sizeof(frame) +
                sizeof(stats) + sizeof(info) + sizeof(entity) + sizeof(log_callback) +
-               sizeof(level) + sizeof(result);
+               sizeof(level) + sizeof(result) + sizeof(camera) + sizeof(options) +
+               sizeof(targets) + sizeof(timings) + sizeof(view) + sizeof(renderer);
   /* Take the address of every function so a declaration typo fails to compile. Casts between
      function pointer types are valid C; the pointers are never called. */
-  AnyFn functions[18];
+  AnyFn functions[23];
   functions[0] = (AnyFn)caelix_get_version;
   functions[1] = (AnyFn)caelix_version_string;
   functions[2] = (AnyFn)caelix_set_log_callback;
   functions[3] = (AnyFn)caelix_get_device_requirements;
   functions[4] = (AnyFn)caelix_device_adopt;
   functions[5] = (AnyFn)caelix_device_destroy;
-  functions[6] = (AnyFn)caelix_clear_target;
+  functions[6] = (AnyFn)caelix_renderer_create;
   functions[7] = (AnyFn)caelix_scene_destroy;
   functions[8] = (AnyFn)caelix_scene_add_entity;
   functions[9] = (AnyFn)caelix_scene_remove_entity;
@@ -50,7 +59,12 @@ size_t caelix_abi_c99_touch(void) {
   functions[15] = (AnyFn)caelix_scene_get_stats;
   functions[16] = (AnyFn)caelix_scene_query_brick;
   functions[17] = (AnyFn)caelix_scene_get_tlas;
-  sum += sizeof(functions) + (create != NULL ? 1u : 0u) + (functions[17] != NULL ? 1u : 0u);
+  functions[18] = (AnyFn)caelix_renderer_destroy;
+  functions[19] = (AnyFn)caelix_renderer_render;
+  functions[20] = (AnyFn)caelix_renderer_release_target_views;
+  functions[21] = (AnyFn)caelix_renderer_get_gpu_timings;
+  functions[22] = (AnyFn)caelix_get_device_requirements;
+  sum += sizeof(functions) + (create != NULL ? 1u : 0u) + (functions[22] != NULL ? 1u : 0u);
   sum += (size_t)key.x + (size_t)frame.frame_number + (size_t)info.resident;
   return sum;
 }

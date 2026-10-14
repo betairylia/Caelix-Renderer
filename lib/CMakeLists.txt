@@ -5,8 +5,11 @@ add_library(caelix_renderer SHARED
   src/device.cpp
   src/device.h
   src/finalize.h
+  src/frame_constants.h
   src/gpu_buffer.cpp
   src/gpu_buffer.h
+  src/gpu_timer.cpp
+  src/gpu_timer.h
   src/hash_map.h
   src/log.cpp
   src/log.h
@@ -15,6 +18,8 @@ add_library(caelix_renderer SHARED
   src/record_layout.h
   src/record_pool.cpp
   src/record_pool.h
+  src/renderer.cpp
+  src/renderer.h
   src/row_pool.cpp
   src/row_pool.h
   src/scene.cpp
@@ -57,4 +62,8 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
   SOURCES
     ${PROJECT_SOURCE_DIR}/shaders/caelix_platform.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/caelix_record.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_finalize.hlsl)
+    ${PROJECT_SOURCE_DIR}/shaders/caelix_block.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/caelix_frame.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/caelix_brick_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/caelix_finalize.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/caelix_trace_primary.hlsl)
