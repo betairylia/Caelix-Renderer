@@ -1,0 +1,4 @@
+[env]
+# Machine-specific: libclang for bindgen. Override with your own LIBCLANG_PATH if different.
+# Use the x64 directory: Llvm/bin holds a 32-bit libclang.dll that a 64-bit bindgen cannot load.
+LIBCLANG_PATH = "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin"

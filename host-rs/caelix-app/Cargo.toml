@@ -1,0 +1,8 @@
+[package]
+name = "caelix-app"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone Rust host for the Caelix native renderer."
+
+[dependencies]
+caelix-sys = { path = "../caelix-sys" }
