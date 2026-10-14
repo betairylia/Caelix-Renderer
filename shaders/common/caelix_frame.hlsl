@@ -56,9 +56,8 @@ struct CaelixFrameConstants {
   float t_max;              // 424  bounce ray length and the "no hit" hit distance (1e4)
   float sun_solid_angle;    // 428  2 pi (1 - sun_cos_radius): solid angle of the sun cone
   uint denoised;            // 432  1 = NRD ran this frame (composite: validation view)
-  uint pad0;                // 436
-  uint pad1;                // 440
-  uint pad2;                // 444
+  uint bounce_count_transparent;  // 436  delta chain interfaces, 0..15
+  uint64_t materials;       // 440  CaelixMaterial (48 B) by block code (common/caelix_material.hlsl)
   float4 hit_dist_params;   // 448  REBLUR hit distance normalization A, B, C (w unused)
 };
 
@@ -76,6 +75,8 @@ static const uint kViewSteps = 5;
 static const uint kViewNrdValidation = 6;  // path trace mode: NRD's validation layer
 static const uint kViewNrdDiff = 7;        // path trace mode: denoised diffuse radiance
 static const uint kViewMotion = 8;         // path trace mode: the motion vector of the primary hit
+static const uint kViewMaterial = 9;       // primary mode: the material table's albedo, tinted by kind
+static const uint kViewNrdSpec = 10;       // path trace mode: denoised specular radiance
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

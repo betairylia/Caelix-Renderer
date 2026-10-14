@@ -334,6 +334,48 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
   return CAELIX_OK;
 }
 
+CAELIX_API CaelixResult caelix_scene_set_materials(CaelixScene* scene, const CaelixMaterial* entries,
+                                                   uint32_t count) {
+  constexpr const char* kFunction = "caelix_scene_set_materials";
+  caelix::Scene* impl = SceneFor(scene, kFunction);
+  if (impl == nullptr) {
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  try {
+    return impl->SetMaterials(entries, count);
+  } catch (...) {
+    return TranslateException(kFunction);
+  }
+}
+
+CAELIX_API CaelixResult caelix_scene_set_glass_palette(CaelixScene* scene,
+                                                       const CaelixMaterial* entries, uint32_t count) {
+  constexpr const char* kFunction = "caelix_scene_set_glass_palette";
+  caelix::Scene* impl = SceneFor(scene, kFunction);
+  if (impl == nullptr) {
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  try {
+    return impl->SetGlassPalette(entries, count);
+  } catch (...) {
+    return TranslateException(kFunction);
+  }
+}
+
+CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint32_t code,
+                                                  CaelixMaterial* out) {
+  constexpr const char* kFunction = "caelix_scene_get_material";
+  if (scene == nullptr || scene->impl == nullptr) {
+    CAELIX_LOGE("%s: scene is null", kFunction);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  if (out == nullptr) {
+    CAELIX_LOGE("%s: out is null", kFunction);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  return scene->impl->GetMaterial(code, *out);
+}
+
 CAELIX_API CaelixResult caelix_renderer_create(CaelixDevice* device, CaelixScene* scene,
                                                CaelixRenderer** out_renderer) {
   constexpr const char* kFunction = "caelix_renderer_create";

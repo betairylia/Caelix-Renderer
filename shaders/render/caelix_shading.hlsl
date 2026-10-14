@@ -1,16 +1,18 @@
-// Shading helpers of the trace and composite kernels: block colours (debug views
-// and materials), the random number stream, the opaque shading rule of Unity's
-// path tracer (CaelixShadeVoxelHit, opaque branch) and the procedural sky.
+// Shading helpers of the trace and composite kernels: block colours (debug views),
+// the random number stream, the shading rule of Unity's path tracer
+// (CaelixShadeVoxelHit, opaque and transparent branches), the interface decision of
+// the delta chain, the medium extinction and the procedural sky. Materials come
+// from the scene's material table (common/caelix_material.hlsl, GET_MATERIAL).
 //
 // Ported from Unity (Caelix/Runtime/Rendering/Shaders):
-//   Utils/Utils.hlsl                      K_T_MAX, K_RAY_ORIGIN_PUSH_OFF, FresnelReflectAmountOpaque
+//   Utils/Utils.hlsl                      K_T_MAX, K_RAY_ORIGIN_PUSH_OFF, FresnelReflectAmountOpaque,
+//                                         FresnelReflectAmountTransparent
 //   Utils/BlueNoise.hlsl                  RandomFloat01 / RandomUnitVector semantics (inout state)
-//   def/CaelixPackedSceneMaterial.hlsl    the packed material decode
-//   PathTrace_full/CaelixPathTraceCommon.hlsl  CaelixShadeVoxelHit, CaelixSanitizeRadiance
+//   PathTrace_full/CaelixPathTraceCommon.hlsl  CaelixShadeVoxelHit, AdvanceDeltaRay (interface),
+//                                         CaelixMediumExtinction, CaelixSanitizeRadiance
 // Differences, all marked NATIVE: the random stream is a hash + xorshift per pixel
-// (Unity samples a spatio-temporal blue-noise texture); a transparent block is
-// shaded as an opaque diffuse surface with a fixed tint (the delta chain through
-// glass comes in a later step); the sky is procedural (Unity samples a cubemap).
+// (Unity samples a spatio-temporal blue-noise texture); the sky is procedural
+// (Unity samples a cubemap).
 #ifndef CAELIX_SHADING_HLSL
 #define CAELIX_SHADING_HLSL
 
@@ -18,6 +20,7 @@
 #include "common/caelix_record.hlsl"
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
+#include "common/caelix_material.hlsl"
 
 static const float K_PI = 3.1415926535f;
 static const float K_TWO_PI = 6.283185307f;
@@ -27,7 +30,7 @@ static const float K_RAY_ORIGIN_PUSH_OFF = 0.002f;
 static const float kHalfMax = 65504.0f;
 
 static const float3 kAirColor = float3(1.0f, 0.0f, 1.0f);     // air hit: should not happen
-static const float3 kGlassTint = float3(0.6f, 0.8f, 1.0f);
+static const float3 kGlassTint = float3(0.6f, 0.8f, 1.0f);  // debug views only
 
 // ---------------------------------------------------------------------------
 // Block colours
@@ -67,46 +70,6 @@ float3 BlockAlbedo(uint v) {
     return id == 0u ? kAirColor : Pastel(HashU32(id | 0x10000u));
   }
   return Pastel(HashU32(v & 0x7FFFu));
-}
-
-// ---------------------------------------------------------------------------
-// Materials
-
-struct CaelixMaterial {
-  float3 albedo;
-  float3 emission;
-  float smoothness;
-  float metallic;
-  float ior;
-};
-
-// The lighting material of a block value. Packed encoding (Unity's
-// GetMaterial_Color): opaque rgb5 / 31, emissive rgb4 / 15 with
-// emission = albedo * 2^(3 * strength) (CAELIX_PACKED_EMISSION_SCALE = 1),
-// smoothness 0, metallic 0, IOR 1.5. Block-ID encoding: the pastel hash colour,
-// no emission (the native library has no material table yet).
-// NATIVE: a transparent block (glass, also an air boundary) is an opaque diffuse
-// surface with kGlassTint and no emission until the glass step ports the delta
-// chain.
-CaelixMaterial DecodeMaterial(uint v) {
-  CaelixMaterial m;
-  m.smoothness = 0.0f;
-  m.metallic = 0.0f;
-  m.ior = 1.5f;
-  m.emission = float3(0.0f, 0.0f, 0.0f);
-  if (!IsOpaque(int(v))) {
-    m.albedo = kGlassTint;
-  } else if (g_blockEncoding == kEncodingPacked) {
-    if ((v & 0x8000u) != 0u) {
-      m.albedo = float3((v >> 10) & 31u, (v >> 5) & 31u, v & 31u) / 31.0f;
-    } else {
-      m.albedo = float3((v >> 10) & 15u, (v >> 6) & 15u, (v >> 2) & 15u) / 15.0f;
-      m.emission = m.albedo * exp2(3.0f * float(v & 3u));
-    }
-  } else {
-    m.albedo = Pastel(HashU32(v & 0x7FFFu));
-  }
-  return m;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,27 +129,119 @@ float FresnelReflectAmountOpaque(float n1, float n2, float3 incident, float3 nor
   return r0 + (1.0f - r0) * xx * xx * x;
 }
 
+// Unity Utils.hlsl: Schlick's approximation for an interface from a medium of ior n1
+// into one of ior n2. When n1 > n2 the cosine of the transmitted direction is used,
+// and past the critical angle it returns 1 (total internal reflection).
+float FresnelReflectAmountTransparent(float n1, float n2, float3 incident, float3 normal) {
+  float r0 = (n1 - n2) / (n1 + n2);
+  r0 *= r0;
+  float cos_x = -dot(normal, incident);
+  if (n1 > n2) {
+    const float n = n1 / n2;
+    const float sin_t2 = n * n * (1.0f - cos_x * cos_x);
+    if (sin_t2 >= 1.0f) {
+      return 1.0f;
+    }
+    cos_x = sqrt(1.0f - sin_t2);
+  }
+  const float x = 1.0f - cos_x;
+  const float xx = x * x;
+  return r0 + (1.0f - r0) * xx * xx * x;
+}
+
+// Unity CaelixMediumExtinction: the transmission of a straight segment of length t
+// inside the transparent medium `medium` (a face-free transparent id; 0 = air:
+// nothing). A miss has t = 0, so the sky is never attenuated.
+float3 MediumExtinction(uint medium, float t) {
+  if (medium == 0u) {
+    return float3(1.0f, 1.0f, 1.0f);
+  }
+  const CaelixMaterial m = GET_MATERIAL(medium);
+  return exp(-(1.0f - m.albedo) * t * m.extinction);
+}
+
+// One reflect-or-refract decision at a transparent interface, shared by the delta
+// chain (Unity AdvanceDeltaRay) and the transparent branch of ShadeVoxelHit: a ray
+// in medium `source` (0 = air) meets a voxel of transparent id `destination` (ior
+// `destination_ior`) through a face with world normal `normal`, which is flipped
+// against the ray. Refraction is chosen when it exists and RandomFloat01 >= the
+// Fresnel reflectance; the random number is drawn only when refraction exists, as
+// in Unity (k = 1: the probability carries the Fresnel weight).
+struct CaelixInterface {
+  float3 normal;     // flipped against the incoming ray
+  float3 direction;  // the chosen direction, normalized
+  bool refracted;
+  bool can_refract;  // false: total internal reflection
+  uint medium;       // the medium after the interface: destination when refracted, else source
+};
+
+CaelixInterface CrossInterface(uint source, uint destination, float destination_ior,
+                               float3 ray_direction, float3 normal, inout uint rng) {
+  CaelixInterface it;
+  it.normal = SafeNormalize(normal);
+  if (dot(ray_direction, it.normal) > 0.0f) {
+    it.normal = -it.normal;
+  }
+  const float source_ior = source != 0u ? GET_MATERIAL(source).ior : 1.0f;
+  const float target_ior = destination != 0u ? destination_ior : 1.0f;
+  const float eta = source_ior / target_ior;
+  const float3 reflection = reflect(ray_direction, it.normal);
+  const float3 refraction = refract(ray_direction, it.normal, eta);
+  it.can_refract = dot(refraction, refraction) > 0.000001f;
+  const float fresnel = it.can_refract
+                            ? FresnelReflectAmountTransparent(source_ior, target_ior, ray_direction, it.normal)
+                            : 1.0f;
+  it.refracted = false;
+  if (it.can_refract) {
+    it.refracted = RandomFloat01(rng) >= fresnel;
+  }
+  it.direction = SafeNormalize(it.refracted ? refraction : reflection);
+  it.medium = it.refracted ? destination : source;
+  return it;
+}
+
 struct CaelixShadeResult {
   float3 albedo;
   float3 emission;
   float3 bounce_origin;
   float3 bounce_direction;
-  bool specular_lobe;  // the bounce sampled the specular lobe
+  bool specular_lobe;  // the bounce sampled the specular lobe (always at a transparent block)
   float k;             // lobe probability divisor (1, as in Unity)
-  float roughness;     // NRD's linear roughness of the specular lobe: 1 - smoothness
+  float roughness;     // NRD's linear roughness of the lobe: 1 - smoothness; 0 at a transparent block
 };
 
-// Unity CaelixShadeVoxelHit, opaque branch: albedo and emission of the block,
-// specular chance lerp(metallic, 1, fresnel * smoothness), cosine-weighted diffuse
-// direction normalize(N + unit), the specular direction lerped by smoothness, the
-// lobe chosen by one random number, k = 1, origin pushed off along N. The random
-// numbers are drawn in Unity's order (lobe, then the unit vector).
+// Unity CaelixShadeVoxelHit.
+// Opaque branch: albedo and emission of the block, specular chance
+// lerp(metallic, 1, fresnel * smoothness), cosine-weighted diffuse direction
+// normalize(N + unit), the specular direction lerped by smoothness, the lobe chosen
+// by one random number, k = 1, origin pushed off along N. The random numbers are
+// drawn in Unity's order (lobe, then the unit vector).
+// Transparent branch (the hit is an interface from the medium `medium` into the
+// medium of the block's id): reflect or refract as in CrossInterface (whatever the
+// smoothness, as in Unity), albedo 1 (the medium's colour is its extinction, a
+// per-segment term), the block's emission, the specular lobe with roughness 0 (both
+// directions are delta), origin pushed off to the side of the chosen direction;
+// `medium` becomes the medium of the outgoing ray.
 CaelixShadeResult ShadeVoxelHit(uint block, float3 hit_position, float3 ray_direction,
-                                float3 normal, inout uint rng) {
-  const CaelixMaterial material = DecodeMaterial(block);
+                                float3 normal, inout uint rng, inout uint medium) {
+  const CaelixMaterial material = GET_MATERIAL(block);
   CaelixShadeResult shade;
-  shade.albedo = material.albedo;
   shade.emission = material.emission;
+  shade.k = 1.0f;
+  CAELIX_BRANCH
+  if (!IsOpaque(int(block))) {
+    const CaelixInterface it = CrossInterface(medium, CaelixTransparentId(block), material.ior,
+                                              ray_direction, normal, rng);
+    shade.albedo = float3(1.0f, 1.0f, 1.0f);
+    shade.bounce_origin =
+        hit_position + (it.refracted ? -K_RAY_ORIGIN_PUSH_OFF : K_RAY_ORIGIN_PUSH_OFF) * it.normal;
+    shade.bounce_direction = it.direction;
+    shade.specular_lobe = true;
+    shade.roughness = 0.0f;
+    medium = it.medium;
+    return shade;
+  }
+  shade.albedo = material.albedo;
 
   const float fresnel = FresnelReflectAmountOpaque(1.0f, material.ior, ray_direction, normal);
   const float specular_chance = lerp(material.metallic, 1.0f, fresnel * material.smoothness);
@@ -197,7 +252,6 @@ CaelixShadeResult ShadeVoxelHit(uint block, float3 hit_position, float3 ray_dire
   float3 specular_dir = reflect(ray_direction, normal);
   specular_dir = SafeNormalize(lerp(diffuse_dir, specular_dir, material.smoothness));
 
-  shade.k = 1.0f;
   shade.bounce_origin = hit_position + K_RAY_ORIGIN_PUSH_OFF * normal;
   shade.bounce_direction = lerp(diffuse_dir, specular_dir, do_specular);
   shade.specular_lobe = do_specular > 0.5f;

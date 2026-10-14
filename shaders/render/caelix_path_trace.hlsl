@@ -20,6 +20,14 @@
 //                   caelix_composite.hlsl.
 //                   With kRenderFlagSunNee every diffuse vertex also samples the
 //                   sun cone and traces a shadow ray (TracePath, SunNextEvent).
+//                   Before the shading, the delta chain (RunDeltaChain, Unity's
+//                   AdvanceDeltaRay loop) carries the camera ray through up to
+//                   bounce_count_transparent smooth transparent interfaces
+//                   (stochastic Fresnel choice between reflection and refraction,
+//                   medium extinction); the surface where it stops replaces the
+//                   primary hit (PSR): G-buffer, shading and emission, all times the
+//                   chain's transmission, depth = chain length along the camera ray.
+//                   Materials come from the scene's material table (GET_MATERIAL).
 //
 // Inputs: the push constant is the device address of the frame constants; the
 // scene's tables (page table, slot rows, group infos, entity infos) are read
@@ -40,6 +48,7 @@
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
 #include "render/caelix_brick_trace.hlsl"
+#include "common/caelix_material.hlsl"
 #include "render/caelix_shading.hlsl"
 // NRD's front-end packing (normal + roughness, radiance + normalized hit distance);
 // NRDConfig.hlsli next to it fixes the encodings NRD was built with.
@@ -236,10 +245,93 @@ float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout
   return fc.sun_radiance.xyz * (fc.sun_solid_angle * cos_l * (1.0f / K_PI));
 }
 
-// The path tracer at one primary hit (Unity CaelixPathTraceMain, "Further
-// Bounces", opaque surfaces only): shades the primary hit, then traces up to
-// bounce_count stochastic segments. Returns the primary shade result; `stochastic`
-// receives (incident radiance, hit distance of the first segment).
+// NRD lobe rule of a path that went through a delta interface (primary surface
+// replacement). 0: every pixel whose camera ray crossed an interface goes to the
+// specular target with roughness 0 (the transparent lobes are delta). 1: only a
+// path whose FIRST interface reflected goes to the specular target (roughness 0);
+// a refracted path keeps the lobe and roughness of the replaced surface (Unity's
+// BOUNCEIDX_IS_SPECULAR rule, the usual PSR practice). Compile-time switch for the
+// 6d measurement; the build uses 0.
+#ifndef CAELIX_PSR_LOBE
+#define CAELIX_PSR_LOBE 0
+#endif
+
+// The delta chain of the primary ray (Unity's primary loop + AdvanceDeltaRay):
+// starting from the primary hit, every smooth transparent interface (smoothness >=
+// 0.99, not opaque) is crossed by reflection or refraction (CrossInterface), up to
+// `budget` interfaces, and every segment inside a medium is attenuated by its
+// extinction. The first hit that is not crossed is the primary surface for
+// everything after it (primary surface replacement).
+struct DeltaChain {
+  TraceResult surface;   // the hit that ended the chain; hit = false: the chain ended in the sky
+  TraceResult geometry;  // the G-buffer's hit: `surface`, or the last interface on a sky end
+                         // (the primary miss when the camera ray hit nothing)
+  RayDesc ray;           // the ray that found `surface`
+  float3 throughput;     // transmission of the chain (extinction; k = 1 at every interface)
+  float t_virtual;       // chain length up to `geometry` (PSR depth along the camera ray)
+  uint medium;           // the medium `ray` travels in (face-free transparent id, 0 = air)
+  uint interfaces;       // interfaces crossed
+  bool first_reflected;  // the first interface reflected
+};
+
+DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult primary, uint budget,
+                         inout uint rng) {
+  DeltaChain c;
+  c.surface = primary;
+  c.geometry = primary;
+  c.ray = ray;
+  c.throughput = float3(1.0f, 1.0f, 1.0f);
+  c.t_virtual = 0.0f;
+  c.medium = 0u;
+  c.interfaces = 0u;
+  c.first_reflected = false;
+  CAELIX_LOOP
+  for (;;) {
+    if (!c.surface.hit) {
+      break;
+    }
+    // The segment that found this hit ran inside c.medium.
+    c.throughput *= MediumExtinction(c.medium, c.surface.T);
+    c.t_virtual += c.surface.T;
+    c.geometry = c.surface;
+    if (c.interfaces >= budget) {
+      break;
+    }
+    const uint block = (c.surface.attrib >> 16) & 0xFFFFu;
+    // Opaque surfaces always end the chain (Unity: smooth metals are a TODO there; the
+    // owner chose parity, the specular lobe of the stochastic shading reflects them).
+    if (IsOpaque(int(block))) {
+      break;
+    }
+    const CaelixMaterial material = GET_MATERIAL(block);
+    if (material.smoothness < 0.99f) {
+      break;
+    }
+    const float3 hit_position = c.ray.Origin + c.ray.Direction * c.surface.T;
+    const CaelixInterface it = CrossInterface(c.medium, CaelixTransparentId(block), material.ior,
+                                              c.ray.Direction, c.surface.normal, rng);
+    if (c.interfaces == 0u && !it.refracted) {
+      c.first_reflected = true;
+    }
+    c.interfaces += 1u;
+    c.medium = it.medium;
+    c.ray.Origin =
+        hit_position + (it.refracted ? -K_RAY_ORIGIN_PUSH_OFF : K_RAY_ORIGIN_PUSH_OFF) * it.normal;
+    c.ray.Direction = it.direction;
+    c.ray.TMin = 0.0f;
+    c.ray.TMax = kRayTMax;
+    c.surface = TraceScene(fc, c.ray);
+  }
+  return c;
+}
+
+// The path tracer at the primary surface (Unity CaelixPathTraceMain, "Further
+// Bounces"): shades the surface `surface` found by `ray` (the last ray of the delta
+// chain) in medium `medium`, then traces up to bounce_count stochastic segments.
+// Every segment is attenuated by the medium it runs in (MediumExtinction; a miss has
+// T = 0). Returns the surface's shade result; `stochastic` receives (incident
+// radiance, hit distance of the first segment). The incident radiance does not
+// include the delta chain's throughput: the caller applies it to the albedo.
 //
 // Sun NEE (kRenderFlagSunNee with a nonzero sun radiance): every vertex that
 // sampled the diffuse lobe AND has a next segment (the primary when
@@ -248,18 +340,18 @@ float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout
 // Russian roulette). So NEE replaces exactly the sun contribution that the next
 // BSDF segment would have found, and the expected value does not change. The
 // segment that leaves such a vertex sees the sky without the sun disk; a segment
-// that leaves a specular-lobe vertex (no NEE there) still sees the disk, so the sun
-// is counted once on every path. NEE draws from its own random stream, so the BSDF
-// path consumes the same random numbers with NEE on or off.
-CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult primary,
-                            out float4 stochastic) {
-  uint rng = InitRandom(pixel, fc.frame_seed);
+// that leaves a specular-lobe vertex (no NEE there, transparent vertices included)
+// still sees the disk, so the sun is counted once on every path. Shadow rays treat
+// glass as opaque. NEE draws from its own random stream, so the BSDF path consumes
+// the same random numbers with NEE on or off.
+CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
+                            uint medium, inout uint rng, out float4 stochastic) {
   uint nee_rng = InitRandom(pixel, fc.frame_seed ^ 0x68E31DA4u);
   const bool nee = (fc.flags & kRenderFlagSunNee) != 0u && any(fc.sun_radiance.xyz > 0.0f);
-  const uint primary_block = (primary.attrib >> 16) & 0xFFFFu;
+  const uint surface_block = (surface.attrib >> 16) & 0xFFFFu;
   const CaelixShadeResult primary_shade =
-      ShadeVoxelHit(primary_block, ray.Origin + ray.Direction * primary.T, ray.Direction,
-                    primary.normal, rng);
+      ShadeVoxelHit(surface_block, ray.Origin + ray.Direction * surface.T, ray.Direction,
+                    surface.normal, rng, medium);
 
   float3 radiance = float3(0.0f, 0.0f, 0.0f);
   float3 throughput = 1.0f / max(0.001f, primary_shade.k);
@@ -273,7 +365,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
   bool segment_sees_sun = true;
   CAELIX_BRANCH
   if (nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u) {
-    radiance += SunNextEvent(fc, primary_shade.bounce_origin, primary.normal, nee_rng) * throughput;
+    radiance += SunNextEvent(fc, primary_shade.bounce_origin, surface.normal, nee_rng) * throughput;
     segment_sees_sun = false;
   }
 
@@ -290,6 +382,8 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
   CAELIX_LOOP
   for (; bounce_index <= fc.bounce_count;) {
     const TraceResult hit = TraceScene(fc, bounce);
+    // The segment ran inside `medium` (a miss has T = 0: the sky is not attenuated).
+    throughput *= MediumExtinction(medium, hit.T);
     if (!hit.hit) {
       radiance += (segment_sees_sun ? SkyRadiance(fc, bounce.Direction)
                                     : SkyRadianceNoSun(fc, bounce.Direction)) * throughput;
@@ -301,7 +395,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     }
     const CaelixShadeResult shade =
         ShadeVoxelHit((hit.attrib >> 16) & 0xFFFFu, bounce.Origin + bounce.Direction * hit.T,
-                      bounce.Direction, hit.normal, rng);
+                      bounce.Direction, hit.normal, rng, medium);
     bounce_index += 1;
 
     radiance += shade.emission * throughput;
@@ -329,6 +423,16 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
   return primary_shade;
 }
 
+// The material debug view (kViewMaterial): the table's albedo, mixed with blue for
+// a transparent code and with white for an emissive entry; air is magenta.
+float3 MaterialViewColor(uint block) {
+  const CaelixMaterial m = GET_MATERIAL(block);
+  if (!IsOpaque(int(block))) {
+    return CaelixTransparentId(block) == 0u ? kAirColor : lerp(m.albedo, float3(0.2f, 0.45f, 1.0f), 0.5f);
+  }
+  return any(m.emission > 0.0f) ? lerp(m.albedo, float3(1.0f, 1.0f, 1.0f), 0.5f) : m.albedo;
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 thread_id : SV_DispatchThreadID) {
   const CaelixFrameConstants fc = CAELIX_LOAD_STRUCT(CaelixFrameConstants, g_push.frame_constants, 16);
@@ -336,6 +440,7 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     return;
   }
   g_blockEncoding = fc.encoding;
+  g_materialTable = fc.materials;
 
   // Pixel -> ray. Row 0 is the top row of the image.
   RayDesc ray;
@@ -346,13 +451,22 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
 
   const TraceResult primary = TraceScene(fc, ray);
   const bool hit = primary.hit;
-  const float T = primary.T;
-  const float3 normal = primary.normal;
-
-  const uint block = (primary.attrib >> 16) & 0xFFFFu;
-  const float3 albedo = hit ? BlockAlbedo(block) : float3(0.0f, 0.0f, 0.0f);
   const uint targets = fc.target_mask;
   const bool lighting = fc.mode != kModePrimary;
+
+  // The delta chain (lighting modes; the primary mode and budget 0 leave the primary
+  // hit as the surface without drawing a random number, so an opaque scene consumes
+  // the random stream exactly as before the chain existed).
+  uint rng = InitRandom(thread_id.xy, fc.frame_seed);
+  const DeltaChain chain =
+      RunDeltaChain(fc, ray, primary, lighting ? fc.bounce_count_transparent : 0u, rng);
+  // The G-buffer describes chain.geometry at the chain length t_virtual along the
+  // camera ray (PSR). Without an interface it is the primary hit at primary.T.
+  const TraceResult geometry = chain.geometry;
+  const float T = chain.t_virtual;
+  const float3 normal = geometry.normal;
+  const uint block = (geometry.attrib >> 16) & 0xFFFFu;
+  const float3 albedo = hit ? BlockAlbedo(block) : float3(0.0f, 0.0f, 0.0f);
 
   CAELIX_BRANCH
   if (!lighting && (targets & kTargetColor) != 0u) {
@@ -370,7 +484,7 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
       } else if (fc.debug_view == kViewBrick) {
         color = Pastel(HashU32(HashU32(primary.group + 0x632BE5ABu) ^ (primary.id + 0x2545F491u)));
       } else {
-        color = albedo;
+        color = fc.debug_view == kViewMaterial ? MaterialViewColor(block) : albedo;
         if ((fc.flags & kRenderFlagShading) != 0u) {
           color *= 0.25f + 0.75f * saturate(dot(normal, fc.sun_dir.xyz));
         }
@@ -391,7 +505,7 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     g_normal[thread_id.xy] = float4(stored, coverage);
   }
 
-  // View space of the current camera: the hit is position + direction * T.
+  // View space of the current camera: the (virtual) hit is position + direction * T.
   const float3 rel = ray.Direction * T;
   const float view_z = dot(rel, fc.forward.xyz);
   CAELIX_BRANCH
@@ -415,13 +529,24 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   if (((targets & kTargetMotion) != 0u || lighting) && hit && fc.has_prev_camera != 0u) {
     // The hit point under the entity's previous transform: EntityInfo prev rows,
     // bytes 80..127 of the entity's 128-byte row (GroupInfo word 3 = entity).
-    const uint entity = CAELIX_LOAD_U32(fc.group_infos + uint64_t(primary.group) * 32 + 12);
+    const uint entity = CAELIX_LOAD_U32(fc.group_infos + uint64_t(geometry.group) * 32 + 12);
     const uint64_t entity_info = fc.entity_infos + uint64_t(entity) * 128;
     const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + 80));
     const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + 96));
     const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + 112));
-    const float4 h = float4(primary.object_hit, 1.0f);
-    const float3 prev_world = float3(dot(r0, h), dot(r1, h), dot(r2, h));
+    const float4 h = float4(geometry.object_hit, 1.0f);
+    float3 prev_world = float3(dot(r0, h), dot(r1, h), dot(r2, h));
+    CAELIX_BRANCH
+    if (chain.interfaces > 0u) {
+      // PSR (Unity): the virtual point on the camera ray, moved by the replaced
+      // surface's own motion (its previous minus its current world position; the
+      // current rows are bytes 32..79).
+      const float4 c0 = asfloat(CAELIX_LOAD_U32x4(entity_info + 32));
+      const float4 c1 = asfloat(CAELIX_LOAD_U32x4(entity_info + 48));
+      const float4 c2 = asfloat(CAELIX_LOAD_U32x4(entity_info + 64));
+      const float3 cur_world = float3(dot(c0, h), dot(c1, h), dot(c2, h));
+      prev_world = fc.position.xyz + rel + (prev_world - cur_world);
+    }
     float2 prev_pixel;
     float prev_view_z;
     if (PreviousPixel(fc, prev_world, prev_pixel, prev_view_z)) {
@@ -437,37 +562,60 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   CAELIX_BRANCH
   if (lighting) {
     const uint2 pixel = thread_id.xy;
-    g_int_view_z[pixel] = float4(hit ? view_z : kInternalMissViewZ, 0.0f, 0.0f, 0.0f);
+    // A chain that ended in the sky has no surface: NRD sees a miss (view z 1e30, no
+    // radiance) and the composite shows the deterministic sky radiance.
+    const bool surface = chain.surface.hit;
+    g_int_view_z[pixel] = float4(surface ? view_z : kInternalMissViewZ, 0.0f, 0.0f, 0.0f);
     g_int_motion[pixel] = float4(motion, motion_view_z, 0.0f);
 
     float3 material_albedo = float3(0.0f, 0.0f, 0.0f);
     float3 deterministic = float3(0.0f, 0.0f, 0.0f);
-    // NRD packing. The lobe that the primary hit did not sample gets 0 radiance and
-    // 0 hit distance (NRD's "invalid" sample, reconstructed by
-    // HitDistanceReconstructionMode); a miss gets 0 in both (the composite draws the
-    // sky; view z 1e30 is outside the denoising range). The hit distance is
-    // normalized with REBLUR's A, B, C at the primary view z: roughness 1 for the
-    // diffuse lobe, the material roughness for the specular one.
+    // NRD packing. The lobe that the path did not sample gets 0 radiance and 0 hit
+    // distance (NRD's "invalid" sample, reconstructed by HitDistanceReconstructionMode);
+    // a miss gets 0 in both (the composite draws the sky; view z 1e30 is outside the
+    // denoising range). The hit distance is normalized with REBLUR's A, B, C at the
+    // (virtual) view z: roughness 1 for the diffuse lobe, the NRD roughness for the
+    // specular one.
     float4 diffuse = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 specular = float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 normal_roughness = float4(0.0f, 0.0f, 0.0f, 0.0f);
     CAELIX_BRANCH
-    if (hit) {
+    if (surface) {
       float4 stochastic;
-      const CaelixShadeResult shade = TracePath(fc, pixel, ray, primary, stochastic);
-      material_albedo = shade.albedo;
+      const CaelixShadeResult shade =
+          TracePath(fc, pixel, chain.ray, chain.surface, chain.medium, rng, stochastic);
+      // The chain's transmission modulates everything the surface sends (Unity:
+      // AlbedoTarget = throughput * albedo, deterministic = throughput * emission).
+      material_albedo = chain.throughput * shade.albedo;
       // Primary emission is deterministic: nothing was sampled to obtain it.
-      deterministic = shade.emission;
-      normal_roughness = NRD_FrontEnd_PackNormalAndRoughness(normal, shade.roughness, 0.0f);
-      const float lobe_roughness = shade.specular_lobe ? shade.roughness : 1.0f;
+      deterministic = chain.throughput * shade.emission;
+      bool specular_target = shade.specular_lobe;
+      float nrd_roughness = shade.roughness;
+#if CAELIX_PSR_LOBE == 0
+      if (chain.interfaces > 0u) {
+        specular_target = true;
+        nrd_roughness = 0.0f;
+      }
+#else
+      if (chain.first_reflected) {
+        specular_target = true;
+        nrd_roughness = 0.0f;
+      }
+#endif
+      normal_roughness = NRD_FrontEnd_PackNormalAndRoughness(normal, nrd_roughness, 0.0f);
+      const float lobe_roughness = specular_target ? nrd_roughness : 1.0f;
       const float norm_hit_dist =
           REBLUR_FrontEnd_GetNormHitDist(stochastic.a, view_z, fc.hit_dist_params.xyz, lobe_roughness);
       const float4 packed = REBLUR_FrontEnd_PackRadianceAndNormHitDist(stochastic.rgb, norm_hit_dist, true);
-      if (shade.specular_lobe) {
+      if (specular_target) {
         specular = packed;
       } else {
         diffuse = packed;
       }
+    } else if (hit) {
+      // The chain went through at least one interface and left the scene: the sky in
+      // the last direction times the transmission (Unity: delta miss).
+      deterministic = chain.throughput * SkyRadiance(fc, chain.ray.Direction);
     }
     g_int_normal_roughness[pixel] = normal_roughness;
     // Coverage is albedo.a.

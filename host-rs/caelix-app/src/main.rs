@@ -16,6 +16,7 @@
 //! (`testscene.rs`, Test window) to judge the motion vectors and NRD.
 
 mod camera;
+mod materials;
 mod settings;
 mod testscene;
 mod ui;
@@ -40,7 +41,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use camera::Camera;
-use settings::{same_options, Mode, RenderSettings, View};
+use settings::{same_options, Encoding, Mode, RenderSettings, View};
 use testscene::{EditPattern, TestScene};
 
 /// Free camera: default speed in world units (blocks) per second.
@@ -146,7 +147,8 @@ struct Args {
     /// Rendering mode. Default: `pt` with --world, else `primary`.
     #[arg(long, value_enum)]
     mode: Option<Mode>,
-    /// Primary mode: the debug view (albedo .. steps); pt mode: nrd-validation, nrd-diff, motion.
+    /// Primary mode: the debug view (albedo .. steps, material); pt mode: nrd-validation, nrd-diff,
+    /// nrd-spec, motion.
     #[arg(long, value_enum, default_value_t = View::Albedo)]
     view: View,
     /// Pt mode: no NRD denoising (the raw 1 sample per pixel image).
@@ -165,6 +167,19 @@ struct Args {
     /// Lighting modes: stochastic bounces after the primary hit (0..14).
     #[arg(long, value_name = "N", default_value_t = 4)]
     bounces: u32,
+    /// Lighting modes: smooth transparent interfaces (glass) that the primary ray crosses by
+    /// reflection or refraction before the surface that is shaded (0..15, 0 = off).
+    #[arg(long, value_name = "N", default_value_t = 5)]
+    bounces_transparent: u32,
+    /// Block encoding of the scene: packed (Caelix worlds) or block-id.
+    #[arg(long, value_enum, default_value_t = Encoding::Packed)]
+    encoding: Encoding,
+    /// A JSON material table (an array of {"id", "albedo", "smoothness", "metallic", "emission",
+    /// "ior", "extinction", "transparent"}), applied with caelix_scene_set_materials over the
+    /// built-in table. For block-ID worlds: an entry goes to code 0x8000 | id, or to code id with
+    /// "transparent": true.
+    #[arg(long, value_name = "PATH")]
+    materials: Option<PathBuf>,
     /// Lighting modes: colour multiplier before the sRGB encode.
     #[arg(long, value_name = "F", default_value_t = 1.0)]
     exposure: f32,
@@ -434,7 +449,7 @@ impl App {
             records_per_page: 0,
             group_shift: self.args.group_shift,
             block_bytes: 0,
-            encoding: 0, // packed scene colour
+            encoding: self.args.encoding.raw(),
             scratch_bytes: 0, // 128 MiB of acceleration structure build scratch
         };
         // SAFETY: the device is adopted; scene_desc and the out pointer are valid for the call.
@@ -443,10 +458,14 @@ impl App {
             bail!("caelix_scene_create failed: CaelixResult {result}");
         }
         log::info!(
-            "scene created: staging {} MiB, group shift {}",
+            "scene created: staging {} MiB, group shift {}, encoding {:?}",
             self.args.staging_mib,
-            self.args.group_shift
+            self.args.group_shift,
+            self.args.encoding
         );
+        if let Some(path) = self.args.materials.as_deref() {
+            materials::apply(state.scene, path)?;
+        }
         // SAFETY: the device and the scene are live; the out pointer is valid for the call.
         let result = unsafe { caelix_renderer_create(state.caelix_device, state.scene, &mut state.renderer) };
         if result != CaelixResult_CAELIX_OK || state.renderer.is_null() {
@@ -1126,13 +1145,25 @@ fn main() -> anyhow::Result<()> {
     if args.accumulate.is_some() && mode != Mode::Ref {
         bail!("--accumulate needs --mode ref");
     }
-    if matches!(args.view, View::NrdValidation | View::NrdDiff | View::Motion) && mode != Mode::Pt {
+    if args.bounces_transparent > CAELIX_MAX_BOUNCES_TRANSPARENT {
+        bail!(
+            "--bounces-transparent {} is above the maximum {}",
+            args.bounces_transparent,
+            CAELIX_MAX_BOUNCES_TRANSPARENT
+        );
+    }
+    if args.view.needs_pt() && mode != Mode::Pt {
         bail!("--view {:?} needs --mode pt", args.view);
     }
+    if args.view == View::Material && mode != Mode::Primary {
+        bail!("--view material needs --mode primary");
+    }
     log::info!(
-        "mode {mode:?}, bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, sun NEE {}, denoise {}, \
+        "mode {mode:?}, bounces {}, transparent bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, \
+         sun NEE {}, denoise {}, \
          window {}x{}",
         args.bounces,
+        args.bounces_transparent,
         args.exposure,
         !args.no_sky_on_miss,
         args.sun_radiance,
@@ -1147,6 +1178,7 @@ fn main() -> anyhow::Result<()> {
         mode,
         view: args.view,
         bounces: args.bounces,
+        bounces_transparent: args.bounces_transparent,
         denoise: !args.no_denoise,
         sun_nee: !args.no_sun_nee,
         sky_on_miss: !args.no_sky_on_miss,

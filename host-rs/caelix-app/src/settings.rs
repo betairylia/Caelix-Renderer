@@ -26,10 +26,14 @@ pub enum View {
     NrdDiff,
     /// Path trace mode: the motion vector of the primary hit (grey = no motion, +-32 px saturate).
     Motion,
+    /// Primary mode: the material table's albedo (transparent codes tinted blue, emitters white).
+    Material,
+    /// Path trace mode: the denoised specular radiance without the albedo.
+    NrdSpec,
 }
 
 impl View {
-    pub const ALL: [View; 9] = [
+    pub const ALL: [View; 11] = [
         View::Albedo,
         View::Normal,
         View::Depth,
@@ -39,6 +43,8 @@ impl View {
         View::NrdValidation,
         View::NrdDiff,
         View::Motion,
+        View::Material,
+        View::NrdSpec,
     ];
 
     pub fn raw(self) -> u32 {
@@ -52,6 +58,8 @@ impl View {
             View::NrdValidation => CaelixDebugView_CAELIX_VIEW_NRD_VALIDATION as u32,
             View::NrdDiff => CaelixDebugView_CAELIX_VIEW_NRD_DIFF as u32,
             View::Motion => CaelixDebugView_CAELIX_VIEW_MOTION as u32,
+            View::Material => CaelixDebugView_CAELIX_VIEW_MATERIAL as u32,
+            View::NrdSpec => CaelixDebugView_CAELIX_VIEW_NRD_SPEC as u32,
         }
     }
 
@@ -66,6 +74,31 @@ impl View {
             View::NrdValidation => "nrd validation (pt)",
             View::NrdDiff => "nrd diff (pt)",
             View::Motion => "motion (pt)",
+            View::Material => "material",
+            View::NrdSpec => "nrd spec (pt)",
+        }
+    }
+
+    /// Views that only the path trace mode shows.
+    pub fn needs_pt(self) -> bool {
+        matches!(self, View::NrdValidation | View::NrdDiff | View::Motion | View::NrdSpec)
+    }
+}
+
+/// Block encoding of the scene (`CaelixSceneDesc::encoding`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Encoding {
+    /// Packed scene colour (Caelix worlds): opaque rgb5, emissive rgb4, glass palette ids.
+    Packed,
+    /// Block IDs: opaque when bit 15 is set, transparent ids 0..511; materials from --materials.
+    BlockId,
+}
+
+impl Encoding {
+    pub fn raw(self) -> u32 {
+        match self {
+            Encoding::Packed => 0,
+            Encoding::BlockId => 1,
         }
     }
 }
@@ -107,6 +140,8 @@ pub struct RenderSettings {
     pub mode: Mode,
     pub view: View,
     pub bounces: u32,
+    /// Lighting modes: smooth transparent interfaces of the primary ray's delta chain (0..15).
+    pub bounces_transparent: u32,
     /// Pt mode: NRD denoising.
     pub denoise: bool,
     /// Lighting modes: sun next-event estimation.
@@ -183,6 +218,7 @@ impl RenderSettings {
             sky_horizon: self.sky_horizon,
             sky_ground: self.sky_ground,
             frame_seed,
+            bounce_count_transparent: self.bounces_transparent,
         }
     }
 }
@@ -195,6 +231,7 @@ pub fn same_options(a: &CaelixRenderOptions, b: &CaelixRenderOptions) -> bool {
         && a.sun_dir == b.sun_dir
         && a.mode == b.mode
         && a.bounce_count == b.bounce_count
+        && a.bounce_count_transparent == b.bounce_count_transparent
         && a.denoise == b.denoise
         && a.exposure == b.exposure
         && a.sun_radiance == b.sun_radiance

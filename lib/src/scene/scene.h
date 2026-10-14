@@ -10,6 +10,7 @@
 #include "rhi/pipeline.h"
 #include "rhi/staging_ring.h"
 #include "scene/gpu_structs.h"
+#include "scene/material_table.h"
 #include "scene/record_layout.h"
 #include "scene/slot_table_pool.h"
 
@@ -123,6 +124,11 @@ class Scene {
   void GetStats(CaelixSceneStats& out) const;
   CaelixResult QueryBrick(CaelixEntityId entity, CaelixBrickKey key, CaelixBrickInfo& out) const;
   void GetTlas(uint64_t& handle, uint64_t& address) const;
+  // Materials (scene_materials.cpp). The changed part of the table is uploaded at
+  // the next flush.
+  CaelixResult SetMaterials(const CaelixMaterial* entries, uint32_t count);
+  CaelixResult SetGlassPalette(const CaelixMaterial* entries, uint32_t count);
+  CaelixResult GetMaterial(uint32_t code, CaelixMaterial& out) const;
 
   bool EntityAlive(CaelixEntityId entity) const {
     return entity < entities_.size() && entities_[entity].alive;
@@ -137,6 +143,8 @@ class Scene {
   VkDeviceAddress slot_tables_address() const { return slot_tables_.address(); }
   VkDeviceAddress group_infos_address() const { return group_infos_.address(); }
   VkDeviceAddress entity_infos_address() const { return entity_infos_.address(); }
+  // The GPU material table: 65536 CaelixMaterial entries by block code.
+  VkDeviceAddress materials_address() const { return material_buffer_.address(); }
   uint32_t records_per_page_shift() const;
   uint32_t record_bytes() const { return layout_.record_bytes; }
   uint32_t group_shift() const { return group_shift_; }
@@ -229,6 +237,9 @@ class Scene {
   bool StageGroup(uint32_t group_index, Group& group);
   bool StageEntity(CaelixEntityId id, Entity& entity);
   bool StagePageTable();
+  // Zero-fills the GPU table at the first flush, then stages the dirty chunks of
+  // the material table that fit into the ring; the rest wait for a later flush.
+  void StageMaterials();
   // Builds the dispatch list from dirty_. Returns the number of entries staged.
   uint32_t StageDirtyList();
   bool EnsureNanRow();
@@ -272,6 +283,9 @@ class Scene {
   GrowableBuffer dirty_buffer_;  // DirtyEntry list of the current flush
   uint32_t pages_staged_ = 0;
   StagingRing staging_;
+  std::unique_ptr<MaterialTable> materials_;  // CPU copy of the material table
+  GpuBuffer material_buffer_;                 // MaterialTable::kBytes, device local
+  bool material_buffer_filled_ = false;       // the zero fill of the first flush was recorded
   ComputePipeline finalize_;
   GpuTimer flush_timer_;  // brackets the work that a flush records
 

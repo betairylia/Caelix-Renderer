@@ -150,6 +150,8 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
   scene->page_table_ = GrowableBuffer(allocator, vk_device, kPageTableInitialBytes);
   scene->dirty_buffer_ = GrowableBuffer(allocator, vk_device, kDirtyListInitialBytes);
   scene->staging_ = StagingRing(allocator, vk_device, staging_bytes);
+  scene->materials_ = std::make_unique<MaterialTable>(d.encoding);
+  scene->material_buffer_ = GpuBuffer::DeviceLocal(allocator, vk_device, MaterialTable::kBytes);
   scene->as_pool_.Init(allocator, vk_device);
   scene->scratch_ = GpuBuffer::DeviceLocalWithUsage(
       allocator, vk_device, scratch_bytes,
@@ -536,6 +538,7 @@ void Scene::GetStats(CaelixSceneStats& out) const {
     }
   }
   out.as_builds_pending = pending;
+  out.material_table_bytes = material_buffer_.size();
 }
 
 CaelixResult Scene::QueryBrick(CaelixEntityId entity_id, CaelixBrickKey key,

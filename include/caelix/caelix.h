@@ -50,7 +50,11 @@ extern "C" {
    added CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT, the debug views CAELIX_VIEW_NRD_*,
    CaelixNrdInfo and caelix_renderer_get_nrd_info, renamed CaelixGpuTimings::pad to denoise_ms
    (same layout) and made CaelixRenderOptions::denoise active, also without a bump. The motion
-   view step added CAELIX_VIEW_MOTION (a new enum value, no struct change). A host
+   view step added CAELIX_VIEW_MOTION (a new enum value, no struct change). The materials step (6d)
+   added CaelixMaterial, caelix_scene_set_materials, caelix_scene_set_glass_palette,
+   caelix_scene_get_material, CaelixSceneStats::material_table_bytes,
+   CaelixRenderOptions::bounce_count_transparent, CAELIX_MAX_BOUNCES_TRANSPARENT and the debug views
+   CAELIX_VIEW_MATERIAL and CAELIX_VIEW_NRD_SPEC, also without a bump. A host
    built against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -336,6 +340,7 @@ typedef struct CaelixSceneStats {
   uint64_t as_builds_total;         /* BLAS and TLAS builds recorded so far */
   uint64_t as_builds_pending;       /* groups whose BLAS is out of date (waiting for finalization,
                                        scratch or ring space), plus 1 when the TLAS is out of date */
+  uint64_t material_table_bytes;    /* GPU size of the material table (65536 * 48 = 3 MiB) */
 } CaelixSceneStats;
 
 /* Fills *out. A NULL argument is ignored. */
@@ -384,6 +389,67 @@ CAELIX_API CaelixResult caelix_scene_query_brick(const CaelixScene* scene, Caeli
    CAELIX_ERROR_INVALID_ARGUMENT. */
 CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t* out_handle,
                                               uint64_t* out_address);
+
+/* ---------------------------------------------------------------------------
+ * Materials
+ *
+ * Every scene has a material table: 65536 CaelixMaterial entries, one per 16-bit block code, in a
+ * device-local GPU buffer that the lighting modes read (Unity's g_Materials). A transparent code is
+ * looked up with its face bits removed (code & id mask, see the encodings above), so only the entry
+ * of the face-free code is used; an opaque code is looked up as it is.
+ *
+ * Built-in content, by encoding:
+ *   packed: an opaque code (bit 15) is albedo rgb5 / 31 (r = bits 14..10, g = 9..5, b = 4..0); an
+ *     emissive code (bits 15..14 = 01) is albedo rgb4 / 15 (r = bits 13..10, g = 9..6, b = 5..2)
+ *     and emission albedo * 2^(3 * (code & 3)); both smoothness 0, metallic 0, ior 1.5,
+ *     extinction 0. A transparent code (bits 15..14 = 00) is glass palette entry code & 0xFF: the
+ *     built-in palette is Caelix's glass-palette.json (ids 1..132: tint, ior, extinction,
+ *     smoothness; metallic 0, no emission); id 0 (air) and the reserved ids 133..255 are albedo 1,
+ *     smoothness 1, ior 1, extinction 0 (Unity's GetSharedGlass default).
+ *   block-ID: an opaque code is a pastel hash colour of code & 0x7FFF; a transparent id 1..511 a
+ *     pastel hash colour of the id; both smoothness 0, metallic 0, ior 1.5, no emission. Air (id 0)
+ *     is the vacuum entry of the packed table. The host is expected to replace the table.
+ * Changes take effect at the next caelix_scene_flush, which uploads the changed part of the table
+ * through the staging ring (a part that does not fit waits for a later flush). Until the first
+ * upload has completed the GPU table is all zero (black, no emission).
+ * ------------------------------------------------------------------------- */
+
+/* One material table entry. 48 bytes, the layout of the GPU table. All values are linear. */
+typedef struct CaelixMaterial {
+  float albedo[3];    /* diffuse / base colour; for a transparent medium its tint */
+  float smoothness;   /* 0..1. NRD roughness = 1 - smoothness. A transparent entry with smoothness
+                         >= 0.99 is a delta interface (reflection and refraction in the delta chain,
+                         CaelixRenderOptions::bounce_count_transparent); a rougher one is shaded
+                         stochastically (still a perfect reflection or refraction, as in Unity) */
+  float emission[3];  /* emitted radiance */
+  float metallic;     /* 0..1; opaque entries: specular chance lerp(metallic, 1, fresnel * smoothness) */
+  float ior;          /* index of refraction; must be > 0 (transparent entries use it at interfaces,
+                         opaque entries for the Fresnel term of the specular chance) */
+  float extinction;   /* transparent entries: per voxel unit; a segment of length t inside the medium
+                         transmits exp(-(1 - albedo) * t * extinction). Must be >= 0. */
+  float pad[2];       /* ignored; stored as 0 */
+} CaelixMaterial;
+
+/* Replaces the whole material table: entries [0, count) come from `entries`, entries [count, 65536)
+   get the built-in default of the scene's encoding (packed: with the current glass palette).
+   count <= 65536 (0 restores the default table).
+   Every value must be finite, ior > 0 and extinction >= 0: an invalid entry returns
+   CAELIX_ERROR_INVALID_ARGUMENT (logged, the table is unchanged). Entries of transparent codes with
+   face bits are stored but never read. Packed scenes: a later caelix_scene_set_glass_palette
+   rewrites the transparent codes. */
+CAELIX_API CaelixResult caelix_scene_set_materials(CaelixScene* scene, const CaelixMaterial* entries,
+                                                   uint32_t count);
+/* Packed encoding only (a block-ID scene returns CAELIX_ERROR_INVALID_ARGUMENT): replaces glass
+   palette ids 1 .. count - 1 by entries[1 .. count - 1] (entries[0] is ignored: air stays the vacuum
+   entry; ids >= count keep their current palette value) and rewrites the table entries of every
+   transparent code with such an id. count <= 256. Same value checks as caelix_scene_set_materials. */
+CAELIX_API CaelixResult caelix_scene_set_glass_palette(CaelixScene* scene,
+                                                       const CaelixMaterial* entries, uint32_t count);
+/* Inspection: the current table entry of a raw block code (code <= 0xFFFF; face bits of a
+   transparent code are removed first, as the kernels do). The value is the CPU copy: it reaches the
+   GPU at the next flush. */
+CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint32_t code,
+                                                  CaelixMaterial* out);
 
 /* ---------------------------------------------------------------------------
  * Renderer: traces a scene into the host's images
@@ -494,6 +560,8 @@ typedef enum CaelixRenderMode {
 
 /* Largest CaelixRenderOptions::bounce_count (Unity's path tracer has the same limit). */
 #define CAELIX_MAX_BOUNCES 14u
+/* Largest CaelixRenderOptions::bounce_count_transparent. */
+#define CAELIX_MAX_BOUNCES_TRANSPARENT 15u
 
 typedef enum CaelixDebugView {
   CAELIX_VIEW_ALBEDO = 0,  /* material albedo; Lambert-shaded with CAELIX_RENDER_FLAG_SHADING */
@@ -502,19 +570,28 @@ typedef enum CaelixDebugView {
   CAELIX_VIEW_GROUP = 3,   /* hash colour of the render group of the hit */
   CAELIX_VIEW_BRICK = 4,   /* hash colour of the brick of the hit (group and dense brick id) */
   CAELIX_VIEW_STEPS = 5,   /* heat map of the procedural candidates of the ray, 0 .. 64 */
-  /* Views 6, 7 and 8 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo view for
-     them, CAELIX_MODE_REFERENCE ignores debug_view). */
+  /* Views 6, 7, 8 and 10 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo view
+     for them, CAELIX_MODE_REFERENCE ignores debug_view); view 9 to CAELIX_MODE_PRIMARY (the lighting
+     modes ignore it). */
   CAELIX_VIEW_NRD_VALIDATION = 6, /* NRD's validation layer (CommonSettings::enableValidation) blended
                                      over the image by its alpha (after the sRGB encode); the normal
                                      image when the frame was not denoised */
   CAELIX_VIEW_NRD_DIFF = 7,       /* the denoised diffuse radiance without the albedo (the raw diffuse
                                      radiance when the frame was not denoised), exposure applied */
-  CAELIX_VIEW_MOTION = 8          /* the motion vector of the primary hit (the motion target's value):
+  CAELIX_VIEW_MOTION = 8,         /* the motion vector of the primary hit (the motion target's value):
                                      rgb = (saturate(motion.x / 32 * 0.5 + 0.5),
                                      saturate(motion.y / 32 * 0.5 + 0.5), 0.5 * coverage), alpha =
                                      coverage, written as is (no exposure, no sRGB encode). A hit
                                      without motion is grey (0.5, 0.5, 0.5), a miss (0.5, 0.5, 0);
                                      +-32 px saturate. */
+  CAELIX_VIEW_MATERIAL = 9,       /* CAELIX_MODE_PRIMARY: the material table's albedo of the primary
+                                     hit, mixed 50 % with blue (0.2, 0.45, 1) for a transparent code
+                                     and 50 % with white for an emissive entry (any emission > 0);
+                                     an air code is magenta. Lambert-shaded with
+                                     CAELIX_RENDER_FLAG_SHADING. */
+  CAELIX_VIEW_NRD_SPEC = 10       /* CAELIX_MODE_PATH_TRACE: the denoised specular radiance without
+                                     the albedo (the raw specular radiance when the frame was not
+                                     denoised), exposure applied; like CAELIX_VIEW_NRD_DIFF */
 } CaelixDebugView;
 
 /* CaelixRenderOptions::flags */
@@ -535,8 +612,8 @@ typedef enum CaelixDebugView {
 
 /* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
 typedef struct CaelixRenderOptions {
-  uint32_t debug_view;  /* CaelixDebugView; read in CAELIX_MODE_PRIMARY (views 0..5) and
-                           CAELIX_MODE_PATH_TRACE (views 6, 7, 8), checked in every mode */
+  uint32_t debug_view;  /* CaelixDebugView; read in CAELIX_MODE_PRIMARY (views 0..5, 9) and
+                           CAELIX_MODE_PATH_TRACE (views 6, 7, 8, 10), checked in every mode */
   uint32_t flags;       /* CAELIX_RENDER_FLAG_* */
   float sun_dir[3];     /* world-space direction TOWARD the sun; the library normalizes it ((0, 1, 0)
                            when zero). Every mode: the Lambert term of the primary mode and the sun
@@ -572,6 +649,22 @@ typedef struct CaelixRenderOptions {
   float sky_ground[3];         /* radiance straight down (below the horizon) */
   uint32_t frame_seed;         /* random seed of the frame: the per-pixel random stream is a function of
                                   the pixel and this value only. Increment it every frame. */
+  uint32_t bounce_count_transparent; /* lighting modes: the delta chain of the primary ray, 0 ..
+                                  CAELIX_MAX_BOUNCES_TRANSPARENT (Unity default 5; 0 = off). The camera
+                                  ray crosses up to this many smooth transparent interfaces (materials
+                                  with smoothness >= 0.99): at each it reflects or refracts, chosen at
+                                  random with the Fresnel reflectance as the reflection probability
+                                  (Schlick; total internal reflection always reflects), and the
+                                  medium's extinction attenuates every segment inside it. The first hit
+                                  that is not such an interface (an opaque or rough surface, or any hit
+                                  after the budget) is the primary surface for everything that follows
+                                  (primary surface replacement): albedo and normal targets, shading,
+                                  emission and bounces, all times the chain's transmission; the depth
+                                  and view_z targets get the distance along the whole chain, measured
+                                  along the camera ray. A chain that ends in the sky writes the sky
+                                  radiance times the transmission (coverage 1). Opaque surfaces always
+                                  end the chain (smooth metals reflect through the stochastic
+                                  specular lobe, as in Unity). */
 } CaelixRenderOptions;
 
 /* The images of one render call. A target is PRESENT when its `image` is nonzero; an absent target
@@ -625,7 +718,7 @@ typedef struct CaelixRenderTargets {
    Returns CAELIX_ERROR_INVALID_ARGUMENT for a null argument, no present target, a present target
    without format or size, present targets of different sizes, one image in two targets, a geometry
    target format outside its list above, an unknown debug view, an unknown mode, a bounce_count above
-   CAELIX_MAX_BOUNCES, a frame number not above safe_frame_number, or a ninth frame in flight;
+   CAELIX_MAX_BOUNCES, a bounce_count_transparent above CAELIX_MAX_BOUNCES_TRANSPARENT, a frame number not above safe_frame_number, or a ninth frame in flight;
    CAELIX_ERROR_OUT_OF_MEMORY when the internal targets of the lighting modes or the NRD instance
    cannot be allocated (nothing is recorded); CAELIX_ERROR_UNSUPPORTED when a target format
    cannot be written as a storage image without a format qualifier.

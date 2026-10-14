@@ -52,3 +52,9 @@ caelix_add_gpu_test(caelix_trace_test trace_test.cpp)
 # NRD denoising through the renderer: executor creation and resize, denoised image
 # against a reference, history reset, debug views.
 caelix_add_gpu_test(caelix_nrd_test nrd_test.cpp)
+
+# The material table through the C ABI: the packed defaults against the old shader decode and
+# data/glass-palette.json, the glass palette, the block-ID table, argument checks.
+caelix_add_gpu_test(caelix_material_test material_test.cpp)
+target_compile_definitions(caelix_material_test PRIVATE
+  CAELIX_GLASS_PALETTE_JSON="${PROJECT_SOURCE_DIR}/data/glass-palette.json")

@@ -345,6 +345,13 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             ui.add_enabled(lighting, Slider::new(&mut settings.bounces, 0..=CAELIX_MAX_BOUNCES));
             ui.end_row();
 
+            ui.label("transparent bounces");
+            ui.add_enabled(
+                lighting,
+                Slider::new(&mut settings.bounces_transparent, 0..=CAELIX_MAX_BOUNCES_TRANSPARENT),
+            );
+            ui.end_row();
+
             ui.label("exposure");
             ui.add_enabled(lighting, Slider::new(&mut settings.exposure, 0.05..=8.0).logarithmic(true));
             ui.end_row();

@@ -133,3 +133,62 @@ UI controls for both. The fixture pose from the step-5 artifact README frames th
    surface each frame and REBLUR's history resets on glass (boiling, flashing, validation view
    shows disocclusion). If that happens, port the checkerboard split and cross resolve as the fix.
    Section 3 therefore applies only in that case.
+
+## As built (2026-10-14, uncommitted after d5925da)
+
+Implemented as designed in sections 1, 2, 4 and 5 with the owner decisions above (no
+checkerboard, no cross resolve). README "Materials and glass (step 6d)" is the user
+documentation. Differences and decisions taken during the implementation:
+
+1. **Air is smooth.** The packed table's air entry (id 0) and the reserved ids 133..255 are
+   Unity's `GetSharedGlass` default: albedo 1, smoothness 1, ior 1, extinction 0. Smoothness
+   0 for air (as first proposed) would end the chain at every glass-to-air exit, because the
+   DDA reports that exit as a hit on an air cell. The block-ID default table uses the same
+   vacuum entry for id 0. (Titania's block-ID table has smoothness 0 for air; the chain then
+   ends at an exit as in Unity, and the transparent shading branch continues the path.)
+2. **Face bits** are removed in the shader before the lookup (`CaelixMaterialCode`), not by
+   filling every face-bit variant in a host table. The built-in tables fill the variants
+   anyway, so a raw dump is consistent; `caelix_scene_get_material` masks them too.
+3. **set_materials semantics**: replaces the whole table; entries past `count` get the
+   built-in default, whose transparent codes use the CURRENT glass palette. A later
+   `set_glass_palette` rewrites the transparent codes.
+4. **Budget**: up to `bounce_count_transparent` interfaces are crossed; the hit after them is
+   the surface (shaded by the transparent branch with the correct current medium). Unity
+   crosses one fewer and shades the last interface with the medium already advanced (the bug
+   noted in the 2026-09-04 denoiser review); the native version has neither difference.
+5. **Chain into the sky**: deterministic = transmission x sky (with the sun disk), coverage 1,
+   internal view z 1e30 (outside NRD's range, so NRD neither uses nor writes the pixel), host
+   depth / view_z from the chain length to the last interface, G-buffer normal and albedo of
+   the last interface.
+6. **NRD lobe**: build switch `CAELIX_PSR_LOBE` in `caelix_path_trace.hlsl`; 0 (default, as the
+   brief): any interface on the camera ray sends the path to the specular target with
+   roughness 0; 1: only a first-interface reflection does, a refraction keeps the surface's
+   lobe and roughness (Unity's `BOUNCEIDX_IS_SPECULAR`, the usual PSR practice). Both were
+   measured (below); the difference is small because the main noise source is elsewhere.
+7. **Motion under PSR**: Unity's rule, the virtual point on the camera ray moved by the
+   replaced surface's own motion (its previous minus current world position). Without an
+   interface the 6a formula runs unchanged.
+8. **Host**: `--encoding packed|block-id` was added so that `--materials` is usable (the host
+   created packed scenes only). JSON entries take an optional `"transparent": true` to map to
+   code `id` instead of `0x8000 | id`.
+9. The GPU table upload is chunked (64 x 48 KiB, dirty mask), staged after everything else in
+   the flush; the first flush zero-fills the buffer.
+
+### Results
+
+- Tests: see README "Tests" (`caelix_material_test`, the step 6d cases of `caelix_trace_test`).
+  Slab normal incidence +0.16 %, 60 degrees +0.64 %, amber-7 extinction within +0.24 %, total
+  internal reflection +0.06 % with 0 leakage, mirror 3.592 / 3.608.
+- Regression: citadel primary overview byte-identical to step 5; denoised detail 38.42 dB
+  against the 6a reference (unchanged).
+- Glass under NRD (`Artifacts/native-renderer-step6d-20261014/README.md`): the known risk
+  happened. On the fixture's glass the denoised image changes from frame to frame by
+  19.7 dB PSNR (temporal std 7.1 levels) against 59.8 dB (0.11 levels) on sky-lit opaque
+  faces. With 0 stochastic bounces it is still 21.1 dB: the main source is the stochastic
+  reflect/refract flip itself, which changes the albedo and deterministic targets (emission
+  seen through the glass, sky in the reflection) every frame, and those targets are not
+  denoised. `CAELIX_PSR_LOBE` 1 changes the NRD part only slightly (21.8 instead of 20.9 dB
+  against the reference). NRD's validation view shows the glass pixels with a near-zero
+  specular history (frequent resets). Conclusion: the plain stochastic first-interface choice
+  is not good enough under NRD; section 3 (checkerboard split + cross resolve, which keeps both
+  branches every frame and removes the flip from the G-buffer of a pixel) is the next step.

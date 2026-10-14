@@ -7,7 +7,8 @@
 //   raw = deterministic + albedo * (diffuse + specular)      (incident radiance, demodulated)
 //   kModeReference: accum = n == 0 ? raw : lerp(accum, raw, 1 / (n + 1)), output accum
 //                   (n = accum_count, frames accumulated since the last reset)
-//   kModePathTrace: output raw; debug view kViewNrdDiff outputs diffuse instead
+//   kModePathTrace: output raw; debug view kViewNrdDiff outputs diffuse instead,
+//                   kViewNrdSpec specular
 //   colour = output * exposure; a miss is SkyRadiance(primary direction) * exposure
 //   with kRenderFlagSkyOnMiss, else 0; alpha = coverage; linear -> sRGB when the
 //   colour target is a UNORM format (output_srgb).
@@ -27,6 +28,7 @@
 #include "common/caelix_record.hlsl"
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
+#include "common/caelix_material.hlsl"
 #include "render/caelix_shading.hlsl"
 #include "NRD.hlsli"
 
@@ -75,7 +77,12 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     const float3 diffuse = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_int_diff[pixel]).rgb;
     const float3 specular = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_int_spec[pixel]).rgb;
     const float3 raw = g_int_deterministic[pixel].rgb + albedo.rgb * (diffuse + specular);
-    color = (path_trace && fc.debug_view == kViewNrdDiff) ? diffuse : raw;
+    color = raw;
+    if (path_trace && fc.debug_view == kViewNrdDiff) {
+      color = diffuse;
+    } else if (path_trace && fc.debug_view == kViewNrdSpec) {
+      color = specular;
+    }
     CAELIX_BRANCH
     if (fc.mode == kModeReference) {
       // The first frame after a reset is exactly the raw frame.

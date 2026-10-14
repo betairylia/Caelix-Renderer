@@ -1376,3 +1376,398 @@ TEST_CASE("lighting: sun next-event estimation: energy, no double counting, shad
   DestroyTarget(rig.gpu, color);
   CloseRig(rig);
 }
+
+// ---------------------------------------------------------------------------
+// Step 6d: the material table on the GPU, the glass delta chain, extinction,
+// total internal reflection, and the specular lobe of a host material table.
+
+namespace {
+
+// Packed emitters (rgb4, strength 1: emission = colour * 8).
+constexpr uint16_t kRedEmitter8 = 0x4000u | (15u << 10) | 1u;
+constexpr uint16_t kGreenEmitter8 = 0x4000u | (15u << 6) | 1u;
+constexpr uint16_t kWhiteEmitter8 = 0x4000u | (15u << 10) | (15u << 6) | (15u << 2) | 1u;
+constexpr uint16_t kClearGlass = 1;  // palette id 1: tint 1, ior 1.55, smoothness 1
+constexpr uint16_t kAmber7 = 35;     // palette id 35: tint (0.98, 0.72, 0.32), extinction 0.032
+constexpr double kGlassIor = 1.55;
+
+int32_t FloorDiv8(int32_t v) { return v >= 0 ? v / 8 : -((-v + 7) / 8); }
+
+// Sets every voxel of the box [lo, hi] (inclusive, entity-local block coordinates) to `value`,
+// creating zero (air) bricks where needed.
+void FillBox(World& world, int32_t x0, int32_t y0, int32_t z0, int32_t x1, int32_t y1, int32_t z1,
+             uint16_t value) {
+  for (int32_t z = z0; z <= z1; ++z) {
+    for (int32_t y = y0; y <= y1; ++y) {
+      for (int32_t x = x0; x <= x1; ++x) {
+        const Key key{FloorDiv8(x), FloorDiv8(y), FloorDiv8(z)};
+        auto found = world.bricks.find(key);
+        if (found == world.bricks.end()) {
+          found = world.bricks.emplace(key, Brick{}).first;
+        }
+        const int32_t lx = x - key[0] * 8;
+        const int32_t ly = y - key[1] * 8;
+        const int32_t lz = z - key[2] * 8;
+        found->second[static_cast<size_t>(lx + 8 * ly + 64 * lz)] = value;
+      }
+    }
+  }
+}
+
+// A camera at `position` looking along `forward` (normalized here), right = Y x forward,
+// up = forward x right (Unity's basis for a camera without roll).
+CaelixCamera LookAlong(const double position[3], const double forward[3], double tan_half_fov_y) {
+  double f[3] = {forward[0], forward[1], forward[2]};
+  const double fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+  for (double& c : f) {
+    c /= fl;
+  }
+  double r[3] = {f[2], 0.0, -f[0]};  // (0, 1, 0) x f
+  const double rl = std::sqrt(r[0] * r[0] + r[2] * r[2]);
+  r[0] /= rl;
+  r[2] /= rl;
+  const double u[3] = {f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0]};
+  CaelixCamera camera{};
+  for (int c = 0; c < 3; ++c) {
+    camera.position[c] = static_cast<float>(position[c]);
+    camera.right[c] = static_cast<float>(r[c]);
+    camera.up[c] = static_cast<float>(u[c]);
+    camera.forward[c] = static_cast<float>(f[c]);
+  }
+  camera.tan_half_fov_y = static_cast<float>(tan_half_fov_y);
+  camera.aspect = 1.0f;
+  camera.near_z = kNear;
+  camera.far_z = kFar;
+  NormalZProjection(camera.projection, camera.tan_half_fov_y, camera.aspect);
+  return camera;
+}
+
+// Lighting options with a black sky, no sky on miss, no sun.
+CaelixRenderOptions GlassOptions(uint32_t mode, uint32_t bounces, uint32_t transparent, uint32_t seed) {
+  CaelixRenderOptions options = LightOptions(mode, bounces, seed);
+  options.flags = 0;
+  const float black[3] = {0.0f, 0.0f, 0.0f};
+  Set3(options.sky_zenith, black);
+  Set3(options.sky_horizon, black);
+  Set3(options.sky_ground, black);
+  options.bounce_count_transparent = transparent;
+  return options;
+}
+
+void RenderGlassReference(Rig& rig, CaelixRenderer* renderer, TargetSet& set,
+                          const CaelixCamera& camera, uint32_t bounces, uint32_t transparent,
+                          uint32_t frames, uint32_t seed0) {
+  for (uint32_t i = 0; i < frames; ++i) {
+    CaelixRenderOptions options = GlassOptions(CAELIX_MODE_REFERENCE, bounces, transparent, seed0 + i);
+    options.reset_accumulation = i == 0 ? 1u : 0u;
+    Render(rig, renderer, set, camera, options, i + 1 == frames);
+  }
+}
+
+// CPU port of FresnelReflectAmountTransparent (Unity Utils.hlsl, caelix_shading.hlsl).
+// `incident` is unit length, `normal` faces against it.
+double FresnelTransparent(double n1, double n2, const double incident[3], const double normal[3]) {
+  double r0 = (n1 - n2) / (n1 + n2);
+  r0 *= r0;
+  double cos_x = -(normal[0] * incident[0] + normal[1] * incident[1] + normal[2] * incident[2]);
+  if (n1 > n2) {
+    const double n = n1 / n2;
+    const double sin_t2 = n * n * (1.0 - cos_x * cos_x);
+    if (sin_t2 >= 1.0) {
+      return 1.0;
+    }
+    cos_x = std::sqrt(1.0 - sin_t2);
+  }
+  const double x = 1.0 - cos_x;
+  return r0 + (1.0 - r0) * x * x * x * x * x;
+}
+
+// HLSL refract(i, n, eta); false for total internal reflection.
+bool Refract(const double i[3], const double n[3], double eta, double out[3]) {
+  const double cos_i = -(i[0] * n[0] + i[1] * n[1] + i[2] * n[2]);
+  const double k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+  if (k < 0.0) {
+    return false;
+  }
+  for (int c = 0; c < 3; ++c) {
+    out[c] = eta * i[c] + (eta * cos_i - std::sqrt(k)) * n[c];
+  }
+  return true;
+}
+
+// The slab scene: a red emitter wall (z 16..23) behind a one-voxel clear glass pane (z = 4) that
+// sits in air bricks (so the air cells on both sides of the pane exist and report the exit).
+void UploadSlab(Rig& rig) {
+  World world;
+  FillBox(world, -24, -16, 0, 31, 15, 7, 0);
+  FillBox(world, -24, -16, 4, 31, 15, 4, kClearGlass);
+  FillBox(world, -48, -24, 16, 47, 23, 23, kRedEmitter8);
+  Upload(rig, world, KeysOf(world));
+  DrainBuilds(rig);
+}
+
+struct GlassRig {
+  Rig rig;
+  CaelixRenderer* renderer = nullptr;
+  Target color;
+  TargetSet set;
+};
+
+void OpenGlassRig(GlassRig& g, uint32_t encoding) {
+  OpenRig(g.rig, "caelix_trace_test", RigDesc(encoding, 0, 0));
+  REQUIRE(caelix_renderer_create(g.rig.device, g.rig.scene, &g.renderer) == CAELIX_OK);
+  g.color = CreateTarget(g.rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+  g.set.t[kColor] = &g.color;
+}
+
+void CloseGlassRig(GlassRig& g) {
+  REQUIRE(vkDeviceWaitIdle(g.rig.gpu.device.device) == VK_SUCCESS);
+  caelix_renderer_release_target_views(g.renderer);
+  caelix_renderer_destroy(g.renderer);
+  DestroyTarget(g.rig.gpu, g.color);
+  CloseRig(g.rig);
+}
+
+}  // namespace
+
+TEST_CASE("glass: material table on the GPU, slab at normal incidence and at 60 degrees") {
+  GlassRig g;
+  OpenGlassRig(g, 0);
+  UploadSlab(g.rig);
+  const double straight_pos[3] = {0.5, 0.5, -30.0};
+  const double straight_dir[3] = {0.0, 0.0, 1.0};
+  const CaelixCamera straight = LookAlong(straight_pos, straight_dir, std::tan(4.0 * kPi / 180.0));
+  constexpr uint32_t cx = kSize / 2;
+  constexpr uint32_t cy = kSize / 2;
+
+  // 1. The material view reads the GPU table: clear glass (albedo 1) mixed with blue.
+  {
+    CaelixRenderOptions options = Options(CAELIX_VIEW_MATERIAL);
+    Render(g.rig, g.renderer, g.set, straight, options);
+    std::printf("material view, clear glass: %.5f %.5f %.5f\n", g.color.F32(cx, cy, 0),
+                g.color.F32(cx, cy, 1), g.color.F32(cx, cy, 2));
+    CHECK(std::abs(g.color.F32(cx, cy, 0) - 0.6f) < 1e-5f);
+    CHECK(std::abs(g.color.F32(cx, cy, 1) - 0.725f) < 1e-5f);
+    CHECK(std::abs(g.color.F32(cx, cy, 2) - 1.0f) < 1e-5f);
+    // A new palette entry for id 1 reaches the GPU at the next flush.
+    CaelixMaterial original{};
+    REQUIRE(caelix_scene_get_material(g.rig.scene, kClearGlass, &original) == CAELIX_OK);
+    CaelixMaterial entries[2] = {original, original};
+    entries[1].albedo[0] = entries[1].albedo[1] = entries[1].albedo[2] = 0.5f;
+    REQUIRE(caelix_scene_set_glass_palette(g.rig.scene, entries, 2) == CAELIX_OK);
+    Render(g.rig, g.renderer, g.set, straight, options);
+    std::printf("material view, palette id 1 set to grey 0.5: %.5f %.5f %.5f\n",
+                g.color.F32(cx, cy, 0), g.color.F32(cx, cy, 1), g.color.F32(cx, cy, 2));
+    CHECK(std::abs(g.color.F32(cx, cy, 0) - 0.35f) < 1e-5f);
+    CHECK(std::abs(g.color.F32(cx, cy, 1) - 0.475f) < 1e-5f);
+    CHECK(std::abs(g.color.F32(cx, cy, 2) - 0.75f) < 1e-5f);
+    entries[1] = original;
+    REQUIRE(caelix_scene_set_glass_palette(g.rig.scene, entries, 2) == CAELIX_OK);
+  }
+
+  // 2. Normal incidence, no stochastic bounce: the wall's emission (8, 0, 0) through two
+  //    interfaces. Fresnel at each: F = ((1.55 - 1) / (1.55 + 1))^2. The chain chooses
+  //    refraction with probability 1 - F, so the expected value is 8 (1 - F)^2 (1 + F^2 + ...):
+  //    paths that reflect twice inside the pane and leave toward the wall add the F^2 term.
+  const double f0 = std::pow((kGlassIor - 1.0) / (kGlassIor + 1.0), 2.0);
+  {
+    RenderGlassReference(g.rig, g.renderer, g.set, straight, 0, 5, 512, 100);
+    const double measured = CentreMean(g.color, 32, 0);
+    const double brief = 8.0 * (1.0 - f0) * (1.0 - f0);
+    const double expected = brief * (1.0 + f0 * f0);
+    std::printf("glass slab, normal incidence, reference 512 frames: centre 32x32 red %.5f, "
+                "expected 8 (1 - F)^2 = %.5f (ratio %.5f), with the F^2 term %.5f (ratio %.5f); "
+                "F = %.5f; green %.6f blue %.6f\n",
+                measured, brief, measured / brief, expected, measured / expected, f0,
+                CentreMean(g.color, 32, 1), CentreMean(g.color, 32, 2));
+    CHECK(std::abs(measured / brief - 1.0) < 0.02);
+    CHECK(std::abs(measured / expected - 1.0) < 0.01);
+    CHECK(CentreMean(g.color, 32, 1) == 0.0);
+    CHECK(CentreMean(g.color, 32, 2) == 0.0);
+    CHECK(g.color.F32(cx, cy, 3) == 1.0f);
+    // Without the chain the pane is a rough interface shaded stochastically; with no bounce it
+    // contributes nothing (glass has no emission).
+    RenderGlassReference(g.rig, g.renderer, g.set, straight, 0, 0, 4, 200);
+    CHECK(CentreMax(g.color, 32) == 0.0f);
+  }
+
+  // 3. 60 degrees incidence (camera in the x-z plane). Expected 8 (1 - F1)(1 - F2)(1 + F1 F2),
+  //    F1 entering (air -> glass) and F2 leaving (glass -> air, Schlick with the transmitted
+  //    cosine), both from the shader's formula.
+  {
+    const double theta = 60.0 * 3.14159265358979323846 / 180.0;
+    const double d[3] = {std::sin(theta), 0.0, std::cos(theta)};
+    const double target[3] = {0.5, 0.5, 4.0};
+    const double pos[3] = {target[0] - 40.0 * d[0], target[1], target[2] - 40.0 * d[2]};
+    const CaelixCamera oblique = LookAlong(pos, d, std::tan(4.0 * kPi / 180.0));
+    const double n[3] = {0.0, 0.0, -1.0};
+    const double f1 = FresnelTransparent(1.0, kGlassIor, d, n);
+    double inside[3];
+    REQUIRE(Refract(d, n, 1.0 / kGlassIor, inside));
+    const double f2 = FresnelTransparent(kGlassIor, 1.0, inside, n);
+    RenderGlassReference(g.rig, g.renderer, g.set, oblique, 0, 5, 512, 1000);
+    const double measured = CentreMean(g.color, 32, 0);
+    const double brief = 8.0 * (1.0 - f1) * (1.0 - f2);
+    const double expected = brief * (1.0 + f1 * f2);
+    std::printf("glass slab, 60 degrees, reference 512 frames: centre 32x32 red %.5f, expected "
+                "8 (1 - F1)(1 - F2) = %.5f (ratio %.5f), with the F1 F2 term %.5f (ratio %.5f); "
+                "F1 = %.5f, F2 = %.5f\n",
+                measured, brief, measured / brief, expected, measured / expected, f1, f2);
+    CHECK(std::abs(measured / brief - 1.0) < 0.03);
+  }
+
+  // Argument check: more than CAELIX_MAX_BOUNCES_TRANSPARENT interfaces.
+  ExpectLibraryErrors(1, [&] {
+    CaelixFrameDesc desc{};
+    desc.command_buffer = 1;
+    desc.frame_number = g.rig.frames.next;
+    const CaelixRenderTargets targets = ToAbi(g.set);
+    CaelixRenderOptions bad =
+        GlassOptions(CAELIX_MODE_PATH_TRACE, 0, CAELIX_MAX_BOUNCES_TRANSPARENT + 1, 0);
+    REQUIRE(caelix_renderer_render(g.renderer, &desc, &targets, &straight, &bad) ==
+            CAELIX_ERROR_INVALID_ARGUMENT);
+  });
+  CloseGlassRig(g);
+}
+
+TEST_CASE("glass: extinction through an 8-voxel amber block") {
+  GlassRig g;
+  OpenGlassRig(g, 0);
+  {
+    World world;
+    FillBox(world, -16, -16, 0, 15, 15, 15, 0);
+    FillBox(world, -16, -16, 4, 15, 15, 11, kAmber7);
+    FillBox(world, -32, -32, 24, 31, 31, 31, kWhiteEmitter8);
+    Upload(g.rig, world, KeysOf(world));
+    DrainBuilds(g.rig);
+  }
+  const double pos[3] = {0.5, 0.5, -30.0};
+  const double dir[3] = {0.0, 0.0, 1.0};
+  const CaelixCamera camera = LookAlong(pos, dir, std::tan(4.0 * kPi / 180.0));
+  RenderGlassReference(g.rig, g.renderer, g.set, camera, 0, 5, 512, 3000);
+  const double f = std::pow((kGlassIor - 1.0) / (kGlassIor + 1.0), 2.0);
+  const double tint[3] = {0.98, 0.72, 0.32};
+  for (uint32_t c = 0; c < 3; ++c) {
+    const double transmission = std::exp(-(1.0 - tint[c]) * 8.0 * 0.032);
+    const double brief = 8.0 * transmission * (1.0 - f) * (1.0 - f);
+    // Two internal reflections add F^2 and two more passes through the block.
+    const double expected = brief * (1.0 + f * f * transmission * transmission);
+    const double measured = CentreMean(g.color, 32, c);
+    std::printf("amber-7, 8 voxels, channel %u: measured %.5f, expected 8 T (1 - F)^2 = %.5f "
+                "(ratio %.5f), with the F^2 term %.5f (ratio %.5f); T = %.5f\n",
+                c, measured, brief, measured / brief, expected, measured / expected, transmission);
+    CHECK(std::abs(measured / brief - 1.0) < 0.02);
+  }
+  CloseGlassRig(g);
+}
+
+TEST_CASE("glass: total internal reflection at a side face") {
+  // A 16^3 clear glass block (4..19 on every axis) in air bricks, a red emitter floor below it
+  // (y -16..-9) and a green emitter wall beyond its +X face (x 32..39). The camera looks down at
+  // 60 degrees from the vertical onto the top face near the +X edge: the refracted ray (34 degrees)
+  // meets the +X face at 56 degrees, past the critical angle (40 degrees): it must reflect, leave
+  // through the bottom face and reach the red floor. A refraction through the side face would
+  // show the green wall.
+  GlassRig g;
+  OpenGlassRig(g, 0);
+  {
+    World world;
+    FillBox(world, 0, 0, 0, 23, 23, 23, 0);
+    FillBox(world, 4, 4, 4, 19, 19, 19, kClearGlass);
+    FillBox(world, -24, -16, 0, 23, -9, 23, kRedEmitter8);
+    FillBox(world, 32, -16, 0, 39, 23, 23, kGreenEmitter8);
+    Upload(g.rig, world, KeysOf(world));
+    DrainBuilds(g.rig);
+  }
+  const double theta = 60.0 * 3.14159265358979323846 / 180.0;
+  const double d[3] = {std::sin(theta), -std::cos(theta), 0.0};
+  const double target[3] = {17.0, 20.0, 12.0};
+  const double pos[3] = {target[0] - 40.0 * d[0], target[1] - 40.0 * d[1], target[2]};
+  const CaelixCamera camera = LookAlong(pos, d, std::tan(2.0 * kPi / 180.0));
+  RenderGlassReference(g.rig, g.renderer, g.set, camera, 0, 5, 512, 4000);
+  // Entering at 60 degrees and leaving the bottom at 34 degrees inside have the same Fresnel term.
+  const double n_top[3] = {0.0, 1.0, 0.0};
+  const double f = FresnelTransparent(1.0, kGlassIor, d, n_top);
+  const double brief = 8.0 * (1.0 - f) * (1.0 - f);
+  const double expected = brief * (1.0 + f * f);
+  const double red = CentreMean(g.color, 32, 0);
+  const double green = CentreMean(g.color, 32, 1);
+  std::printf("total internal reflection: centre 32x32 red %.5f, expected 8 (1 - F)^2 = %.5f "
+              "(ratio %.5f), with the F^2 term %.5f (ratio %.5f), F = %.5f; green %.6f (no "
+              "refraction through the side face)\n",
+              red, brief, red / brief, expected, red / expected, f, green);
+  CHECK(std::abs(red / brief - 1.0) < 0.03);
+  CHECK(green < 0.01 * 8.0);
+  CloseGlassRig(g);
+}
+
+TEST_CASE("specular: a smooth metal floor from a host table mirrors an emitter; NRD spec channel") {
+  // Block-ID scene: id 1 (code 0x8001) = smooth metal (albedo 0.9, smoothness 1, metallic 1),
+  // id 2 (code 0x8002) = white emitter (emission 4). Floor y -8..-1, emitter cube x -8..7,
+  // y 12..19, z 16..23. The camera at (0, 16, -16) looks down at 45 degrees at (0, 0, 0): the
+  // mirror direction (0, 1, 1) / sqrt 2 meets the cube's -Z face at y = 16.
+  GlassRig g;
+  OpenGlassRig(g, 1);
+  {
+    const uint32_t count = 0x8003;
+    std::vector<CaelixMaterial> table(count);
+    for (uint32_t code = 0; code < count; ++code) {
+      REQUIRE(caelix_scene_get_material(g.rig.scene, code, &table[code]) == CAELIX_OK);
+    }
+    CaelixMaterial mirror{};
+    mirror.albedo[0] = mirror.albedo[1] = mirror.albedo[2] = 0.9f;
+    mirror.smoothness = 1.0f;
+    mirror.metallic = 1.0f;
+    mirror.ior = 1.5f;
+    CaelixMaterial emitter{};
+    emitter.albedo[0] = emitter.albedo[1] = emitter.albedo[2] = 1.0f;
+    emitter.emission[0] = emitter.emission[1] = emitter.emission[2] = 4.0f;
+    emitter.ior = 1.5f;
+    table[0x8001] = mirror;
+    table[0x8002] = emitter;
+    REQUIRE(caelix_scene_set_materials(g.rig.scene, table.data(), count) == CAELIX_OK);
+    World world;
+    FillBox(world, -32, -8, -32, 31, -1, 31, 0x8001);
+    FillBox(world, -8, 12, 16, 7, 19, 23, 0x8002);
+    Upload(g.rig, world, KeysOf(world));
+    DrainBuilds(g.rig);
+  }
+  const double pos[3] = {0.0, 16.0, -16.0};
+  const double dir[3] = {0.0, -1.0, 1.0};
+  const CaelixCamera camera = LookAlong(pos, dir, std::tan(30.0 * kPi / 180.0));
+  constexpr uint32_t cx = kSize / 2;
+  constexpr uint32_t cy = kSize / 2;
+  // The composite multiplies by the RGBA8 albedo target: 0.9 -> 230/255.
+  const double expected = std::round(0.9 * 255.0) / 255.0 * 4.0;
+  RenderGlassReference(g.rig, g.renderer, g.set, camera, 1, 5, 16, 5000);
+  const double centre = CentreMean(g.color, 8, 0);
+  const float beside = g.color.F32(4, cy, 0);  // far left: the mirror sees the black sky
+  std::printf("mirror floor, reference 16 frames: centre 8x8 %.5f (expected %.5f, ratio %.5f), "
+              "far left %.5f\n",
+              centre, expected, centre / expected, beside);
+  CHECK(std::abs(centre / expected - 1.0) < 0.01);
+  CHECK(beside < 0.05f);
+
+  // Path trace mode with NRD: the radiance is in the specular channel, not the diffuse one.
+  float spec = 0.0f;
+  float diff = 0.0f;
+  for (uint32_t view : {static_cast<uint32_t>(CAELIX_VIEW_NRD_SPEC),
+                        static_cast<uint32_t>(CAELIX_VIEW_NRD_DIFF)}) {
+    for (uint32_t i = 0; i < 16; ++i) {
+      CaelixRenderOptions options = GlassOptions(CAELIX_MODE_PATH_TRACE, 1, 5, 6000 + i);
+      options.denoise = 1;
+      options.debug_view = view;
+      Render(g.rig, g.renderer, g.set, camera, options, i + 1 == 16);
+    }
+    (view == CAELIX_VIEW_NRD_SPEC ? spec : diff) = g.color.F32(cx, cy, 0);
+  }
+  CaelixNrdInfo info{};
+  REQUIRE(caelix_renderer_get_nrd_info(g.renderer, &info) == CAELIX_OK);
+  std::printf("mirror floor, NRD after 16 frames: specular view %.5f, diffuse view %.5f (NRD "
+              "failed %u)\n",
+              spec, diff, info.failed);
+  CHECK(info.failed == 0);
+  CHECK(spec > 2.0f);
+  CHECK(diff < 0.05f * spec);
+  CloseGlassRig(g);
+}

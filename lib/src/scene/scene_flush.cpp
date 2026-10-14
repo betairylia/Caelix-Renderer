@@ -282,6 +282,35 @@ bool Scene::StagePageTable() {
   return true;
 }
 
+void Scene::StageMaterials() {
+  if (!material_buffer_filled_) {
+    // Until the chunks arrive, the kernels read zeros (black, no emission), not
+    // uninitialized memory. The fill is recorded before the copies of this flush.
+    fills_.push_back(PendingFill{material_buffer_.buffer(), 0, material_buffer_.size(), 0});
+    material_buffer_filled_ = true;
+  }
+  const uint64_t dirty = materials_->dirty_chunks();
+  for (uint32_t chunk = 0; chunk < MaterialTable::kChunks; ++chunk) {
+    if ((dirty & (1ull << chunk)) == 0) {
+      continue;
+    }
+    StagingRing::Span span;
+    if (!staging_.TryAllocate(MaterialTable::kChunkBytes, kRowAlignment,
+                              StagingRing::Purpose::kRows, span)) {
+      CAELIX_LOGD("caelix_scene_flush: the staging ring is full; material table chunks wait for "
+                  "the next flush");
+      return;
+    }
+    const VkDeviceSize offset = static_cast<VkDeviceSize>(chunk) * MaterialTable::kChunkBytes;
+    std::memcpy(span.data,
+                reinterpret_cast<const uint8_t*>(materials_->data()) + offset,
+                MaterialTable::kChunkBytes);
+    pending_.push_back(
+        PendingCopy{span.offset, material_buffer_.buffer(), offset, MaterialTable::kChunkBytes});
+    materials_->MarkStaged(chunk);
+  }
+}
+
 uint32_t Scene::StageDirtyList() {
   if (dirty_.empty()) {
     return 0;
@@ -521,6 +550,9 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
   //     TLAS instances).
   bool as_out_of_memory = false;
   const bool as_planned = PlanAccelerationStructures(frame, as_out_of_memory);
+
+  // 4c. The material table: lowest priority, it takes the ring space that is left.
+  StageMaterials();
 
   // 5. Pool growth since the last flush: the old contents are copied first, at
   //    the same offsets. The dirty list buffer is rewritten every flush and needs

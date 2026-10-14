@@ -17,7 +17,7 @@ namespace {
 
 // [numthreads(8, 8, 1)] in caelix_path_trace.hlsl and caelix_composite.hlsl.
 constexpr uint32_t kWorkgroupSize = 8;
-constexpr uint32_t kDebugViewCount = 9;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_MOTION
+constexpr uint32_t kDebugViewCount = 11;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_NRD_SPEC
 constexpr uint32_t kModeCount = 3;
 constexpr float kDefaultSunAngularRadius = 0.00873f;  // 0.5 degrees
 
@@ -125,6 +125,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   if (options.bounce_count > CAELIX_MAX_BOUNCES) {
     CAELIX_LOGE("%s: bounce_count %u is above the maximum %u", kFunction, options.bounce_count,
                 CAELIX_MAX_BOUNCES);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  if (options.bounce_count_transparent > CAELIX_MAX_BOUNCES_TRANSPARENT) {
+    CAELIX_LOGE("%s: bounce_count_transparent %u is above the maximum %u", kFunction,
+                options.bounce_count_transparent, CAELIX_MAX_BOUNCES_TRANSPARENT);
     return CAELIX_ERROR_INVALID_ARGUMENT;
   }
   const bool lighting = options.mode != CAELIX_MODE_PRIMARY;
@@ -299,6 +304,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   constants.slot_tables = scene_.slot_tables_address();
   constants.group_infos = scene_.group_infos_address();
   constants.entity_infos = scene_.entity_infos_address();
+  constants.materials = scene_.materials_address();
   constants.records_per_page_shift = scene_.records_per_page_shift();
   constants.record_bytes = scene_.record_bytes();
   constants.group_shift = scene_.group_shift();
@@ -341,6 +347,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   const uint32_t accum_count = restart_accumulation ? 0u : accum_count_;
   constants.mode = options.mode;
   constants.bounce_count = options.bounce_count;
+  constants.bounce_count_transparent = options.bounce_count_transparent;
   constants.frame_seed = options.frame_seed;
   constants.accum_count = accum_count;
   constants.exposure = options.exposure != 0.0f ? options.exposure : 1.0f;

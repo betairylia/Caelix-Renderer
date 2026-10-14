@@ -57,7 +57,8 @@ struct FrameConstants {
   float t_max;              // 424  kTMax: bounce ray length and the "no hit" hit distance
   float sun_solid_angle;    // 428  2 pi (1 - sun_cos_radius): solid angle of the sun cone (NEE pdf 1 / it)
   uint32_t denoised;        // 432  1 = NRD ran this frame: the composite reads its outputs (validation view)
-  uint32_t pad0[3];         // 436
+  uint32_t bounce_count_transparent;  // 436  delta chain interfaces, 0..CAELIX_MAX_BOUNCES_TRANSPARENT
+  uint64_t materials;       // 440  CaelixMaterial (48 B) by block code, 65536 entries
   float hit_dist_params[4]; // 448  REBLUR hit distance normalization A, B, C (w unused), = ReblurSettings
   uint32_t pad[12];         // 464
 };
@@ -81,6 +82,8 @@ static_assert(offsetof(FrameConstants, sun_cos_radius) == 416);
 static_assert(offsetof(FrameConstants, t_max) == 424);
 static_assert(offsetof(FrameConstants, sun_solid_angle) == 428);
 static_assert(offsetof(FrameConstants, denoised) == 432);
+static_assert(offsetof(FrameConstants, bounce_count_transparent) == 436);
+static_assert(offsetof(FrameConstants, materials) == 440);
 static_assert(offsetof(FrameConstants, hit_dist_params) == 448);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
