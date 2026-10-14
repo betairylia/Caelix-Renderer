@@ -139,6 +139,7 @@ impl App {
             group_shift: self.args.group_shift,
             block_bytes: 0,
             encoding: 0, // packed scene colour
+            scratch_bytes: 0, // 128 MiB of acceleration structure build scratch
         };
         // SAFETY: the device is adopted; scene_desc and the out pointer are valid for the call.
         let result = unsafe { caelix_scene_create(state.caelix_device, &scene_desc, &mut state.scene) };
@@ -186,7 +187,7 @@ impl App {
                 );
             }
             if let Some(loader) = state.loader.as_mut() {
-                if let world::LoadOutcome::Mismatch = loader.after_flush(state.scene, uploaded) {
+                if let world::LoadOutcome::Mismatch = loader.after_flush(state.scene, uploaded, frame.frame_number) {
                     self.load_mismatch = true;
                 }
             }
@@ -222,7 +223,7 @@ impl App {
         if let Some(limit) = self.args.frames {
             if self.frames_presented >= limit {
                 if let Some(loader) = state.loader.as_ref() {
-                    loader.log_incomplete();
+                    loader.log_incomplete(state.scene);
                 }
                 log::info!("{} frames presented, exiting", self.frames_presented);
                 event_loop.exit();

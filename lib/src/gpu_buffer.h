@@ -32,8 +32,14 @@ class GpuBuffer {
   GpuBuffer(const GpuBuffer&) = delete;
   GpuBuffer& operator=(const GpuBuffer&) = delete;
 
-  // A device-local pool buffer: storage, transfer src/dst, device address.
-  static GpuBuffer DeviceLocal(VmaAllocator allocator, VkDevice device, VkDeviceSize size);
+  // A device-local pool buffer: storage, transfer src/dst, device address, plus
+  // `extra_usage` (for example ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY).
+  static GpuBuffer DeviceLocal(VmaAllocator allocator, VkDevice device, VkDeviceSize size,
+                               VkBufferUsageFlags extra_usage = 0);
+  // A device-local buffer with exactly `usage` (which must include
+  // SHADER_DEVICE_ADDRESS); its device address is queried.
+  static GpuBuffer DeviceLocalWithUsage(VmaAllocator allocator, VkDevice device,
+                                        VkDeviceSize size, VkBufferUsageFlags usage);
   // A persistently mapped, host-visible upload buffer (transfer src).
   static GpuBuffer HostUpload(VmaAllocator allocator, VkDevice device, VkDeviceSize size);
 

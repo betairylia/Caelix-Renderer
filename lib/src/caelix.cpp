@@ -379,4 +379,19 @@ CAELIX_API CaelixResult caelix_scene_query_brick(const CaelixScene* scene, Caeli
   }
 }
 
+CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t* out_handle,
+                                              uint64_t* out_address) {
+  constexpr const char* kFunction = "caelix_scene_get_tlas";
+  if (scene == nullptr || scene->impl == nullptr) {
+    CAELIX_LOGE("%s: scene is null", kFunction);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  if (out_handle == nullptr || out_address == nullptr) {
+    CAELIX_LOGE("%s: null argument", kFunction);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  scene->impl->GetTlas(*out_handle, *out_address);
+  return CAELIX_OK;
+}
+
 }  // extern "C"

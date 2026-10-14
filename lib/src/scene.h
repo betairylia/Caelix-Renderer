@@ -1,5 +1,6 @@
 #pragma once
 #include "caelix/caelix.h"
+#include "as_pool.h"
 #include "device.h"
 #include "finalize.h"
 #include "gpu_buffer.h"
@@ -53,6 +54,19 @@ struct Group {
   std::vector<uint16_t> dirty_ids;   // rows to restage (ignored when full_rewrite)
   std::vector<uint32_t> reverse_dirty_words;  // reverse table u32 words (pos >> 1) to restage
   std::vector<uint16_t> nan_ids;     // freed ids whose AABB row becomes NaN
+
+  // Bottom-level acceleration structure over the AABB rows [0, high water).
+  AsBlock blas;                                       // storage; invalid = never built
+  VkAccelerationStructureKHR blas_handle = VK_NULL_HANDLE;
+  VkDeviceAddress blas_address = 0;
+  uint32_t blas_primitive_count = 0;                  // high water of the last build
+  // The BLAS is out of date: a brick of the group was queued for finalization or
+  // removed, or the AABB range moved. Cleared when a build is recorded.
+  bool blas_dirty = false;
+  bool in_blas_list = false;         // listed in Scene::blas_pending_; survives free and reuse
+  // == Scene::flush_serial_ while finalize entries of the group wait for a later
+  // flush: the BLAS build waits too.
+  uint64_t finalize_wait_serial = 0;
 };
 
 struct Entity {
@@ -76,6 +90,14 @@ struct Entity {
   std::vector<uint32_t> grid_dirty_cells;
   bool info_dirty = false;           // the EntityInfo row is restaged at the next flush
   bool in_dirty_list = false;        // listed in Scene::dirty_entities_
+
+  // Object-to-world rows (3x4, rotation | position) as staged in the EntityInfo
+  // row: the current transform and the previous frame's transform.
+  float cur_rows[3][4] = {};
+  float prev_rows[3][4] = {};
+  // position/rotation changed since the last flush: the next flush moves cur to
+  // prev and computes cur.
+  bool transform_changed = false;
 };
 
 class Scene {
@@ -99,6 +121,7 @@ class Scene {
   void Recycle(uint64_t safe_frame);
   void GetStats(CaelixSceneStats& out) const;
   CaelixResult QueryBrick(CaelixEntityId entity, CaelixBrickKey key, CaelixBrickInfo& out) const;
+  void GetTlas(uint64_t& handle, uint64_t& address) const;
 
   bool EntityAlive(CaelixEntityId entity) const {
     return entity < entities_.size() && entities_[entity].alive;
@@ -143,6 +166,10 @@ class Scene {
     int32_t min[3];
     int32_t dims[3];
     uint64_t cells;
+  };
+  struct RetiredBlas {
+    AsBlock block;
+    VkAccelerationStructureKHR handle;
   };
 
   explicit Scene(Device& device);
@@ -189,6 +216,20 @@ class Scene {
   bool EnsureNanRow();
   void RecordCopies(VkCommandBuffer cmd);
 
+  // Acceleration structures.
+  void MarkBlasDirty(uint32_t group_index);
+  // The rows of an entity's current transform.
+  static void TransformRows(const float position[3], const float rotation[4], float rows[3][4]);
+  VkAccelerationStructureBuildSizesInfoKHR BlasSizes(uint32_t primitive_count);
+  VkAccelerationStructureBuildSizesInfoKHR TlasSizes(uint32_t instance_count) const;
+  // Chooses the builds of this flush, allocates their storage and scratch, stages
+  // the TLAS instances and fills blas_infos_ / tlas_info_. Returns false when
+  // nothing is built. Sets `out_of_memory` (and builds nothing) when storage
+  // cannot be allocated.
+  bool PlanAccelerationStructures(uint64_t frame, bool& out_of_memory);
+  void RecordAccelerationStructureBuilds(VkCommandBuffer cmd);
+  void DestroyAccelerationStructures();
+
   Device& device_;
   RecordLayout layout_;
   uint32_t group_shift_ = 4;
@@ -214,6 +255,30 @@ class Scene {
   uint32_t pages_staged_ = 0;
   StagingRing staging_;
   ComputePipeline finalize_;
+
+  // Acceleration structures.
+  BlockAllocator as_pool_;
+  GpuBuffer scratch_;            // build scratch of one flush, bump-allocated
+  GrowableBuffer instances_;     // VkAccelerationStructureInstanceKHR per TLAS instance
+  AsBlock tlas_;
+  VkAccelerationStructureKHR tlas_handle_ = VK_NULL_HANDLE;
+  VkDeviceAddress tlas_address_ = 0;
+  bool tlas_dirty_ = false;
+  std::vector<uint32_t> blas_pending_;       // groups with blas_dirty (may hold stale entries)
+  std::vector<RetiredBlas> retired_blas_;    // BLASes of freed groups; the current TLAS uses them
+  std::vector<CaelixEntityId> motion_entities_;  // staged with prev != cur at the last flush
+  ankerl::unordered_dense::map<uint32_t, VkAccelerationStructureBuildSizesInfoKHR> blas_sizes_;
+  // The builds planned for the current flush.
+  std::vector<VkAccelerationStructureGeometryKHR> blas_geometries_;
+  std::vector<VkAccelerationStructureBuildGeometryInfoKHR> blas_infos_;
+  std::vector<VkAccelerationStructureBuildRangeInfoKHR> blas_ranges_;
+  bool tlas_planned_ = false;
+  VkAccelerationStructureGeometryKHR tlas_geometry_{};
+  VkAccelerationStructureBuildGeometryInfoKHR tlas_info_{};
+  VkAccelerationStructureBuildRangeInfoKHR tlas_range_{};
+  uint64_t flush_serial_ = 0;
+  uint64_t blas_count_ = 0;
+  uint64_t as_builds_total_ = 0;
 
   std::vector<PendingCopy> pending_;
   std::vector<PendingFill> fills_;

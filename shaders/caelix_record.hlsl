@@ -72,13 +72,23 @@ struct GroupInfo {
   uint high_water;     // dense ids in [0, high_water) were handed out
 };
 
-// One entity, indexed by the entity id. 32 bytes.
+// One entity, indexed by the entity id. 128 bytes.
 struct EntityInfo {
   int3 grid_min;   // group coordinate of grid cell (0, 0, 0)
   uint grid_base;  // first u32 cell of the entity's group grid
   int3 grid_dims;  // cells per axis (powers of two; 0 = no grid)
   uint pad;
+  // Object-to-world rows (rotation | position) of the current transform and of
+  // the previous frame's transform (equal to cur except for one flush after a
+  // transform change).
+  float4 cur_row0;
+  float4 cur_row1;
+  float4 cur_row2;
+  float4 prev_row0;
+  float4 prev_row1;
+  float4 prev_row2;
 };
+static const uint kEntityInfoBytes = 128;
 
 // Block encodings (FinalizePush::encoding).
 static const uint kEncodingPacked = 0;   // opaque 0xC000, id mask 0xFF, faces at bit 8

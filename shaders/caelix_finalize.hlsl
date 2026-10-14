@@ -86,7 +86,7 @@ uint64_t ResolveNeighbor(uint d) {
   if (any(n < 0) || any(n > mask)) {
     // Another group of the same entity: look it up in the entity's group grid.
     const int3 coord = gs_coord + delta;
-    const uint64_t entity_address = g_push.entity_infos + uint64_t(gs_entity) * 32;
+    const uint64_t entity_address = g_push.entity_infos + uint64_t(gs_entity) * kEntityInfoBytes;
     const uint4 e0 = CAELIX_LOAD_U32x4(entity_address);
     const uint4 e1 = CAELIX_LOAD_U32x4(entity_address + 16);
     const int3 rel = coord - int3(e0.xyz);

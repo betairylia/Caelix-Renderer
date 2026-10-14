@@ -11,8 +11,9 @@ else()
 endif()
 
 # Shared Vulkan setup of the GPU tests: a Vulkan 1.3 device (vk-bootstrap,
-# validation layers when installed), readback buffers, the frame loop.
-add_library(caelix_test_device STATIC test_device.cpp test_device.h)
+# validation layers when installed), readback buffers, the frame loop; and the
+# synthetic scenes and the one-entity scene rig (test_scenes.h).
+add_library(caelix_test_device STATIC test_device.cpp test_device.h test_scenes.cpp test_scenes.h)
 target_compile_definitions(caelix_test_device PUBLIC VK_NO_PROTOTYPES)
 target_link_libraries(caelix_test_device PUBLIC
   caelix_renderer
@@ -41,3 +42,6 @@ caelix_add_gpu_test(caelix_scene_smoke scene_smoke.cpp)
 
 # Finalize kernel against a CPU reference, by GPU readback.
 caelix_add_gpu_test(caelix_finalize_test finalize_test.cpp)
+
+# Acceleration structures (BLAS per group, TLAS): validation, property queries, stats.
+caelix_add_gpu_test(caelix_as_test as_test.cpp)

@@ -28,15 +28,21 @@ In `host-rs/`:
 
 `CAELIX_ABI_VERSION` is 2. Version 2 adds the scene API (`caelix_scene_*`):
 entities, raw brick upload and removal, a per-frame flush, stats and a brick
-query for inspection. The flush runs the finalize kernel (see below). There are
-no acceleration structures or rendering yet. All calls on one scene (or on a
-scene and its device) are externally synchronized by the host.
+query for inspection. The flush runs the finalize kernel and builds the
+acceleration structures (see below). There is no rendering yet. All calls on
+one scene (or on a scene and its device) are externally synchronized by the
+host.
 
 Version 2 is still in development: the finalize step appended fields to
 `CaelixSceneDesc` (`encoding`, default 0 = packed), `CaelixSceneStats`
 (`finalized_bricks_total`, `reverse_table_bytes`, `aabb_bytes`, `grid_bytes`)
 and `CaelixBrickInfo` (`aabb_buffer`, `aabb_row_offset_bytes`) without a
-version bump. Rebuild hosts against the current header.
+version bump. The acceleration structure step appended
+`CaelixSceneDesc::scratch_bytes` (default 0 = 128 MiB), six `CaelixSceneStats`
+fields (`blas_count` .. `as_builds_pending`), four `CaelixBrickInfo` fields
+(`blas_address`, `blas_handle`, `entity_info_buffer`,
+`entity_info_offset_bytes`) and the function `caelix_scene_get_tlas`, also
+without a bump. Rebuild hosts against the current header.
 
 Scene model:
 
@@ -109,6 +115,75 @@ All pools grow by doubling with a copy at the next flush, like the slot table.
 Small table updates are staged as runs that also cover short clean gaps,
 because every `vkCmdCopyBuffer` region has a fixed GPU cost.
 
+### Acceleration structures
+
+Each flush builds the acceleration structures after the finalize kernel
+(`Scene::PlanAccelerationStructures` and `RecordAccelerationStructureBuilds` in
+`lib/src/scene.cpp`). There is no trace kernel yet; the next step adds the
+ray query renderer that binds the TLAS.
+
+- BLAS per render group: procedural AABB geometry
+  (`VK_GEOMETRY_TYPE_AABBS_KHR`, `VK_GEOMETRY_OPAQUE_BIT_KHR`) over the
+  group's AABB rows, stride 24, `primitiveCount` = the group's high water. Free
+  ids and bricks without occupied voxels have NaN rows, which are inactive
+  primitives. Build flag `PREFER_FAST_TRACE` only, mode BUILD; refit
+  (`ALLOW_UPDATE`) and compaction come later.
+- TLAS per scene: one instance per live group that has a BLAS.
+  `instanceCustomIndex` = the scene-wide group index (24 bits, so a scene
+  holds at most 2^24 groups), mask 0xFF, SBT record offset 0,
+  `FORCE_OPAQUE`, transform = the entity transform (unit quaternion and
+  position, scale 1) as a 3x4 row-major matrix: the AABBs are in
+  entity-local block coordinates. The instance array is rebuilt on the CPU,
+  staged through the ring and copied to a device-local buffer.
+- Storage (`lib/src/as_pool.h`, `BlockAllocator`): an acceleration structure
+  must never move (the TLAS refers to BLASes by device address), so it does
+  not use `RowPool`. Storage comes in 64 MiB device-local chunks
+  (`ACCELERATION_STRUCTURE_STORAGE | SHADER_DEVICE_ADDRESS`) that are only
+  added. Blocks come from power-of-two size classes from 4 KiB, with one free
+  list per class per chunk and a bump pointer per chunk; a block larger than a
+  chunk gets a chunk of its own. A structure is rebuilt in place when its
+  block is large enough (safe: one queue, and the flush starts with a barrier
+  from all earlier commands). Otherwise it gets a new block and a new handle;
+  the old block and handle are released when the safe frame reaches the
+  flush, because a TLAS of a frame in flight may still refer to them. The
+  BLAS of a freed group is released after the TLAS build that drops it.
+- Scratch budget: one buffer of `CaelixSceneDesc::scratch_bytes` (default
+  128 MiB), bump-allocated per flush with
+  `minAccelerationStructureScratchOffsetAlignment` (128 on an RTX 5080). The
+  TLAS takes its scratch first (sized for an instance per live group), then
+  BLASes in first-come order until one does not fit; the rest wait for the
+  next flush. The buffer grows when the TLAS and the largest single BLAS do
+  not fit together. Builds are recorded in calls of up to 256 infos.
+- Rebuild policy: a group's BLAS is out of date when one of its bricks is
+  queued for finalization (its own upload, or the upload or removal of a
+  face neighbour) or removed. It is built in the first flush in which its AABB
+  rows are final: its table rows were staged and none of its finalize entries
+  wait for a later flush. The TLAS is out of date when a BLAS was built, a
+  group with a BLAS was freed, or an entity was moved or removed. Every BLAS
+  build invalidates the TLAS, so BLASes are built only in a flush that also
+  builds the TLAS: when the ring has no room for the instances, all builds
+  wait.
+- Barriers inside the flush: the first barrier now goes from all earlier
+  commands to all commands (it also covers in-place rebuilds and the reused
+  scratch); after the copies and the kernel, transfer and compute writes ->
+  all commands; after the BLAS builds, `AS_BUILD` write -> `AS_BUILD` read;
+  after the TLAS build, `AS_BUILD` write -> all commands, memory read.
+- Entity transforms on the GPU: the entity info row is 128 bytes (grid fields,
+  then the current and the previous object-to-world rows as `float4` x 3
+  each). `prev` differs from `cur` for exactly one flush after
+  `caelix_scene_set_entity_transform`; the trace kernels read both for motion
+  vectors.
+
+What the host can query: `CaelixSceneStats` (`blas_count`, `blas_bytes` and
+`tlas_bytes` including blocks that wait for a safe frame, `scratch_bytes`,
+`as_builds_total`, `as_builds_pending`), the BLAS of a brick's group and the
+entity info row through `caelix_scene_query_brick`, and the TLAS handle and
+address through `caelix_scene_get_tlas` (owned by the library; it can change
+at any flush). A brick is traceable in the commands recorded after the flush
+that finalizes it when the scratch and ring budgets allowed its group's build;
+`as_builds_pending == 0` tells the host that every structure matches the
+uploaded bricks.
+
 ### Shaders
 
 HLSL in `shaders/` is compiled at build time by DXC (`$VULKAN_SDK/Bin/dxc.exe`,
@@ -129,10 +204,10 @@ rebuilding the library.
 Frame contract: call `caelix_scene_flush` once per frame with a command buffer
 in the recording state, a strictly increasing `frame_number` (1 or higher), and
 `safe_frame_number` = the newest frame that has completed on the GPU (0 = none).
-The flush records the staging-to-pool copies and the finalize dispatch between
-barriers. Staging
-space and replaced GPU buffers of a frame are released only when that frame is
-safe. `caelix_scene_recycle(safe)` releases them without a flush, for a host
+The flush records the staging-to-pool copies, the finalize dispatch and the
+acceleration structure builds between barriers. Staging space, replaced GPU
+buffers and replaced acceleration structures of a frame are released only
+when that frame is safe. `caelix_scene_recycle(safe)` releases them without a flush, for a host
 that waits for a frame and then uploads before the next flush. Destroy every
 scene before `caelix_device_destroy`, with the device idle.
 
@@ -176,7 +251,18 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   slab in both encodings, removal and replacement (neighbours re-finalized),
   an identical re-upload (records stay bit-identical) and a neighbour that
   arrives later across a group boundary. The device setup is shared with the
-  smoke test (`tests/test_device.h`).
+  smoke test (`tests/test_device.h`); the synthetic scenes and the one-entity
+  scene rig are shared with the acceleration structure test
+  (`tests/test_scenes.h`).
+- `caelix_as_test`: the acceleration structures. Every group of the random
+  opaque scene and of the solid cube gets a BLAS and the scene a TLAS
+  (`blas_count == groups`); `vkCmdWriteAccelerationStructuresPropertiesKHR`
+  (serialization size) returns a nonzero size for BLASes and the TLAS; after
+  removals, replacements and new groups every group is rebuilt; after an
+  entity removal the BLAS storage is released only once the frame of the TLAS
+  rebuild is safe; a 4 MiB scratch budget with 2000 one-brick groups spreads
+  the builds over two flushes; a transform change rebuilds only the TLAS and
+  the entity info row shows the old rows as `prev` for exactly one flush.
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -220,10 +306,15 @@ it adds one scene entity per file entity, then streams the bricks:
 - The window keeps showing the temporary clear colour. When the decoder has
   finished and every brick is uploaded, the host logs one summary (entities,
   groups, resident bricks, record pages, GPU memory, decode and upload time,
-  upload frames, bricks/s, the full `CaelixSceneStats`) and queries the first
-  key of the first 3 decoded sectors with `caelix_scene_query_brick`. When
-  `bricks_resident` differs from the number of decoded bricks, it logs an error
-  and exits with a non-zero code.
+  upload frames, bricks/s, the acceleration structure stats, the full
+  `CaelixSceneStats`) and queries the first key of the first 3 decoded sectors
+  with `caelix_scene_query_brick`. When `bricks_resident` differs from the
+  number of decoded bricks, it logs an error and exits with a non-zero code.
+- After the load, the first flush that leaves `as_builds_pending == 0` logs
+  one more line: its frame number, the time since the loader opened the file,
+  the frames since the first upload and since the load summary, and the BLAS,
+  TLAS and scratch sizes. When `blas_count` differs from the group count, it
+  logs an error and exits with a non-zero code.
 - `--frames N` exits after N frames even when the load is not complete (with a
   warning). At exit the host drops the channel receiver and joins the decoder
   thread. `decode_all` cannot be cancelled: it decodes the remaining sectors and
@@ -233,13 +324,16 @@ Expected numbers for `VoxelTestScenes/epic-citadel.8192.packed.cxw` (release,
 RTX 5080, 64 MiB staging): 3837 sectors, 1 entity, 3837 groups, 1,095,051
 resident bricks in 5 record pages (1370 MiB of record pages, 32 MiB of slot
 tables, 32 MiB of reverse tables, 48 MiB of AABB rows, 4 to 8 MiB of group
-grid). The upload takes about 0.38 s over 39 frames, 20 of which upload (the
-ring holds one frame's records until that frame is safe), about 2.8 M bricks/s;
-without the finalize step it took 0.30 s. The render thread is the limit: the
-extra time is CPU work for the neighbour queue and the table staging, the
-kernel itself costs almost nothing. About 1.18 M bricks are finalized (bricks
-are finalized again when a neighbour arrives in a later frame). Peak working
-set of the process is about 0.6 GB.
+grid). The upload takes about 0.52 s over 39 frames, 20 of which upload (the
+ring holds one frame's records until that frame is safe), about 2.1 M bricks/s;
+before the acceleration structure step it took 0.38 s, and without the
+finalize step 0.30 s. About 1.18 M bricks are finalized (bricks are finalized
+again when a neighbour arrives in a later frame). The acceleration structures
+are complete in the same flush that completes the load (frame 46, 0.56 s after
+the file was opened): 3837 BLASes in 64 MiB, a 2 MiB TLAS, 128 MiB of scratch,
+about 8250 builds (a group is rebuilt when a neighbour arrives later, and the
+TLAS is rebuilt every upload frame). Peak working set of the process is about
+0.6 GB.
 
 Debug builds enable `VK_LAYER_KHRONOS_validation` when it is installed; its
 messages are logged with target `vulkan`. Library messages use target `caelix`.

@@ -29,6 +29,10 @@ class Device {
   VkQueue graphics_queue() const { return graphics_queue_; }
   uint32_t graphics_queue_family() const { return graphics_queue_family_; }
   VmaAllocator allocator() const { return allocator_; }
+  // VK_KHR_acceleration_structure limits of the physical device (queried at adoption).
+  const VkPhysicalDeviceAccelerationStructurePropertiesKHR& as_properties() const {
+    return as_properties_;
+  }
 
  private:
   Device() = default;
@@ -39,6 +43,8 @@ class Device {
   VkQueue graphics_queue_ = VK_NULL_HANDLE;
   uint32_t graphics_queue_family_ = 0;
   VmaAllocator allocator_ = VK_NULL_HANDLE;
+  VkPhysicalDeviceAccelerationStructurePropertiesKHR as_properties_{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
 };
 
 }  // namespace caelix

@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstring>
+#include <exception>
 #include <new>
 #include <optional>
 
@@ -49,6 +51,20 @@ constexpr VkDeviceSize kDirtyListInitialBytes = 4096 * sizeof(DirtyEntry);
 // A group grid larger than this (64 MiB of cells) is refused: the entity's groups
 // are spread too far apart for a dense grid.
 constexpr uint64_t kMaxGridCells = 1ull << 24;
+
+// Acceleration structures.
+constexpr uint64_t kDefaultScratchBytes = 128ull << 20;
+constexpr VkDeviceSize kInstanceBytes = sizeof(VkAccelerationStructureInstanceKHR);
+static_assert(kInstanceBytes == 64);
+constexpr VkDeviceSize kInstancesInitialBytes = 1024 * kInstanceBytes;
+// Build infos per vkCmdBuildAccelerationStructuresKHR call.
+constexpr size_t kMaxBuildsPerCall = 256;
+// The group index is the instance's 24-bit instanceCustomIndex.
+constexpr size_t kMaxGroups = size_t{1} << 24;
+
+uint64_t AlignUp(uint64_t value, uint64_t alignment) {
+  return (value + alignment - 1) / alignment * alignment;
+}
 
 // Neighbour directions in face order: +X, -X, +Y, -Y, +Z, -Z.
 constexpr int32_t kDirections[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
@@ -140,7 +156,7 @@ uint64_t RunWords(const std::vector<WordRun>& runs) {
 
 Scene::Scene(Device& device) : device_(device) {}
 
-Scene::~Scene() = default;
+Scene::~Scene() { DestroyAccelerationStructures(); }
 
 CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
                            std::unique_ptr<Scene>& out) {
@@ -153,6 +169,7 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
       d.records_per_page != 0 ? d.records_per_page : kDefaultRecordsPerPage;
   const uint32_t group_shift = d.group_shift != 0 ? d.group_shift : kDefaultGroupShift;
   const uint32_t block_bytes = d.block_bytes != 0 ? d.block_bytes : kDefaultBlockBytes;
+  const uint64_t scratch_bytes = d.scratch_bytes != 0 ? d.scratch_bytes : kDefaultScratchBytes;
 
   if (staging_bytes < kMinStagingBytes) {
     CAELIX_LOGE("caelix_scene_create: staging_bytes %llu is below the minimum of 4 MiB",
@@ -194,11 +211,13 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
   properties.pNext = &vk13;
   vkGetPhysicalDeviceProperties2(device.physical_device(), &properties);
   const uint64_t page_bytes = static_cast<uint64_t>(records_per_page) * layout.record_bytes;
-  if (page_bytes > vk13.maxBufferSize || staging_bytes > vk13.maxBufferSize) {
-    CAELIX_LOGE("caelix_scene_create: a record page (%llu bytes) or the staging ring (%llu bytes) "
-                "exceeds the device's maxBufferSize (%llu bytes)",
+  if (page_bytes > vk13.maxBufferSize || staging_bytes > vk13.maxBufferSize ||
+      scratch_bytes > vk13.maxBufferSize) {
+    CAELIX_LOGE("caelix_scene_create: a record page (%llu bytes), the staging ring (%llu bytes) or "
+                "the build scratch (%llu bytes) exceeds the device's maxBufferSize (%llu bytes)",
                 static_cast<unsigned long long>(page_bytes),
                 static_cast<unsigned long long>(staging_bytes),
+                static_cast<unsigned long long>(scratch_bytes),
                 static_cast<unsigned long long>(vk13.maxBufferSize));
     return CAELIX_ERROR_INVALID_ARGUMENT;
   }
@@ -213,8 +232,10 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
   scene->encoding_ = d.encoding;
   scene->records_ = RecordPool(allocator, vk_device, records_per_page, layout.record_bytes);
   scene->slot_tables_ = MakeSlotTablePool(allocator, vk_device);
-  scene->aabbs_ =
-      RowPool(allocator, vk_device, kAabbRowBytes, kSlotMinRows, kAabbInitialRows, "AABB");
+  // The AABB rows are the BLAS geometry: build input.
+  scene->aabbs_ = RowPool(allocator, vk_device, kAabbRowBytes, kSlotMinRows, kAabbInitialRows,
+                          "AABB",
+                          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
   scene->reverse_tables_ =
       RowPool(allocator, vk_device, sizeof(uint16_t), bricks_per_group,
               std::max(kReverseInitialRows, bricks_per_group), "reverse table");
@@ -225,14 +246,22 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
   scene->page_table_ = GrowableBuffer(allocator, vk_device, kPageTableInitialBytes);
   scene->dirty_buffer_ = GrowableBuffer(allocator, vk_device, kDirtyListInitialBytes);
   scene->staging_ = StagingRing(allocator, vk_device, staging_bytes);
+  scene->as_pool_.Init(allocator, vk_device);
+  scene->scratch_ = GpuBuffer::DeviceLocalWithUsage(
+      allocator, vk_device, scratch_bytes,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+  scene->instances_ =
+      GrowableBuffer(allocator, vk_device, kInstancesInitialBytes,
+                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
   const std::vector<uint32_t> finalize_spirv = LoadShader("caelix_finalize");
   scene->finalize_ = ComputePipeline(vk_device, finalize_spirv, sizeof(FinalizePush),
                                      "caelix_finalize");
   CAELIX_LOGI("scene created: staging %llu bytes, %u records per page (%llu bytes), group %u^3 "
-              "bricks, record %u bytes, %s encoding",
+              "bricks, record %u bytes, %s encoding, build scratch %llu bytes",
               static_cast<unsigned long long>(staging_bytes), records_per_page,
               static_cast<unsigned long long>(page_bytes), 1u << group_shift,
-              layout.record_bytes, d.encoding == kEncodingPacked ? "packed" : "block-ID");
+              layout.record_bytes, d.encoding == kEncodingPacked ? "packed" : "block-ID",
+              static_cast<unsigned long long>(scratch_bytes));
   out = std::move(scene);
   return CAELIX_OK;
 }
@@ -266,6 +295,9 @@ CaelixResult Scene::AddEntity(const CaelixEntityDesc& desc, CaelixEntityId& out_
   std::memcpy(entity.guid, desc.guid, sizeof(entity.guid));
   std::memcpy(entity.position, desc.position, sizeof(entity.position));
   std::memcpy(entity.rotation, desc.rotation, sizeof(entity.rotation));
+  TransformRows(entity.position, entity.rotation, entity.cur_rows);
+  std::memcpy(entity.prev_rows, entity.cur_rows, sizeof(entity.prev_rows));
+  entity.transform_changed = false;
   entity.groups.clear();
   entity.alive = true;
   std::fill(std::begin(entity.grid_min), std::end(entity.grid_min), 0);
@@ -306,8 +338,10 @@ CaelixResult Scene::RemoveEntity(CaelixEntityId id) {
   entity.has_bounds = false;
   entity.grid_fill = false;
   entity.info_dirty = false;
+  entity.transform_changed = false;
   entity.alive = false;
   free_entities_.push_back(id);
+  tlas_dirty_ = true;
   --entities_alive_;
   return CAELIX_OK;
 }
@@ -317,6 +351,10 @@ CaelixResult Scene::SetEntityTransform(CaelixEntityId id, const float position[3
   Entity& entity = entities_[id];
   std::memcpy(entity.position, position, sizeof(entity.position));
   std::memcpy(entity.rotation, rotation, sizeof(entity.rotation));
+  // The next flush moves cur to prev, restages the info row and rebuilds the TLAS.
+  entity.transform_changed = true;
+  ListEntity(id);
+  tlas_dirty_ = true;
   return CAELIX_OK;
 }
 
@@ -469,7 +507,14 @@ uint32_t Scene::CreateGroup(CaelixEntityId entity_id, const Location& loc, SlotR
   group.info_dirty = true;
   group.reverse_fill = true;
   group.alive = true;
-  // in_dirty_list keeps its value: the index may still be listed from its previous life.
+  group.blas = AsBlock{};
+  group.blas_handle = VK_NULL_HANDLE;
+  group.blas_address = 0;
+  group.blas_primitive_count = 0;
+  group.blas_dirty = false;
+  group.finalize_wait_serial = 0;
+  // in_dirty_list and in_blas_list keep their values: the index may still be listed
+  // from its previous life.
   ListGroup(index);
 
   Entity& entity = entities_[entity_id];
@@ -512,6 +557,17 @@ void Scene::ReleaseGroup(uint32_t group_index) {
   group.info_dirty = false;
   group.reverse_fill = false;
   group.alive = false;
+  // The current TLAS refers to the BLAS: it is released after the next TLAS build.
+  if (group.blas_handle != VK_NULL_HANDLE) {
+    retired_blas_.push_back(RetiredBlas{group.blas, group.blas_handle});
+    --blas_count_;
+    tlas_dirty_ = true;
+  }
+  group.blas = AsBlock{};
+  group.blas_handle = VK_NULL_HANDLE;
+  group.blas_address = 0;
+  group.blas_primitive_count = 0;
+  group.blas_dirty = false;
   free_groups_.push_back(group_index);
   --groups_alive_;
 }
@@ -574,6 +630,12 @@ Scene::Placed Scene::PlaceBrick(CaelixEntityId entity_id, const Location& loc) {
       new_aabbs = aabbs_.Allocate(kSlotMinRows);
       new_reverse = reverse_tables_.Allocate(bricks_per_group_);
       if (free_groups_.empty()) {
+        if (groups_.size() >= kMaxGroups) {
+          CAELIX_LOGE("the scene has %zu render groups, the maximum (the group index is the 24-bit "
+                      "TLAS instance custom index)",
+                      groups_.size());
+          throw std::bad_alloc();
+        }
         group_infos_.Reserve((groups_.size() + 1) * sizeof(GroupInfo));
       }
       if (!GridContains(entity, loc.gx, loc.gy, loc.gz)) {
@@ -647,6 +709,8 @@ void Scene::QueueFinalize(uint32_t group_index, uint16_t id) {
   }
   slot.finalize_epoch = finalize_epoch_;
   dirty_.push_back(DirtyBrick{group_index, id});
+  // The finalize kernel rewrites the brick's AABB row.
+  MarkBlasDirty(group_index);
 }
 
 void Scene::QueueNeighbors(CaelixEntityId entity_id, const CaelixBrickKey& key,
@@ -784,6 +848,7 @@ CaelixResult Scene::RemoveBricks(CaelixEntityId entity_id, uint32_t count,
       MarkDirty(group_index, id);
       MarkReverseDirty(group, loc.pos);
       group.nan_ids.push_back(id);  // the freed id's AABB row becomes inactive
+      MarkBlasDirty(group_index);
     }
     // The neighbours lose a neighbour: they are finalized again.
     QueueNeighbors(entity_id, keys[i], group.brick_count > 0 ? group_index : 0xFFFFFFFFu);
@@ -944,6 +1009,8 @@ bool Scene::StageEntity(CaelixEntityId id, Entity& entity) {
       info.grid_dims[a] = entity.grid_dims[a];
     }
     info.grid_base = entity.grid_range.offset;
+    std::memcpy(info.cur_rows, entity.cur_rows, sizeof(info.cur_rows));
+    std::memcpy(info.prev_rows, entity.prev_rows, sizeof(info.prev_rows));
     std::memcpy(span.data, &info, sizeof(info));
     pending_.push_back(PendingCopy{span.offset, entity_infos_.buffer(),
                                    static_cast<VkDeviceSize>(id) * sizeof(EntityInfo),
@@ -1101,6 +1168,7 @@ void Scene::RecordCopies(VkCommandBuffer cmd) {
 void Scene::Recycle(uint64_t safe_frame) {
   safe_frame_ = std::max(safe_frame_, safe_frame);
   staging_.Recycle(safe_frame_);
+  as_pool_.Recycle(safe_frame_);
   std::erase_if(deferred_buffers_,
                 [this](const DeferredBuffer& deferred) { return deferred.frame <= safe_frame_; });
 }
@@ -1123,6 +1191,17 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
 
   // 1. Release what the GPU has finished with.
   Recycle(desc.safe_frame_number);
+  ++flush_serial_;
+  // Entities staged with prev != cur at the last flush: prev = cur from now on.
+  for (const CaelixEntityId id : motion_entities_) {
+    Entity& entity = entities_[id];
+    if (entity.alive) {
+      std::memcpy(entity.prev_rows, entity.cur_rows, sizeof(entity.prev_rows));
+      entity.info_dirty = true;
+      ListEntity(id);
+    }
+  }
+  motion_entities_.clear();
 
   // 2. GPU-side table work that needs no staging space: AABB range moves and
   //    NaN fills, reverse table and group grid fills of new ranges.
@@ -1134,6 +1213,13 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
   }
   for (const CaelixEntityId id : dirty_entities_) {
     Entity& entity = entities_[id];
+    if (entity.alive && entity.transform_changed) {
+      // The transform of the last flush becomes the previous frame's.
+      std::memcpy(entity.prev_rows, entity.cur_rows, sizeof(entity.prev_rows));
+      TransformRows(entity.position, entity.rotation, entity.cur_rows);
+      entity.transform_changed = false;
+      entity.info_dirty = true;
+    }
     if (entity.alive && entity.grid_fill) {
       fills_.push_back(PendingFill{grids_.buffer(), grids_.ByteOffset(entity.grid_range.offset),
                                    grids_.ByteOffset(entity.grid_range.rows), kNoGroup});
@@ -1177,6 +1263,9 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
         continue;
       }
       entity.in_dirty_list = false;
+      if (std::memcmp(entity.prev_rows, entity.cur_rows, sizeof(entity.prev_rows)) != 0) {
+        motion_entities_.push_back(id);
+      }
     }
     dirty_entities_.swap(still_dirty);
   }
@@ -1186,8 +1275,19 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
                 dirty_groups_.size(), dirty_entities_.size());
   }
 
-  // 4. The finalize list.
+  // 4. The finalize list. Groups with entries that wait for a later flush do not
+  //    build their BLAS in this one.
   const uint32_t dispatch_count = ring_full ? 0 : StageDirtyList();
+  for (const DirtyBrick& brick : dirty_) {
+    if (brick.group_index < groups_.size()) {
+      groups_[brick.group_index].finalize_wait_serial = flush_serial_;
+    }
+  }
+
+  // 4b. Acceleration structure builds after the kernel (needs ring space for the
+  //     TLAS instances).
+  bool as_out_of_memory = false;
+  const bool as_planned = PlanAccelerationStructures(frame, as_out_of_memory);
 
   // 5. Pool growth since the last flush: the old contents are copied first, at
   //    the same offsets. The dirty list buffer is rewritten every flush and needs
@@ -1209,20 +1309,26 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
   take_growth(group_infos_.TakeGrowthSource(), group_infos_.buffer());
   take_growth(entity_infos_.TakeGrowthSource(), entity_infos_.buffer());
   take_growth(page_table_.TakeGrowthSource(), page_table_.buffer());
+  // The dirty list and the instance array are rewritten every time they are used
+  // and need no copy.
   if (std::optional<GpuBuffer> old = dirty_buffer_.TakeGrowthSource(); old.has_value()) {
+    deferred_buffers_.push_back(DeferredBuffer{frame, std::move(*old)});
+  }
+  if (std::optional<GpuBuffer> old = instances_.TakeGrowthSource(); old.has_value()) {
     deferred_buffers_.push_back(DeferredBuffer{frame, std::move(*old)});
   }
 
   if (!pending_.empty() || !growth.empty() || !fills_.empty() || !aabb_moves_.empty() ||
-      dispatch_count > 0) {
+      dispatch_count > 0 || as_planned) {
     staging_.FlushHostWrites();
 
-    // 6. Earlier commands (shader reads of reused records and rows included)
-    //    complete before the transfers write.
+    // 6. Earlier commands complete before this flush writes: shader reads of reused
+    //    records and rows, and traversal of acceleration structures and builds of
+    //    earlier frames (in-place rebuilds and the reused scratch buffer).
     MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                   VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-                  VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                  VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
 
     // 7. Growth copies.
     if (!growth.empty()) {
@@ -1285,9 +1391,15 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                     VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
     }
+
+    // 11. BLAS builds over the AABB rows, then the TLAS over the instances. The
+    //     barrier above makes the copies and the kernel's writes visible to them.
+    if (as_planned) {
+      RecordAccelerationStructureBuilds(cmd);
+    }
   }
 
-  // 11. Close the window.
+  // 12. Close the window.
   staging_.CloseFrame(frame);
   pending_.clear();
   fills_.clear();
@@ -1300,7 +1412,388 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc) {
   ranges_to_free_after_flush_.clear();
   last_frame_ = frame;
   has_flushed_ = true;
-  return CAELIX_OK;
+  return as_out_of_memory ? CAELIX_ERROR_OUT_OF_MEMORY : CAELIX_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Acceleration structures
+
+void Scene::MarkBlasDirty(uint32_t group_index) {
+  Group& group = groups_[group_index];
+  group.blas_dirty = true;
+  if (!group.in_blas_list) {
+    group.in_blas_list = true;
+    blas_pending_.push_back(group_index);
+  }
+}
+
+void Scene::TransformRows(const float position[3], const float rotation[4], float rows[3][4]) {
+  float x = rotation[0];
+  float y = rotation[1];
+  float z = rotation[2];
+  float w = rotation[3];
+  // Scale 1: the quaternion is normalized (an invalid one becomes the identity).
+  const float norm = std::sqrt(x * x + y * y + z * z + w * w);
+  if (norm > 0.0f && std::isfinite(norm)) {
+    x /= norm;
+    y /= norm;
+    z /= norm;
+    w /= norm;
+  } else {
+    x = y = z = 0.0f;
+    w = 1.0f;
+  }
+  rows[0][0] = 1.0f - 2.0f * (y * y + z * z);
+  rows[0][1] = 2.0f * (x * y - w * z);
+  rows[0][2] = 2.0f * (x * z + w * y);
+  rows[0][3] = position[0];
+  rows[1][0] = 2.0f * (x * y + w * z);
+  rows[1][1] = 1.0f - 2.0f * (x * x + z * z);
+  rows[1][2] = 2.0f * (y * z - w * x);
+  rows[1][3] = position[1];
+  rows[2][0] = 2.0f * (x * z - w * y);
+  rows[2][1] = 2.0f * (y * z + w * x);
+  rows[2][2] = 1.0f - 2.0f * (x * x + y * y);
+  rows[2][3] = position[2];
+}
+
+namespace {
+
+VkAccelerationStructureGeometryKHR AabbGeometry(VkDeviceAddress data) {
+  VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+  geometry.geometryType = VK_GEOMETRY_TYPE_AABBS_KHR;
+  geometry.geometry.aabbs.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR;
+  geometry.geometry.aabbs.data.deviceAddress = data;
+  geometry.geometry.aabbs.stride = kAabbRowBytes;
+  geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+  return geometry;
+}
+
+VkAccelerationStructureGeometryKHR InstanceGeometry(VkDeviceAddress data) {
+  VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+  geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+  geometry.geometry.instances.sType =
+      VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+  geometry.geometry.instances.arrayOfPointers = VK_FALSE;
+  geometry.geometry.instances.data.deviceAddress = data;
+  return geometry;
+}
+
+// Mode BUILD, PREFER_FAST_TRACE only. Refit (ALLOW_UPDATE) and compaction
+// (ALLOW_COMPACTION) come later.
+VkAccelerationStructureBuildGeometryInfoKHR BuildInfo(VkAccelerationStructureTypeKHR type,
+                                                      const VkAccelerationStructureGeometryKHR* geometry) {
+  VkAccelerationStructureBuildGeometryInfoKHR info{
+      VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+  info.type = type;
+  info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+  info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+  info.geometryCount = 1;
+  info.pGeometries = geometry;
+  return info;
+}
+
+}  // namespace
+
+VkAccelerationStructureBuildSizesInfoKHR Scene::BlasSizes(uint32_t primitive_count) {
+  // The sizes of an AABB BLAS depend only on the primitive count (same type, flags
+  // and geometry count), so they are cached.
+  const auto found = blas_sizes_.find(primitive_count);
+  if (found != blas_sizes_.end()) {
+    return found->second;
+  }
+  const VkAccelerationStructureGeometryKHR geometry = AabbGeometry(0);
+  const VkAccelerationStructureBuildGeometryInfoKHR info =
+      BuildInfo(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, &geometry);
+  VkAccelerationStructureBuildSizesInfoKHR sizes{
+      VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+  vkGetAccelerationStructureBuildSizesKHR(device_.device(),
+                                          VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &info,
+                                          &primitive_count, &sizes);
+  blas_sizes_.emplace(primitive_count, sizes);
+  return sizes;
+}
+
+VkAccelerationStructureBuildSizesInfoKHR Scene::TlasSizes(uint32_t instance_count) const {
+  const VkAccelerationStructureGeometryKHR geometry = InstanceGeometry(0);
+  const VkAccelerationStructureBuildGeometryInfoKHR info =
+      BuildInfo(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, &geometry);
+  VkAccelerationStructureBuildSizesInfoKHR sizes{
+      VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+  vkGetAccelerationStructureBuildSizesKHR(device_.device(),
+                                          VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &info,
+                                          &instance_count, &sizes);
+  return sizes;
+}
+
+bool Scene::PlanAccelerationStructures(uint64_t frame, bool& out_of_memory) {
+  out_of_memory = false;
+  blas_geometries_.clear();
+  blas_infos_.clear();
+  blas_ranges_.clear();
+  tlas_planned_ = false;
+
+  // 1. Candidates: groups whose BLAS is out of date and whose AABB rows are final
+  //    after this flush (no unstaged rows, no finalize entries left for later).
+  //    The pending list keeps its order, so builds are first come, first served.
+  std::vector<uint32_t> candidates;
+  {
+    size_t kept = 0;
+    for (const uint32_t group_index : blas_pending_) {
+      Group& group = groups_[group_index];
+      if (!group.alive || !group.blas_dirty) {
+        group.in_blas_list = false;
+        continue;
+      }
+      blas_pending_[kept++] = group_index;
+      if (!group.in_dirty_list && group.finalize_wait_serial != flush_serial_) {
+        candidates.push_back(group_index);
+      }
+    }
+    blas_pending_.resize(kept);
+  }
+  // Every BLAS build changes what the TLAS refers to, so a BLAS is only built in a
+  // flush that also builds the TLAS.
+  if (candidates.empty() && !tlas_dirty_) {
+    return false;
+  }
+
+  // 2. Sizes. The TLAS is sized for every live group, an upper bound of the
+  //    instances after this flush's BLAS builds.
+  const uint32_t instance_bound = std::max(1u, groups_alive_);
+  const VkAccelerationStructureBuildSizesInfoKHR tlas_sizes = TlasSizes(instance_bound);
+  std::vector<VkAccelerationStructureBuildSizesInfoKHR> sizes(candidates.size());
+  VkDeviceSize max_blas_scratch = 0;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    sizes[i] = BlasSizes(static_cast<uint32_t>(groups_[candidates[i]].slots.size()));
+    max_blas_scratch = std::max(max_blas_scratch, sizes[i].buildScratchSize);
+  }
+  const VkDeviceSize align = std::max<VkDeviceSize>(
+      1, device_.as_properties().minAccelerationStructureScratchOffsetAlignment);
+
+  // 3. Allocations, before anything changes: a failure leaves the scene as it was.
+  struct NewAs {
+    AsBlock block;
+    VkAccelerationStructureKHR handle = VK_NULL_HANDLE;
+    VkDeviceAddress address = 0;
+  };
+  NewAs new_tlas;
+  std::vector<NewAs> new_blas;  // parallel to the selected candidates; no handle = in place
+  std::vector<VkDeviceAddress> blas_scratch;
+  VkDeviceAddress tlas_scratch = 0;
+  StagingRing::Span span;
+  const VkDevice device = device_.device();
+  try {
+    // The TLAS and the largest single BLAS must fit together, else the scratch
+    // buffer grows (its contents need no copy; the old buffer is kept until this
+    // frame is safe, as earlier frames may still use it).
+    const VkDeviceSize required = AlignUp(tlas_sizes.buildScratchSize, align) +
+                                  AlignUp(max_blas_scratch, align) + align;
+    if (required > scratch_.size()) {
+      GpuBuffer grown = GpuBuffer::DeviceLocalWithUsage(
+          device_.allocator(), device, std::bit_ceil(required),
+          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+      CAELIX_LOGI("acceleration structure scratch grows from %llu to %llu bytes",
+                  static_cast<unsigned long long>(scratch_.size()),
+                  static_cast<unsigned long long>(grown.size()));
+      deferred_buffers_.push_back(DeferredBuffer{frame, std::move(scratch_)});
+      scratch_ = std::move(grown);
+    }
+    instances_.Reserve(static_cast<VkDeviceSize>(instance_bound) * kInstanceBytes);
+    if (!staging_.TryAllocate(static_cast<uint64_t>(instance_bound) * kInstanceBytes, 16,
+                              StagingRing::Purpose::kRows, span)) {
+      CAELIX_LOGD("caelix_scene_flush: the staging ring has no room for %u TLAS instances; the "
+                  "acceleration structure builds wait for the next flush",
+                  instance_bound);
+      return false;
+    }
+
+    // Scratch: the TLAS first, then BLASes in list order until one does not fit.
+    const VkDeviceAddress base = scratch_.address();
+    VkDeviceSize cursor = 0;
+    const auto take = [&](VkDeviceSize bytes, VkDeviceAddress& out) {
+      const VkDeviceAddress aligned = AlignUp(base + cursor, align);
+      const VkDeviceSize end = aligned - base + bytes;
+      if (end > scratch_.size()) {
+        return false;
+      }
+      out = aligned;
+      cursor = end;
+      return true;
+    };
+    if (!take(tlas_sizes.buildScratchSize, tlas_scratch)) {
+      return false;  // cannot happen: the buffer holds `required`
+    }
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      VkDeviceAddress address = 0;
+      if (!take(sizes[i].buildScratchSize, address)) {
+        break;
+      }
+      blas_scratch.push_back(address);
+    }
+
+    // Storage. A structure is rebuilt in place when its block is large enough.
+    if (tlas_handle_ == VK_NULL_HANDLE || tlas_.size < tlas_sizes.accelerationStructureSize) {
+      new_tlas.block = as_pool_.Allocate(tlas_sizes.accelerationStructureSize, AsKind::kTlas);
+      new_tlas.handle = CreateAccelerationStructure(device, as_pool_.buffer(new_tlas.block),
+                                                    new_tlas.block,
+                                                    VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR);
+      new_tlas.address = AccelerationStructureAddress(device, new_tlas.handle);
+    }
+    new_blas.reserve(blas_scratch.size());
+    for (size_t i = 0; i < blas_scratch.size(); ++i) {
+      const Group& group = groups_[candidates[i]];
+      new_blas.emplace_back();
+      if (group.blas_handle != VK_NULL_HANDLE &&
+          group.blas.size >= sizes[i].accelerationStructureSize) {
+        continue;
+      }
+      NewAs& created = new_blas.back();
+      created.block = as_pool_.Allocate(sizes[i].accelerationStructureSize, AsKind::kBlas);
+      created.handle = CreateAccelerationStructure(device, as_pool_.buffer(created.block),
+                                                   created.block,
+                                                   VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+      created.address = AccelerationStructureAddress(device, created.handle);
+    }
+  } catch (const std::exception& error) {
+    // Nothing recorded uses the new structures: release them at once.
+    new_blas.push_back(new_tlas);
+    for (const NewAs& created : new_blas) {
+      if (created.handle != VK_NULL_HANDLE) {
+        vkDestroyAccelerationStructureKHR(device, created.handle, nullptr);
+      }
+      as_pool_.Free(created.block);
+    }
+    CAELIX_LOGE("caelix_scene_flush: cannot allocate acceleration structures (%s); the builds "
+                "wait",
+                error.what());
+    out_of_memory = true;
+    return false;
+  }
+
+  // 4. Commit: the BLAS builds.
+  const VkDeviceAddress aabb_base = aabbs_.address();
+  blas_geometries_.reserve(new_blas.size());  // the infos point into it
+  for (size_t i = 0; i < new_blas.size(); ++i) {
+    Group& group = groups_[candidates[i]];
+    const NewAs& created = new_blas[i];
+    if (created.handle != VK_NULL_HANDLE) {
+      if (group.blas_handle != VK_NULL_HANDLE) {
+        // The old BLAS is used until this frame's TLAS replaces it.
+        as_pool_.FreeAfter(group.blas, frame, group.blas_handle);
+      } else {
+        ++blas_count_;
+      }
+      group.blas = created.block;
+      group.blas_handle = created.handle;
+      group.blas_address = created.address;
+    }
+    group.blas_primitive_count = static_cast<uint32_t>(group.slots.size());
+    group.blas_dirty = false;
+    blas_geometries_.push_back(
+        AabbGeometry(aabb_base + aabbs_.ByteOffset(group.aabb_rows.offset)));
+    VkAccelerationStructureBuildGeometryInfoKHR info =
+        BuildInfo(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, &blas_geometries_.back());
+    info.dstAccelerationStructure = group.blas_handle;
+    info.scratchData.deviceAddress = blas_scratch[i];
+    blas_infos_.push_back(info);
+    VkAccelerationStructureBuildRangeInfoKHR range{};
+    range.primitiveCount = group.blas_primitive_count;
+    blas_ranges_.push_back(range);
+  }
+
+  // 5. The TLAS: one instance per live group with a BLAS.
+  if (new_tlas.handle != VK_NULL_HANDLE) {
+    if (tlas_handle_ != VK_NULL_HANDLE) {
+      as_pool_.FreeAfter(tlas_, frame, tlas_handle_);
+    }
+    tlas_ = new_tlas.block;
+    tlas_handle_ = new_tlas.handle;
+    tlas_address_ = new_tlas.address;
+  }
+  uint32_t instance_count = 0;
+  for (uint32_t group_index = 0; group_index < groups_.size(); ++group_index) {
+    const Group& group = groups_[group_index];
+    if (!group.alive || group.blas_handle == VK_NULL_HANDLE) {
+      continue;
+    }
+    const Entity& entity = entities_[group.entity];
+    VkAccelerationStructureInstanceKHR instance{};
+    std::memcpy(instance.transform.matrix, entity.cur_rows, sizeof(instance.transform.matrix));
+    instance.instanceCustomIndex = group_index;
+    instance.mask = 0xFF;
+    instance.instanceShaderBindingTableRecordOffset = 0;
+    instance.flags = VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+    instance.accelerationStructureReference = group.blas_address;
+    std::memcpy(span.data + static_cast<VkDeviceSize>(instance_count) * kInstanceBytes, &instance,
+                sizeof(instance));
+    ++instance_count;
+  }
+  if (instance_count > 0) {
+    pending_.push_back(PendingCopy{span.offset, instances_.buffer(), 0,
+                                   static_cast<VkDeviceSize>(instance_count) * kInstanceBytes});
+  }
+  tlas_geometry_ = InstanceGeometry(instances_.address());
+  tlas_info_ = BuildInfo(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, &tlas_geometry_);
+  tlas_info_.dstAccelerationStructure = tlas_handle_;
+  tlas_info_.scratchData.deviceAddress = tlas_scratch;
+  tlas_range_ = VkAccelerationStructureBuildRangeInfoKHR{};
+  tlas_range_.primitiveCount = instance_count;
+  tlas_planned_ = true;
+  tlas_dirty_ = false;
+  // The new TLAS no longer refers to the BLASes of freed groups.
+  for (const RetiredBlas& retired : retired_blas_) {
+    as_pool_.FreeAfter(retired.block, frame, retired.handle);
+  }
+  retired_blas_.clear();
+  as_builds_total_ += blas_infos_.size() + 1;
+  return true;
+}
+
+void Scene::RecordAccelerationStructureBuilds(VkCommandBuffer cmd) {
+  if (!blas_infos_.empty()) {
+    std::vector<const VkAccelerationStructureBuildRangeInfoKHR*> ranges(blas_ranges_.size());
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      ranges[i] = &blas_ranges_[i];
+    }
+    for (size_t i = 0; i < blas_infos_.size(); i += kMaxBuildsPerCall) {
+      const size_t n = std::min(kMaxBuildsPerCall, blas_infos_.size() - i);
+      vkCmdBuildAccelerationStructuresKHR(cmd, static_cast<uint32_t>(n), blas_infos_.data() + i,
+                                          ranges.data() + i);
+    }
+    // The TLAS build reads the BLASes.
+    MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                  VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                  VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                  VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+  }
+  if (tlas_planned_) {
+    const VkAccelerationStructureBuildRangeInfoKHR* range = &tlas_range_;
+    vkCmdBuildAccelerationStructuresKHR(cmd, 1, &tlas_info_, &range);
+    // Later commands (the ray query kernels) traverse the structures.
+    MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                  VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
+  }
+}
+
+void Scene::DestroyAccelerationStructures() {
+  const VkDevice device = device_.device();
+  for (Group& group : groups_) {
+    if (group.blas_handle != VK_NULL_HANDLE) {
+      vkDestroyAccelerationStructureKHR(device, group.blas_handle, nullptr);
+      group.blas_handle = VK_NULL_HANDLE;
+    }
+  }
+  for (const RetiredBlas& retired : retired_blas_) {
+    vkDestroyAccelerationStructureKHR(device, retired.handle, nullptr);
+  }
+  retired_blas_.clear();
+  if (tlas_handle_ != VK_NULL_HANDLE) {
+    vkDestroyAccelerationStructureKHR(device, tlas_handle_, nullptr);
+    tlas_handle_ = VK_NULL_HANDLE;
+  }
+  // as_pool_ destroys the handles of its pending frees.
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,6 +1815,19 @@ void Scene::GetStats(CaelixSceneStats& out) const {
   out.reverse_table_bytes = reverse_tables_.bytes();
   out.aabb_bytes = aabbs_.bytes();
   out.grid_bytes = grids_.bytes();
+  out.blas_count = blas_count_;
+  out.blas_bytes = as_pool_.allocated_bytes(AsKind::kBlas);
+  out.tlas_bytes = as_pool_.allocated_bytes(AsKind::kTlas);
+  out.scratch_bytes = scratch_.size();
+  out.as_builds_total = as_builds_total_;
+  uint64_t pending = tlas_dirty_ ? 1 : 0;
+  for (const uint32_t group_index : blas_pending_) {
+    const Group& group = groups_[group_index];
+    if (group.alive && group.blas_dirty) {
+      ++pending;
+    }
+  }
+  out.as_builds_pending = pending;
 }
 
 CaelixResult Scene::QueryBrick(CaelixEntityId entity_id, CaelixBrickKey key,
@@ -1357,7 +1863,16 @@ CaelixResult Scene::QueryBrick(CaelixEntityId entity_id, CaelixBrickKey key,
   out.slot_row_offset_bytes = slot_tables_.ByteOffset(group.slot_rows.offset + id);
   out.aabb_buffer = HandleToU64(aabbs_.buffer());
   out.aabb_row_offset_bytes = aabbs_.ByteOffset(group.aabb_rows.offset + id);
+  out.blas_address = group.blas_address;
+  out.blas_handle = HandleToU64(group.blas_handle);
+  out.entity_info_buffer = HandleToU64(entity_infos_.buffer());
+  out.entity_info_offset_bytes = static_cast<uint64_t>(entity_id) * sizeof(EntityInfo);
   return CAELIX_OK;
+}
+
+void Scene::GetTlas(uint64_t& handle, uint64_t& address) const {
+  handle = HandleToU64(tlas_handle_);
+  address = tlas_address_;
 }
 
 }  // namespace caelix

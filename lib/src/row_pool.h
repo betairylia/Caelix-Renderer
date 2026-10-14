@@ -18,7 +18,9 @@ namespace caelix {
 class GrowableBuffer {
  public:
   GrowableBuffer() = default;
-  GrowableBuffer(VmaAllocator allocator, VkDevice device, VkDeviceSize initial_bytes);
+  // `extra_usage` is added to the usage of every buffer (see GpuBuffer::DeviceLocal).
+  GrowableBuffer(VmaAllocator allocator, VkDevice device, VkDeviceSize initial_bytes,
+                 VkBufferUsageFlags extra_usage = 0);
 
   // Makes the buffer hold at least `bytes`. Throws VulkanError (or
   // std::bad_alloc); the buffer is unchanged then.
@@ -35,6 +37,7 @@ class GrowableBuffer {
  private:
   VmaAllocator allocator_ = VK_NULL_HANDLE;
   VkDevice device_ = VK_NULL_HANDLE;
+  VkBufferUsageFlags extra_usage_ = 0;
   GpuBuffer buffer_;
   // Holds the GPU-valid contents while a growth copy is pending.
   std::optional<GpuBuffer> growth_source_;
@@ -61,7 +64,7 @@ class RowPool {
   RowPool() = default;
   // `min_rows` and `initial_rows` are powers of two, initial_rows >= min_rows.
   RowPool(VmaAllocator allocator, VkDevice device, uint32_t row_bytes, uint32_t min_rows,
-          uint32_t initial_rows, const char* name);
+          uint32_t initial_rows, const char* name, VkBufferUsageFlags extra_usage = 0);
 
   // Throws VulkanError (or std::bad_alloc) when the buffer cannot grow. On
   // throw, the pool is unchanged.

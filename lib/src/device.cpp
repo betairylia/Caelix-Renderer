@@ -186,11 +186,16 @@ CaelixResult Device::Adopt(const CaelixDeviceAdoptDesc& desc, std::unique_ptr<De
     return FromVkResult(result);
   }
 
+  VkPhysicalDeviceAccelerationStructurePropertiesKHR as_properties{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
   VkPhysicalDeviceVulkan12Properties vk12_properties{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+  vk12_properties.pNext = &as_properties;
   VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
   properties.pNext = &vk12_properties;
   vkGetPhysicalDeviceProperties2(device->physical_device_, &properties);
+  as_properties.pNext = nullptr;
+  device->as_properties_ = as_properties;
   CAELIX_LOGI("adopted device: %s, driver %s %s (0x%08x), Vulkan %u.%u.%u, queue family %u",
               properties.properties.deviceName, vk12_properties.driverName,
               vk12_properties.driverInfo, properties.properties.driverVersion,
@@ -198,6 +203,12 @@ CaelixResult Device::Adopt(const CaelixDeviceAdoptDesc& desc, std::unique_ptr<De
               VK_API_VERSION_MINOR(properties.properties.apiVersion),
               VK_API_VERSION_PATCH(properties.properties.apiVersion),
               device->graphics_queue_family_);
+  CAELIX_LOGI("acceleration structure properties: scratch offset alignment %u, max instance count "
+              "%llu, max primitive count %llu, max geometry count %llu",
+              as_properties.minAccelerationStructureScratchOffsetAlignment,
+              static_cast<unsigned long long>(as_properties.maxInstanceCount),
+              static_cast<unsigned long long>(as_properties.maxPrimitiveCount),
+              static_cast<unsigned long long>(as_properties.maxGeometryCount));
 
   out = std::move(device);
   return CAELIX_OK;

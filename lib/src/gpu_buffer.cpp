@@ -56,13 +56,20 @@ GpuBuffer& GpuBuffer::operator=(GpuBuffer&& other) noexcept {
   return *this;
 }
 
-GpuBuffer GpuBuffer::DeviceLocal(VmaAllocator allocator, VkDevice device, VkDeviceSize size) {
+GpuBuffer GpuBuffer::DeviceLocal(VmaAllocator allocator, VkDevice device, VkDeviceSize size,
+                                 VkBufferUsageFlags extra_usage) {
+  return DeviceLocalWithUsage(
+      allocator, device, size,
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+          extra_usage);
+}
+
+GpuBuffer GpuBuffer::DeviceLocalWithUsage(VmaAllocator allocator, VkDevice device,
+                                          VkDeviceSize size, VkBufferUsageFlags usage) {
   VmaAllocationCreateInfo allocation_info{};
   allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-  return GpuBuffer(allocator, device, size,
-                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                   allocation_info, true);
+  return GpuBuffer(allocator, device, size, usage, allocation_info, true);
 }
 
 GpuBuffer GpuBuffer::HostUpload(VmaAllocator allocator, VkDevice device, VkDeviceSize size) {

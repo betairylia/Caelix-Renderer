@@ -37,9 +37,10 @@ extern "C" {
 #endif
 
 /* Bumped on every breaking change of this header. Exception: version 2 is still in development;
-   the finalize step appended fields to CaelixSceneDesc (encoding, default 0), CaelixSceneStats and
-   CaelixBrickInfo without a bump. A host built against an older version-2 header must be rebuilt
-   (the library writes the larger output structs). */
+   the finalize step and the acceleration structure step appended fields to CaelixSceneDesc
+   (encoding, scratch_bytes; 0 = default), CaelixSceneStats and CaelixBrickInfo, and added
+   caelix_scene_get_tlas, without a bump. A host built against an older version-2 header must be
+   rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
 typedef struct CaelixVersion {
@@ -187,6 +188,20 @@ CAELIX_API CaelixResult caelix_clear_target(CaelixDevice* device, uint64_t comma
  * Record pool pages never move: a record keeps its page and offset until the
  * brick is removed.
  *
+ * Acceleration structures: every render group has one bottom-level acceleration structure (BLAS)
+ * over its AABB rows (procedural AABB geometry, one primitive per dense brick id; a free id or a
+ * brick without occupied voxels has a NaN row and is an inactive primitive). The scene has one
+ * top-level acceleration structure (TLAS) with one instance per group that has a BLAS; the instance
+ * transform is the entity transform (the AABBs are in entity-local block coordinates) and
+ * instanceCustomIndex is the scene-wide group index. caelix_scene_flush builds them after the
+ * finalize kernel: a group's BLAS is rebuilt when its bricks or AABB rows change, the TLAS when a
+ * BLAS was built, a group was freed, or an entity was moved or removed. Builds share a scratch
+ * buffer (CaelixSceneDesc::scratch_bytes) and the TLAS instances go through the staging ring; the
+ * builds that do not fit wait for a later flush. A brick is traceable in the commands recorded
+ * after the flush that finalizes it when both budgets allowed its group's build; otherwise after a
+ * later flush. CaelixSceneStats::as_builds_pending == 0 means that every acceleration structure
+ * matches the bricks the host has uploaded and that flushes have finalized.
+ *
  * Frame contract: the host calls caelix_scene_flush once per frame that has
  * scene changes (or every frame), with a strictly increasing frame number and
  * the newest frame number that has completed on the GPU. Staging space and
@@ -206,6 +221,10 @@ typedef struct CaelixSceneDesc {
   uint32_t encoding;           /* block encoding for finalization: 0 = packed scene colour (the
                                   default, what Caelix worlds use), 1 = block-ID. Other values
                                   return CAELIX_ERROR_INVALID_ARGUMENT. See the encodings above. */
+  uint64_t scratch_bytes;      /* scratch buffer of the acceleration structure builds of one flush.
+                                  0 = 128 MiB. A flush builds as many BLASes as fit (the TLAS
+                                  first); the rest wait. The buffer grows when the TLAS and the
+                                  largest single BLAS do not fit together. */
 } CaelixSceneDesc;
 
 /* Creates an empty scene on an adopted device. `desc` may be NULL (all defaults).
@@ -267,11 +286,14 @@ typedef struct CaelixFrameDesc {
 
 /* Records into the command buffer all copies from staging to the pools for everything uploaded or
    removed since the previous flush, then the finalize kernel over the changed bricks and their
-   neighbours, with barriers: one before the copies (all earlier commands -> transfer), transfer ->
-   compute before the kernel, and one at the end (transfer and compute -> all later commands).
-   Recycles staging spans whose frame <= safe. With nothing to do it records nothing. A frame_number that is not greater than
-   the previous flush's, or a safe_frame_number >= frame_number, returns
-   CAELIX_ERROR_INVALID_ARGUMENT. */
+   neighbours, then the acceleration structure builds (BLASes, then the TLAS), with barriers: one
+   before the copies (all earlier commands -> all commands), transfer -> compute before the kernel,
+   transfer and compute -> all later commands after it, BLAS builds -> TLAS build, and TLAS build ->
+   all later commands. Recycles staging spans and acceleration structures whose frame <= safe. With
+   nothing to do it records nothing. A frame_number that is not greater than the previous flush's,
+   or a safe_frame_number >= frame_number, returns CAELIX_ERROR_INVALID_ARGUMENT. When an
+   acceleration structure cannot be allocated, the flush records everything else, the builds stay
+   pending, and it returns CAELIX_ERROR_OUT_OF_MEMORY. */
 CAELIX_API CaelixResult caelix_scene_flush(CaelixScene* scene, const CaelixFrameDesc* desc);
 
 /* Tells the scene that every frame <= safe_frame_number has completed on the GPU and releases the
@@ -281,7 +303,8 @@ CAELIX_API CaelixResult caelix_scene_flush(CaelixScene* scene, const CaelixFrame
    no effect. */
 CAELIX_API CaelixResult caelix_scene_recycle(CaelixScene* scene, uint64_t safe_frame_number);
 
-/* Fields are only appended. The last four fields were added to ABI version 2 by the finalize step. */
+/* Fields are only appended. finalized_bricks_total .. grid_bytes were added to ABI version 2 by the
+   finalize step, blas_count .. as_builds_pending by the acceleration structure step. */
 typedef struct CaelixSceneStats {
   uint32_t entities, groups;                               /* live entities and render groups */
   uint64_t bricks_resident, bricks_known;                  /* with a GPU record; with a slot */
@@ -292,13 +315,21 @@ typedef struct CaelixSceneStats {
   uint64_t reverse_table_bytes;     /* GPU allocation sizes of the finalize lookup tables: */
   uint64_t aabb_bytes;              /*   reverse tables, AABB rows, group grids */
   uint64_t grid_bytes;
+  uint64_t blas_count;              /* live groups that have a BLAS */
+  uint64_t blas_bytes;              /* BLAS storage blocks, including blocks whose release waits for
+                                       a safe frame */
+  uint64_t tlas_bytes;              /* TLAS storage block(s), same rule */
+  uint64_t scratch_bytes;           /* capacity of the build scratch buffer */
+  uint64_t as_builds_total;         /* BLAS and TLAS builds recorded so far */
+  uint64_t as_builds_pending;       /* groups whose BLAS is out of date (waiting for finalization,
+                                       scratch or ring space), plus 1 when the TLAS is out of date */
 } CaelixSceneStats;
 
 /* Fills *out. A NULL argument is ignored. */
 CAELIX_API void caelix_scene_get_stats(const CaelixScene* scene, CaelixSceneStats* out);
 
-/* Inspection and debug aid: where the GPU record, the slot table row and the AABB row of a brick
-   live. The GPU
+/* Inspection and debug aid: where the GPU record, the slot table row, the AABB row, the group's
+   BLAS and the entity's info row of a brick live. The GPU
    contents match the last flush; the buffers can change at the next upload or flush (the slot table
    grows by reallocation), so use the handles only until then. An unknown brick reports
    resident = 0 and 0 in every other field.
@@ -319,10 +350,27 @@ typedef struct CaelixBrickInfo {
   uint64_t aabb_row_offset_bytes;     /* byte offset of the brick's AABB row (24 bytes: float min[3],
                                          float max[3], entity-local block coordinates, all NaN
                                          when the brick has no occupied voxel) */
+  uint64_t blas_address;              /* VkDeviceAddress of the group's BLAS, 0 when not built yet */
+  uint64_t blas_handle;               /* VkAccelerationStructureKHR of the group's BLAS, 0 when not
+                                         built yet. Owned by the library. */
+  uint64_t entity_info_buffer;        /* VkBuffer that holds the entity info rows */
+  uint64_t entity_info_offset_bytes;  /* byte offset of the entity's info row (128 bytes: int32
+                                         grid_min[3], uint32 grid_base, int32 grid_dims[3], uint32
+                                         pad, float cur_rows[3][4], float prev_rows[3][4]; the rows
+                                         are the object-to-world matrix, rotation | position, of the
+                                         current and of the previous frame's transform) */
 } CaelixBrickInfo;
 
 CAELIX_API CaelixResult caelix_scene_query_brick(const CaelixScene* scene, CaelixEntityId entity,
                                                  CaelixBrickKey key, CaelixBrickInfo* out);
+
+/* The scene's TLAS: *out_handle = its VkAccelerationStructureKHR, *out_address = its
+   VkDeviceAddress, both 0 before the first TLAS build. This is the handle the renderer binds. The
+   library owns it: the host must not destroy it. The TLAS may be rebuilt into a new handle at any
+   flush, so query it after the flush whose commands use it. NULL out pointers return
+   CAELIX_ERROR_INVALID_ARGUMENT. */
+CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t* out_handle,
+                                              uint64_t* out_address);
 
 /* Reserved for later (not declared yet):
  *   caelix_scene_upload_brick_summaries - per-brick summaries for bricks that are known but not

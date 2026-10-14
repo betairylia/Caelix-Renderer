@@ -26,14 +26,20 @@ struct GroupInfo {
 };
 static_assert(sizeof(GroupInfo) == 32);
 
-// One entity, indexed by the entity id. 32 bytes.
+// One entity, indexed by the entity id. 128 bytes. The finalize kernel reads the
+// first 32 bytes; the transform rows are for the trace kernels.
 struct EntityInfo {
   int32_t grid_min[3];   // group coordinate of grid cell (0, 0, 0)
   uint32_t grid_base;    // first u32 cell of the group grid
   int32_t grid_dims[3];  // cells per axis, powers of two; 0 = no grid
   uint32_t pad;
+  // Object-to-world rows (3x4, row-major: rotation | position) of the current
+  // transform, then of the previous frame's transform. prev differs from cur for
+  // exactly one flush after a transform change.
+  float cur_rows[3][4];
+  float prev_rows[3][4];
 };
-static_assert(sizeof(EntityInfo) == 32);
+static_assert(sizeof(EntityInfo) == 128);
 
 // Push constants of the finalize kernel. 88 bytes.
 struct FinalizePush {

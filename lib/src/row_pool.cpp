@@ -9,9 +9,9 @@
 namespace caelix {
 
 GrowableBuffer::GrowableBuffer(VmaAllocator allocator, VkDevice device,
-                               VkDeviceSize initial_bytes)
-    : allocator_(allocator), device_(device) {
-  buffer_ = GpuBuffer::DeviceLocal(allocator_, device_, initial_bytes);
+                               VkDeviceSize initial_bytes, VkBufferUsageFlags extra_usage)
+    : allocator_(allocator), device_(device), extra_usage_(extra_usage) {
+  buffer_ = GpuBuffer::DeviceLocal(allocator_, device_, initial_bytes, extra_usage_);
 }
 
 void GrowableBuffer::Reserve(VkDeviceSize bytes) {
@@ -22,7 +22,7 @@ void GrowableBuffer::Reserve(VkDeviceSize bytes) {
   while (new_bytes < bytes) {
     new_bytes *= 2;
   }
-  GpuBuffer grown = GpuBuffer::DeviceLocal(allocator_, device_, new_bytes);
+  GpuBuffer grown = GpuBuffer::DeviceLocal(allocator_, device_, new_bytes, extra_usage_);
   if (!growth_source_.has_value()) {
     // buffer_ holds the GPU-valid contents; keep it as the copy source.
     growth_source_ = std::move(buffer_);
@@ -39,8 +39,9 @@ std::optional<GpuBuffer> GrowableBuffer::TakeGrowthSource() {
 }
 
 RowPool::RowPool(VmaAllocator allocator, VkDevice device, uint32_t row_bytes, uint32_t min_rows,
-                 uint32_t initial_rows, const char* name)
-    : storage_(allocator, device, static_cast<VkDeviceSize>(initial_rows) * row_bytes),
+                 uint32_t initial_rows, const char* name, VkBufferUsageFlags extra_usage)
+    : storage_(allocator, device, static_cast<VkDeviceSize>(initial_rows) * row_bytes,
+               extra_usage),
       name_(name),
       row_bytes_(row_bytes),
       min_rows_(min_rows),

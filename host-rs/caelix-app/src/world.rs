@@ -36,7 +36,9 @@ pub enum LoadOutcome {
     Loading,
     /// The load completed in this frame and the resident brick count matches.
     Complete,
-    /// The load completed in this frame and the resident brick count does not match.
+    /// The load completed in this frame and the resident brick count does not match,
+    /// or the acceleration structures completed and their count does not match the
+    /// group count.
     Mismatch,
 }
 
@@ -52,6 +54,13 @@ pub struct WorldLoader {
     pending: Option<(DecodedSector, usize)>,
     decode_time: Option<Duration>,
     complete: bool,
+    /// Frame number of the flush after which the load summary was logged.
+    complete_frame: u64,
+    /// Every acceleration structure was up to date (`as_builds_pending == 0`) after a
+    /// flush that followed the load.
+    as_ready: bool,
+    /// When `open` was called.
+    load_start: Instant,
     sectors_received: u64,
     bricks_received: u64,
     bricks_uploaded: u64,
@@ -67,6 +76,7 @@ pub struct WorldLoader {
 impl WorldLoader {
     /// Opens the file, adds every entity to the scene and starts the decoder thread.
     pub fn open(scene: *mut CaelixScene, path: &Path) -> anyhow::Result<Self> {
+        let load_start = Instant::now();
         let file = CxwFile::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let world = file.world();
         log::info!("world {}: format version {}", path.display(), world.version);
@@ -119,6 +129,9 @@ impl WorldLoader {
             pending: None,
             decode_time: None,
             complete: false,
+            complete_frame: 0,
+            as_ready: false,
+            load_start,
             sectors_received: 0,
             bricks_received: 0,
             bricks_uploaded: 0,
@@ -185,20 +198,49 @@ impl WorldLoader {
     }
 
     /// Call after the frame's `caelix_scene_flush`. `uploaded` is the result of this
-    /// frame's `upload`. Logs the summary once when the load has completed.
-    pub fn after_flush(&mut self, scene: *const CaelixScene, uploaded: bool) -> LoadOutcome {
+    /// frame's `upload`. Logs the summary once when the load has completed, and one
+    /// more line when every acceleration structure is up to date after the load.
+    pub fn after_flush(&mut self, scene: *const CaelixScene, uploaded: bool, frame_number: u64) -> LoadOutcome {
         if uploaded {
             self.upload_end = Some(Instant::now());
         }
-        if self.complete || self.decoder.is_some() || self.pending.is_some() {
+        if self.as_ready || self.decoder.is_some() || self.pending.is_some() {
             return LoadOutcome::Loading;
         }
-        self.complete = true;
-        self.log_summary(scene)
+        let mut outcome = LoadOutcome::Loading;
+        if !self.complete {
+            self.complete = true;
+            self.complete_frame = frame_number;
+            outcome = self.log_summary(scene);
+        }
+        let stats = scene_stats(scene);
+        if stats.as_builds_pending == 0 {
+            self.as_ready = true;
+            let first_upload = self.upload_frame_range.map_or(frame_number, |(first, _)| first);
+            log::info!(
+                "acceleration structures complete after the flush of frame {frame_number}: {:.3} s after \
+                 load start, {} frames after the first upload frame {first_upload}, {} frames after the \
+                 load completed (frame {}); {} BLAS ({:.1} MiB), TLAS {:.1} MiB, scratch {:.1} MiB, {} builds",
+                self.load_start.elapsed().as_secs_f64(),
+                frame_number - first_upload,
+                frame_number - self.complete_frame,
+                self.complete_frame,
+                stats.blas_count,
+                mib(stats.blas_bytes),
+                mib(stats.tlas_bytes),
+                mib(stats.scratch_bytes),
+                stats.as_builds_total
+            );
+            if stats.blas_count != u64::from(stats.groups) {
+                log::error!("blas_count {} differs from the {} render groups", stats.blas_count, stats.groups);
+                outcome = LoadOutcome::Mismatch;
+            }
+        }
+        outcome
     }
 
     /// Logs the progress of an incomplete load.
-    pub fn log_incomplete(&self) {
+    pub fn log_incomplete(&self, scene: *const CaelixScene) {
         if !self.complete {
             log::warn!(
                 "world load incomplete: {} of {} received bricks uploaded, {} sectors received, decoder {}",
@@ -206,6 +248,14 @@ impl WorldLoader {
                 self.bricks_received,
                 self.sectors_received,
                 if self.decoder.is_some() { "running" } else { "finished" }
+            );
+        } else if !self.as_ready {
+            let stats = scene_stats(scene);
+            log::warn!(
+                "acceleration structures incomplete: {} builds pending, {} of {} groups have a BLAS",
+                stats.as_builds_pending,
+                stats.blas_count,
+                stats.groups
             );
         }
     }
@@ -257,12 +307,7 @@ impl WorldLoader {
     }
 
     fn log_summary(&self, scene: *const CaelixScene) -> LoadOutcome {
-        // SAFETY: CaelixSceneStats holds only integers, so all-zero is a valid value.
-        let mut stats: CaelixSceneStats = unsafe { std::mem::zeroed() };
-        // SAFETY: the scene is live and stats is writable.
-        unsafe { caelix_scene_get_stats(scene, &mut stats) };
-
-        let mib = |bytes: u64| bytes as f64 / (1u64 << 20) as f64;
+        let stats = scene_stats(scene);
         let decode_secs = self.decode_time.map_or(0.0, |t| t.as_secs_f64());
         let upload_secs = match (self.upload_start, self.upload_end) {
             (Some(start), Some(end)) => end.duration_since(start).as_secs_f64(),
@@ -284,6 +329,15 @@ impl WorldLoader {
             mib(stats.record_bytes),
             mib(stats.slot_table_bytes),
             mib(stats.staging_bytes)
+        );
+        log::info!(
+            "acceleration structures: {} BLAS ({:.1} MiB), TLAS {:.1} MiB, scratch {:.1} MiB, {} builds, {} pending",
+            stats.blas_count,
+            mib(stats.blas_bytes),
+            mib(stats.tlas_bytes),
+            mib(stats.scratch_bytes),
+            stats.as_builds_total,
+            stats.as_builds_pending
         );
         log::info!(
             "decode {:.3} s ({} sectors, {} bricks; wall time includes channel back-pressure), \
@@ -327,4 +381,16 @@ impl WorldLoader {
             LoadOutcome::Complete
         }
     }
+}
+
+fn scene_stats(scene: *const CaelixScene) -> CaelixSceneStats {
+    // SAFETY: CaelixSceneStats holds only integers, so all-zero is a valid value.
+    let mut stats: CaelixSceneStats = unsafe { std::mem::zeroed() };
+    // SAFETY: the scene is live and stats is writable.
+    unsafe { caelix_scene_get_stats(scene, &mut stats) };
+    stats
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 20) as f64
 }

@@ -31,7 +31,7 @@ size_t caelix_abi_c99_touch(void) {
                sizeof(level) + sizeof(result);
   /* Take the address of every function so a declaration typo fails to compile. Casts between
      function pointer types are valid C; the pointers are never called. */
-  AnyFn functions[17];
+  AnyFn functions[18];
   functions[0] = (AnyFn)caelix_get_version;
   functions[1] = (AnyFn)caelix_version_string;
   functions[2] = (AnyFn)caelix_set_log_callback;
@@ -49,7 +49,8 @@ size_t caelix_abi_c99_touch(void) {
   functions[14] = (AnyFn)caelix_scene_recycle;
   functions[15] = (AnyFn)caelix_scene_get_stats;
   functions[16] = (AnyFn)caelix_scene_query_brick;
-  sum += sizeof(functions) + (create != NULL ? 1u : 0u) + (functions[16] != NULL ? 1u : 0u);
+  functions[17] = (AnyFn)caelix_scene_get_tlas;
+  sum += sizeof(functions) + (create != NULL ? 1u : 0u) + (functions[17] != NULL ? 1u : 0u);
   sum += (size_t)key.x + (size_t)frame.frame_number + (size_t)info.resident;
   return sum;
 }

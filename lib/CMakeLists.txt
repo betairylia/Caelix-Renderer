@@ -1,4 +1,6 @@
 add_library(caelix_renderer SHARED
+  src/as_pool.cpp
+  src/as_pool.h
   src/caelix.cpp
   src/device.cpp
   src/device.h

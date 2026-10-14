@@ -3,7 +3,7 @@
 // every record and AABB row back from the GPU and compares them word by word
 // with Reference(), a straightforward scalar implementation of the rules in
 // shaders/caelix_finalize.hlsl.
-#include "test_device.h"
+#include "test_scenes.h"
 
 #include <array>
 #include <bit>
@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <map>
 #include <random>
-#include <set>
 #include <vector>
 
 using namespace test;
@@ -24,9 +23,6 @@ constexpr uint32_t kAabbWords = 6;
 constexpr uint32_t kAabbBytes = kAabbWords * 4;
 constexpr uint32_t kQuietNaN = 0x7FC00000u;
 
-using Key = std::array<int32_t, 3>;
-using Brick = std::array<uint16_t, 512>;  // voxel index x + 8y + 64z
-
 struct Encoding {
   uint32_t opaque_mask;
   uint32_t id_mask;
@@ -36,11 +32,6 @@ struct Encoding {
 Encoding EncodingOf(uint32_t encoding) {
   return encoding == 0 ? Encoding{0xC000u, 0x00FFu, 8} : Encoding{0x8000u, 0x01FFu, 9};
 }
-
-// The host's raw bricks of one entity.
-struct World {
-  std::map<Key, Brick> bricks;
-};
 
 uint32_t BlockAt(const World& world, Key key, int32_t x, int32_t y, int32_t z) {
   int32_t c[3] = {x, y, z};
@@ -140,86 +131,6 @@ struct Actual {
   std::array<uint32_t, kAabbWords> aabb{};
 };
 
-// ---------------------------------------------------------------------------
-// Scene helpers
-
-struct Rig {
-  Gpu gpu;
-  CaelixDevice* device = nullptr;
-  CaelixScene* scene = nullptr;
-  CaelixEntityId entity = CAELIX_INVALID_ENTITY;
-  Frames frames;
-  uint32_t group_shift = 4;
-  uint32_t encoding = 0;
-};
-
-void OpenRig(Rig& rig, const char* name, uint32_t encoding, uint32_t group_shift,
-             uint32_t records_per_page) {
-  caelix_set_log_callback(LibraryLog, nullptr);
-  CreateGpu(rig.gpu, name);
-  rig.device = AdoptDevice(rig.gpu);
-  CaelixSceneDesc desc{};
-  desc.staging_bytes = 8ull << 20;
-  desc.records_per_page = records_per_page;
-  desc.group_shift = group_shift;
-  desc.encoding = encoding;
-  REQUIRE(caelix_scene_create(rig.device, &desc, &rig.scene) == CAELIX_OK);
-  CaelixEntityDesc entity{};
-  entity.rotation[3] = 1.0f;
-  REQUIRE(caelix_scene_add_entity(rig.scene, &entity, &rig.entity) == CAELIX_OK);
-  rig.group_shift = group_shift;
-  rig.encoding = encoding;
-}
-
-void CloseRig(Rig& rig) {
-  REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
-  caelix_scene_destroy(rig.scene);
-  caelix_device_destroy(rig.device);
-  DestroyGpu(rig.gpu);
-  caelix_set_log_callback(nullptr, nullptr);
-  RequireNoMessages();
-}
-
-// Uploads `keys` (taken from `world`), flushing whenever the ring is full, then
-// flushes twice more: the first finalizes, the second must find nothing to do.
-void Upload(Rig& rig, const World& world, const std::vector<Key>& keys) {
-  std::vector<CaelixBrickKey> brick_keys;
-  std::vector<uint16_t> blocks;
-  for (const Key& key : keys) {
-    brick_keys.push_back({key[0], key[1], key[2]});
-    const Brick& brick = world.bricks.at(key);
-    blocks.insert(blocks.end(), brick.begin(), brick.end());
-  }
-  size_t done = 0;
-  int iterations = 0;
-  while (done < brick_keys.size()) {
-    uint32_t consumed = 0;
-    REQUIRE(caelix_scene_upload_bricks(rig.scene, rig.entity,
-                                       static_cast<uint32_t>(brick_keys.size() - done),
-                                       brick_keys.data() + done, blocks.data() + done * 512,
-                                       &consumed) == CAELIX_OK);
-    done += consumed;
-    FlushFrame(rig.gpu, rig.scene, rig.frames);
-    REQUIRE(++iterations < 100);
-  }
-  CaelixSceneStats before{};
-  caelix_scene_get_stats(rig.scene, &before);
-  FlushFrame(rig.gpu, rig.scene, rig.frames);
-  CaelixSceneStats after{};
-  caelix_scene_get_stats(rig.scene, &after);
-  REQUIRE(after.finalized_bricks_total == before.finalized_bricks_total);
-}
-
-void Remove(Rig& rig, const std::vector<Key>& keys) {
-  std::vector<CaelixBrickKey> brick_keys;
-  for (const Key& key : keys) {
-    brick_keys.push_back({key[0], key[1], key[2]});
-  }
-  REQUIRE(caelix_scene_remove_bricks(rig.scene, rig.entity, static_cast<uint32_t>(brick_keys.size()),
-                                     brick_keys.data()) == CAELIX_OK);
-  FlushFrame(rig.gpu, rig.scene, rig.frames);
-}
-
 // Reads the record and the AABB row of every brick of `world` from the GPU.
 std::map<Key, Actual> ReadBack(Rig& rig, const World& world) {
   std::vector<Key> keys;
@@ -290,59 +201,6 @@ std::map<Key, Actual> Verify(Rig& rig, const World& world, const char* label) {
   return actual;
 }
 
-std::vector<Key> KeysOf(const World& world) {
-  std::vector<Key> keys;
-  for (const auto& [key, brick] : world.bricks) {
-    keys.push_back(key);
-  }
-  return keys;
-}
-
-size_t GroupCount(const std::vector<Key>& keys, uint32_t group_shift) {
-  std::set<Key> groups;
-  for (const Key& key : keys) {
-    groups.insert({key[0] >> group_shift, key[1] >> group_shift, key[2] >> group_shift});
-  }
-  return groups.size();
-}
-
-// A random opaque brick with about 30 % air.
-Brick RandomBrick(std::mt19937& rng) {
-  Brick brick{};
-  for (uint16_t& block : brick) {
-    const uint32_t r = rng();
-    block = (r % 100) < 30 ? 0 : static_cast<uint16_t>(0x8000u | ((r >> 8) & 0x7FFFu));
-  }
-  return brick;
-}
-
-// Blobs of face-connected bricks around random seeds, so that many bricks have
-// neighbours, some across group boundaries.
-std::vector<Key> RandomBlobs(std::mt19937& rng, size_t count) {
-  std::set<Key> set;
-  std::vector<Key> keys;
-  constexpr int32_t kDir[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-  while (keys.size() < count) {
-    std::vector<Key> blob;
-    blob.push_back(Key{static_cast<int32_t>(rng() % 80) - 40, static_cast<int32_t>(rng() % 40) - 20,
-                       static_cast<int32_t>(rng() % 80) - 40});
-    if (!set.insert(blob[0]).second) {
-      continue;
-    }
-    keys.push_back(blob[0]);
-    for (int k = 0; k < 29 && keys.size() < count; ++k) {
-      const Key& from = blob[rng() % blob.size()];
-      const uint32_t d = rng() % 6;
-      const Key next{from[0] + kDir[d][0], from[1] + kDir[d][1], from[2] + kDir[d][2]};
-      if (set.insert(next).second) {
-        blob.push_back(next);
-        keys.push_back(next);
-      }
-    }
-  }
-  return keys;
-}
-
 // Scenario 3/4: a glass slab inside air on an opaque floor. Bricks (0..2, 0, 0)
 // are the floor, (0..2, 1, 0) hold the glass slab x 2..21, y 8..11, z 2..5 in air.
 World GlassWorld(uint16_t glass, uint16_t floor) {
@@ -380,7 +238,7 @@ bool OccupiedBit(const Actual& actual, uint32_t x, uint32_t y, uint32_t z) {
 
 void GlassScenario(const char* name, uint32_t encoding, uint16_t glass) {
   Rig rig;
-  OpenRig(rig, name, encoding, 4, 0);
+  OpenRig(rig, name, RigDesc(encoding, 4, 0));
   const World world = GlassWorld(glass, 0x8123);
   Upload(rig, world, KeysOf(world));
   const std::map<Key, Actual> actual = Verify(rig, world, name);
@@ -414,7 +272,7 @@ TEST_CASE("finalize: random opaque bricks, then removal, replacement and re-uplo
           "[finalize]") {
   Rig rig;
   // Group shift 3 and small record pages: many groups and several pages.
-  OpenRig(rig, "caelix_finalize_test", 0, 3, 128);
+  OpenRig(rig, "caelix_finalize_test", RigDesc(0, 3, 128));
   std::mt19937 rng(20261014);
   World world;
   const std::vector<Key> keys = RandomBlobs(rng, 300);
@@ -475,22 +333,10 @@ TEST_CASE("finalize: random opaque bricks, then removal, replacement and re-uplo
 
 TEST_CASE("finalize: solid cube across group boundaries", "[finalize]") {
   Rig rig;
-  OpenRig(rig, "caelix_finalize_test", 0, 4, 0);
+  OpenRig(rig, "caelix_finalize_test", RigDesc(0, 4, 0));
   // 3 x 3 x 3 bricks around key (16, 0, 32): crosses the group boundaries x 15|16,
   // y -1|0 and z 31|32.
-  World world;
-  std::mt19937 rng(7);
-  for (int32_t z = 31; z <= 33; ++z) {
-    for (int32_t y = -1; y <= 1; ++y) {
-      for (int32_t x = 15; x <= 17; ++x) {
-        Brick brick{};
-        for (uint16_t& block : brick) {
-          block = static_cast<uint16_t>(0xC000u | (rng() & 0x3FFFu));
-        }
-        world.bricks[{x, y, z}] = brick;
-      }
-    }
-  }
+  const World world = SolidCubeWorld(7);
   REQUIRE(GroupCount(KeysOf(world), 4) == 8);
   Upload(rig, world, KeysOf(world));
   const std::map<Key, Actual> actual = Verify(rig, world, "scenario 2 cube");
@@ -521,7 +367,7 @@ TEST_CASE("finalize: glass slab, block-ID encoding", "[finalize]") {
 
 TEST_CASE("finalize: a neighbour across a group boundary arrives later", "[finalize]") {
   Rig rig;
-  OpenRig(rig, "caelix_finalize_test", 0, 4, 0);
+  OpenRig(rig, "caelix_finalize_test", RigDesc(0, 4, 0));
   World world;
   Brick solid{};
   solid.fill(0x8001);
