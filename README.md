@@ -28,6 +28,27 @@ In `host-rs/`:
   crate with Vulkan code (`ash`); its public API exposes raw `u64` handles only.
 - `caelix-app`: the window (winit), the CLI and the glue between the two.
 
+### Source layout
+
+The library sources are in `lib/src/`, one namespace `caelix`. Includes are
+relative to `lib/src/` (`#include "rhi/device.h"`).
+
+- `abi/`: the C ABI entry points (`caelix.cpp`); they convert exceptions to `CaelixResult`.
+- `core/`: logging, the Vulkan include header (volk, VMA) and the hash map alias.
+- `rhi/`: thin Vulkan wrappers (device, buffers, images, compute pipelines, GPU timers, staging ring, shader loading).
+- `rhi/alloc/`: GPU memory pools (record pages, row ranges, acceleration structure blocks).
+- `scene/`: `Scene` (one class in `scene.h`, split into `scene_entities.cpp`, `scene_bricks.cpp`, `scene_flush.cpp`, `scene_accel.cpp`) and the CPU mirrors of the GPU tables.
+- `render/`: `Renderer` (one class in `renderer.h`, split into `renderer_targets.cpp`, `renderer_render.cpp`, `renderer_denoise.cpp`), the frame constants and the NRD executor.
+
+The HLSL is in `shaders/`, the include root of DXC (`#include "common/caelix_platform.hlsl"`):
+
+- `shaders/common/`: the platform header, the record and table layouts, the frame constants, the block decode.
+- `shaders/scene/`: the finalize kernel.
+- `shaders/render/`: the trace and composite kernels, the brick DDA, the shading helpers.
+
+A kernel's name is its file name without the folder (`caelix_finalize`), so
+kernel file names must be unique across the folders (CMake checks it).
+
 ### ABI version 2: the scene
 
 `CAELIX_ABI_VERSION` is 2. Version 2 adds the scene API (`caelix_scene_*`):
@@ -86,7 +107,7 @@ Scene model:
 
 ### Finalize kernel
 
-`shaders/caelix_finalize.hlsl` turns raw records into renderer records. Each
+`shaders/scene/caelix_finalize.hlsl` turns raw records into renderer records. Each
 flush dispatches it over every brick uploaded since the previous flush and
 every resident face neighbour (same entity, across groups too) of an uploaded
 or removed brick: one workgroup of 64 threads per brick, one thread per row of
@@ -136,7 +157,7 @@ because every `vkCmdCopyBuffer` region has a fixed GPU cost.
 
 Each flush builds the acceleration structures after the finalize kernel
 (`Scene::PlanAccelerationStructures` and `RecordAccelerationStructureBuilds` in
-`lib/src/scene.cpp`). The renderer binds the TLAS (see "Renderer").
+`lib/src/scene/scene_accel.cpp`). The renderer binds the TLAS (see "Renderer").
 
 - BLAS per render group: procedural AABB geometry
   (`VK_GEOMETRY_TYPE_AABBS_KHR`, `VK_GEOMETRY_OPAQUE_BIT_KHR`) over the
@@ -151,7 +172,7 @@ Each flush builds the acceleration structures after the finalize kernel
   position, scale 1) as a 3x4 row-major matrix: the AABBs are in
   entity-local block coordinates. The instance array is rebuilt on the CPU,
   staged through the ring and copied to a device-local buffer.
-- Storage (`lib/src/as_pool.h`, `BlockAllocator`): an acceleration structure
+- Storage (`lib/src/rhi/alloc/as_pool.h`, `BlockAllocator`): an acceleration structure
   must never move (the TLAS refers to BLASes by device address), so it does
   not use `RowPool`. Storage comes in 64 MiB device-local chunks
   (`ACCELERATION_STRUCTURE_STORAGE | SHADER_DEVICE_ADDRESS`) that are only
@@ -207,7 +228,7 @@ HLSL in `shaders/` is compiled at build time by DXC (`$VULKAN_SDK/Bin/dxc.exe`,
 `build/shaders/<name>.spv`, then embedded into the library as `uint32_t` arrays
 (`cmake/Shaders.cmake`, `cmake/EmbedShaders.cmake`). DXC writes a depfile, so
 an edit of an included header rebuilds the kernels that include it. The SPIR-V
-does not depend on the C++ configuration. `shaders/caelix_platform.hlsl` is the
+does not depend on the C++ configuration. `shaders/common/caelix_platform.hlsl` is the
 only file with DXC-specific syntax (buffer device address loads and stores,
 push constants, descriptor bindings, attributes); a Slang port replaces this
 header. Storage images that are written without a format qualifier need
@@ -232,13 +253,13 @@ that waits for a frame and then uploads before the next flush. Destroy every
 scene before `caelix_device_destroy`, with the device idle.
 
 When a flush records work, it brackets that work with two timestamp queries
-(`lib/src/gpu_timer.h`); the time is reported as `flush_ms` by
+(`lib/src/rhi/gpu_timer.h`); the time is reported as `flush_ms` by
 `caelix_renderer_get_gpu_timings` (0 for a flush that recorded nothing).
 
 ### Renderer
 
 `caelix_renderer_create(device, scene)` creates a renderer for one scene
-(`lib/src/renderer.cpp`). `caelix_renderer_render(renderer, frame, targets,
+(`lib/src/render/renderer_*.cpp`). `caelix_renderer_render(renderer, frame, targets,
 camera, options)` records the frame's rendering. Call it after
 `caelix_scene_flush` of the same frame, with the same `CaelixFrameDesc`: the
 flush builds the TLAS that the render binds.
@@ -247,7 +268,7 @@ flush builds the TLAS that the render binds.
   the primary hit, one dispatch), `CAELIX_MODE_PATH_TRACE` (path-traced
   lighting, raw 1 sample per pixel) and `CAELIX_MODE_REFERENCE` (the same,
   accumulated over frames). See "Lighting" below.
-- Trace kernel `shaders/caelix_path_trace.hlsl`, `[numthreads(8, 8, 1)]`:
+- Trace kernel `shaders/render/caelix_path_trace.hlsl`, `[numthreads(8, 8, 1)]`:
   one primary ray per pixel, `RayQuery<RAY_FLAG_FORCE_OPAQUE>` through the
   TLAS (`TraceScene`, also used by the bounce rays). For every procedural
   candidate it reads the group info (`CandidateInstanceID()` = the group
@@ -257,14 +278,14 @@ flush builds the TLAS that the render binds.
   present target (see "Render targets" below). A miss writes the sky colour
   and the miss values. In the lighting modes it also shades the hit and
   traces the bounces into the internal targets.
-- Composite kernel `shaders/caelix_composite.hlsl`, `[numthreads(8, 8, 1)]`,
+- Composite kernel `shaders/render/caelix_composite.hlsl`, `[numthreads(8, 8, 1)]`,
   lighting modes only: internal targets -> the host's colour target.
-- NRD (`lib/src/nrd_executor.*`, path trace mode with `denoise = 1`): NRD's
+- NRD (`lib/src/render/nrd_executor.*`, path trace mode with `denoise = 1`): NRD's
   own compute dispatches between the trace and the composite (see "Denoising
   (step 6b)" below).
-- Shading helpers `shaders/caelix_shading.hlsl`: block colours, the material
+- Shading helpers `shaders/render/caelix_shading.hlsl`: block colours, the material
   decode, the random stream, the opaque shading rule and the procedural sky.
-- Brick DDA `shaders/caelix_brick_trace.hlsl`: a copy of Unity's
+- Brick DDA `shaders/render/caelix_brick_trace.hlsl`: a copy of Unity's
   `CaelixBrickTrace.hlsl` (2-level occupancy DDA on the 8^3 brick, tight
   bounds from record word 1, transparency by face bits). Every change is
   marked `// NATIVE:`: no Unity includes (`caelix_block.hlsl` decodes the
@@ -277,8 +298,8 @@ flush builds the TLAS that the render binds.
   albedo, normal, depth, motion and view_z targets as storage images without a
   format qualifier, bindings 7..13 the internal targets of the lighting modes
   with fixed formats) and one push constant, the device address of a 512-byte
-  `CaelixFrameConstants` block (`shaders/caelix_frame.hlsl`,
-  `lib/src/frame_constants.h`): camera, target size, the addresses of the page
+  `CaelixFrameConstants` block (`shaders/common/caelix_frame.hlsl`,
+  `lib/src/render/frame_constants.h`): camera, target size, the addresses of the page
   table, slot tables, group infos and entity infos, the record layout, group
   shift, encoding, view, flags, sun and sky, the rows of the host projection,
   the previous render call's camera, the present-target mask, the miss values,
@@ -405,7 +426,7 @@ mean of the raw estimate.
 `CaelixRenderOptions::denoise = 1` in `CAELIX_MODE_PATH_TRACE` (with a colour
 target) runs NVIDIA NRD v4.18.0, denoiser `REBLUR_DIFFUSE_SPECULAR`, between the
 trace and the composite. NRD is a static library with embedded SPIR-V; the
-renderer drives it without NRI through `NrdExecutor` (`lib/src/nrd_executor.*`):
+renderer drives it without NRI through `NrdExecutor` (`lib/src/render/nrd_executor.*`):
 
 - From `nrd::GetInstanceDesc` / `GetLibraryDesc` (nothing hard-coded): one
   pipeline layout shared by NRD's 14 pipelines, set 0 = 18 sampled images from

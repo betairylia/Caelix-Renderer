@@ -3,11 +3,15 @@
 # caelix_add_shaders(<target> <out_var> SOURCES <file.hlsl>...)
 #
 # Every source that defines `main(` is a compute kernel: DXC compiles it to
-# <build>/shaders/<name>.spv. The other sources are include files; DXC reports
-# which of them a kernel includes in a depfile, so editing a header rebuilds
-# exactly the kernels that include it. Then cmake/EmbedShaders.cmake turns every
-# .spv into a uint32_t array in a generated .cpp that is added to <target>
-# (lookup: lib/src/shaders.h). <out_var> receives the list of .spv files.
+# <build>/shaders/<name>.spv, where <name> is the file name without extension and
+# without its folder (shaders/scene/caelix_finalize.hlsl -> caelix_finalize). The
+# names are the keys of LoadShader and of CAELIX_SHADER_DIR overrides, so they stay
+# flat and must be unique across folders. The other sources are include files,
+# included by their path relative to shaders/ ("common/caelix_platform.hlsl").
+# DXC reports which of them a kernel includes in a depfile, so editing a header
+# rebuilds exactly the kernels that include it. Then cmake/EmbedShaders.cmake
+# turns every .spv into a uint32_t array in a generated .cpp that is added to
+# <target> (lookup: lib/src/rhi/shaders.h). <out_var> receives the list of .spv files.
 #
 # The .spv files do not depend on the C++ configuration: Debug and Release use
 # the same output paths, so a shader compiles once.
@@ -27,6 +31,7 @@ function(caelix_add_shaders target out_var)
     -T cs_6_6 -E main -spirv -fspv-target-env=vulkan1.3 -HV 2021 -O3
     # Shader warnings fail the build, like /W4 warnings in review.
     -WX
+    # Include root of our shaders: "common/...", "scene/...", "render/...".
     -I ${PROJECT_SOURCE_DIR}/shaders
     # NRD.hlsli + NRDConfig.hlsli (cmake/Dependencies.cmake). DXC predefines
     # __hlsl_dx_compiler, which NRD.hlsli uses to select its DXC branch.
@@ -34,6 +39,7 @@ function(caelix_add_shaders target out_var)
 
   set(spv_files)
   set(embed_list)
+  set(names)
   foreach(source IN LISTS ARG_SOURCES)
     get_filename_component(source ${source} ABSOLUTE)
     file(READ ${source} text)
@@ -41,6 +47,11 @@ function(caelix_add_shaders target out_var)
       continue()  # an include file
     endif()
     get_filename_component(name ${source} NAME_WE)
+    if(name IN_LIST names)
+      message(FATAL_ERROR "caelix_add_shaders: two kernels are named ${name}; kernel names "
+                          "are flat (no folder), so every kernel file name must be unique")
+    endif()
+    list(APPEND names ${name})
     set(spv ${out_dir}/${name}.spv)
     set(depfile ${out_dir}/${name}.d)
     # DXC 1.8 does not compile when -MF is given: the first command writes the

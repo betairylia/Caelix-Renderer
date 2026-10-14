@@ -88,7 +88,7 @@ Passes per frame, all inside `caelix_renderer_render`:
 Timestamps around each pass; `CaelixGpuTimings` grows: `trace_ms`, `denoise_ms`,
 `composite_ms`.
 
-## NRD integration: `NrdExecutor` (lib/src/nrd_executor.*)
+## NRD integration: `NrdExecutor` (lib/src/render/nrd_executor.*)
 
 NRD v4.18.0 by FetchContent, static library, `NRD_EMBEDS_SPIRV_SHADERS=ON`,
 `NRD_NORMAL_ENCODING=2`, `NRD_ROUGHNESS_ENCODING=1`. The build needs CMake 3.30 or newer and
@@ -261,7 +261,7 @@ Images: `Artifacts/native-renderer-step6a-20261014/*-nee.png`.
 ## 6b as built (2026-10-14)
 
 NRD v4.18.0 runs in `CAELIX_MODE_PATH_TRACE` with `CaelixRenderOptions::denoise = 1`
-(`lib/src/nrd_executor.*`, integration in `Renderer::Render`; README "Denoising (step 6b)").
+(`lib/src/render/nrd_executor.*`, integration in `Renderer::Render`; README "Denoising (step 6b)").
 Differences from the plan above:
 
 - **Device requirements.** The embedded SPIR-V (dumped from `PipelineDesc::computeShaderSPIRV`,

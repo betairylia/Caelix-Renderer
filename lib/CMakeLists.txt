@@ -1,45 +1,59 @@
 add_library(caelix_renderer SHARED
-  src/as_pool.cpp
-  src/as_pool.h
-  src/caelix.cpp
-  src/device.cpp
-  src/device.h
-  src/finalize.h
-  src/frame_constants.h
-  src/gpu_buffer.cpp
-  src/gpu_buffer.h
-  src/gpu_image.cpp
-  src/gpu_image.h
-  src/gpu_timer.cpp
-  src/gpu_timer.h
-  src/hash_map.h
-  src/log.cpp
-  src/log.h
-  src/nrd_executor.cpp
-  src/nrd_executor.h
-  src/pipeline.cpp
-  src/pipeline.h
-  src/record_layout.h
-  src/record_pool.cpp
-  src/record_pool.h
-  src/renderer.cpp
-  src/renderer.h
-  src/row_pool.cpp
-  src/row_pool.h
-  src/scene.cpp
-  src/scene.h
-  src/shader_loader.cpp
-  src/shader_loader.h
-  src/shaders.h
-  src/slot_table_pool.h
-  src/staging_ring.cpp
-  src/staging_ring.h
-  src/vk_common.h
-  src/vma.cpp)
+  # C ABI entry points (include/caelix/caelix.h).
+  src/abi/caelix.cpp
+  # Logging, Vulkan includes, shared containers.
+  src/core/hash_map.h
+  src/core/log.cpp
+  src/core/log.h
+  src/core/vk_common.h
+  # Vulkan wrappers: device, buffers, images, pipelines, timers, shader loading.
+  src/rhi/device.cpp
+  src/rhi/device.h
+  src/rhi/gpu_buffer.cpp
+  src/rhi/gpu_buffer.h
+  src/rhi/gpu_image.cpp
+  src/rhi/gpu_image.h
+  src/rhi/gpu_timer.cpp
+  src/rhi/gpu_timer.h
+  src/rhi/pipeline.cpp
+  src/rhi/pipeline.h
+  src/rhi/shader_loader.cpp
+  src/rhi/shader_loader.h
+  src/rhi/shaders.h
+  src/rhi/staging_ring.cpp
+  src/rhi/staging_ring.h
+  src/rhi/vma.cpp
+  # GPU memory pools.
+  src/rhi/alloc/as_pool.cpp
+  src/rhi/alloc/as_pool.h
+  src/rhi/alloc/record_pool.cpp
+  src/rhi/alloc/record_pool.h
+  src/rhi/alloc/row_pool.cpp
+  src/rhi/alloc/row_pool.h
+  # The scene: entities, bricks, flush, acceleration structures.
+  src/scene/gpu_structs.h
+  src/scene/record_layout.h
+  src/scene/scene.h
+  src/scene/scene_accel.cpp
+  src/scene/scene_bricks.cpp
+  src/scene/scene_entities.cpp
+  src/scene/scene_flush.cpp
+  src/scene/scene_internal.h
+  src/scene/slot_table_pool.h
+  # The renderer: render targets, the pass sequence, NRD.
+  src/render/frame_constants.h
+  src/render/nrd_executor.cpp
+  src/render/nrd_executor.h
+  src/render/renderer.h
+  src/render/renderer_denoise.cpp
+  src/render/renderer_internal.h
+  src/render/renderer_render.cpp
+  src/render/renderer_targets.cpp)
 set_target_properties(caelix_renderer PROPERTIES OUTPUT_NAME caelix_renderer)
 target_include_directories(caelix_renderer
   PUBLIC ${PROJECT_SOURCE_DIR}/include
-  # The generated caelix_shaders_embedded.cpp includes "shaders.h".
+  # Includes are relative to src/ ("rhi/device.h"); the generated
+  # caelix_shaders_embedded.cpp includes "rhi/shaders.h".
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(caelix_renderer PRIVATE
   CAELIX_BUILD_SHARED
@@ -66,12 +80,12 @@ target_link_libraries(caelix_renderer PRIVATE
 # Kernels (HLSL -> SPIR-V, embedded). See cmake/Shaders.cmake.
 caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
   SOURCES
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_platform.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_record.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_block.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_frame.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_brick_trace.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_shading.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_finalize.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_path_trace.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/caelix_composite.hlsl)
+    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_platform.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_record.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_block.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_frame.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_finalize.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_brick_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite.hlsl)
