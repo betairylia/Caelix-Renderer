@@ -728,6 +728,14 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => self.input.keys.insert(code),
                         ElementState::Released => self.input.keys.remove(&code),
                     };
+                    // P prints the pose in --pose form so a view can be reproduced.
+                    if code == KeyCode::KeyP && event.state == ElementState::Pressed && !event.repeat {
+                        let c = &self.camera;
+                        log::info!(
+                            "pose: --pose {:.1},{:.1},{:.1},{:.3},{:.3} --fov {:.1}",
+                            c.position[0], c.position[1], c.position[2], c.pitch, c.yaw, c.fov_y
+                        );
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Right, .. } if !self.args.no_input => {
