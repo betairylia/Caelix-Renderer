@@ -51,6 +51,24 @@ struct State {
   std::atomic<uint64_t> renders{0};
   std::atomic<uint64_t> failed_events{0};
   std::atomic<uint64_t> view_releases{0};
+  // Version 2 status: the scene after the newest flush (CaelixUnityStatus).
+  std::atomic<uint32_t> scene_encoding{0xFFFFFFFFu};
+  std::atomic<uint32_t> scene_entities{0};
+  std::atomic<uint32_t> scene_groups{0};
+  std::atomic<uint32_t> scene_recreations{0};
+  std::atomic<uint64_t> bricks_resident{0};
+  std::atomic<uint64_t> bricks_pending_plugin{0};
+  std::atomic<uint64_t> as_builds_pending{0};
+  std::atomic<uint64_t> uploaded_total{0};
+  std::atomic<uint64_t> removed_total{0};
+  std::atomic<uint64_t> scene_packets{0};
+  std::atomic<uint64_t> record_bytes{0};
+  std::atomic<uint64_t> blas_bytes{0};
+  std::atomic<float> flush_ms{0.0f};
+  std::atomic<float> trace_ms{0.0f};
+  std::atomic<float> composite_ms{0.0f};
+  std::atomic<float> denoise_ms{0.0f};
+  std::atomic<uint64_t> timings_frame{0};
 
   // Render thread only (device events and plugin events).
   CaelixDevice* device = nullptr;
@@ -72,7 +90,8 @@ PFN_vkGetInstanceProcAddr UNITY_INTERFACE_API InterceptVulkanInitialization(
 void UNITY_INTERFACE_API OnPluginEvent(int event_id, void* data);
 // Configures the two plugin events (IUnityGraphicsVulkanV2::ConfigureEvent).
 void ConfigureEvents();
-// Destroys renderer and scene (device idle) and forgets the frame mapping.
+// Destroys renderer and scene (device idle) and forgets the frame mapping, the entity map and the
+// pending uploads.
 void DestroyRenderObjects();
 
 }  // namespace caelix_unity

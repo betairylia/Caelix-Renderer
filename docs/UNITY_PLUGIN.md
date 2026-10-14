@@ -129,6 +129,35 @@ sun and sky.
   next to the Unity renderer in the same scene: GPU frame time from the frame debugger /
   profiler recipe in the notes.
 
+## P2 as built (2026-10-15)
+
+Packet version 2 (`plugin/unity/include/caelix_unity.h`, mirrored in `CaelixNativeBridge.cs`): one
+unmanaged block per ring slot = the fixed `CaelixUnityPacket` (368 B: v1 fields + a 48 B scene
+section of counts and byte offsets) followed by `CaelixUnityEntity[]` (48 B: guid, position,
+rotation, flags add 1 / remove 2 / transform 4, 0 = reference), `CaelixUnityBrickRemove[]` (16 B),
+`CaelixUnityUpload[]` (16 B: entity index, count, keys offset, blocks offset), the material entries
+(full table `CaelixMaterial[]` or partial `CaelixUnityMaterialEntry[]`, 52 B) and the brick data
+(keys, then 16-byte aligned 1024 B blocks). Scene flag `RESET` (remove every entity, drop pending,
+built-in materials) is set on the first scene packet of a component: the plugin's scene outlives
+Play sessions.
+
+Differences from the design above: the render thread reads the packet IN PLACE and publishes
+`last_consumed_sequence` after the scene records are applied (no 64 MiB copy); the library copies
+bricks into its staging ring and the plugin copies only the remainder into its pending queue. An
+encoding change is handled by the release event, which now receives the following packet as its
+data. `CaelixNativeRenderer.Tick` is called by `CaelixHost` after the renderers that read the same
+change lists (the serialized `nativeRenderer` field, or `CaelixNativeRenderer.Active`); it fills the
+scene section, and `TryPrepareFrame` adds camera, options and target to that slot.
+
+Trap: slot reuse depends on sequence numbers, and a domain reload resets the C# counter while the
+plugin keeps its last consumed sequence. `TryPrepareFrame` continues above the plugin's value;
+without that every slot looked consumed and C# overwrote packets the render thread was reading
+(fingerprint: "a record names an entity the scene does not have", invalid material entries).
+
+Display: the primary-mode debug views are written as they are into the RGBA16F target, which Unity
+treats as linear and encodes to sRGB on output, so the albedo view looks brighter than in the Rust
+host (same values: 51 dB after decoding). The lighting modes write linear values and are correct.
+
 ## Open questions for the owner
 
 1. (answered) Loading time: "Load on startup" on the plugin importer; P1 verifies it.
