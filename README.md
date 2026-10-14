@@ -379,7 +379,7 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
 - `--screenshot <PATH.png>`: write a PNG of the swapchain image. With `--world`
   it is taken 3 frames after the world is complete on the GPU (every brick
   uploaded and `as_builds_pending == 0`); without `--world` at frame 10.
-- `--exit-after-screenshot`: exit once the PNG is written.
+- `--exit-after-screenshot`, `--no-input` (ignore keyboard and mouse for deterministic automated runs): exit once the PNG is written.
 
 Camera convention (`caelix-app/src/camera.rs`, Unity's): for yaw θ and pitch φ,
 `forward = (sin θ cos φ, -sin φ, cos θ cos φ)`, `right = (cos θ, 0, -sin θ)`,

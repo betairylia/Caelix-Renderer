@@ -141,6 +141,9 @@ struct Args {
     /// Exit after the screenshot is written.
     #[arg(long, requires = "screenshot")]
     exit_after_screenshot: bool,
+    /// Ignore keyboard and mouse, so automated screenshot runs stay deterministic.
+    #[arg(long)]
+    no_input: bool,
 }
 
 /// Everything that lives while the window exists. Drop order matters: Drop
@@ -510,7 +513,7 @@ impl ApplicationHandler for App {
                     state.context.resize(size.width, size.height);
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, .. } if !self.args.no_input => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match event.state {
                         ElementState::Pressed => self.input.keys.insert(code),
@@ -518,10 +521,10 @@ impl ApplicationHandler for App {
                     };
                 }
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Right, .. } => {
+            WindowEvent::MouseInput { state, button: MouseButton::Right, .. } if !self.args.no_input => {
                 self.input.looking = state == ElementState::Pressed;
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !self.args.no_input => {
                 let notches = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 120.0,
@@ -544,7 +547,7 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.input.looking {
+            if self.input.looking && !self.args.no_input {
                 self.camera
                     .rotate(dx as f32 * MOUSE_DEGREES_PER_PIXEL, dy as f32 * MOUSE_DEGREES_PER_PIXEL);
             }
