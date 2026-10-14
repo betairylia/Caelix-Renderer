@@ -51,6 +51,8 @@ const DEPTH_FAR: f32 = 8192.0;
 /// Direction toward the sun (normalized by the library) and the sky colour.
 const SUN_DIR: [f32; 3] = [-0.45, 0.8, -0.3];
 const SKY_COLOR: [f32; 3] = [0.55, 0.7, 0.9];
+/// An absent render target (image 0): the library does not write it.
+const NO_TARGET: CaelixTargetImage = CaelixTargetImage { image: 0, format: 0, width: 0, height: 0, layout: 0 };
 
 /// Debug view of the renderer (`CaelixDebugView`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -364,6 +366,11 @@ impl App {
                     height: frame.height,
                     layout: frame.layout,
                 },
+                albedo: NO_TARGET,
+                normal: NO_TARGET,
+                depth: NO_TARGET,
+                motion: NO_TARGET,
+                view_z: NO_TARGET,
             };
             let aspect = frame.width as f32 / frame.height.max(1) as f32;
             let camera = self.camera.to_caelix(aspect, DEPTH_NEAR, DEPTH_FAR);
@@ -374,6 +381,9 @@ impl App {
                 pad: 0.0,
                 sky_color: SKY_COLOR,
                 pad2: 0.0,
+                // The camera's projection is reverse-Z infinite.
+                miss_depth: 0.0,
+                miss_view_z: 1e30,
             };
             // SAFETY: the command buffer is recording after this frame's flush; the image is
             // the acquired one; every struct is valid for the call.

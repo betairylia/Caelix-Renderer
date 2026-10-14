@@ -41,8 +41,11 @@ extern "C" {
    (encoding, scratch_bytes; 0 = default), CaelixSceneStats and CaelixBrickInfo, and added
    caelix_scene_get_tlas, without a bump. The renderer step removed caelix_clear_target and added
    the renderer API (caelix_renderer_*) and CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT, also
-   without a bump. A host built against an older version-2 header must be rebuilt (the library
-   reads and writes the larger structs). */
+   without a bump. The optional-targets step appended CaelixCamera::projection,
+   CaelixRenderOptions::miss_depth / miss_view_z and the albedo, normal, depth, motion and view_z
+   targets of CaelixRenderTargets, and made the colour target optional, also without a bump. A host
+   built against an older version-2 header must be rebuilt (the library reads and writes the larger
+   structs). */
 #define CAELIX_ABI_VERSION 2u
 
 typedef struct CaelixVersion {
@@ -375,8 +378,23 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  *
  * A renderer draws one scene. caelix_renderer_render records a compute dispatch that traces one
  * primary ray per pixel through the scene's TLAS with an inline ray query (VK_KHR_ray_query), runs
- * the brick DDA on every procedural candidate, and writes the albedo of the hit (or a debug view)
- * into the colour target.
+ * the brick DDA on every procedural candidate, and writes the result of the hit into the targets
+ * that the host passes (CaelixRenderTargets): a colour image (albedo or a debug view) and the
+ * optional geometry targets albedo, normal, depth, motion and view_z. Every target is optional, but
+ * at least one must be present.
+ *
+ * G-buffer mode: a host with its own deferred pipeline passes only the geometry targets (no colour
+ * target). The library then writes no lighting at all: per pixel, the material albedo, the world
+ * normal, the device depth of the host's projection, the screen-space motion vector and the linear
+ * view depth, with coverage (1 on a hit, 0 on a miss) in the alpha channel of albedo and normal.
+ *
+ * Mapping to NVIDIA NRD (the denoiser of a later step consumes the same targets):
+ *   view_z -> IN_VIEWZ (positive linear view depth; give NRD the same view and projection).
+ *   motion -> IN_MV with CommonSettings::motionVectorScale = (1 / width, 1 / height) and
+ *             isMotionVectorInWorldSpace = false: NRD's uvPrev = uv + mv * scale matches
+ *             motion = previous_pixel - current_pixel (both use a top-left origin, y down).
+ *   normal -> IN_NORMAL_ROUGHNESS after packing with a roughness (NRD_FrontEnd_PackNormalAndRoughness).
+ *   albedo -> not an NRD input: demodulate the radiance by it before the denoiser and multiply after.
  *
  * Frame contract: call caelix_renderer_render AFTER caelix_scene_flush of the same frame, into the
  * same command buffer and with the same CaelixFrameDesc: the flush builds the TLAS that the render
@@ -384,10 +402,14 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * (descriptor set, constants, timestamp queries) in a ring of 3 slots that grows to at most 8
  * frames in flight; a slot is reused only when its frame is <= safe_frame_number.
  *
- * Layout contract: the colour target is received in CaelixTargetImage::layout and left in
- * VK_IMAGE_LAYOUT_GENERAL. The last barrier of the render call makes its writes available to all
- * later commands (ALL_COMMANDS, memory read and write); the host transitions the image from
+ * Layout contract: every present target is received in its CaelixTargetImage::layout and left in
+ * VK_IMAGE_LAYOUT_GENERAL. The last barrier of the render call makes the writes available to all
+ * later commands (ALL_COMMANDS, memory read and write); the host transitions the images from
  * GENERAL for present or for its own use.
+ *
+ * Previous frame: the renderer keeps the camera of its previous render call and uses it, with the
+ * entity's previous transform (CaelixBrickInfo: prev_rows), for the motion target. The first render
+ * call of a renderer has no previous camera and writes motion 0.
  * ------------------------------------------------------------------------- */
 
 typedef struct CaelixRenderer CaelixRenderer;  /* opaque */
@@ -417,6 +439,14 @@ typedef struct CaelixCamera {
   float tan_half_fov_y;  /* tangent of half the VERTICAL field of view */
   float aspect;          /* width / height */
   float near_z, far_z;   /* distance range of the depth debug view only (no clipping) */
+  /* The host's projection, column-major 4x4 (row r, column c = projection[c * 4 + r]):
+     clip = projection * (view.x, view.y, view.z, 1) with the view space of this camera,
+       view = (dot(p - position, right), dot(p - position, up), dot(p - position, forward)).
+     It must describe the same frustum as tan_half_fov_y and aspect; the library does not check.
+     Used only for the depth target (device depth = clip.z / clip.w). A normal-Z host passes, for
+     example, clip.z = far / (far - near) * (z - near), clip.w = z; a reverse-Z infinite host
+     clip.z = near, clip.w = z. */
+  float projection[16];
 } CaelixCamera;
 
 typedef enum CaelixDebugView {
@@ -438,28 +468,57 @@ typedef struct CaelixRenderOptions {
   float pad;
   float sky_color[3];   /* colour of rays that hit nothing (every view) */
   float pad2;
+  float miss_depth;     /* depth target value of a miss: 1.0 for a normal-Z host, 0.0 for reverse Z */
+  float miss_view_z;    /* view_z target value of a miss, for example 1e30 */
 } CaelixRenderOptions;
 
-/* The images of one render call. Depth, normal and motion targets are added in a later step; the
-   struct exists so that hosts fill it from day one. */
+/* The images of one render call. A target is PRESENT when its `image` is nonzero; an absent target
+   is not written. At least one target must be present, and every present target must have the same
+   width and height and a different image.
+   Every present image needs STORAGE usage (the kernel writes it as a storage image without a format
+   qualifier, so its format must support VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT with
+   optimal tiling). It arrives in CaelixTargetImage::layout and is left in VK_IMAGE_LAYOUT_GENERAL.
+   Every pixel of a present target is written on every render call, a miss included. */
 typedef struct CaelixRenderTargets {
-  /* Required. Usage: STORAGE (written by the kernel as a storage image without a format qualifier,
-     so the format must support VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) and
-     TRANSFER_DST (before the scene's first TLAS build the image is cleared to the sky colour).
-     Written in VK_IMAGE_LAYOUT_GENERAL and left in GENERAL. */
+  /* Any storage format, typically RGBA8, BGRA8 or RGBA16F. rgb = the debug view of
+     CaelixRenderOptions::debug_view (the albedo view, optionally Lambert shaded, is the lit colour
+     of this version); a miss is the sky colour. alpha = 1 everywhere (opaque, also on a miss, so
+     that a host can present the image directly; the coverage is in the albedo and normal targets). */
   CaelixTargetImage color;
+  /* R8G8B8A8_UNORM or R16G16B16A16_SFLOAT. rgb = the material albedo as stored in the block (sRGB
+     encoded, no shading), a = coverage (1 hit, 0 miss). A miss is (0, 0, 0, 0). */
+  CaelixTargetImage albedo;
+  /* R16G16B16A16_SFLOAT, or R8G8B8A8_UNORM (then xyz is stored as n * 0.5 + 0.5). xyz = world-space
+     face normal (unit length), w = coverage. A miss is (0, 0, 0, 0). */
+  CaelixTargetImage normal;
+  /* R32_SFLOAT (a storage image, not a depth attachment). Device depth clip.z / clip.w of
+     CaelixCamera::projection at the hit; a miss is CaelixRenderOptions::miss_depth. */
+  CaelixTargetImage depth;
+  /* R16G16_SFLOAT or R32G32_SFLOAT. previous_pixel - current_pixel, in pixels of the current target
+     size: the hit point is moved back by the entity's previous transform and projected with the
+     previous render call's camera (same pinhole mapping as the ray generation); the current pixel is
+     the pixel centre (px + 0.5, py + 0.5). Example: a camera that moved +1 unit along `right` sees
+     a static point move LEFT on the screen, so motion.x > 0 (the point was to the right).
+     0 on a miss, on the first render call of the renderer, and when the point was behind the
+     previous camera. */
+  CaelixTargetImage motion;
+  /* R32_SFLOAT. Linear view depth dot(hit - position, forward) (NRD's IN_VIEWZ); a miss is
+     CaelixRenderOptions::miss_view_z. */
+  CaelixTargetImage view_z;
 } CaelixRenderTargets;
 
-/* Records the frame's rendering into frame->command_buffer: a barrier from the target's layout to
-   GENERAL, the trace dispatch (8 x 8 pixels per workgroup) between two timestamps, and a barrier
-   from the kernel's writes to all later commands. Before the scene's first TLAS build it clears
-   the target to the sky colour instead of the dispatch. The renderer creates one image view per
-   target image and caches it (16 views; the least recently used view is destroyed once its last
-   frame is safe).
-   Returns CAELIX_ERROR_INVALID_ARGUMENT for a null argument, a target without image or size, an
-   unknown debug view, a frame number not above safe_frame_number, or a ninth frame in flight;
-   CAELIX_ERROR_UNSUPPORTED when the target format cannot be written as a storage image without a
-   format qualifier. */
+/* Records the frame's rendering into frame->command_buffer: one barrier per present target from its
+   layout to GENERAL (one vkCmdPipelineBarrier2), the trace dispatch (8 x 8 pixels per workgroup)
+   between two timestamps, and one barrier from the kernel's writes to all later commands. Before the
+   scene's first TLAS build the dispatch traces nothing and writes the miss values. The renderer
+   creates one image view per target image and caches it (16 views; the least recently used view
+   is destroyed once its last frame is safe). A successful call stores the camera as the previous
+   camera of the next call.
+   Returns CAELIX_ERROR_INVALID_ARGUMENT for a null argument, no present target, a present target
+   without format or size, present targets of different sizes, one image in two targets, a geometry
+   target format outside its list above, an unknown debug view, a frame number not above
+   safe_frame_number, or a ninth frame in flight; CAELIX_ERROR_UNSUPPORTED when a target format
+   cannot be written as a storage image without a format qualifier. */
 CAELIX_API CaelixResult caelix_renderer_render(CaelixRenderer* renderer, const CaelixFrameDesc* frame,
                                                const CaelixRenderTargets* targets,
                                                const CaelixCamera* camera,
@@ -475,7 +534,7 @@ CAELIX_API void caelix_renderer_release_target_views(CaelixRenderer* renderer);
    render call whose safe_frame_number has reached that frame, so the values trail the current
    frame by the number of frames in flight. */
 typedef struct CaelixGpuTimings {
-  float trace_ms;         /* the trace dispatch (or the sky clear) of that frame */
+  float trace_ms;         /* the trace dispatch of that frame */
   float flush_ms;         /* caelix_scene_flush of that frame; 0 when the flush recorded no work */
   uint64_t frame_number;  /* the frame the values belong to; 0 = none yet */
 } CaelixGpuTimings;

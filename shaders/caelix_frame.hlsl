@@ -1,6 +1,6 @@
 // Per-frame constants of the trace kernels. Mirrors lib/src/frame_constants.h;
 // change both together. The kernel's only push constant is the device address of
-// one CaelixFrameConstants (256 bytes on the CPU side; the tail is padding and is
+// one CaelixFrameConstants (512 bytes on the CPU side; the tail is padding and is
 // not declared here). Every field sits at an offset that is a multiple of its
 // size, so std430 and scalar layout rules give the same offsets.
 #ifndef CAELIX_FRAME_HLSL
@@ -30,6 +30,18 @@ struct CaelixFrameConstants {
   uint flags;               // 140  kRenderFlag*
   float4 sun_dir;           // 144  normalized, toward the sun, w unused
   float4 sky_color;         // 160  w unused
+  float4 projection[4];     // 176  ROWS of the host projection: clip[i] = dot(projection[i], float4(view, 1))
+  float4 prev_position;     // 240  camera of the previous render call, w unused
+  float4 prev_right;        // 256
+  float4 prev_up;           // 272
+  float4 prev_forward;      // 288
+  float prev_tan_half_fov_y;  // 304
+  float prev_aspect;        // 308
+  uint target_mask;         // 312  kTarget* bits
+  float miss_depth;         // 316
+  float miss_view_z;        // 320
+  uint has_prev_camera;     // 324  0 on the first render call of the renderer
+  uint has_tlas;            // 328  0 before the scene's first TLAS build
 };
 
 struct CaelixTracePush {
@@ -46,5 +58,14 @@ static const uint kViewSteps = 5;
 
 // CaelixRenderOptions::flags
 static const uint kRenderFlagShading = 1u << 0;
+
+// CaelixFrameConstants::target_mask: bit i = the target at descriptor binding i + 1.
+static const uint kTargetColor = 1u << 0;
+static const uint kTargetAlbedo = 1u << 1;
+static const uint kTargetNormal = 1u << 2;
+static const uint kTargetDepth = 1u << 3;
+static const uint kTargetMotion = 1u << 4;
+static const uint kTargetViewZ = 1u << 5;
+static const uint kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
 
 #endif  // CAELIX_FRAME_HLSL

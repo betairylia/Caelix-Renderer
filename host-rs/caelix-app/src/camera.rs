@@ -89,8 +89,23 @@ impl Camera {
             aspect,
             near_z,
             far_z,
+            projection: perspective_reverse_z(self.fov_y, aspect, near_z),
         }
     }
+}
+
+/// Column-major reverse-Z infinite perspective for the camera's view space
+/// (+z forward): clip = (x / (tan * aspect), y / tan, near, z), so the device
+/// depth is near / z (1 at `near`, 0 at infinity). `fov_y` is the vertical field
+/// of view in degrees.
+pub fn perspective_reverse_z(fov_y: f32, aspect: f32, near: f32) -> [f32; 16] {
+    let tan_half = (fov_y.to_radians() * 0.5).tan();
+    let mut m = [0.0; 16];
+    m[0] = 1.0 / (tan_half * aspect);
+    m[5] = 1.0 / tan_half;
+    m[11] = 1.0; // column 2, row 3: clip.w = z
+    m[14] = near; // column 3, row 2: clip.z = near
+    m
 }
 
 /// Wraps degrees to (-180, 180].
@@ -131,6 +146,14 @@ mod tests {
         let q = [hx.sin() * hy.cos(), hy.sin() * hx.cos(), -hx.sin() * hy.sin(), hx.cos() * hy.cos()];
         let camera = Camera::from_quaternion([0.0; 3], q, 60.0);
         assert!((camera.yaw - 45.0).abs() < 1e-3 && (camera.pitch - 20.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn reverse_z_depth() {
+        let m = perspective_reverse_z(60.0, 1.0, 0.5);
+        // clip.z / clip.w at view depth z (row r, column c = m[c * 4 + r]).
+        let depth = |z: f32| (m[10] * z + m[14]) / (m[11] * z + m[15]);
+        assert!((depth(0.5) - 1.0).abs() < 1e-6 && (depth(50.0) - 0.01).abs() < 1e-6);
     }
 
     #[test]

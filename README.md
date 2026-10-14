@@ -237,8 +237,8 @@ flush builds the TLAS that the render binds.
   (`CandidateInstanceID()` = the group index) and the slot row of the dense
   brick id (`CandidatePrimitiveIndex()`), skips bricks that are not resident,
   and runs the brick DDA on the record. A hit inside `[TMin, CommittedRayT())`
-  is committed. Then it writes the albedo (or a debug view) to the colour
-  target. A miss writes the sky colour.
+  is committed. Then it writes every present target (see "Render targets"
+  below). A miss writes the sky colour and the miss values.
 - Brick DDA `shaders/caelix_brick_trace.hlsl`: a copy of Unity's
   `CaelixBrickTrace.hlsl` (2-level occupancy DDA on the 8^3 brick, tight
   bounds from record word 1, transparency by face bits). Every change is
@@ -248,21 +248,28 @@ flush builds the TLAS that the render binds.
   0); `CaelixTraceBrickPrimitiveCore` takes the brick origin in entity-local
   block coordinates as a parameter instead of deriving it from word 0 and the
   render group macros; `half` = float, `UNITY_BRANCH` -> `CAELIX_BRANCH`.
-- Inputs: one descriptor set (binding 0 the TLAS, binding 1 the colour target
-  as a storage image without a format qualifier) and one push constant, the
-  device address of a 256-byte `CaelixFrameConstants` block
-  (`shaders/caelix_frame.hlsl`, `lib/src/frame_constants.h`): camera, target
-  size, the addresses of the page table, slot tables, group infos and entity
-  infos, the record layout, group shift, encoding, view, flags, sun and sky.
+- Inputs: one descriptor set (binding 0 the TLAS, bindings 1..6 the colour,
+  albedo, normal, depth, motion and view_z targets as storage images without a
+  format qualifier) and one push constant, the device address of a 512-byte
+  `CaelixFrameConstants` block (`shaders/caelix_frame.hlsl`,
+  `lib/src/frame_constants.h`): camera, target size, the addresses of the page
+  table, slot tables, group infos and entity infos, the record layout, group
+  shift, encoding, view, flags, sun and sky, the rows of the host projection,
+  the previous render call's camera, the present-target mask, the miss values,
+  and `has_prev_camera` / `has_tlas`. Every binding is `PARTIALLY_BOUND`
+  (`VkDescriptorSetLayoutBindingFlagsCreateInfo`): a render call writes only the
+  TLAS (when the scene has one) and the present targets, and the kernel touches
+  a binding only when its bit is set. Absent targets and a scene without a TLAS
+  therefore need no dummy descriptors.
 - Per-frame resources: a ring of slots (descriptor set + host-visible constants
   buffer), 3 at first, grown up to 8 when a slot's frame is not safe yet.
 - Image views: one per target image, cached (16; the least recently used view
   is destroyed once its frame is safe). `caelix_renderer_release_target_views`
   destroys all of them; call it before the host destroys target images (a new
   image can reuse the handle of a destroyed one).
-- Before the scene's first TLAS build, the render clears the target to the sky
-  colour (`vkCmdClearColorImage`), so the target needs `STORAGE` and
-  `TRANSFER_DST` usage.
+- Before the scene's first TLAS build, the kernel still runs but does not
+  start a ray query (`has_tlas` = 0): every pixel gets the sky colour and the
+  miss values. The targets need `STORAGE` usage only.
 - Debug views (`CaelixRenderOptions::debug_view`): albedo (optionally Lambert
   shaded with `sun_dir`), world normal, depth (`near_z`..`far_z`), hash colour
   of the group, hash colour of the brick, and a heat map of the procedural
@@ -270,7 +277,7 @@ flush builds the TLAS that the render binds.
   emissive rgb4, glass a fixed tint (0.6, 0.8, 1.0), air magenta (a primary
   ray should never report an air boundary). In the block-ID encoding the
   colour is a pastel hash of the id.
-- GPU timings: two timestamps around the dispatch (or the clear), read back in
+- GPU timings: two timestamps around the dispatch, read back in
   a later render call whose safe frame has reached that frame;
   `caelix_renderer_get_gpu_timings` returns `trace_ms`, `flush_ms` and the
   frame they belong to.
@@ -281,12 +288,60 @@ Pixel mapping: pixel (px, py), row 0 = the top row,
 The camera basis is Unity's (+X right, +Y up, +Z forward); the host's
 `camera.rs` builds it from Unity's `eulerAngles` (see "Running the host").
 
+### Render targets and G-buffer mode
+
+`CaelixRenderTargets` has six targets. Each is optional: a target is present
+when its `image` is nonzero. At least one must be present; every present target
+must have the same size and a different image. Every pixel of a present target
+is written on every render call, a miss included.
+
+| Target | Formats | Content | Miss |
+|---|---|---|---|
+| `color` | any storage format (RGBA8, BGRA8, RGBA16F) | the debug view (albedo, optionally Lambert shaded); alpha 1 everywhere | sky colour, alpha 1 |
+| `albedo` | RGBA8, RGBA16F | material albedo as stored in the block (sRGB), no shading; a = coverage | (0, 0, 0, 0) |
+| `normal` | RGBA16F, RGBA8_UNORM (stored as n * 0.5 + 0.5) | world-space face normal; w = coverage | (0, 0, 0, 0) |
+| `depth` | R32F (storage image, not a depth attachment) | device depth clip.z / clip.w of `CaelixCamera::projection` | `options.miss_depth` |
+| `motion` | RG16F, RG32F | previous pixel - current pixel, in pixels of the current size | (0, 0) |
+| `view_z` | R32F | linear view depth dot(hit - position, forward) | `options.miss_view_z` |
+
+A host with its own deferred pipeline passes only the geometry targets
+("G-buffer mode"): the library then writes no lighting at all.
+
+`CaelixCamera::projection` is the host's column-major projection for the
+camera's view space (x = right, y = up, z = forward). It must describe the same
+frustum as `tan_half_fov_y` and `aspect` (not checked) and is used only for the
+depth target. A normal-Z host passes `miss_depth` 1, a reverse-Z host 0. The
+Rust host passes a reverse-Z infinite projection (`camera.rs`,
+`perspective_reverse_z`; depth = near / z).
+
+Motion: the renderer keeps the camera of its previous successful render call.
+The kernel moves the hit point (entity-local) through the entity's previous
+transform (`EntityInfo` prev rows, which differ from the current rows for one
+flush after `caelix_scene_set_entity_transform`) and projects it with the
+previous camera, with the same pinhole mapping as the ray generation. The
+current pixel is the pixel centre. Sign: `motion = previous - current`. A
+camera that moves +1 unit along `right` sees a static point at depth z move
+left on the screen, so `motion.x = +width / (2 * tan_half_fov_y * aspect * z)`
+(+11.08 px for the test camera at z = 20, 256 px, 60 degrees). The first render
+call of a renderer has no previous camera and writes 0; so does a point that
+was behind the previous camera.
+
+Mapping to NVIDIA NRD (the denoiser step consumes the same targets): `view_z`
+is `IN_VIEWZ`; `motion` is `IN_MV` with `motionVectorScale = (1 / width,
+1 / height)` and `isMotionVectorInWorldSpace = false` (NRD computes
+`uvPrev = uv + mv * scale`, the same convention, top-left origin); `normal`
+becomes `IN_NORMAL_ROUGHNESS` after packing with a roughness
+(`NRD_FrontEnd_PackNormalAndRoughness`); `albedo` is not an NRD input but
+demodulates the radiance before the denoiser and modulates it after.
+
 ### Layout contract
 
-A render call receives the target image in the layout that
-`CaelixTargetImage::layout` names, and leaves it in `VK_IMAGE_LAYOUT_GENERAL`.
-Its last barrier makes the kernel's writes available to all later commands.
-The host transitions it from `GENERAL` for present (or for its own use).
+A render call receives every present target in the layout that its
+`CaelixTargetImage::layout` names, and leaves it in `VK_IMAGE_LAYOUT_GENERAL`:
+one `vkCmdPipelineBarrier2` with one image barrier per present target before
+the dispatch, one after it. The last barrier makes the kernel's writes
+available to all later commands. The host transitions the images from
+`GENERAL` for present (or for its own use).
 
 ## Build
 
@@ -334,14 +389,24 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   rebuild is safe; a 4 MiB scratch budget with 2000 one-brick groups spreads
   the builds over two flushes; a transform change rebuilds only the TLAS and
   the entity info row shows the old rows as `prev` for exactly one flush.
-- `caelix_trace_test`: the trace kernel, by readback of a 256x256 RGBA8 storage
-  image. Before any brick the render clears to the sky colour. One pure-red
-  opaque brick at key (0, 0, 0), camera at (4, 4, -20) looking +Z: the centre
-  pixel is red, the corners are sky, the normal view shows (0.5, 0.5, 0) (the
-  -Z face), the brick view and the step view are not sky at the centre, every
-  other view runs without validation messages, `caelix_renderer_get_gpu_timings`
-  reports a resolved frame with `trace_ms > 0`, and an unknown debug view is
-  rejected. The random opaque scene: some pixels hit and none is magenta.
+- `caelix_trace_test`: the trace kernel, by readback of 256x256 storage images
+  (STORAGE and TRANSFER_SRC usage only). Before any brick the kernel writes the
+  sky colour and the miss values. One pure-red opaque brick at key (0, 0, 0),
+  camera at (4, 4, -20) looking +Z: the centre pixel is red, the corners are
+  sky, the normal view shows (0.5, 0.5, 0) (the -Z face), the brick view and the
+  step view are not sky at the centre, every other view runs without validation
+  messages, `caelix_renderer_get_gpu_timings` reports a resolved frame with
+  `trace_ms > 0`, and an unknown debug view is rejected. Geometry targets
+  (colour RGBA8, albedo RGBA8, normal RGBA16F, depth R32F, motion RG32F, view_z
+  R32F): at the centre albedo (255, 0, 0, 255), normal (0, 0, -1, 1),
+  view_z 20 (the -Z face is the plane z = 0), depth = the projection of view_z
+  within 1e-5 for a normal-Z and a reverse-Z infinite projection; at the corner
+  the miss values; coverage agrees across the targets; motion is exactly 0 on
+  the first render, below 1e-3 px with the same camera, +11.085 px after the
+  camera moves +1 along `right`, -22.17 px after the entity moves +2 along X,
+  and 0 again one frame later. A depth-only render works; no target, different
+  sizes, one image twice and a wrong format are rejected. The random opaque
+  scene: some pixels hit and none is magenta.
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 

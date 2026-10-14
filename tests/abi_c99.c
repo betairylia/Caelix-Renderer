@@ -21,10 +21,13 @@ size_t caelix_abi_c99_touch(void) {
   CaelixSceneStats stats = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   CaelixBrickInfo info = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   CaelixCamera camera = {{0.0f, 0.0f, 0.0f}, 0.0f, {1.0f, 0.0f, 0.0f}, 0.0f, {0.0f, 1.0f, 0.0f},
-                         0.0f, {0.0f, 0.0f, 1.0f}, 0.0f, 0.577f, 1.0f, 0.1f, 1000.0f};
+                         0.0f, {0.0f, 0.0f, 1.0f}, 0.0f, 0.577f, 1.0f, 0.1f, 1000.0f,
+                         {1.732f, 0.0f, 0.0f, 0.0f, 0.0f, 1.732f, 0.0f, 0.0f,
+                          0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.1f, 0.0f}};
   CaelixRenderOptions options = {CAELIX_VIEW_ALBEDO, CAELIX_RENDER_FLAG_SHADING, {0.0f, 1.0f, 0.0f},
-                                 0.0f, {0.5f, 0.7f, 0.9f}, 0.0f};
-  CaelixRenderTargets targets = {{0, 0, 0, 0, 0}};
+                                 0.0f, {0.5f, 0.7f, 0.9f}, 0.0f, 0.0f, 1e30f};
+  CaelixRenderTargets targets = {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0},
+                                 {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}};
   CaelixGpuTimings timings = {0.0f, 0.0f, 0};
   CaelixDebugView view = CAELIX_VIEW_STEPS;
   CaelixRenderer* renderer = NULL;

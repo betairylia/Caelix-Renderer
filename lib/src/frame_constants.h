@@ -6,7 +6,7 @@ namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/caelix_frame.hlsl; change both
 // together. One per render call, in a host-visible buffer; its device address is
-// the trace kernel's only push constant. 256 bytes. Every field sits at an offset
+// the trace kernel's only push constant. 512 bytes. Every field sits at an offset
 // that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
 // std430 and scalar layout rules give the same offsets.
 struct FrameConstants {
@@ -31,14 +31,42 @@ struct FrameConstants {
   uint32_t flags;           // 140  CAELIX_RENDER_FLAG_*
   float sun_dir[4];         // 144  normalized, toward the sun, w unused
   float sky_color[4];       // 160  w unused
-  uint32_t pad[20];         // 176
+  float projection[4][4];   // 176  ROWS of CaelixCamera::projection: clip[i] = dot(row i, (view, 1))
+  float prev_position[4];   // 240  camera of the previous render call, w unused
+  float prev_right[4];      // 256
+  float prev_up[4];         // 272
+  float prev_forward[4];    // 288
+  float prev_tan_half_fov_y;  // 304
+  float prev_aspect;        // 308
+  uint32_t target_mask;     // 312  kTarget* bits: present targets, normal encoding
+  float miss_depth;         // 316
+  float miss_view_z;        // 320
+  uint32_t has_prev_camera; // 324  0 on the first render call of the renderer
+  uint32_t has_tlas;        // 328  0 before the scene's first TLAS build: write the miss values
+  uint32_t pad[45];         // 332
 };
-static_assert(sizeof(FrameConstants) == 256);
+static_assert(sizeof(FrameConstants) == 512);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
 static_assert(offsetof(FrameConstants, sun_dir) == 144);
 static_assert(offsetof(FrameConstants, sky_color) == 160);
+static_assert(offsetof(FrameConstants, projection) == 176);
+static_assert(offsetof(FrameConstants, prev_position) == 240);
+static_assert(offsetof(FrameConstants, prev_forward) == 288);
+static_assert(offsetof(FrameConstants, prev_tan_half_fov_y) == 304);
+static_assert(offsetof(FrameConstants, target_mask) == 312);
+static_assert(offsetof(FrameConstants, has_tlas) == 328);
+
+// FrameConstants::target_mask: one bit per present target (bit i = descriptor
+// binding i + 1), plus the encoding of the normal target.
+constexpr uint32_t kTargetColor = 1u << 0;
+constexpr uint32_t kTargetAlbedo = 1u << 1;
+constexpr uint32_t kTargetNormal = 1u << 2;
+constexpr uint32_t kTargetDepth = 1u << 3;
+constexpr uint32_t kTargetMotion = 1u << 4;
+constexpr uint32_t kTargetViewZ = 1u << 5;
+constexpr uint32_t kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
 
 // Push constants of the trace kernel: the address of the frame's FrameConstants.
 struct TracePush {

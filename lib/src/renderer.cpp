@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 
 namespace caelix {
 namespace {
@@ -17,23 +18,50 @@ constexpr uint32_t kDebugViewCount = 6;
 
 const VkImageSubresourceRange kColorRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-void ImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout,
-                  VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
-                  VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
-  VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-  barrier.srcStageMask = src_stage;
-  barrier.srcAccessMask = src_access;
-  barrier.dstStageMask = dst_stage;
-  barrier.dstAccessMask = dst_access;
-  barrier.oldLayout = old_layout;
-  barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  barrier.image = image;
-  barrier.subresourceRange = kColorRange;
+// The targets of CaelixRenderTargets in descriptor binding order (binding = index + 1).
+// `formats` lists the accepted formats; all VK_FORMAT_UNDEFINED = any storage format.
+struct TargetSpec {
+  const char* name;
+  uint32_t bit;
+  VkFormat formats[2];
+};
+constexpr TargetSpec kTargetSpecs[] = {
+    {"colour", kTargetColor, {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED}},
+    {"albedo", kTargetAlbedo, {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT}},
+    {"normal", kTargetNormal, {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM}},
+    {"depth", kTargetDepth, {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT}},
+    {"motion", kTargetMotion, {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32G32_SFLOAT}},
+    {"view_z", kTargetViewZ, {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT}},
+};
+
+bool FormatAccepted(const TargetSpec& spec, VkFormat format) {
+  return spec.formats[0] == VK_FORMAT_UNDEFINED || format == spec.formats[0] ||
+         format == spec.formats[1];
+}
+
+// One vkCmdPipelineBarrier2 with one image barrier per image: old layout -> GENERAL.
+void TargetBarriers(VkCommandBuffer cmd, uint32_t count, const VkImage* images,
+                    const VkImageLayout* old_layouts, VkPipelineStageFlags2 src_stage,
+                    VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                    VkAccessFlags2 dst_access) {
+  VkImageMemoryBarrier2 barriers[std::size(kTargetSpecs)];
+  for (uint32_t i = 0; i < count; ++i) {
+    VkImageMemoryBarrier2& barrier = barriers[i];
+    barrier = VkImageMemoryBarrier2{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = src_stage;
+    barrier.srcAccessMask = src_access;
+    barrier.dstStageMask = dst_stage;
+    barrier.dstAccessMask = dst_access;
+    barrier.oldLayout = old_layouts[i];
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = images[i];
+    barrier.subresourceRange = kColorRange;
+  }
   VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-  dependency.imageMemoryBarrierCount = 1;
-  dependency.pImageMemoryBarriers = &barrier;
+  dependency.imageMemoryBarrierCount = count;
+  dependency.pImageMemoryBarriers = barriers;
   vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
@@ -53,12 +81,28 @@ CaelixResult Renderer::Create(Device& device, Scene& scene, std::unique_ptr<Rend
   std::unique_ptr<Renderer> renderer(new Renderer(device, scene));
   const VkDevice vk_device = device.device();
 
-  const VkDescriptorSetLayoutBinding bindings[2] = {
-      {0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-      {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-  };
+  // Binding 0 the TLAS, bindings 1..6 the targets. Every binding is PARTIALLY_BOUND
+  // (descriptorBindingPartiallyBound, a device requirement): a render call writes
+  // only the TLAS when there is one and the targets that are present, and the
+  // kernel touches only those.
+  constexpr uint32_t kBindingCount = 1 + kTargetCount;
+  static_assert(std::size(kTargetSpecs) == kTargetCount);
+  VkDescriptorSetLayoutBinding bindings[kBindingCount];
+  VkDescriptorBindingFlags binding_flags[kBindingCount];
+  for (uint32_t i = 0; i < kBindingCount; ++i) {
+    bindings[i] = {i,
+                   i == 0 ? VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR
+                          : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                   1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    binding_flags[i] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+  }
+  VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  flags_info.bindingCount = kBindingCount;
+  flags_info.pBindingFlags = binding_flags;
   VkDescriptorSetLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  layout_info.bindingCount = 2;
+  layout_info.pNext = &flags_info;
+  layout_info.bindingCount = kBindingCount;
   layout_info.pBindings = bindings;
   const VkResult result =
       vkCreateDescriptorSetLayout(vk_device, &layout_info, nullptr, &renderer->set_layout_);
@@ -100,7 +144,7 @@ void Renderer::AddSlot() {
   auto slot = std::make_unique<FrameSlot>();
   const VkDescriptorPoolSize sizes[2] = {
       {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kTargetCount},
   };
   VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   pool_info.maxSets = 1;
@@ -236,7 +280,6 @@ void Renderer::ReleaseTargetViews() {
 CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTargets& targets,
                               const CaelixCamera& camera, const CaelixRenderOptions& options) {
   constexpr const char* kFunction = "caelix_renderer_render";
-  const CaelixTargetImage& color = targets.color;
   if (frame.command_buffer == 0) {
     CAELIX_LOGE("%s: the frame's command buffer is null", kFunction);
     return CAELIX_ERROR_INVALID_ARGUMENT;
@@ -247,43 +290,72 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                 static_cast<unsigned long long>(frame.frame_number));
     return CAELIX_ERROR_INVALID_ARGUMENT;
   }
-  if (color.image == 0 || color.width == 0 || color.height == 0 ||
-      color.format == VK_FORMAT_UNDEFINED) {
-    CAELIX_LOGE("%s: the colour target needs an image, a format and a nonzero size", kFunction);
-    return CAELIX_ERROR_INVALID_ARGUMENT;
-  }
   if (options.debug_view >= kDebugViewCount) {
     CAELIX_LOGE("%s: unknown debug view %u", kFunction, options.debug_view);
     return CAELIX_ERROR_INVALID_ARGUMENT;
   }
-  if (!FormatSupported(static_cast<VkFormat>(color.format))) {
-    return CAELIX_ERROR_UNSUPPORTED;
+
+  // The present targets (image != 0), in binding order.
+  const CaelixTargetImage* const all[kTargetCount] = {&targets.color,  &targets.albedo,
+                                                      &targets.normal, &targets.depth,
+                                                      &targets.motion, &targets.view_z};
+  uint32_t present[kTargetCount];  // indices into `all`
+  uint32_t present_count = 0;
+  uint32_t mask = 0;
+  for (uint32_t i = 0; i < kTargetCount; ++i) {
+    const CaelixTargetImage& target = *all[i];
+    const TargetSpec& spec = kTargetSpecs[i];
+    if (target.image == 0) {
+      continue;
+    }
+    if (target.width == 0 || target.height == 0 || target.format == VK_FORMAT_UNDEFINED) {
+      CAELIX_LOGE("%s: the %s target needs a format and a nonzero size", kFunction, spec.name);
+      return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (present_count > 0) {
+      const CaelixTargetImage& first = *all[present[0]];
+      if (target.width != first.width || target.height != first.height) {
+        CAELIX_LOGE("%s: the %s target is %ux%u, the %s target %ux%u; every target must have the "
+                    "same size",
+                    kFunction, spec.name, target.width, target.height,
+                    kTargetSpecs[present[0]].name, first.width, first.height);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+      }
+    }
+    for (uint32_t j = 0; j < present_count; ++j) {
+      if (all[present[j]]->image == target.image) {
+        CAELIX_LOGE("%s: the %s and %s targets are the same image", kFunction,
+                    kTargetSpecs[present[j]].name, spec.name);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+      }
+    }
+    if (!FormatAccepted(spec, static_cast<VkFormat>(target.format))) {
+      CAELIX_LOGE("%s: VkFormat %u is not an accepted format of the %s target (see "
+                  "CaelixRenderTargets)",
+                  kFunction, target.format, spec.name);
+      return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    present[present_count++] = i;
+    mask |= spec.bit;
   }
+  if (present_count == 0) {
+    CAELIX_LOGE("%s: no target is present (every target image is 0)", kFunction);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  for (uint32_t p = 0; p < present_count; ++p) {
+    if (!FormatSupported(static_cast<VkFormat>(all[present[p]]->format))) {
+      return CAELIX_ERROR_UNSUPPORTED;
+    }
+  }
+  if (targets.normal.image != 0 && targets.normal.format == VK_FORMAT_R8G8B8A8_UNORM) {
+    mask |= kTargetNormalUnorm;
+  }
+  const uint32_t width = all[present[0]]->width;
+  const uint32_t height = all[present[0]]->height;
 
   const VkCommandBuffer cmd = HandleFromU64<VkCommandBuffer>(frame.command_buffer);
-  const VkImage image = HandleFromU64<VkImage>(color.image);
   const uint64_t safe = frame.safe_frame_number;
   timer_.Resolve(safe);
-
-  const VkAccelerationStructureKHR tlas = scene_.tlas();
-  if (tlas == VK_NULL_HANDLE) {
-    // No TLAS yet (no bricks were ever built): the image shows the sky.
-    ImageBarrier(cmd, image, static_cast<VkImageLayout>(color.layout),
-                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
-                 VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    timer_.Begin(cmd, frame.frame_number, safe);
-    VkClearColorValue sky{};
-    sky.float32[0] = options.sky_color[0];
-    sky.float32[1] = options.sky_color[1];
-    sky.float32[2] = options.sky_color[2];
-    sky.float32[3] = 1.0f;
-    vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &sky, 1, &kColorRange);
-    timer_.End(cmd);
-    ImageBarrier(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
-                 VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                 VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
-    return CAELIX_OK;
-  }
 
   FrameSlot* slot = AcquireSlot(frame.frame_number, safe);
   if (slot == nullptr) {
@@ -292,27 +364,45 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                 static_cast<unsigned long long>(frame.frame_number));
     return CAELIX_ERROR_INVALID_ARGUMENT;
   }
-  const VkImageView view = ViewFor(color, frame.frame_number, safe);
 
-  // Descriptors: the slot's previous frame has completed, so its set is free.
+  // Descriptors: the slot's previous frame has completed, so its set is free. Only
+  // the TLAS (when the scene has one) and the present targets are written; the
+  // other bindings keep stale or no descriptors, which PARTIALLY_BOUND allows
+  // because the kernel does not touch them (has_tlas, target_mask).
+  const VkAccelerationStructureKHR tlas = scene_.tlas();
   VkWriteDescriptorSetAccelerationStructureKHR as_write{
       VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
   as_write.accelerationStructureCount = 1;
   as_write.pAccelerationStructures = &tlas;
-  const VkDescriptorImageInfo image_info{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
-  VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
-                                    {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-  writes[0].pNext = &as_write;
-  writes[0].dstSet = slot->set;
-  writes[0].dstBinding = 0;
-  writes[0].descriptorCount = 1;
-  writes[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-  writes[1].dstSet = slot->set;
-  writes[1].dstBinding = 1;
-  writes[1].descriptorCount = 1;
-  writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-  writes[1].pImageInfo = &image_info;
-  vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
+  VkDescriptorImageInfo image_infos[kTargetCount];
+  VkWriteDescriptorSet writes[1 + kTargetCount];
+  VkImage images[kTargetCount];
+  VkImageLayout layouts[kTargetCount];
+  uint32_t write_count = 0;
+  if (tlas != VK_NULL_HANDLE) {
+    VkWriteDescriptorSet& write = writes[write_count++];
+    write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.pNext = &as_write;
+    write.dstSet = slot->set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+  }
+  for (uint32_t p = 0; p < present_count; ++p) {
+    const CaelixTargetImage& target = *all[present[p]];
+    images[p] = HandleFromU64<VkImage>(target.image);
+    layouts[p] = static_cast<VkImageLayout>(target.layout);
+    image_infos[p] = {VK_NULL_HANDLE, ViewFor(target, frame.frame_number, safe),
+                      VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet& write = writes[write_count++];
+    write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = slot->set;
+    write.dstBinding = 1 + present[p];
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &image_infos[p];
+  }
+  vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
 
   // Frame constants.
   FrameConstants constants{};
@@ -320,8 +410,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   Copy3(camera.right, constants.right);
   Copy3(camera.up, constants.up);
   Copy3(camera.forward, constants.forward);
-  constants.size[0] = color.width;
-  constants.size[1] = color.height;
+  constants.size[0] = width;
+  constants.size[1] = height;
   constants.tan_half_fov_y = camera.tan_half_fov_y;
   constants.aspect = camera.aspect;
   constants.near_z = camera.near_z;
@@ -349,26 +439,50 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   }
   Copy3(sun, constants.sun_dir);
   Copy3(options.sky_color, constants.sky_color);
+  // CaelixCamera::projection is column-major; the constants hold its rows.
+  for (uint32_t row = 0; row < 4; ++row) {
+    for (uint32_t column = 0; column < 4; ++column) {
+      constants.projection[row][column] = camera.projection[column * 4 + row];
+    }
+  }
+  if (has_prev_camera_) {
+    Copy3(prev_camera_.position, constants.prev_position);
+    Copy3(prev_camera_.right, constants.prev_right);
+    Copy3(prev_camera_.up, constants.prev_up);
+    Copy3(prev_camera_.forward, constants.prev_forward);
+    constants.prev_tan_half_fov_y = prev_camera_.tan_half_fov_y;
+    constants.prev_aspect = prev_camera_.aspect;
+    constants.has_prev_camera = 1;
+  }
+  constants.target_mask = mask;
+  constants.miss_depth = options.miss_depth;
+  constants.miss_view_z = options.miss_view_z;
+  constants.has_tlas = tlas != VK_NULL_HANDLE ? 1u : 0u;
   std::memcpy(slot->constants.mapped(), &constants, sizeof(constants));
   slot->constants.FlushHostWrites(0, sizeof(constants));
 
-  // Any earlier use of the image (the host's acquire chains into ALL_COMMANDS)
+  // Any earlier use of the targets (the host's acquire chains into ALL_COMMANDS)
   // -> the kernel's writes.
-  ImageBarrier(cmd, image, static_cast<VkImageLayout>(color.layout),
-               VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
-               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+  TargetBarriers(cmd, present_count, images, layouts, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                 VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace_.pipeline());
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace_.layout(), 0, 1, &slot->set,
                           0, nullptr);
   const TracePush push{slot->constants.address()};
   vkCmdPushConstants(cmd, trace_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
   timer_.Begin(cmd, frame.frame_number, safe);
-  vkCmdDispatch(cmd, (color.width + kWorkgroupSize - 1) / kWorkgroupSize,
-                (color.height + kWorkgroupSize - 1) / kWorkgroupSize, 1);
+  vkCmdDispatch(cmd, (width + kWorkgroupSize - 1) / kWorkgroupSize,
+                (height + kWorkgroupSize - 1) / kWorkgroupSize, 1);
   timer_.End(cmd);
-  ImageBarrier(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-               VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+  VkImageLayout general[kTargetCount];
+  std::fill(general, general + kTargetCount, VK_IMAGE_LAYOUT_GENERAL);
+  TargetBarriers(cmd, present_count, images, general, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                 VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+
+  prev_camera_ = camera;
+  has_prev_camera_ = true;
   return CAELIX_OK;
 }
 

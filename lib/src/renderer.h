@@ -13,14 +13,17 @@ namespace caelix {
 
 class Scene;
 
-// Traces one scene into the host's colour target (caelix_renderer_*).
+// Traces one scene into the host's targets (caelix_renderer_*).
 //
 // The trace kernel (shaders/caelix_trace_primary.hlsl) reads the scene's tables
 // through buffer device addresses in the frame constants; the TLAS and the
-// colour target are the only descriptors (set 0: binding 0 acceleration
-// structure, binding 1 storage image). Per-frame resources live in a ring of
-// slots (descriptor set + 256-byte constants buffer); a slot is reused only when
-// its frame is safe.
+// targets are the only descriptors (set 0: binding 0 acceleration structure,
+// bindings 1..6 storage images colour, albedo, normal, depth, motion, view_z;
+// every binding PARTIALLY_BOUND, so absent targets and a missing TLAS are simply
+// not written). Per-frame resources live in a ring of slots (descriptor set +
+// 512-byte constants buffer); a slot is reused only when its frame is safe. The
+// camera of each successful render call is kept as the previous camera of the
+// next one (motion target).
 class Renderer {
  public:
   static CaelixResult Create(Device& device, Scene& scene, std::unique_ptr<Renderer>& out);
@@ -37,6 +40,7 @@ class Renderer {
   static constexpr uint32_t kInitialSlots = 3;
   static constexpr uint32_t kMaxSlots = 8;
   static constexpr size_t kMaxCachedViews = 16;
+  static constexpr uint32_t kTargetCount = 6;  // descriptor bindings 1..6
 
   struct FrameSlot {
     uint64_t frame = 0;  // last frame that used the slot (0 = never)
@@ -75,6 +79,8 @@ class Renderer {
   std::vector<CachedView> views_;
   std::vector<FormatSupport> formats_;
   GpuTimer timer_;
+  CaelixCamera prev_camera_{};
+  bool has_prev_camera_ = false;
 };
 
 }  // namespace caelix
