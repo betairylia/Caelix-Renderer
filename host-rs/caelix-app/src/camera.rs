@@ -74,6 +74,14 @@ impl Camera {
         self.position[1] += up;
     }
 
+    /// The pose as command line arguments: "--pose x,y,z,pitch,yaw --fov f".
+    pub fn pose_args(&self) -> String {
+        format!(
+            "--pose {:.1},{:.1},{:.1},{:.3},{:.3} --fov {:.1}",
+            self.position[0], self.position[1], self.position[2], self.pitch, self.yaw, self.fov_y
+        )
+    }
+
     pub fn to_caelix(self, aspect: f32, near_z: f32, far_z: f32) -> CaelixCamera {
         let (right, up, forward) = self.basis();
         CaelixCamera {
@@ -108,8 +116,57 @@ pub fn perspective_reverse_z(fov_y: f32, aspect: f32, near: f32) -> [f32; 16] {
     m
 }
 
+/// Hamilton product a * b of quaternions (x, y, z, w): the rotation b, then a.
+fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let [ax, ay, az, aw] = a;
+    let [bx, by, bz, bw] = b;
+    [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ]
+}
+
+/// Unity's `Quaternion.Euler(pitch, yaw, roll)` (degrees): roll about Z first, then pitch about X,
+/// then yaw about Y, i.e. q = Ry(yaw) * Rx(pitch) * Rz(roll). Same convention as the camera
+/// (`Camera::from_quaternion` reads yaw and pitch back from this order).
+pub fn quat_from_euler(pitch: f32, yaw: f32, roll: f32) -> [f32; 4] {
+    let (sx, cx) = (pitch.to_radians() * 0.5).sin_cos();
+    let (sy, cy) = (yaw.to_radians() * 0.5).sin_cos();
+    let (sz, cz) = (roll.to_radians() * 0.5).sin_cos();
+    let qx = [sx, 0.0, 0.0, cx];
+    let qy = [0.0, sy, 0.0, cy];
+    let qz = [0.0, 0.0, sz, cz];
+    quat_mul(quat_mul(qy, qx), qz)
+}
+
+/// Inverse of [`quat_from_euler`]: (pitch, yaw, roll) in degrees, each in (-180, 180], pitch in
+/// [-90, 90]. Unit quaternion (x, y, z, w). At pitch +-90 (gimbal lock) the roll is 0.
+pub fn euler_from_quat(q: [f32; 4]) -> [f32; 3] {
+    let [x, y, z, w] = q;
+    // Rotation matrix entries of R = Ry Rx Rz: R12 = -sin(pitch), R02 / R22 give the yaw,
+    // R10 / R11 the roll.
+    let r12 = 2.0 * (y * z - w * x);
+    let pitch = (-r12).clamp(-1.0, 1.0).asin();
+    let (yaw, roll) = if r12.abs() < 0.999_999 {
+        let r02 = 2.0 * (x * z + w * y);
+        let r22 = 1.0 - 2.0 * (x * x + y * y);
+        let r10 = 2.0 * (x * y + w * z);
+        let r11 = 1.0 - 2.0 * (x * x + z * z);
+        (r02.atan2(r22), r10.atan2(r11))
+    } else {
+        // Gimbal lock: only yaw - roll (or yaw + roll) is defined; put it all in the yaw.
+        let r00 = 1.0 - 2.0 * (y * y + z * z);
+        let r20 = 2.0 * (x * z - w * y);
+        ((-r20).atan2(r00), 0.0)
+    };
+    // + 0.0 turns -0.0 into 0.0 (shown as "-0.00" otherwise).
+    [pitch, yaw, roll].map(|a| wrap_degrees(a.to_degrees()) + 0.0)
+}
+
 /// Wraps degrees to (-180, 180].
-fn wrap_degrees(degrees: f32) -> f32 {
+pub fn wrap_degrees(degrees: f32) -> f32 {
     let wrapped = degrees.rem_euclid(360.0);
     if wrapped > 180.0 {
         wrapped - 360.0
@@ -154,6 +211,22 @@ mod tests {
         // clip.z / clip.w at view depth z (row r, column c = m[c * 4 + r]).
         let depth = |z: f32| (m[10] * z + m[14]) / (m[11] * z + m[15]);
         assert!((depth(0.5) - 1.0).abs() < 1e-6 && (depth(50.0) - 0.01).abs() < 1e-6);
+    }
+
+    #[test]
+    fn euler_quaternion_round_trip() {
+        // Matches the Unity quaternion of the test above.
+        let (hy, hx) = (45f32.to_radians() * 0.5, 20f32.to_radians() * 0.5);
+        let unity = [hx.sin() * hy.cos(), hy.sin() * hx.cos(), -hx.sin() * hy.sin(), hx.cos() * hy.cos()];
+        let q = quat_from_euler(20.0, 45.0, 0.0);
+        assert!(q.iter().zip(unity).all(|(a, b)| (a - b).abs() < 1e-6));
+        for &(p, y, r) in &[(0.0, 0.0, 0.0), (10.0, -120.0, 35.0), (-60.0, 170.0, -90.0), (89.0, 15.0, 5.0)] {
+            let e = euler_from_quat(quat_from_euler(p, y, r));
+            assert!((e[0] - p).abs() < 1e-2 && (e[1] - y).abs() < 1e-2 && (e[2] - r).abs() < 1e-2, "{e:?}");
+        }
+        // Roll is applied first: forward stays the camera's forward for any roll.
+        let camera = Camera::from_quaternion([0.0; 3], quat_from_euler(20.0, 45.0, 30.0), 60.0);
+        assert!((camera.yaw - 45.0).abs() < 1e-3 && (camera.pitch - 20.0).abs() < 1e-3);
     }
 
     #[test]

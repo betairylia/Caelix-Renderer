@@ -12,13 +12,18 @@
 //!    that has completed on the GPU (`safe_frame_number`, 0 = none).
 //! 2. The caller records its work. The work must leave the image in
 //!    `VK_IMAGE_LAYOUT_GENERAL`.
-//! 3. [`Context::end_frame`] transitions the image to `PRESENT_SRC_KHR`, submits
-//!    and presents. After [`Context::request_readback`], the next `end_frame` also
-//!    copies the image to a host buffer; [`Context::take_readback`] returns the
-//!    pixels once that frame has completed.
+//! 3. Optional, in this order: [`Context::readback_now`] records a copy of the
+//!    image into a host buffer at that point of the command buffer (the image
+//!    stays in `GENERAL`); [`Context::take_readback`] returns the pixels once the
+//!    frame has completed. [`Context::draw_overlay`] (after
+//!    [`Context::init_overlay`]) draws egui's output over the image and leaves it
+//!    in `GENERAL`. A readback recorded before the overlay excludes the overlay.
+//! 4. [`Context::end_frame`] transitions the image to `PRESENT_SRC_KHR`, submits
+//!    and presents.
 
 mod debug;
 mod device;
+mod overlay;
 mod readback;
 mod swapchain;
 
@@ -110,8 +115,10 @@ pub enum Error {
     NoSuitableDevice(String),
     #[error("{call} failed: {result}")]
     Vulkan { call: &'static str, result: String },
-    #[error("end_frame called without a frame from begin_frame")]
+    #[error("called without a frame from begin_frame")]
     NoFrameInFlight,
+    #[error("egui overlay: {0}")]
+    Overlay(String),
 }
 
 pub(crate) fn vk_error(call: &'static str) -> impl FnOnce(vk::Result) -> Error {
@@ -160,9 +167,9 @@ pub struct Context {
     completed_frame: u64,
     /// Incremented every time the swapchain is recreated.
     swapchain_generation: u64,
-    /// The next end_frame copies the image to a host buffer.
-    readback_requested: bool,
     readback: Option<readback::PendingReadback>,
+    /// The egui overlay renderer, after `init_overlay`. Dropped first in Drop.
+    overlay: Option<overlay::Overlay>,
 }
 
 impl Context {
@@ -235,8 +242,8 @@ impl Context {
             acquired: None,
             completed_frame: 0,
             swapchain_generation: 0,
-            readback_requested: false,
             readback: None,
+            overlay: None,
         };
         context.create_frame_sync()?;
         context.ensure_render_finished_semaphores()?;
@@ -266,12 +273,88 @@ impl Context {
         self.swapchain_generation
     }
 
-    /// Asks the next `end_frame` to copy its image into a host buffer (one
-    /// request at a time; ignored while a copy is pending).
-    pub fn request_readback(&mut self) {
-        if self.readback.is_none() {
-            self.readback_requested = true;
+    /// Records a copy of the frame's image into a host buffer at this point of the
+    /// frame's command buffer. The image must be in `GENERAL` layout and stays in
+    /// it. Call it before [`Context::draw_overlay`] for an image without the
+    /// overlay. One copy at a time: returns `Ok(false)` and records nothing while
+    /// a copy is pending, or when the swapchain format is not RGBA8 or BGRA8.
+    pub fn readback_now(&mut self, frame: &Frame) -> Result<bool, Error> {
+        let image_index = self.acquired.ok_or(Error::NoFrameInFlight)?;
+        if self.readback.is_some() {
+            return Ok(false);
         }
+        let Some(bgra) = readback::rgba8_order(self.swapchain.format()) else {
+            log::warn!("readback skipped: swapchain format {:?} is not RGBA8 or BGRA8", self.swapchain.format());
+            return Ok(false);
+        };
+        let extent = self.swapchain.extent();
+        let pending = readback::PendingReadback::new(
+            &self.instance,
+            &self.device,
+            self.physical_device,
+            extent.width,
+            extent.height,
+            bgra,
+            self.recording_frame,
+        )?;
+        let cmd = self.frames[self.frame_index].command_buffer;
+        debug_assert_eq!(frame.command_buffer, cmd.as_raw());
+        debug_assert_eq!(frame.frame_number, self.recording_frame);
+        pending.record(&self.device, cmd, self.swapchain.image(image_index));
+        self.readback = Some(pending);
+        Ok(true)
+    }
+
+    /// Creates the egui overlay renderer for the swapchain format. Idempotent.
+    pub fn init_overlay(&mut self) -> Result<(), Error> {
+        if self.overlay.is_none() {
+            self.overlay = Some(overlay::Overlay::new(
+                &self.instance,
+                self.physical_device,
+                &self.device,
+                self.queue_family,
+                self.swapchain.format(),
+                self.swapchain.images(),
+                FRAMES_IN_FLIGHT,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Draws egui's output over the frame's image: uploads `textures_delta.set`,
+    /// records GENERAL -> COLOR_ATTACHMENT_OPTIMAL, a dynamic rendering pass
+    /// (load and store) with the egui draws and COLOR_ATTACHMENT_OPTIMAL ->
+    /// GENERAL, and destroys `textures_delta.free` once this frame has completed.
+    /// Call between `begin_frame` and `end_frame`, after the work that writes the
+    /// image, and after [`Context::init_overlay`]. Texture uploads wait for the
+    /// queue to be idle (egui uploads only when its textures change).
+    pub fn draw_overlay(
+        &mut self,
+        frame: &Frame,
+        textures_delta: egui::TexturesDelta,
+        clipped_primitives: &[egui::ClippedPrimitive],
+        pixels_per_point: f32,
+    ) -> Result<(), Error> {
+        let image_index = self.acquired.ok_or(Error::NoFrameInFlight)?;
+        let overlay = self
+            .overlay
+            .as_mut()
+            .ok_or_else(|| Error::Overlay("draw_overlay called before init_overlay".into()))?;
+        let cmd = self.frames[self.frame_index].command_buffer;
+        debug_assert_eq!(frame.command_buffer, cmd.as_raw());
+        debug_assert_eq!(frame.frame_number, self.recording_frame);
+        overlay.draw(
+            self.queue,
+            cmd,
+            self.swapchain.image(image_index),
+            image_index,
+            self.swapchain.extent(),
+            self.recording_frame,
+            self.completed_frame,
+            textures_delta,
+            clipped_primitives,
+            pixels_per_point,
+        )
     }
 
     /// The pixels of the requested readback, once its frame has completed (about
@@ -430,41 +513,13 @@ impl Context {
             .command_buffer_infos(&command_buffers)
             .signal_semaphore_infos(&signal);
 
-        // A requested readback replaces the GENERAL -> PRESENT barrier with
-        // GENERAL -> TRANSFER_SRC, the copy, and TRANSFER_SRC -> PRESENT.
-        let mut copy = None;
-        if self.readback_requested {
-            self.readback_requested = false;
-            let extent = self.swapchain.extent();
-            match readback::rgba8_order(self.swapchain.format()) {
-                Some(bgra) => {
-                    copy = Some(readback::PendingReadback::new(
-                        &self.instance,
-                        &self.device,
-                        self.physical_device,
-                        extent.width,
-                        extent.height,
-                        bgra,
-                        recording_frame,
-                    )?);
-                }
-                None => log::warn!(
-                    "readback skipped: swapchain format {:?} is not RGBA8 or BGRA8",
-                    self.swapchain.format()
-                ),
-            }
-        }
-
         // SAFETY: the command buffer is in the recording state (begin_frame), and
         // every handle belongs to this device.
         unsafe {
-            match &copy {
-                Some(pending) => pending.record(&self.device, sync.command_buffer, image),
-                None => self.device.cmd_pipeline_barrier2(
-                    sync.command_buffer,
-                    &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_present)),
-                ),
-            }
+            self.device.cmd_pipeline_barrier2(
+                sync.command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_present)),
+            );
             self.device
                 .end_command_buffer(sync.command_buffer)
                 .map_err(vk_error("vkEndCommandBuffer"))?;
@@ -473,9 +528,6 @@ impl Context {
                 .map_err(vk_error("vkQueueSubmit2"))?;
         }
         self.frames[self.frame_index].submitted_frame = recording_frame;
-        if copy.is_some() {
-            self.readback = copy;
-        }
 
         let swapchains = [self.swapchain.handle()];
         let image_indices = [image_index];
@@ -565,6 +617,9 @@ impl Context {
     fn recreate_swapchain(&mut self) -> Result<(), Error> {
         // Simple and correct: nothing may still use the old swapchain images.
         self.wait_idle();
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.destroy_views();
+        }
         self.swapchain.recreate(
             &self.instance,
             &self.surface_fn,
@@ -574,6 +629,9 @@ impl Context {
             self.height,
         )?;
         self.ensure_render_finished_semaphores()?;
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.set_swapchain(self.swapchain.format(), self.swapchain.images())?;
+        }
         self.needs_recreate = false;
         self.swapchain_generation += 1;
         Ok(())
@@ -587,6 +645,9 @@ impl Drop for Context {
         // destroyed in reverse creation order; the debug messenger goes last
         // before the instance so it reports every destruction.
         unsafe {
+            // The overlay first: its objects (and its clone of the device's function table) must
+            // go before the device.
+            self.overlay = None;
             if let Some(pending) = self.readback.take() {
                 pending.destroy(&self.device);
             }

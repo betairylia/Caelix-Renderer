@@ -9,9 +9,12 @@
 //! scene, then `caelix_renderer_render` traces the scene into the swapchain image:
 //! a debug view (`--mode primary`), the path-traced 1 spp image denoised by NRD
 //! (`--mode pt`, `--no-denoise` for the raw image) or the accumulated reference
-//! (`--mode ref`).
+//! (`--mode ref`). Debug windows (egui, `ui.rs`, F1) are drawn over the image by
+//! `caelix-vk` after the render; a screenshot is copied before them.
 
 mod camera;
+mod settings;
+mod ui;
 mod world;
 
 use std::collections::HashSet;
@@ -24,7 +27,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context as _};
 use caelix_sys::*;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -33,6 +36,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use camera::Camera;
+use settings::{same_options, Mode, RenderSettings, View};
 
 /// Free camera: default speed in world units (blocks) per second.
 const DEFAULT_SPEED: f32 = 100.0;
@@ -51,65 +55,12 @@ const LOG_EVERY_FRAMES: u64 = 120;
 /// Distance range of the depth view.
 const DEPTH_NEAR: f32 = 1.0;
 const DEPTH_FAR: f32 = 8192.0;
-/// Primary mode: direction toward the sun of the Lambert term (normalized by the library) and the
-/// sky colour. `--sun` overrides the direction.
-const PRIMARY_SUN_DIR: [f32; 3] = [-0.45, 0.8, -0.3];
-const SKY_COLOR: [f32; 3] = [0.55, 0.7, 0.9];
-/// Lighting modes: default direction toward the sun.
-const LIGHTING_SUN_DIR: [f32; 3] = [0.45, 0.7, 0.55];
+/// `--ui-demo`: entity 0 is turned at this presented-frame count.
+const UI_DEMO_FRAME: u64 = 60;
+/// `--ui-demo`: the yaw of entity 0 in degrees.
+const UI_DEMO_YAW: f32 = 15.0;
 /// An absent render target (image 0): the library does not write it.
 const NO_TARGET: CaelixTargetImage = CaelixTargetImage { image: 0, format: 0, width: 0, height: 0, layout: 0 };
-
-/// Debug view of the renderer (`CaelixDebugView`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum View {
-    Albedo,
-    Normal,
-    Depth,
-    Group,
-    Brick,
-    Steps,
-    /// Path trace mode: NRD's validation layer over the image.
-    NrdValidation,
-    /// Path trace mode: the denoised diffuse radiance without the albedo.
-    NrdDiff,
-}
-
-impl View {
-    fn raw(self) -> u32 {
-        match self {
-            View::Albedo => CaelixDebugView_CAELIX_VIEW_ALBEDO as u32,
-            View::Normal => CaelixDebugView_CAELIX_VIEW_NORMAL as u32,
-            View::Depth => CaelixDebugView_CAELIX_VIEW_DEPTH as u32,
-            View::Group => CaelixDebugView_CAELIX_VIEW_GROUP as u32,
-            View::Brick => CaelixDebugView_CAELIX_VIEW_BRICK as u32,
-            View::Steps => CaelixDebugView_CAELIX_VIEW_STEPS as u32,
-            View::NrdValidation => CaelixDebugView_CAELIX_VIEW_NRD_VALIDATION as u32,
-            View::NrdDiff => CaelixDebugView_CAELIX_VIEW_NRD_DIFF as u32,
-        }
-    }
-}
-
-/// Rendering mode (`CaelixRenderMode`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum Mode {
-    /// Debug views of the primary hit (`--view`).
-    Primary,
-    /// Path-traced lighting, raw 1 sample per pixel.
-    Pt,
-    /// Path-traced lighting accumulated over frames (reference image).
-    Ref,
-}
-
-impl Mode {
-    fn raw(self) -> u32 {
-        match self {
-            Mode::Primary => CaelixRenderMode_CAELIX_MODE_PRIMARY as u32,
-            Mode::Pt => CaelixRenderMode_CAELIX_MODE_PATH_TRACE as u32,
-            Mode::Ref => CaelixRenderMode_CAELIX_MODE_REFERENCE as u32,
-        }
-    }
-}
 
 /// Parses "x,y,z" into three floats.
 fn parse_vec3(text: &str) -> Result<[f32; 3], String> {
@@ -252,9 +203,21 @@ struct Args {
     /// Exit after the screenshot is written.
     #[arg(long, requires = "screenshot")]
     exit_after_screenshot: bool,
-    /// Ignore keyboard and mouse, so automated screenshot runs stay deterministic.
+    /// Ignore keyboard and mouse, so automated screenshot runs stay deterministic. Also disables
+    /// the debug UI.
     #[arg(long)]
     no_input: bool,
+    /// Start with the debug UI hidden (F1 shows it).
+    #[arg(long)]
+    no_ui: bool,
+    /// Directory of the PNGs of the debug UI's Screenshot button (screenshot-<frame>.png).
+    /// Default: the directory of the executable.
+    #[arg(long, value_name = "DIR")]
+    screenshot_dir: Option<PathBuf>,
+    /// Debug UI demo: every window and section starts open, and at frame 60 entity 0 is turned to a
+    /// yaw of 15 degrees (for captures of the debug UI).
+    #[arg(long, conflicts_with_all = ["no_ui", "no_input"])]
+    ui_demo: bool,
 }
 
 /// Everything that lives while the window exists. Drop order matters: Drop
@@ -263,6 +226,8 @@ struct Args {
 /// context, then window).
 struct State {
     loader: Option<world::WorldLoader>,
+    /// The debug UI; `None` with --no-input.
+    ui: Option<ui::Ui>,
     renderer: *mut CaelixRenderer,
     scene: *mut CaelixScene,
     caelix_device: *mut CaelixDevice,
@@ -295,6 +260,14 @@ struct Input {
     speed: f32,
 }
 
+/// Who receives the pending readback.
+enum ReadbackOwner {
+    /// The --screenshot flow.
+    Cli,
+    /// The debug UI's Screenshot button: the PNG path.
+    Ui(PathBuf),
+}
+
 /// Screenshot progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Screenshot {
@@ -324,9 +297,19 @@ struct Accumulation {
 
 struct App {
     args: Args,
-    /// The resolved `--mode`.
-    mode: Mode,
+    /// The render options: initial values from the command line, edited by the debug UI.
+    settings: RenderSettings,
+    /// The options of the previous frame (reference accumulation restarts when they change).
+    last_options: Option<CaelixRenderOptions>,
     accumulation: Accumulation,
+    /// The scene entities as the debug UI edits them (empty without --world).
+    entities: Vec<ui::EntityRow>,
+    /// The debug UI's Screenshot button was pressed; the copy is recorded when no readback is pending.
+    ui_screenshot_requested: bool,
+    /// Receiver of the readback that `readback_now` recorded; `None` when nothing is pending.
+    readback_owner: Option<ReadbackOwner>,
+    /// Shown in the Render window: the newest screenshot of the button.
+    screenshot_note: String,
     state: Option<State>,
     camera: Camera,
     input: Input,
@@ -355,7 +338,7 @@ impl App {
         let size = window.inner_size();
 
         let requirements = device_requirements();
-        let context = caelix_vk::Context::new(
+        let mut context = caelix_vk::Context::new(
             &window,
             size.width,
             size.height,
@@ -363,6 +346,13 @@ impl App {
             cfg!(debug_assertions),
         )
         .context("cannot create the Vulkan context")?;
+        // The debug UI: none with --no-input (deterministic runs never touch the overlay).
+        let ui = if self.args.no_input {
+            None
+        } else {
+            context.init_overlay().context("cannot create the egui overlay")?;
+            Some(ui::Ui::new(&window, !self.args.no_ui, self.args.ui_demo))
+        };
 
         let handles = context.adopt_handles();
         let desc = CaelixDeviceAdoptDesc {
@@ -384,6 +374,7 @@ impl App {
         let views_generation = context.swapchain_generation();
         let mut state = State {
             loader: None,
+            ui,
             renderer: ptr::null_mut(),
             scene: ptr::null_mut(),
             caelix_device,
@@ -417,7 +408,9 @@ impl App {
         }
 
         if let Some(path) = self.args.world.as_deref() {
-            state.loader = Some(world::WorldLoader::open(state.scene, path)?);
+            let loader = world::WorldLoader::open(state.scene, path)?;
+            self.entities = loader.entities().iter().map(ui::EntityRow::new).collect();
+            state.loader = Some(loader);
         }
         // Camera: --pose, else the world's player pose, else a fixed pose.
         self.camera = match (self.args.pose, state.loader.as_ref().and_then(|l| l.player_pose())) {
@@ -452,6 +445,67 @@ impl App {
                 unsafe { caelix_renderer_release_target_views(state.renderer) };
                 state.views_generation = state.context.swapchain_generation();
             }
+
+            // Debug UI: one egui pass before the scene work, so that its edits (settings, camera,
+            // entity transforms) apply to this frame. Its stats are the previous frame's.
+            if let Some(loader) = state.loader.as_ref() {
+                for (row, entry) in self.entities.iter_mut().zip(loader.entities()) {
+                    row.bricks = entry.bricks_received;
+                }
+            }
+            if self.args.ui_demo && self.frames_presented == UI_DEMO_FRAME {
+                if let Some(entity) = self.entities.first_mut() {
+                    log::info!("ui demo: entity 0 yaw set to {UI_DEMO_YAW} degrees");
+                    entity.set_euler([entity.euler[0], UI_DEMO_YAW, entity.euler[2]]);
+                }
+            }
+            let mut ui_frame = None;
+            let mut ui_reset = false;
+            if let Some(ui) = state.ui.as_mut().filter(|ui| ui.visible) {
+                let stats = ui::Stats {
+                    timings: gpu_timings(state.renderer),
+                    fps: self.timing.fps,
+                    frame_number: frame.frame_number,
+                    target: (frame.width, frame.height),
+                    scene: scene_stats(state.scene),
+                    nrd: nrd_info(state.renderer),
+                    load_state: state.loader.as_ref().map_or_else(|| "no world".into(), |l| l.status_line()),
+                    accumulated: self.accumulation.frames,
+                    screenshot_note: self.screenshot_note.clone(),
+                };
+                let mut panel = ui::Panel {
+                    stats: &stats,
+                    settings: &mut self.settings,
+                    camera: &mut self.camera,
+                    speed: &mut self.input.speed,
+                    entities: &mut self.entities,
+                    reset_accumulation: false,
+                    screenshot: false,
+                };
+                ui_frame = Some(ui.run(&state.window, &mut panel));
+                ui_reset = panel.reset_accumulation;
+                if panel.screenshot {
+                    self.ui_screenshot_requested = true;
+                }
+            }
+            let mut entity_moved = false;
+            for entity in self.entities.iter_mut().filter(|e| e.dirty) {
+                entity.dirty = false;
+                entity_moved = true;
+                // SAFETY: the scene is live; both arrays are valid for the call.
+                let result = unsafe {
+                    caelix_scene_set_entity_transform(
+                        state.scene,
+                        entity.scene_id,
+                        entity.position.as_ptr(),
+                        entity.rotation.as_ptr(),
+                    )
+                };
+                if result != CaelixResult_CAELIX_OK {
+                    bail!("caelix_scene_set_entity_transform({}) failed: CaelixResult {result}", entity.scene_id);
+                }
+            }
+
             // SAFETY: the scene is live; the frame's slot fence confirmed safe_frame_number.
             let result = unsafe { caelix_scene_recycle(state.scene, frame.safe_frame_number) };
             if result != CaelixResult_CAELIX_OK {
@@ -499,48 +553,21 @@ impl App {
             };
             let aspect = frame.width as f32 / frame.height.max(1) as f32;
             let camera = self.camera.to_caelix(aspect, DEPTH_NEAR, DEPTH_FAR);
-            // Reference mode: restart while the camera moves or the scene still changes. Pt mode:
-            // NRD follows the camera through the motion vectors; its history restarts only while
-            // the world is still loading.
+            // A new random stream every frame.
+            let mut options = self.settings.options(false, frame.frame_number as u32);
+            // Reference mode: restart while the camera moves, the options or an entity change, or
+            // the scene still loads. Pt mode: NRD follows the camera and the entities through the
+            // motion vectors; its history restarts only while the world is still loading. The
+            // Reset accumulation button restarts both.
             let camera_changed = self.accumulation.last_camera.is_none_or(|last| !same_camera(&last, &camera));
+            let options_changed = self.last_options.is_none_or(|last| !same_options(&last, &options));
             self.accumulation.last_camera = Some(camera);
-            let reset_accumulation = if self.mode == Mode::Ref { camera_changed || !world_ready } else { !world_ready };
+            self.last_options = Some(options);
+            let reset_accumulation = ui_reset
+                || !world_ready
+                || (self.settings.mode == Mode::Ref && (camera_changed || options_changed || entity_moved));
             self.accumulation.frames = if reset_accumulation { 1 } else { self.accumulation.frames + 1 };
-            let lighting = self.mode != Mode::Primary;
-            let mut flags = 0;
-            if self.mode == Mode::Primary && !self.args.no_shading {
-                flags |= CAELIX_RENDER_FLAG_SHADING;
-            }
-            if lighting && !self.args.no_sky_on_miss {
-                flags |= CAELIX_RENDER_FLAG_SKY_ON_MISS;
-            }
-            if lighting && !self.args.no_sun_nee {
-                flags |= CAELIX_RENDER_FLAG_SUN_NEE;
-            }
-            let default_sun = if lighting { LIGHTING_SUN_DIR } else { PRIMARY_SUN_DIR };
-            let options = CaelixRenderOptions {
-                debug_view: self.args.view.raw(),
-                flags,
-                sun_dir: self.args.sun.unwrap_or(default_sun),
-                pad: 0.0,
-                sky_color: SKY_COLOR,
-                pad2: 0.0,
-                // The camera's projection is reverse-Z infinite.
-                miss_depth: 0.0,
-                miss_view_z: 1e30,
-                mode: self.mode.raw(),
-                bounce_count: self.args.bounces,
-                denoise: u32::from(self.mode == Mode::Pt && !self.args.no_denoise),
-                reset_accumulation: u32::from(reset_accumulation),
-                exposure: self.args.exposure,
-                sun_radiance: self.args.sun_radiance,
-                sun_angular_radius: self.args.sun_angular_radius.to_radians(),
-                sky_zenith: self.args.sky_zenith,
-                sky_horizon: self.args.sky_horizon,
-                sky_ground: self.args.sky_ground,
-                // A new random stream every frame.
-                frame_seed: frame.frame_number as u32,
-            };
+            options.reset_accumulation = u32::from(reset_accumulation);
             // SAFETY: the command buffer is recording after this frame's flush; the image is
             // the acquired one; every struct is valid for the call.
             let result = unsafe { caelix_renderer_render(state.renderer, &frame_desc, &targets, &camera, &options) };
@@ -549,17 +576,11 @@ impl App {
             }
 
             // Screenshot: wait for the world (or frame 10), then 3 more frames; with
-            // --accumulate, wait for N accumulated frames of the complete world.
+            // --accumulate, wait for N accumulated frames of the complete world. The copy is
+            // recorded here, after the render and before the overlay, so it excludes the debug UI.
+            let mut cli_due = false;
             if let (Some(n), Screenshot::Waiting) = (self.args.accumulate, self.screenshot) {
-                if self.args.screenshot.is_some() && world_ready && self.accumulation.frames >= n {
-                    state.context.request_readback();
-                    self.screenshot = Screenshot::Requested;
-                    log::info!(
-                        "screenshot requested at frame {} after {} accumulated frames",
-                        frame.frame_number,
-                        self.accumulation.frames
-                    );
-                }
+                cli_due = self.args.screenshot.is_some() && world_ready && self.accumulation.frames >= n;
             } else if self.args.screenshot.is_some() {
                 if self.screenshot == Screenshot::Waiting {
                     let ready = match state.loader.as_ref() {
@@ -568,41 +589,83 @@ impl App {
                     };
                     if ready {
                         let extra = if state.loader.is_some() { SCREENSHOT_EXTRA_FRAMES } else { 0 };
-                        let extra = if self.mode == Mode::Pt { extra.max(self.args.warmup) } else { extra };
+                        let extra = if self.settings.mode == Mode::Pt { extra.max(self.args.warmup) } else { extra };
                         self.screenshot = Screenshot::RequestAt(self.frames_presented + extra);
                     }
                 }
                 if let Screenshot::RequestAt(at) = self.screenshot {
-                    if self.frames_presented >= at {
-                        state.context.request_readback();
-                        self.screenshot = Screenshot::Requested;
-                        log::info!("screenshot requested at frame {}", frame.frame_number);
-                    }
+                    cli_due = self.frames_presented >= at;
                 }
             }
+            if cli_due && state.context.readback_now(&frame)? {
+                self.readback_owner = Some(ReadbackOwner::Cli);
+                self.screenshot = Screenshot::Requested;
+                if self.args.accumulate.is_some() {
+                    log::info!(
+                        "screenshot requested at frame {} after {} accumulated frames",
+                        frame.frame_number,
+                        self.accumulation.frames
+                    );
+                } else {
+                    log::info!("screenshot requested at frame {}", frame.frame_number);
+                }
+            } else if self.ui_screenshot_requested && state.context.readback_now(&frame)? {
+                self.ui_screenshot_requested = false;
+                let dir = match &self.args.screenshot_dir {
+                    Some(dir) => dir.clone(),
+                    None => std::env::current_exe()
+                        .ok()
+                        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+                        .unwrap_or_default(),
+                };
+                let path = dir.join(format!("screenshot-{}.png", frame.frame_number));
+                self.screenshot_note = format!("writing {}", path.display());
+                self.readback_owner = Some(ReadbackOwner::Ui(path));
+            }
 
+            if let Some(output) = ui_frame {
+                state.context.draw_overlay(&frame, output.textures_delta, &output.primitives, output.pixels_per_point)?;
+            }
             state.context.end_frame(frame)?;
             self.frames_presented += 1;
         } else {
             log::debug!("frame skipped: swapchain recreated or window size is 0");
         }
 
-        if self.screenshot == Screenshot::Requested {
+        if self.readback_owner.is_some() {
             if let Some((pixels, width, height)) = state.context.take_readback()? {
-                let path = self.args.screenshot.clone().expect("screenshot path");
-                write_png(&path, &pixels, width, height)?;
-                log::info!("screenshot written: {} ({width}x{height})", path.display());
-                // Before the first full second the fps of the open window is the best value.
-                let fps = if self.timing.fps > 0.0 {
-                    self.timing.fps
-                } else {
-                    self.timing.window_frames as f64 / self.timing.window_start.elapsed().as_secs_f64().max(1e-3)
-                };
-                log::info!("{}", timing_line(state.renderer, fps));
-                self.screenshot = Screenshot::Done;
-                if self.args.exit_after_screenshot {
-                    event_loop.exit();
-                    return Ok(());
+                match self.readback_owner.take().expect("checked above") {
+                    ReadbackOwner::Cli => {
+                        let path = self.args.screenshot.clone().expect("screenshot path");
+                        write_png(&path, &pixels, width, height)?;
+                        log::info!("screenshot written: {} ({width}x{height})", path.display());
+                        // Before the first full second the fps of the open window is the best value.
+                        let fps = if self.timing.fps > 0.0 {
+                            self.timing.fps
+                        } else {
+                            self.timing.window_frames as f64
+                                / self.timing.window_start.elapsed().as_secs_f64().max(1e-3)
+                        };
+                        log::info!("{}", timing_line(state.renderer, fps));
+                        self.screenshot = Screenshot::Done;
+                        if self.args.exit_after_screenshot {
+                            event_loop.exit();
+                            return Ok(());
+                        }
+                    }
+                    ReadbackOwner::Ui(path) => {
+                        // A failed write is reported in the Render window, not fatal.
+                        match write_png(&path, &pixels, width, height) {
+                            Ok(()) => {
+                                log::info!("screenshot written: {} ({width}x{height})", path.display());
+                                self.screenshot_note = format!("written: {}", path.display());
+                            }
+                            Err(e) => {
+                                log::error!("screenshot failed: {e:#}");
+                                self.screenshot_note = format!("failed: {e:#}");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -714,6 +777,16 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // egui sees every window event first (while the UI is visible); the free camera then
+        // ignores the pointer and the keys that egui uses.
+        if let Some(state) = self.state.as_mut() {
+            if let Some(ui) = state.ui.as_mut() {
+                ui.on_window_event(&state.window, &event);
+            }
+        }
+        let ui = self.state.as_ref().and_then(|state| state.ui.as_ref());
+        let ui_pointer = ui.is_some_and(|ui| ui.wants_pointer());
+        let ui_keyboard = ui.is_some_and(|ui| ui.wants_keyboard());
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -724,24 +797,31 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } if !self.args.no_input => {
                 if let PhysicalKey::Code(code) = event.physical_key {
-                    match event.state {
-                        ElementState::Pressed => self.input.keys.insert(code),
-                        ElementState::Released => self.input.keys.remove(&code),
-                    };
-                    // P prints the pose in --pose form so a view can be reproduced.
-                    if code == KeyCode::KeyP && event.state == ElementState::Pressed && !event.repeat {
-                        let c = &self.camera;
-                        log::info!(
-                            "pose: --pose {:.1},{:.1},{:.1},{:.3},{:.3} --fov {:.1}",
-                            c.position[0], c.position[1], c.position[2], c.pitch, c.yaw, c.fov_y
-                        );
+                    let pressed = event.state == ElementState::Pressed;
+                    if !pressed {
+                        // Always: a key pressed before egui took the focus must not stick.
+                        self.input.keys.remove(&code);
+                    } else if code == KeyCode::F1 {
+                        // F1 shows and hides the debug UI.
+                        if !event.repeat {
+                            if let Some(ui) = self.state.as_mut().and_then(|state| state.ui.as_mut()) {
+                                ui.visible = !ui.visible;
+                            }
+                        }
+                    } else if !ui_keyboard {
+                        self.input.keys.insert(code);
+                        // P prints the pose in --pose form so a view can be reproduced.
+                        if code == KeyCode::KeyP && !event.repeat {
+                            log::info!("pose: {}", self.camera.pose_args());
+                        }
                     }
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Right, .. } if !self.args.no_input => {
-                self.input.looking = state == ElementState::Pressed;
+                // A press over an egui window does not start the mouse look; a release always ends it.
+                self.input.looking = state == ElementState::Pressed && !ui_pointer;
             }
-            WindowEvent::MouseWheel { delta, .. } if !self.args.no_input => {
+            WindowEvent::MouseWheel { delta, .. } if !self.args.no_input && !ui_pointer => {
                 let notches = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 120.0,
@@ -764,7 +844,12 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.input.looking && !self.args.no_input {
+            let ui_pointer = self
+                .state
+                .as_ref()
+                .and_then(|state| state.ui.as_ref())
+                .is_some_and(|ui| ui.wants_pointer());
+            if self.input.looking && !self.args.no_input && !ui_pointer {
                 self.camera
                     .rotate(dx as f32 * MOUSE_DEGREES_PER_PIXEL, dy as f32 * MOUSE_DEGREES_PER_PIXEL);
             }
@@ -778,12 +863,37 @@ impl ApplicationHandler for App {
     }
 }
 
-/// "Caelix Renderer | trace 1.23 ms | denoise 0.40 ms | composite 0.05 ms | flush 0.45 ms | 144 fps"
-fn timing_line(renderer: *const CaelixRenderer, fps: f64) -> String {
+fn gpu_timings(renderer: *const CaelixRenderer) -> CaelixGpuTimings {
     let mut timings =
         CaelixGpuTimings { trace_ms: 0.0, flush_ms: 0.0, frame_number: 0, composite_ms: 0.0, denoise_ms: 0.0 };
     // SAFETY: the renderer is live and timings is writable.
     unsafe { caelix_renderer_get_gpu_timings(renderer, &mut timings) };
+    timings
+}
+
+fn scene_stats(scene: *const CaelixScene) -> CaelixSceneStats {
+    // SAFETY: CaelixSceneStats holds only integers, so all-zero is a valid value.
+    let mut stats: CaelixSceneStats = unsafe { std::mem::zeroed() };
+    // SAFETY: the scene is live and stats is writable.
+    unsafe { caelix_scene_get_stats(scene, &mut stats) };
+    stats
+}
+
+/// All zero when the call fails.
+fn nrd_info(renderer: *const CaelixRenderer) -> CaelixNrdInfo {
+    // SAFETY: CaelixNrdInfo is a plain C struct of integers; all zero is a valid value.
+    let mut info: CaelixNrdInfo = unsafe { std::mem::zeroed() };
+    // SAFETY: the renderer is live and info is writable.
+    if unsafe { caelix_renderer_get_nrd_info(renderer, &mut info) } != CaelixResult_CAELIX_OK {
+        // SAFETY: as above.
+        info = unsafe { std::mem::zeroed() };
+    }
+    info
+}
+
+/// "Caelix Renderer | trace 1.23 ms | denoise 0.40 ms | composite 0.05 ms | flush 0.45 ms | 144 fps"
+fn timing_line(renderer: *const CaelixRenderer, fps: f64) -> String {
+    let timings = gpu_timings(renderer);
     format!(
         "Caelix Renderer | trace {:.2} ms | denoise {:.2} ms | composite {:.2} ms | flush {:.2} ms | {:.0} fps",
         timings.trace_ms, timings.denoise_ms, timings.composite_ms, timings.flush_ms, fps
@@ -923,12 +1033,37 @@ fn main() -> anyhow::Result<()> {
         args.size.1
     );
 
+    let (sun_color, sun_intensity) = RenderSettings::split_radiance(args.sun_radiance);
+    let settings = RenderSettings {
+        mode,
+        view: args.view,
+        bounces: args.bounces,
+        denoise: !args.no_denoise,
+        sun_nee: !args.no_sun_nee,
+        sky_on_miss: !args.no_sky_on_miss,
+        shading: !args.no_shading,
+        exposure: args.exposure,
+        sun_dir: args.sun,
+        sun_radiance: args.sun_radiance,
+        sun_color,
+        sun_intensity,
+        sun_angular_radius_deg: args.sun_angular_radius,
+        sky_zenith: args.sky_zenith,
+        sky_horizon: args.sky_horizon,
+        sky_ground: args.sky_ground,
+    };
+
     let event_loop = EventLoop::new().context("cannot create the event loop")?;
     let fov = args.fov;
     let mut app = App {
         args,
-        mode,
+        settings,
+        last_options: None,
         accumulation: Accumulation { last_camera: None, frames: 0 },
+        entities: Vec::new(),
+        ui_screenshot_requested: false,
+        readback_owner: None,
+        screenshot_note: String::new(),
         state: None,
         camera: Camera::from_pose([0.0; 3], 0.0, 0.0, fov),
         input: Input { keys: HashSet::new(), looking: false, speed: DEFAULT_SPEED },

@@ -693,7 +693,71 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   to 255). With `--world` it is taken 3 frames after the world is complete on
   the GPU (every brick uploaded and `as_builds_pending == 0`); without
   `--world` at frame 10; with `--accumulate` after N accumulated frames.
-- `--exit-after-screenshot`, `--no-input` (ignore keyboard and mouse for deterministic automated runs). In the window, press `P` to log the current camera as a `--pose ... --fov ...` line: exit once the PNG is written.
+- `--exit-after-screenshot`: exit once the PNG is written.
+- `--no-input`: ignore keyboard and mouse, for deterministic automated runs.
+  It also disables the debug UI (no egui context, no overlay renderer).
+- `--no-ui`: start with the debug UI hidden (`F1` shows it).
+- `--screenshot-dir <DIR>`: directory of the PNGs of the debug UI's
+  Screenshot button. Default: the directory of the executable.
+- `--ui-demo`: every debug window and section starts open, and at frame 60
+  entity 0 is turned to a yaw of 15 degrees (for captures of the debug UI).
+  Conflicts with `--no-ui` and `--no-input`.
+
+In the window, press `P` to log the current camera as a
+`--pose ... --fov ...` line.
+
+### Debug UI
+
+The host draws a debug UI with [egui](https://github.com/emilk/egui) over the
+rendered image. `F1` shows and hides it. Crates: `egui` 0.36.2 and
+`egui-winit` 0.36.2 in `caelix-app` (input and the UI code, `ui.rs`), `egui`
+and `egui-ash-renderer` 0.13.0 (dynamic rendering, default allocator) in
+`caelix-vk` (rendering, `overlay.rs`). `caelix-app` stays free of `ash`.
+
+Four separate egui windows in egui's default style (two changes: no window
+and popup shadows, window titles at 15.5 points instead of 18). Each window
+can be dragged and collapsed, and each has collapsible sections:
+
+- **Stats**: fps (1 s window), frame number, target size; the GPU times of
+  the newest timed frame (trace, denoise, composite, flush,
+  `caelix_renderer_get_gpu_timings`); the scene stats (entities, groups,
+  resident bricks, record and slot table MiB, acceleration structure builds
+  pending); the NRD line (version, size, pool MiB, dispatches) and the world
+  load state.
+- **Render**: every `CaelixRenderOptions` field that the command line sets:
+  mode, debug view (all `CaelixDebugView` values), bounces 0..14, denoise,
+  sun NEE, sky on miss, Lambert (primary mode), exposure (logarithmic,
+  0.05..8); the sun as pitch (elevation, positive up) and yaw (0 = +Z, 90 =
+  +X) in degrees with the resulting direction, colour plus intensity
+  (logarithmic, 0..1e5; radiance = colour x intensity) and angular radius
+  (0.1..10 degrees); the sky zenith, horizon and ground colours.
+  "Reset accumulation" sets `reset_accumulation` for one frame (reference and
+  NRD history); in reference mode the accumulated frame count is shown.
+  "Screenshot" writes `screenshot-<frame>.png` to `--screenshot-dir`.
+  The command line gives the initial values; a value that the UI does not
+  touch reaches the library unchanged (the sun radiance and direction are
+  rewritten only when their controls change).
+- **Camera**: position, pitch, yaw, vertical fov, speed; "Copy --pose" puts
+  the `--pose ... --fov ...` line on the clipboard (the `P` key still logs it).
+- **Entities**: one collapsible row per world entity (index, GUID, decoded
+  brick count) with the position and the Unity Euler angles (pitch, yaw,
+  roll, degrees, `Quaternion.Euler` order: roll, then pitch, then yaw). A
+  change calls `caelix_scene_set_entity_transform` before the frame's flush;
+  "Reset" sends the file's transform (the original quaternion). In reference
+  mode an entity change, a camera change or an option change restarts the
+  accumulation; in path trace mode NRD follows the motion.
+
+Input: egui sees every window event first. While the pointer is over a
+window (or egui drags a widget) the mouse look and the scroll wheel are
+ignored; while a widget has keyboard focus WASD/QE and `P` are ignored.
+
+Frame order: flush, render, then the screenshot copy (`readback_now`), then
+the overlay (`draw_overlay`: GENERAL -> COLOR_ATTACHMENT_OPTIMAL, a dynamic
+rendering pass with load and store, COLOR_ATTACHMENT_OPTIMAL -> GENERAL),
+then `end_frame` (GENERAL -> PRESENT). So `--screenshot` and the Screenshot
+button never contain the UI. egui texture uploads submit their own command
+buffer and wait for the queue (only when egui's textures change); freed egui
+textures are destroyed once their frame has completed.
 
 Camera convention (`caelix-app/src/camera.rs`, Unity's): for yaw θ and pitch φ,
 `forward = (sin θ cos φ, -sin φ, cos θ cos φ)`, `right = (cos θ, 0, -sin θ)`,
@@ -716,12 +780,14 @@ it adds one scene entity per file entity, then streams the bricks:
   the frame's command buffer. Frame numbers start at 1; `safe_frame_number` is
   the frame that last used the frame slot whose fence `begin_frame` waited for.
   Then `caelix_renderer_render` traces the scene into the swapchain image
-  (the swapchain has `STORAGE`, `TRANSFER_DST` and `TRANSFER_SRC` usage), and
-  `end_frame` presents. When the swapchain was recreated, the host calls
+  (the swapchain has `STORAGE`, `TRANSFER_DST`, `TRANSFER_SRC` and
+  `COLOR_ATTACHMENT` usage), the debug UI is drawn over it, and `end_frame`
+  presents. When the swapchain was recreated, the host calls
   `caelix_renderer_release_target_views` first.
 - The window title shows the GPU times once per second
   (`Caelix Renderer | trace 0.53 ms | denoise 0.23 ms | composite 0.01 ms | flush 0.00 ms | 144 fps`); the same line
   is logged at info level every 120 frames and when a screenshot is written.
+  The Stats window of the debug UI shows the same values.
   At the second frame of the renderer's NRD instance the host logs one NRD line
   (`caelix_renderer_get_nrd_info`: version, size, pipelines, pool textures and
   MiB, dispatches per frame).

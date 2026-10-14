@@ -10,3 +10,5 @@ ash-window = "0.13.0"
 log = "0.4.34"
 raw-window-handle = "0.6.2"
 thiserror = "2.0.21"
+egui = { version = "0.36.2", default-features = false }
+egui-ash-renderer = "0.13.0"

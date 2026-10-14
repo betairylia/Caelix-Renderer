@@ -45,6 +45,9 @@ impl Swapchain {
     pub(crate) fn image(&self, index: u32) -> vk::Image {
         self.images[index as usize]
     }
+    pub(crate) fn images(&self) -> &[vk::Image] {
+        &self.images
+    }
     pub(crate) fn image_count(&self) -> usize {
         self.images.len()
     }
@@ -104,7 +107,8 @@ impl Swapchain {
             })?;
 
         // TRANSFER_DST: the renderer clears the image before the scene has a TLAS.
-        // TRANSFER_SRC: screenshots (Context::request_readback).
+        // TRANSFER_SRC: screenshots (Context::readback_now).
+        // COLOR_ATTACHMENT: the egui overlay (Context::draw_overlay).
         let transfer = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
         if !caps.supported_usage_flags.contains(transfer) {
             return Err(Error::Vulkan {

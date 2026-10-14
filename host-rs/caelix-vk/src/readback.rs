@@ -87,8 +87,9 @@ impl PendingReadback {
         Ok(Self { buffer, memory, frame, width, height, bgra })
     }
 
-    /// Records the copy of `image` (in GENERAL layout) into the buffer, and leaves the image in
-    /// PRESENT_SRC_KHR. Replaces the GENERAL -> PRESENT barrier of a normal frame.
+    /// Records the copy of `image` (in GENERAL layout) into the buffer: GENERAL ->
+    /// TRANSFER_SRC_OPTIMAL, the copy, TRANSFER_SRC_OPTIMAL -> GENERAL. The image is left in
+    /// GENERAL, so later work of the frame (the overlay, end_frame's GENERAL -> PRESENT) is unchanged.
     pub(crate) fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, image: vk::Image) {
         let to_transfer = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -110,13 +111,14 @@ impl PendingReadback {
                     .layer_count(1),
             )
             .image_extent(vk::Extent3D { width: self.width, height: self.height, depth: 1 });
-        let to_present = vk::ImageMemoryBarrier2::default()
+        // The copy only reads the image: an execution dependency orders later writes after it.
+        let to_general = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COPY)
             .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-            .dst_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
             .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .new_layout(vk::ImageLayout::GENERAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
@@ -147,7 +149,7 @@ impl PendingReadback {
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default()
-                    .image_memory_barriers(std::slice::from_ref(&to_present))
+                    .image_memory_barriers(std::slice::from_ref(&to_general))
                     .buffer_memory_barriers(std::slice::from_ref(&to_host)),
             );
         }

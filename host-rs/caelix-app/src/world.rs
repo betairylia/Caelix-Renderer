@@ -42,6 +42,18 @@ pub enum LoadOutcome {
     Mismatch,
 }
 
+/// One file entity as added to the scene.
+pub struct EntityEntry {
+    pub scene_id: CaelixEntityId,
+    /// GUID in the file's string form.
+    pub guid: String,
+    /// Transform from the file.
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
+    /// Bricks of this entity that the decoder produced so far (all of them once the load is complete).
+    pub bricks_received: u64,
+}
+
 pub struct WorldLoader {
     /// `None` after `stop`.
     rx: Option<Receiver<DecodedSector>>,
@@ -49,6 +61,8 @@ pub struct WorldLoader {
     decoder: Option<JoinHandle<DecodeOutput>>,
     /// Scene entity id per file entity.
     entity_ids: Vec<CaelixEntityId>,
+    /// The file entities, in file order (same index as `entity_ids`).
+    entities: Vec<EntityEntry>,
     /// A sector that the staging ring could not take completely, and its first
     /// brick that is not uploaded yet.
     pending: Option<(DecodedSector, usize)>,
@@ -90,6 +104,7 @@ impl WorldLoader {
         log::info!("{} entities, {} sectors", world.entities.len(), file.sectors().len());
 
         let mut entity_ids = Vec::with_capacity(world.entities.len());
+        let mut entities = Vec::with_capacity(world.entities.len());
         for (index, entity) in world.entities.iter().enumerate() {
             let desc = CaelixEntityDesc {
                 guid: entity.guid,
@@ -109,6 +124,13 @@ impl WorldLoader {
                 entity.position
             );
             entity_ids.push(id);
+            entities.push(EntityEntry {
+                scene_id: id,
+                guid: entity.guid_string(),
+                position: entity.position,
+                rotation: entity.rotation,
+                bricks_received: 0,
+            });
         }
 
         let (tx, rx) = mpsc::sync_channel::<DecodedSector>(CHANNEL_SECTORS);
@@ -129,6 +151,7 @@ impl WorldLoader {
             rx: Some(rx),
             decoder: Some(decoder),
             entity_ids,
+            entities,
             pending: None,
             decode_time: None,
             complete: false,
@@ -151,6 +174,28 @@ impl WorldLoader {
     /// to date after a flush that followed the load: the scene is complete on the GPU.
     pub fn is_ready(&self) -> bool {
         self.as_ready
+    }
+
+    /// The file entities as added to the scene, with their transforms from the file.
+    pub fn entities(&self) -> &[EntityEntry] {
+        &self.entities
+    }
+
+    /// One line for the debug UI: "loading: ...", "building acceleration structures", "complete".
+    pub fn status_line(&self) -> String {
+        if self.as_ready {
+            format!("complete: {} bricks", self.bricks_uploaded)
+        } else if self.complete {
+            "uploaded; building acceleration structures".into()
+        } else {
+            format!(
+                "loading: {} of {} received bricks uploaded, {} sectors, decoder {}",
+                self.bricks_uploaded,
+                self.bricks_received,
+                self.sectors_received,
+                if self.decoder.is_some() { "running" } else { "finished" }
+            )
+        }
     }
 
     /// The file's player pose, if it has one.
@@ -301,6 +346,7 @@ impl WorldLoader {
             Ok(sector) => {
                 self.sectors_received += 1;
                 self.bricks_received += sector.keys.len() as u64;
+                self.entities[sector.entity].bricks_received += sector.keys.len() as u64;
                 if self.probes.len() < PROBE_COUNT {
                     if let Some(key) = sector.keys.first() {
                         self.probes.push((sector.entity, *key));
