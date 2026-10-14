@@ -285,7 +285,12 @@ flush builds the TLAS that the render binds.
   and the miss values. In the lighting modes it also shades the hit and
   traces the bounces into the internal targets.
 - Composite kernel `shaders/render/caelix_composite.hlsl`, `[numthreads(8, 8, 1)]`,
-  lighting modes only: internal targets -> the host's colour target.
+  lighting modes only: internal targets -> the host's colour target. With the
+  delta checkerboard (path trace mode) it writes an internal RGBA16F resolve
+  image instead, and the cross resolve kernel
+  `shaders/render/caelix_cross_resolve.hlsl` (same descriptor set,
+  `render/caelix_composite_set.hlsl`) writes the colour target; see "Materials
+  and glass (step 6d)".
 - NRD (`lib/src/render/nrd_executor.*`, path trace mode with `denoise = 1`): NRD's
   own compute dispatches between the trace and the composite (see "Denoising
   (step 6b)" below).
@@ -342,7 +347,8 @@ flush builds the TLAS that the render binds.
 - GPU timings: two timestamps around each dispatch, read back in
   a later render call whose safe frame has reached that frame;
   `caelix_renderer_get_gpu_timings` returns `trace_ms`, `denoise_ms` (0 for
-  a frame without NRD), `composite_ms` (0 in the primary mode), `flush_ms` and
+  a frame without NRD), `composite_ms` (0 in the primary mode; includes the
+  cross resolve), `flush_ms` and
   the frame they belong to.
 
 Pixel mapping: pixel (px, py), row 0 = the top row,
@@ -487,6 +493,23 @@ Design and owner decisions: `docs/STEP6D_MATERIALS_DELTA.md` (section "As built"
   the bounce loop, where every segment is attenuated by its medium (a miss has
   T = 0, so the sky is not attenuated). Sun NEE runs at diffuse vertices only;
   shadow rays treat glass as opaque.
+- Delta checkerboard (`CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD`, path trace mode
+  only, host default on, Unity parity): at the FIRST interface of the chain,
+  when refraction exists, even pixels (`(px + py) % 2 == 0`) refract and odd
+  pixels reflect, and the branch carries the weight `2 (1 - F)` or `2 F` (no
+  random number is drawn); total internal reflection stays unsplit. Later
+  interfaces keep the random choice. A split pixel is flagged in the internal
+  motion target's w (and in the host motion target's w for RGBA formats). The
+  RGBA8 albedo target stores half of a split pixel's albedo (the weight can
+  reach 2) and the composite doubles it. The composite then writes its linear
+  output (after the exposure) into an RGBA16F resolve image, and the cross
+  resolve (a port of Unity's `CaelixCrossResolve`) writes the host target: a
+  flagged pixel becomes `0.5 * centre + 0.125 * each flagged orthogonal
+  neighbour`, renormalized (neighbours clamped at the image edge); unflagged
+  pixels and alpha pass through; then the sRGB encode and the NRD validation
+  overlay (moved here from the composite, so the blend is linear). The motion
+  debug view passes through. Reference mode ignores the flag: a fixed branch per
+  pixel would accumulate to a checkerboard, not to the image.
 - Debug views: `CAELIX_VIEW_MATERIAL` (primary mode) and `CAELIX_VIEW_NRD_SPEC`
   (path trace mode, the denoised specular radiance, like `CAELIX_VIEW_NRD_DIFF`).
 
@@ -494,12 +517,13 @@ Measured 2026-10-14 (tests below, fixture images in
 `Artifacts/native-renderer-step6d-20261014/`): the glass slab, extinction and
 total internal reflection tests agree with Fresnel and Beer-Lambert within
 0.7 %; the citadel is unchanged (primary overview byte-identical to step 5,
-denoised detail 38.42 dB against the 6a reference as before). Known problem:
-with the plain stochastic choice, glass boils under NRD (frame-to-frame PSNR
-about 20 dB on the fixture's glass against 60 dB on opaque surfaces), because
-the reflect/refract flip also changes the albedo and deterministic targets,
-which bypass the denoiser. See the artifact README; the documented fix is the
-checkerboard split with cross resolve (design section 3).
+denoised detail 38.41 dB against the 6a reference, 38.42 dB before; run-to-run
+NRD variation is about 57 dB). Glass under NRD on the fixture (static camera,
+screenshots 5 frames apart): with the plain stochastic choice the glass boils
+(frame-to-frame PSNR 19.7 dB, 20.9 dB against the reference), because the
+reflect/refract flip changes the albedo and deterministic targets, which bypass
+the denoiser; with the checkerboard it is stable (39.6 dB frame to frame, 27.7 dB
+against the reference; opaque surfaces 60 dB). Details in the artifact README.
 
 ### Denoising (step 6b)
 
@@ -585,7 +609,7 @@ is written on every render call, a miss included.
 | `albedo` | RGBA8, RGBA16F | material albedo as stored in the block (sRGB), no shading; a = coverage | (0, 0, 0, 0) |
 | `normal` | RGBA16F, RGBA8_UNORM (stored as n * 0.5 + 0.5) | world-space face normal; w = coverage | (0, 0, 0, 0) |
 | `depth` | R32F (storage image, not a depth attachment) | device depth clip.z / clip.w of `CaelixCamera::projection` | `options.miss_depth` |
-| `motion` | RG16F, RG32F | previous pixel - current pixel, in pixels of the current size | (0, 0) |
+| `motion` | RG16F, RG32F, RGBA16F, RGBA32F | previous pixel - current pixel, in pixels of the current size; RGBA formats: z = 0, w = the delta checkerboard flag (1 = the pixel needs the cross resolve with its flagged neighbours) | (0, 0) |
 | `view_z` | R32F | linear view depth dot(hit - position, forward) | `options.miss_view_z` |
 
 A host with its own deferred pipeline passes only the geometry targets
@@ -757,7 +781,16 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   wall behind the side face (0.0); a block-ID host table with a smooth metal
   floor mirrors an emitter cube (3.592 against 3.608 = 0.902 * 4) with the sky
   beside it black, and NRD's specular view shows it (3.99) while the diffuse
-  view stays 0; `bounce_count_transparent` 16 is rejected.
+  view stays 0; `bounce_count_transparent` 16 is rejected. Delta checkerboard:
+  a clear glass block lying on a red emitter (one interface, so nothing random
+  remains): in path trace mode without NRD and without bounces, 10 frames with
+  new seeds are bit-identical; even pixels show the emitter in the albedo
+  target and odd pixels the glass (their reflection reached the black sky),
+  both flagged in the RGBA32F motion target's w; the cross-resolved colour is
+  7.625 = `(1 - F) 8` (7.628, FP16) on both parities; without the flag frames
+  differ and nothing is flagged. On the slab (the second interface still
+  random) the mean of 128 checkerboard frames is within 0.02 % of the
+  stochastic reference.
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -807,6 +840,9 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
 - `--bounces <N>`: lighting modes, stochastic bounces (0..14). Default 4.
 - `--bounces-transparent <N>`: lighting modes, smooth transparent interfaces
   that the primary ray crosses (the delta chain, 0..15, 0 = off). Default 5.
+- `--no-checkerboard`: `pt` mode without the delta checkerboard and its cross
+  resolve (the random reflect/refract choice at the first interface too).
+  Default: checkerboard on; the Render window has a checkbox for it.
   The debug UI's Render window has a slider for it.
 - `--encoding <packed|block-id>`: the scene's block encoding. Default `packed`
   (Caelix worlds).
@@ -923,8 +959,8 @@ can be dragged and collapsed, and each has collapsible sections:
   pending); the NRD line (version, size, pool MiB, dispatches) and the world
   load state.
 - **Render**: every `CaelixRenderOptions` field that the command line sets:
-  mode, debug view (all `CaelixDebugView` values), bounces 0..14, denoise,
-  sun NEE, sky on miss, Lambert (primary mode), exposure (logarithmic,
+  mode, debug view (all `CaelixDebugView` values), bounces 0..14, transparent bounces 0..15, denoise,
+  sun NEE, glass checkerboard (pt mode), sky on miss, Lambert (primary mode), exposure (logarithmic,
   0.05..8); the sun as pitch (elevation, positive up) and yaw (0 = +Z, 90 =
   +X) in degrees with the resulting direction, colour plus intensity
   (logarithmic, 0..1e5; radiance = colour x intensity) and angular radius

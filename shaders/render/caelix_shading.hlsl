@@ -167,16 +167,27 @@ float3 MediumExtinction(uint medium, float t) {
 // against the ray. Refraction is chosen when it exists and RandomFloat01 >= the
 // Fresnel reflectance; the random number is drawn only when refraction exists, as
 // in Unity (k = 1: the probability carries the Fresnel weight).
+// `split`: kInterfaceRandom = the random choice above; kInterfaceSplitReflect /
+// kInterfaceSplitRefract = the delta checkerboard (Unity's first-interface split): the
+// branch is given, no random number is drawn, and `weight` = 2 F (reflection) or
+// 2 (1 - F) (refraction) carries the Fresnel weight that the probability no longer does.
+// Total internal reflection reflects with weight 1 and is not split (`split_applied` false).
+static const int kInterfaceRandom = -1;
+static const int kInterfaceSplitReflect = 0;
+static const int kInterfaceSplitRefract = 1;
+
 struct CaelixInterface {
-  float3 normal;     // flipped against the incoming ray
-  float3 direction;  // the chosen direction, normalized
+  float3 normal;       // flipped against the incoming ray
+  float3 direction;    // the chosen direction, normalized
   bool refracted;
-  bool can_refract;  // false: total internal reflection
-  uint medium;       // the medium after the interface: destination when refracted, else source
+  bool can_refract;    // false: total internal reflection
+  uint medium;         // the medium after the interface: destination when refracted, else source
+  float weight;        // throughput factor: 1, or the checkerboard's 2 F / 2 (1 - F)
+  bool split_applied;  // the checkerboard decided this interface
 };
 
 CaelixInterface CrossInterface(uint source, uint destination, float destination_ior,
-                               float3 ray_direction, float3 normal, inout uint rng) {
+                               float3 ray_direction, float3 normal, int split, inout uint rng) {
   CaelixInterface it;
   it.normal = SafeNormalize(normal);
   if (dot(ray_direction, it.normal) > 0.0f) {
@@ -192,8 +203,16 @@ CaelixInterface CrossInterface(uint source, uint destination, float destination_
                             ? FresnelReflectAmountTransparent(source_ior, target_ior, ray_direction, it.normal)
                             : 1.0f;
   it.refracted = false;
+  it.weight = 1.0f;
+  it.split_applied = false;
   if (it.can_refract) {
-    it.refracted = RandomFloat01(rng) >= fresnel;
+    if (split == kInterfaceRandom) {
+      it.refracted = RandomFloat01(rng) >= fresnel;
+    } else {
+      it.refracted = split == kInterfaceSplitRefract;
+      it.weight = 2.0f * (it.refracted ? 1.0f - fresnel : fresnel);
+      it.split_applied = true;
+    }
   }
   it.direction = SafeNormalize(it.refracted ? refraction : reflection);
   it.medium = it.refracted ? destination : source;
@@ -231,7 +250,7 @@ CaelixShadeResult ShadeVoxelHit(uint block, float3 hit_position, float3 ray_dire
   CAELIX_BRANCH
   if (!IsOpaque(int(block))) {
     const CaelixInterface it = CrossInterface(medium, CaelixTransparentId(block), material.ior,
-                                              ray_direction, normal, rng);
+                                              ray_direction, normal, kInterfaceRandom, rng);
     shade.albedo = float3(1.0f, 1.0f, 1.0f);
     shade.bounce_origin =
         hit_position + (it.refracted ? -K_RAY_ORIGIN_PUSH_OFF : K_RAY_ORIGIN_PUSH_OFF) * it.normal;

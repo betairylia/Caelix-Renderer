@@ -272,10 +272,14 @@ struct DeltaChain {
   uint medium;           // the medium `ray` travels in (face-free transparent id, 0 = air)
   uint interfaces;       // interfaces crossed
   bool first_reflected;  // the first interface reflected
+  bool split;            // the delta checkerboard decided the first interface (cross resolve flag)
 };
 
+// `checkerboard`: the first interface takes the branch of the pixel's parity (even px + py
+// refracts, odd reflects) with the weight 2 (1 - F) / 2 F (CrossInterface split mode), as
+// Unity's AdvanceDeltaRay does; later interfaces stay random.
 DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult primary, uint budget,
-                         inout uint rng) {
+                         bool checkerboard, uint2 pixel, inout uint rng) {
   DeltaChain c;
   c.surface = primary;
   c.geometry = primary;
@@ -285,6 +289,7 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
   c.medium = 0u;
   c.interfaces = 0u;
   c.first_reflected = false;
+  c.split = false;
   CAELIX_LOOP
   for (;;) {
     if (!c.surface.hit) {
@@ -308,10 +313,18 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
       break;
     }
     const float3 hit_position = c.ray.Origin + c.ray.Direction * c.surface.T;
+    int split = kInterfaceRandom;
+    if (checkerboard && c.interfaces == 0u) {
+      split = ((pixel.x + pixel.y) & 1u) == 0u ? kInterfaceSplitRefract : kInterfaceSplitReflect;
+    }
     const CaelixInterface it = CrossInterface(c.medium, CaelixTransparentId(block), material.ior,
-                                              c.ray.Direction, c.surface.normal, rng);
+                                              c.ray.Direction, c.surface.normal, split, rng);
     if (c.interfaces == 0u && !it.refracted) {
       c.first_reflected = true;
+    }
+    if (it.split_applied) {
+      c.split = true;
+      c.throughput *= it.weight;
     }
     c.interfaces += 1u;
     c.medium = it.medium;
@@ -458,8 +471,12 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   // hit as the surface without drawing a random number, so an opaque scene consumes
   // the random stream exactly as before the chain existed).
   uint rng = InitRandom(thread_id.xy, fc.frame_seed);
-  const DeltaChain chain =
-      RunDeltaChain(fc, ray, primary, lighting ? fc.bounce_count_transparent : 0u, rng);
+  // The checkerboard runs in the path trace mode only: the reference mode needs an unbiased
+  // estimate per pixel, which a fixed per-pixel branch is not.
+  const bool checkerboard = fc.mode == kModePathTrace && (fc.flags & kRenderFlagDeltaCheckerboard) != 0u;
+  const DeltaChain chain = RunDeltaChain(fc, ray, primary, lighting ? fc.bounce_count_transparent : 0u,
+                                         checkerboard, thread_id.xy, rng);
+  const float split_flag = chain.split ? 1.0f : 0.0f;
   // The G-buffer describes chain.geometry at the chain length t_virtual along the
   // camera ray (PSR). Without an interface it is the primary hit at primary.T.
   const TraceResult geometry = chain.geometry;
@@ -556,7 +573,8 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   }
   CAELIX_BRANCH
   if ((targets & kTargetMotion) != 0u) {
-    g_motion[thread_id.xy] = float4(motion, 0.0f, 0.0f);
+    // w: the delta checkerboard flag (RGBA formats only; RG formats drop z and w).
+    g_motion[thread_id.xy] = float4(motion, 0.0f, split_flag);
   }
 
   CAELIX_BRANCH
@@ -566,7 +584,8 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     // radiance) and the composite shows the deterministic sky radiance.
     const bool surface = chain.surface.hit;
     g_int_view_z[pixel] = float4(surface ? view_z : kInternalMissViewZ, 0.0f, 0.0f, 0.0f);
-    g_int_motion[pixel] = float4(motion, motion_view_z, 0.0f);
+    // w = the checkerboard flag: the composite (albedo scale) and the cross resolve read it.
+    g_int_motion[pixel] = float4(motion, motion_view_z, split_flag);
 
     float3 material_albedo = float3(0.0f, 0.0f, 0.0f);
     float3 deterministic = float3(0.0f, 0.0f, 0.0f);
@@ -587,6 +606,11 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
       // The chain's transmission modulates everything the surface sends (Unity:
       // AlbedoTarget = throughput * albedo, deterministic = throughput * emission).
       material_albedo = chain.throughput * shade.albedo;
+      // A split pixel's throughput holds the checkerboard weight (up to 2); the RGBA8 albedo
+      // target stores half of it and the composite doubles flagged pixels again.
+      if (chain.split) {
+        material_albedo *= 0.5f;
+      }
       // Primary emission is deterministic: nothing was sampled to obtain it.
       deterministic = chain.throughput * shade.emission;
       bool specular_target = shade.specular_lobe;

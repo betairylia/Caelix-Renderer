@@ -171,6 +171,10 @@ struct Args {
     /// reflection or refraction before the surface that is shaded (0..15, 0 = off).
     #[arg(long, value_name = "N", default_value_t = 5)]
     bounces_transparent: u32,
+    /// Pt mode: no delta checkerboard at the first glass interface (the reflect/refract choice is
+    /// random per frame, no cross resolve). Default: checkerboard on.
+    #[arg(long)]
+    no_checkerboard: bool,
     /// Block encoding of the scene: packed (Caelix worlds) or block-id.
     #[arg(long, value_enum, default_value_t = Encoding::Packed)]
     encoding: Encoding,
@@ -1181,6 +1185,7 @@ fn main() -> anyhow::Result<()> {
         bounces_transparent: args.bounces_transparent,
         denoise: !args.no_denoise,
         sun_nee: !args.no_sun_nee,
+        checkerboard: !args.no_checkerboard,
         sky_on_miss: !args.no_sky_on_miss,
         shading: !args.no_shading,
         exposure: args.exposure,

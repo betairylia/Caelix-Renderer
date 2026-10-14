@@ -73,10 +73,13 @@ class Renderer {
     kInternalDiffOut,          // RGBA16F    NRD OUT_DIFF_RADIANCE_HITDIST
     kInternalSpecOut,          // RGBA16F    NRD OUT_SPEC_RADIANCE_HITDIST
     kInternalValidation,       // RGBA8      NRD OUT_VALIDATION
+    kInternalResolve,          // RGBA16F    composite output before the cross resolve (linear)
     kInternalCount
   };
   static constexpr uint32_t kTraceInternalCount = kInternalAccum;  // bindings 7..13
-  static constexpr uint32_t kCompositeBindingCount = 8;
+  // Composite set (also bound by the cross resolve kernel): binding 0 the host colour
+  // target, bindings 1..8 internal targets (8 = the resolve image).
+  static constexpr uint32_t kCompositeBindingCount = 9;
 
   struct FrameSlot {
     uint32_t index = 0;  // position in slots_ (the NRD executor's frame slot)
@@ -136,6 +139,7 @@ class Renderer {
   VkDescriptorSetLayout composite_layout_ = VK_NULL_HANDLE;
   ComputePipeline trace_;
   ComputePipeline composite_;
+  ComputePipeline cross_resolve_;  // shaders/render/caelix_cross_resolve.hlsl, composite set
   std::vector<std::unique_ptr<FrameSlot>> slots_;
   uint32_t next_slot_ = 0;
   std::vector<CachedView> views_;

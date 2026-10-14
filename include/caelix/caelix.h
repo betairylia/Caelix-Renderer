@@ -54,7 +54,9 @@ extern "C" {
    added CaelixMaterial, caelix_scene_set_materials, caelix_scene_set_glass_palette,
    caelix_scene_get_material, CaelixSceneStats::material_table_bytes,
    CaelixRenderOptions::bounce_count_transparent, CAELIX_MAX_BOUNCES_TRANSPARENT and the debug views
-   CAELIX_VIEW_MATERIAL and CAELIX_VIEW_NRD_SPEC, also without a bump. A host
+   CAELIX_VIEW_MATERIAL and CAELIX_VIEW_NRD_SPEC, also without a bump; its follow-up added
+   CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD (a new flag bit) and the RGBA formats of the motion target
+   (w = the checkerboard flag), also without a bump. A host
    built against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -478,7 +480,7 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
  *                          into an internal RGBA32F image (running mean since the last reset) and
  *                          writes the mean. Use a static camera and a new frame_seed every frame.
  *                          Never denoised.
- * In the two lighting modes the renderer owns internal targets (about 80 bytes per pixel) sized to
+ * In the two lighting modes the renderer owns internal targets (about 90 bytes per pixel) sized to
  * the host's targets; they are created at the first lighting render and recreated when the target
  * size changes. The NRD instance (its own pools, see caelix_renderer_get_nrd_info) is created at the
  * first denoised render and recreated (history lost) when the target size changes: NRD has no
@@ -609,6 +611,24 @@ typedef enum CaelixDebugView {
                                                 Primary misses still show the disk. Without it the
                                                 sun is found only by chance (the sky includes the
                                                 disk for every ray). */
+#define CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD (1u << 3) /* CAELIX_MODE_PATH_TRACE only: at the FIRST
+                                                transparent interface of the delta chain
+                                                (bounce_count_transparent), pixels with even
+                                                px + py refract and odd ones reflect instead of a
+                                                random Fresnel-weighted choice; the chosen branch
+                                                carries the weight 2 (1 - F) or 2 F, and the pixel is
+                                                flagged (motion target w = 1). Total internal
+                                                reflection stays unsplit. With a colour target, the
+                                                composite is followed by the cross resolve: a
+                                                flagged pixel becomes 0.5 * itself + 0.125 * each
+                                                flagged orthogonal neighbour (renormalized) on the
+                                                linear colour, before the sRGB encode. Each pixel then
+                                                shows the same surface every frame (no flip of its
+                                                G-buffer between reflection and refraction), at the
+                                                cost of a one-pixel blend on glass. Later interfaces
+                                                keep the random choice. CAELIX_MODE_REFERENCE ignores
+                                                the flag (a fixed per-pixel branch would converge to
+                                                a checkerboard, not to the image). Unity parity. */
 
 /* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
 typedef struct CaelixRenderOptions {
@@ -694,8 +714,11 @@ typedef struct CaelixRenderTargets {
   /* R32_SFLOAT (a storage image, not a depth attachment). Device depth clip.z / clip.w of
      CaelixCamera::projection at the hit; a miss is CaelixRenderOptions::miss_depth. */
   CaelixTargetImage depth;
-  /* R16G16_SFLOAT or R32G32_SFLOAT. previous_pixel - current_pixel, in pixels of the current target
-     size: the hit point is moved back by the entity's previous transform and projected with the
+  /* R16G16_SFLOAT or R32G32_SFLOAT; or R16G16B16A16_SFLOAT / R32G32B32A32_SFLOAT, which also receive
+     z = 0 and w = the delta checkerboard flag (1 = this pixel traced one branch of the split at the
+     first transparent interface, see CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD, and needs a cross
+     resolve with its flagged neighbours; 0 otherwise). xy = previous_pixel - current_pixel, in
+     pixels of the current target size: the hit point is moved back by the entity's previous transform and projected with the
      previous render call's camera (same pinhole mapping as the ray generation); the current pixel is
      the pixel centre (px + 0.5, py + 0.5). Example: a camera that moved +1 unit along `right` sees
      a static point move LEFT on the screen, so motion.x > 0 (the point was to the right).

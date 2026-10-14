@@ -1771,3 +1771,104 @@ TEST_CASE("specular: a smooth metal floor from a host table mirrors an emitter; 
   CHECK(diff < 0.05f * spec);
   CloseGlassRig(g);
 }
+
+TEST_CASE("glass: delta checkerboard is stable per pixel; the cross resolve matches the reference") {
+  // (1) A clear glass block (z 4..11) lying directly on a red emitter (z 12..19): the camera ray
+  //     has exactly one interface (entering the glass; the glass touches the emitter, so there is
+  //     no exit interface), so with the checkerboard nothing in the image is random.
+  GlassRig g;
+  OpenGlassRig(g, 0);
+  {
+    World world;
+    FillBox(world, -16, -16, 0, 15, 15, 11, 0);
+    FillBox(world, -16, -16, 4, 15, 15, 11, kClearGlass);
+    FillBox(world, -24, -24, 12, 23, 23, 19, kRedEmitter8);
+    Upload(g.rig, world, KeysOf(world));
+    DrainBuilds(g.rig);
+  }
+  Target albedo = CreateTarget(g.rig.gpu, VK_FORMAT_R8G8B8A8_UNORM);
+  Target motion = CreateTarget(g.rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+  TargetSet set = g.set;
+  set.t[kAlbedo] = &albedo;
+  set.t[kMotion] = &motion;
+  const double pos[3] = {0.5, 0.5, -30.0};
+  const double dir[3] = {0.0, 0.0, 1.0};
+  const CaelixCamera camera = LookAlong(pos, dir, std::tan(4.0 * kPi / 180.0));
+  constexpr uint32_t cx = kSize / 2;  // even px + py: refraction
+  constexpr uint32_t cy = kSize / 2;
+  const double f0 = std::pow((kGlassIor - 1.0) / (kGlassIor + 1.0), 2.0);
+  const auto options_for = [](uint32_t seed, bool checkerboard) {
+    CaelixRenderOptions options = GlassOptions(CAELIX_MODE_PATH_TRACE, 0, 5, seed);
+    if (checkerboard) {
+      options.flags |= CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD;
+    }
+    return options;
+  };
+
+  // Checkerboard on, NRD off, no stochastic bounce, 10 frames with new seeds: bit-identical.
+  std::vector<uint8_t> first;
+  uint32_t differing_frames = 0;
+  for (uint32_t i = 0; i < 10; ++i) {
+    Render(g.rig, g.renderer, set, camera, options_for(700 + i, true));
+    if (i == 0) {
+      first = g.color.bytes;
+    } else if (g.color.bytes != first) {
+      ++differing_frames;
+    }
+  }
+  // The parities trace different surfaces: even pixels refract into the emitter (albedo target =
+  // the emitter, red), odd pixels reflect into the black sky (the chain ends after the glass
+  // interface: albedo target = the glass tint). Both are flagged in the motion target's w.
+  const uint8_t* even_albedo = albedo.at(cx, cy);
+  const uint8_t* odd_albedo = albedo.at(cx + 1, cy);
+  const double resolved = g.color.F32(cx, cy, 0);
+  const double resolved_odd = g.color.F32(cx + 1, cy, 0);
+  const double expected = 8.0 * (1.0 - f0);  // 0.5 * 2 (1 - F) * 8 + 0.5 * 0
+  std::printf("checkerboard, 10 frames: %u differ from the first; albedo even (%u %u %u) odd (%u %u "
+              "%u); flags %.1f %.1f; resolved centre %.5f, odd neighbour %.5f, expected (1 - F) 8 = "
+              "%.5f\n",
+              differing_frames, even_albedo[0], even_albedo[1], even_albedo[2], odd_albedo[0],
+              odd_albedo[1], odd_albedo[2], motion.F32(cx, cy, 3), motion.F32(cx + 1, cy, 3),
+              resolved, resolved_odd, expected);
+  CHECK(differing_frames == 0);
+  CHECK(Near(even_albedo, 1.0f, 0.0f, 0.0f, 1));
+  CHECK(Near(odd_albedo, 0.6f, 0.8f, 1.0f, 1));
+  CHECK(motion.F32(cx, cy, 3) == 1.0f);
+  CHECK(motion.F32(cx + 1, cy, 3) == 1.0f);
+  CHECK(std::abs(resolved / expected - 1.0) < 1e-3);
+  CHECK(std::abs(resolved_odd / expected - 1.0) < 1e-3);
+  CHECK(CentreMean(g.color, 32, 1) == 0.0);
+  // Without the checkerboard the same frames are random (Fresnel choice per frame and pixel), and
+  // no pixel is flagged.
+  Render(g.rig, g.renderer, set, camera, options_for(700, false));
+  const std::vector<uint8_t> random_a = g.color.bytes;
+  Render(g.rig, g.renderer, set, camera, options_for(701, false));
+  CHECK(g.color.bytes != random_a);
+  CHECK(motion.F32(cx, cy, 3) == 0.0f);
+  DestroyTarget(g.rig.gpu, albedo);
+  DestroyTarget(g.rig.gpu, motion);
+  CloseGlassRig(g);
+
+  // (2) The slab (two interfaces, the second one still random): path trace mode with the
+  //     checkerboard and the cross resolve, the mean of 128 frames over the centre 32x32, against
+  //     the stochastic reference (512 frames).
+  GlassRig s;
+  OpenGlassRig(s, 0);
+  UploadSlab(s.rig);
+  RenderGlassReference(s.rig, s.renderer, s.set, camera, 0, 5, 512, 9000);
+  const double reference = CentreMean(s.color, 32, 0);
+  double sum = 0.0;
+  constexpr uint32_t kFrames = 128;
+  for (uint32_t i = 0; i < kFrames; ++i) {
+    CaelixRenderOptions options = GlassOptions(CAELIX_MODE_PATH_TRACE, 0, 5, 9600 + i);
+    options.flags |= CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD;
+    Render(s.rig, s.renderer, s.set, camera, options);
+    sum += CentreMean(s.color, 32, 0);
+  }
+  const double checkerboard_mean = sum / kFrames;
+  std::printf("slab: checkerboard + cross resolve, mean of %u frames, centre 32x32 %.5f; stochastic "
+              "reference %.5f; ratio %.5f\n",
+              kFrames, checkerboard_mean, reference, checkerboard_mean / reference);
+  CHECK(std::abs(checkerboard_mean / reference - 1.0) < 0.02);
+  CloseGlassRig(s);
+}

@@ -192,3 +192,47 @@ documentation. Differences and decisions taken during the implementation:
   specular history (frequent resets). Conclusion: the plain stochastic first-interface choice
   is not good enough under NRD; section 3 (checkerboard split + cross resolve, which keeps both
   branches every frame and removes the flip from the G-buffer of a pixel) is the next step.
+
+## Follow-up as built: checkerboard split + cross resolve (2026-10-14, uncommitted after 5debe32)
+
+The owner's decision 2 condition was met, so section 3 is implemented (Unity parity):
+
+- `CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD` (bit 3; host default on, `--no-checkerboard` and a
+  Render-window checkbox to compare). Path trace mode only. At the first interface with a
+  refracted direction: even `px + py` refracts, odd reflects, weight `2 (1 - F)` / `2 F`, no
+  random number; total internal reflection unsplit. Later interfaces stay random.
+- Flag in the internal motion target's w; also in the host motion target's w, which now
+  accepts RGBA16F / RGBA32F (RG formats drop it).
+- **Albedo headroom**: the RGBA8 albedo target cannot hold a throughput of up to 2 (Unity's
+  8-bit albedo target clamps it; a known Unity defect from the 2026-09-04 review). The trace
+  stores half of a split pixel's albedo and the composite doubles flagged pixels.
+- **Cross resolve** (`shaders/render/caelix_cross_resolve.hlsl`): the composite writes its
+  linear output (after the exposure) to a new internal RGBA16F `resolve` image; the cross
+  resolve blends flagged pixels exactly as Unity's `CaelixCrossResolve` (0.5 centre + 0.125
+  per flagged orthogonal neighbour, renormalized, edge-clamped), then does the sRGB encode and
+  the NRD validation overlay (moved out of the composite into the shared
+  `render/caelix_composite_set.hlsl`). One descriptor set serves both kernels (binding 8 =
+  resolve image); its GPU time is part of `composite_ms`.
+- **Deviation from the follow-up brief**: the reference mode ignores the flag. With a fixed
+  branch per pixel the accumulation converges to a checkerboard (each pixel to 2 (1 - F) or
+  2 F times one branch), not to the image; only a region average would be right. The reference
+  therefore stays the stochastic, per-pixel unbiased estimate, and the test compares the
+  checkerboard path trace mode against it.
+
+### Results (fixture close pose, static camera, NRD, screenshots 5 frames apart)
+
+| Glass region | Frame-to-frame PSNR | Temporal std | NRD vs reference |
+|---|---|---|---|
+| stochastic (6d) | 19.7 dB | 7.1 levels | 20.9 dB |
+| checkerboard + cross resolve | 39.6 dB | 1.1 levels | 27.7 dB |
+| stochastic, 0 bounces | 21.1 dB | 3.8 levels | 21.3 dB |
+| checkerboard, 0 bounces | 41.1 dB | 0.13 levels | 35.3 dB |
+| opaque diffuse (front pose), either | 59.8 / 60.0 dB | 0.11 levels | 40.5 / 40.4 dB |
+
+The 0-bounce checkerboard case is not bit-stable on the fixture (41 dB, not infinite): its glass
+voxels are single voxels with different ids side by side, so many camera rays cross a second and
+third interface, which are still random. On a single-interface scene (the test) it is bit-exact.
+Residuals in the image: isolated dark samples from those later interfaces are spread by the cross
+resolve into small "+" shapes; edges of glass faces are softened by one pixel; no parity pattern
+is left (mean even-odd difference 0.22 levels against 0.02 in the reference). Citadel: primary
+byte-identical, detail 38.41 dB (run-to-run NRD variation of the same command is about 57 dB).

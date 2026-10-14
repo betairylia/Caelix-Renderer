@@ -93,4 +93,6 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_brick_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite.hlsl)
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite_set.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_cross_resolve.hlsl)

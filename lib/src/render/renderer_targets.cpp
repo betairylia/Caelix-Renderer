@@ -61,7 +61,8 @@ CaelixResult Renderer::Create(Device& device, Scene& scene, std::unique_ptr<Rend
   std::fill(trace_types, trace_types + kTraceBindingCount, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
   trace_types[0] = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
   renderer->set_layout_ = CreateSetLayout(vk_device, kTraceBindingCount, trace_types);
-  // Composite set: binding 0 the host colour target, 1..5 internal targets.
+  // Composite set: binding 0 the host colour target, 1..8 internal targets. The cross
+  // resolve kernel uses the same layout and set.
   VkDescriptorType composite_types[kCompositeBindingCount];
   std::fill(composite_types, composite_types + kCompositeBindingCount,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
@@ -73,13 +74,17 @@ CaelixResult Renderer::Create(Device& device, Scene& scene, std::unique_ptr<Rend
   const std::vector<uint32_t> composite_spirv = LoadShader("caelix_composite");
   renderer->composite_ = ComputePipeline(vk_device, composite_spirv, sizeof(TracePush),
                                          "caelix_composite", renderer->composite_layout_);
+  const std::vector<uint32_t> resolve_spirv = LoadShader("caelix_cross_resolve");
+  renderer->cross_resolve_ = ComputePipeline(vk_device, resolve_spirv, sizeof(TracePush),
+                                             "caelix_cross_resolve", renderer->composite_layout_);
   for (uint32_t i = 0; i < kInitialSlots; ++i) {
     renderer->AddSlot();
   }
   renderer->timer_ = GpuTimer(device);
   renderer->composite_timer_ = GpuTimer(device);
   renderer->denoise_timer_ = GpuTimer(device);
-  CAELIX_LOGI("renderer created: kernels caelix_path_trace and caelix_composite, %u frame slots",
+  CAELIX_LOGI("renderer created: kernels caelix_path_trace, caelix_composite and "
+              "caelix_cross_resolve, %u frame slots",
               kInitialSlots);
   out = std::move(renderer);
   return CAELIX_OK;
@@ -96,6 +101,7 @@ Renderer::~Renderer() {
   slots_.clear();
   trace_ = ComputePipeline();
   composite_ = ComputePipeline();
+  cross_resolve_ = ComputePipeline();
   if (set_layout_ != VK_NULL_HANDLE) {
     vkDestroyDescriptorSetLayout(device, set_layout_, nullptr);
   }

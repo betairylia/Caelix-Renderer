@@ -22,15 +22,18 @@ inline nrd::ReblurHitDistanceParameters HitDistanceParameters() {
 struct TargetSpec {
   const char* name;
   uint32_t bit;
-  VkFormat formats[2];
+  VkFormat formats[4];  // unused entries are VK_FORMAT_UNDEFINED
 };
 constexpr TargetSpec kTargetSpecs[] = {
-    {"colour", kTargetColor, {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED}},
+    {"colour", kTargetColor, {}},
     {"albedo", kTargetAlbedo, {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT}},
     {"normal", kTargetNormal, {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM}},
-    {"depth", kTargetDepth, {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT}},
-    {"motion", kTargetMotion, {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32G32_SFLOAT}},
-    {"view_z", kTargetViewZ, {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT}},
+    {"depth", kTargetDepth, {VK_FORMAT_R32_SFLOAT}},
+    // RGBA formats also receive the delta checkerboard flag in w.
+    {"motion", kTargetMotion,
+     {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
+      VK_FORMAT_R32G32B32A32_SFLOAT}},
+    {"view_z", kTargetViewZ, {VK_FORMAT_R32_SFLOAT}},
 };
 
 // The internal targets in Renderer::Internal order. The formats match the
@@ -51,6 +54,7 @@ constexpr InternalSpec kInternalSpecs[] = {
     {"diff_out", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"spec_out", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"validation", VK_FORMAT_R8G8B8A8_UNORM},
+    {"resolve", VK_FORMAT_R16G16B16A16_SFLOAT},
 };
 
 }  // namespace caelix

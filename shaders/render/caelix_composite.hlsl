@@ -19,39 +19,25 @@
 //   coverage, without exposure and without the sRGB encode: a hit without motion is
 //   grey (0.5, 0.5, 0.5), a miss (0.5, 0.5, 0).
 //
-// Descriptors (set 0): binding 0 the host colour target (no format qualifier,
-// write only), bindings 1..7 the internal targets albedo (a = coverage),
-// deterministic, diffuse, specular, the reference accumulation, NRD's
-// validation layer and the motion. The push constant is the device address of the frame
-// constants (same block as the trace).
+//   Delta checkerboard (motion.w = 1): the trace stored half the albedo (the split
+//   weight can reach 2); the composite doubles it.
+//   fc.cross_resolve (path trace mode with kRenderFlagDeltaCheckerboard): the output
+//   (after exposure, before the sRGB encode and the validation overlay; the motion view
+//   as it is) goes to the resolve image, and caelix_cross_resolve.hlsl writes the host
+//   target.
+//
+// Descriptors: render/caelix_composite_set.hlsl.
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_record.hlsl"
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
 #include "common/caelix_material.hlsl"
 #include "render/caelix_shading.hlsl"
+#include "render/caelix_composite_set.hlsl"
 #include "NRD.hlsli"
-
-CAELIX_PUSH_CONSTANTS(CaelixTracePush, g_push);
-CAELIX_BINDING(0, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_color;
-CAELIX_BINDING(1, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_albedo;
-CAELIX_BINDING(2, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_deterministic;
-CAELIX_BINDING(3, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_diff;
-CAELIX_BINDING(4, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_spec;
-CAELIX_BINDING(5, 0) CAELIX_FORMAT("rgba32f") RWTexture2D<float4> g_int_accum;
-CAELIX_BINDING(6, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_validation;
-CAELIX_BINDING(7, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_motion;
 
 // kViewMotion: motion (pixels) that maps to full red or green.
 static const float kMotionViewRange = 32.0f;
-
-float3 LinearToSrgb(float3 c) {
-  c = saturate(c);
-  const float3 low = c * 12.92f;
-  const float3 high = 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;
-  return float3(c.x <= 0.0031308f ? low.x : high.x, c.y <= 0.0031308f ? low.y : high.y,
-                c.z <= 0.0031308f ? low.z : high.z);
-}
 
 [numthreads(8, 8, 1)]
 void main(uint3 thread_id : SV_DispatchThreadID) {
@@ -60,15 +46,24 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     return;
   }
   const uint2 pixel = thread_id.xy;
-  const float4 albedo = g_int_albedo[pixel];
+  float4 albedo = g_int_albedo[pixel];
   const bool hit = albedo.a > 0.5f;
+  const float4 motion_flag = g_int_motion[pixel];
+  if (motion_flag.w > 0.5f) {
+    albedo.rgb *= 2.0f;  // the trace stored half of a checkerboard pixel's albedo
+  }
   const bool path_trace = fc.mode == kModePathTrace;
   CAELIX_BRANCH
   if (path_trace && fc.debug_view == kViewMotion) {
-    const float2 motion = g_int_motion[pixel].xy;
+    const float2 motion = motion_flag.xy;
     const float coverage = hit ? 1.0f : 0.0f;
     const float2 shown = saturate(motion / kMotionViewRange * 0.5f + 0.5f);
-    g_color[pixel] = float4(shown, 0.5f * coverage, coverage);
+    const float4 value = float4(shown, 0.5f * coverage, coverage);
+    if (fc.cross_resolve != 0u) {
+      g_int_resolve[pixel] = value;  // passed through by the cross resolve
+    } else {
+      g_color[pixel] = value;
+    }
     return;
   }
 
@@ -102,14 +97,11 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     }
   }
   color *= fc.exposure;
-  if (fc.output_srgb != 0u) {
-    color = LinearToSrgb(color);
-  }
   CAELIX_BRANCH
-  if (path_trace && fc.debug_view == kViewNrdValidation && fc.denoised != 0u) {
-    // NRD's debug layer is display-ready RGBA8: blended after the encode.
-    const float4 layer = g_int_validation[pixel];
-    color = lerp(color, layer.rgb, layer.a);
+  if (fc.cross_resolve != 0u) {
+    // Linear: the cross resolve blends, then encodes.
+    g_int_resolve[pixel] = float4(color, hit ? 1.0f : 0.0f);
+    return;
   }
-  g_color[pixel] = float4(color, hit ? 1.0f : 0.0f);
+  g_color[pixel] = float4(CaelixOutputColor(fc, pixel, color), hit ? 1.0f : 0.0f);
 }

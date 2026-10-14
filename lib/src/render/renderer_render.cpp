@@ -22,8 +22,15 @@ constexpr uint32_t kModeCount = 3;
 constexpr float kDefaultSunAngularRadius = 0.00873f;  // 0.5 degrees
 
 bool FormatAccepted(const TargetSpec& spec, VkFormat format) {
-  return spec.formats[0] == VK_FORMAT_UNDEFINED || format == spec.formats[0] ||
-         format == spec.formats[1];
+  if (spec.formats[0] == VK_FORMAT_UNDEFINED) {
+    return true;  // any storage format
+  }
+  for (const VkFormat accepted : spec.formats) {
+    if (accepted != VK_FORMAT_UNDEFINED && accepted == format) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // UNORM colour formats: the composite writes sRGB-encoded values into them.
@@ -193,6 +200,9 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   const uint32_t height = all[present[0]]->height;
   const bool has_color = targets.color.image != 0;
   const bool composite = lighting && has_color;
+  // The delta checkerboard (path trace mode only) needs the cross resolve after the composite.
+  const bool cross_resolve = composite && options.mode == CAELIX_MODE_PATH_TRACE &&
+                             (options.flags & CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) != 0;
 
   const VkCommandBuffer cmd = HandleFromU64<VkCommandBuffer>(frame.command_buffer);
   const uint64_t safe = frame.safe_frame_number;
@@ -363,6 +373,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   const double half_sin = std::sin(0.5 * static_cast<double>(sun_radius));
   constants.sun_solid_angle = static_cast<float>(4.0 * 3.14159265358979323846 * half_sin * half_sin);
   constants.output_srgb = IsUnormFormat(static_cast<VkFormat>(targets.color.format)) ? 1u : 0u;
+  constants.cross_resolve = cross_resolve ? 1u : 0u;
   constants.t_max = kTMax;
   // The kernels' REBLUR_FrontEnd_GetNormHitDist uses the same A, B, C as the denoiser.
   const nrd::ReblurHitDistanceParameters hit_distance = HitDistanceParameters();
@@ -450,7 +461,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     const uint32_t composite_internals[] = {
         kInternalAlbedo, kInternalDeterministic, denoised ? kInternalDiffOut : kInternalDiff,
         denoised ? kInternalSpecOut : kInternalSpec, kInternalAccum, kInternalValidation,
-        kInternalMotion};
+        kInternalMotion, kInternalResolve};
     static_assert(std::size(composite_internals) + 1 == kCompositeBindingCount);
     for (uint32_t i = 0; i < std::size(composite_internals); ++i) {
       write_image(slot->composite_set, 1 + i, internal_[composite_internals[i]].view());
@@ -469,6 +480,21 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                        &push);
     composite_timer_.Begin(cmd, frame.frame_number, safe);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
+    if (cross_resolve) {
+      // The composite wrote the linear colour into the resolve image; the cross resolve
+      // reads it (and the neighbours' checkerboard flags) and writes the host target.
+      // Same descriptor set and push constant; its time is part of composite_ms.
+      Barriers resolve;
+      resolve.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+      resolve.Record(cmd);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cross_resolve_.pipeline());
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cross_resolve_.layout(), 0, 1,
+                              &slot->composite_set, 0, nullptr);
+      vkCmdPushConstants(cmd, cross_resolve_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                         &push);
+      vkCmdDispatch(cmd, groups_x, groups_y, 1);
+    }
     composite_timer_.End(cmd);
   }
 

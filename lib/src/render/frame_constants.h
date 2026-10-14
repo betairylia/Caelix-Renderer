@@ -60,7 +60,8 @@ struct FrameConstants {
   uint32_t bounce_count_transparent;  // 436  delta chain interfaces, 0..CAELIX_MAX_BOUNCES_TRANSPARENT
   uint64_t materials;       // 440  CaelixMaterial (48 B) by block code, 65536 entries
   float hit_dist_params[4]; // 448  REBLUR hit distance normalization A, B, C (w unused), = ReblurSettings
-  uint32_t pad[12];         // 464
+  uint32_t cross_resolve;   // 464  1 = the composite writes the resolve image, the cross resolve the target
+  uint32_t pad[11];         // 468
 };
 static_assert(sizeof(FrameConstants) == 512);
 static_assert(offsetof(FrameConstants, size) == 64);
@@ -85,6 +86,7 @@ static_assert(offsetof(FrameConstants, denoised) == 432);
 static_assert(offsetof(FrameConstants, bounce_count_transparent) == 436);
 static_assert(offsetof(FrameConstants, materials) == 440);
 static_assert(offsetof(FrameConstants, hit_dist_params) == 448);
+static_assert(offsetof(FrameConstants, cross_resolve) == 464);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

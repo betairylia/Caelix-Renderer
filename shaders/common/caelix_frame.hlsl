@@ -59,6 +59,7 @@ struct CaelixFrameConstants {
   uint bounce_count_transparent;  // 436  delta chain interfaces, 0..15
   uint64_t materials;       // 440  CaelixMaterial (48 B) by block code (common/caelix_material.hlsl)
   float4 hit_dist_params;   // 448  REBLUR hit distance normalization A, B, C (w unused)
+  uint cross_resolve;       // 464  1 = composite -> resolve image -> caelix_cross_resolve -> colour
 };
 
 struct CaelixTracePush {
@@ -87,6 +88,7 @@ static const uint kModeReference = 2;
 static const uint kRenderFlagShading = 1u << 0;
 static const uint kRenderFlagSkyOnMiss = 1u << 1;
 static const uint kRenderFlagSunNee = 1u << 2;
+static const uint kRenderFlagDeltaCheckerboard = 1u << 3;
 
 // CaelixFrameConstants::target_mask: bit i = the target at descriptor binding i + 1.
 static const uint kTargetColor = 1u << 0;

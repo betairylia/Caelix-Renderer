@@ -358,6 +358,10 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         });
         ui.add_enabled(settings.mode == Mode::Pt, egui::Checkbox::new(&mut settings.denoise, "denoise (NRD, pt mode)"));
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.sun_nee, "sun NEE"));
+        ui.add_enabled(
+            settings.mode == Mode::Pt,
+            egui::Checkbox::new(&mut settings.checkerboard, "glass checkerboard (pt mode)"),
+        );
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.sky_on_miss, "sky on miss"));
         ui.add_enabled(!lighting, egui::Checkbox::new(&mut settings.shading, "Lambert (primary mode)"));
     });

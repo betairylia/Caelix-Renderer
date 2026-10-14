@@ -146,6 +146,8 @@ pub struct RenderSettings {
     pub denoise: bool,
     /// Lighting modes: sun next-event estimation.
     pub sun_nee: bool,
+    /// Pt mode: the delta checkerboard at the first glass interface, with the cross resolve.
+    pub checkerboard: bool,
     /// Lighting modes: the sky where the primary ray misses.
     pub sky_on_miss: bool,
     /// Primary mode: Lambert shading of the albedo view.
@@ -196,6 +198,9 @@ impl RenderSettings {
         }
         if lighting && self.sun_nee {
             flags |= CAELIX_RENDER_FLAG_SUN_NEE;
+        }
+        if self.mode == Mode::Pt && self.checkerboard {
+            flags |= CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD;
         }
         CaelixRenderOptions {
             debug_view: self.view.raw(),
