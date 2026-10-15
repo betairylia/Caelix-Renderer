@@ -15,6 +15,8 @@
 // NATIVE: neighbours outside the image are clamped to the edge (Unity's CaelixClampCoord);
 // the kernel also does the output stage that the composite skips when it runs (sRGB
 // encode, NRD validation overlay); the motion debug view passes through untouched.
+// kRenderFlagFlipY: the host colour target is written at the mirrored row; the taps read the
+// internal images at unflipped pixels (they are symmetric, so the flip does not change them).
 //
 // Inputs: the composite set (render/caelix_composite_set.hlsl): binding 8 the
 // composite's linear output, binding 7 the motion (w = flag), binding 0 the host colour.
@@ -34,7 +36,7 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   const float4 centre = g_int_resolve[pixel];
   CAELIX_BRANCH
   if (fc.mode == kModePathTrace && fc.debug_view == kViewMotion) {
-    g_color[pixel] = centre;
+    g_color[CaelixOutputPixel(fc, pixel)] = centre;
     return;
   }
 
@@ -56,5 +58,5 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     }
     color = sum / weight;
   }
-  g_color[pixel] = float4(CaelixOutputColor(fc, pixel, color), centre.a);
+  g_color[CaelixOutputPixel(fc, pixel)] = float4(CaelixOutputColor(fc, pixel, color), centre.a);
 }

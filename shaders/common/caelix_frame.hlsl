@@ -60,6 +60,8 @@ struct CaelixFrameConstants {
   uint64_t materials;       // 440  CaelixMaterial (48 B) by block code (common/caelix_material.hlsl)
   float4 hit_dist_params;   // 448  REBLUR hit distance normalization A, B, C (w unused)
   uint cross_resolve;       // 464  1 = composite -> resolve image -> caelix_cross_resolve -> colour
+  uint pad_468;             // 468
+  float2 jitter;            // 472  CaelixCamera::jitter: sub-pixel offset of the primary sample (pixels, y down)
 };
 
 struct CaelixTracePush {
@@ -89,6 +91,7 @@ static const uint kRenderFlagShading = 1u << 0;
 static const uint kRenderFlagSkyOnMiss = 1u << 1;
 static const uint kRenderFlagSunNee = 1u << 2;
 static const uint kRenderFlagDeltaCheckerboard = 1u << 3;
+static const uint kRenderFlagFlipY = 1u << 4;
 
 // CaelixFrameConstants::target_mask: bit i = the target at descriptor binding i + 1.
 static const uint kTargetColor = 1u << 0;
@@ -99,10 +102,24 @@ static const uint kTargetMotion = 1u << 4;
 static const uint kTargetViewZ = 1u << 5;
 static const uint kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
 
-// The primary ray direction of pixel `pixel` (row 0 = the top row), CaelixCamera's pinhole mapping.
+// The sample position of pixel `pixel` in pixels (row 0 = the top row, y down): the pixel centre
+// plus the camera jitter (CaelixCamera::jitter; 0 for a host without jitter).
+float2 CaelixSamplePosition(CaelixFrameConstants fc, uint2 pixel) {
+  return float2(float(pixel.x) + 0.5f + fc.jitter.x, float(pixel.y) + 0.5f + fc.jitter.y);
+}
+
+// The pixel of a HOST target that receives the result of pixel `pixel`: the same pixel, or with
+// kRenderFlagFlipY the mirrored row (size.y - 1 - y). Internal targets are never flipped.
+uint2 CaelixOutputPixel(CaelixFrameConstants fc, uint2 pixel) {
+  return (fc.flags & kRenderFlagFlipY) != 0u ? uint2(pixel.x, fc.size.y - 1u - pixel.y) : pixel;
+}
+
+// The primary ray direction of pixel `pixel` (row 0 = the top row), CaelixCamera's pinhole mapping
+// at the jittered sample position.
 float3 CaelixPrimaryDirection(CaelixFrameConstants fc, uint2 pixel) {
-  const float2 ndc = float2((float(pixel.x) + 0.5f) / float(fc.size.x) * 2.0f - 1.0f,
-                            1.0f - (float(pixel.y) + 0.5f) / float(fc.size.y) * 2.0f);
+  const float2 sample_position = CaelixSamplePosition(fc, pixel);
+  const float2 ndc = float2(sample_position.x / float(fc.size.x) * 2.0f - 1.0f,
+                            1.0f - sample_position.y / float(fc.size.y) * 2.0f);
   return normalize(fc.right.xyz * (ndc.x * fc.tan_half_fov_y * fc.aspect) +
                    fc.up.xyz * (ndc.y * fc.tan_half_fov_y) + fc.forward.xyz);
 }

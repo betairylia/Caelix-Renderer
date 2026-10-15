@@ -306,6 +306,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   Copy3(camera.forward, constants.forward);
   constants.size[0] = width;
   constants.size[1] = height;
+  constants.jitter[0] = camera.jitter[0];
+  constants.jitter[1] = camera.jitter[1];
   constants.tan_half_fov_y = camera.tan_half_fov_y;
   constants.aspect = camera.aspect;
   constants.near_z = camera.near_z;

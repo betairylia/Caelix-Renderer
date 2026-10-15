@@ -158,6 +158,66 @@ Display: the primary-mode debug views are written as they are into the RGBA16F t
 treats as linear and encodes to sRGB on output, so the albedo view looks brighter than in the Rust
 host (same values: 51 dB after decoding). The lighting modes write linear values and are correct.
 
+## P3 as built (2026-10-15)
+
+Packet version 3 (448 B): `CaelixUnityPacket` gained the optional targets `depth` (R32F), `motion`
+(RGBA16F) and `albedo` (RGBA8 UNORM, a = coverage) after `color`, and `CaelixCamera` gained `jitter`
+(152 B). The plugin accesses each present target like the colour target; a target that
+`AccessTexture` refuses, without STORAGE usage or of another size is dropped with a warning.
+
+Library additions (ABI version 2, no bump):
+- `CAELIX_RENDER_FLAG_FLIP_Y` (bit 4): every HOST target write goes to row `height - 1 - y`, and the
+  host motion's y is negated (also the motion debug view). Ray generation, the random stream, the
+  jitter and the internal targets (NRD's inputs) stay unflipped, so a flipped render is the plain
+  render mirrored, bit for bit (`trace_test` "flip y": colour, albedo, normal, depth, view_z,
+  motion, path trace composite, glass checkerboard + cross resolve). The Unity component always sets
+  it; the present pass has no flip any more. The Rust host does not set it (its overview screenshot
+  is byte-identical to step 5).
+- `CaelixCamera::jitter` (pixels, x right, y down; the sample position is `px + 0.5 + jitter`). The
+  motion target is the surface motion: previous pixel minus the jittered sample position, both
+  through the unjittered pinholes, so a static camera writes motion 0 for any jitter. NRD gets it
+  as `cameraJitter` / `cameraJitterPrev` (clamped to [-0.5, 0.5]); before P3 both were 0.
+
+Unity side:
+- The camera is filled in the feature's `RecordRenderGraph` (it was already), from
+  `UniversalCameraData.GetProjectionMatrix()`, which carries URP's TAA jitter as
+  `Translate(o) * P`. Jitter in library pixels: `((P'02 - P02) * w / 2, -(P'12 - P12) * h / 2)` with
+  `P = camera.projectionMatrix`. Sign test (static camera, TAA, 60+ frames): this sign gives a sharp
+  image, the opposite sign a blurred one (Laplacian variance 169 vs 124 on the castle). TAA off:
+  jitter exactly 0.
+- `CaelixCamera::projection`: rows 0 and 1 from the unjittered GL projection (clip y up, which NRD
+  expects), rows 2 and 3 from `GL.GetGPUProjectionMatrix(P, true)` (Unity's device depth, reversed Z
+  on Vulkan), column 2 negated for the library's +z-forward view.
+- Present (shader `Hidden/Caelix/NativePresent`, `Caelix/Runtime/Resources`): stage 0 at
+  `AfterRenderingOpaques` draws coverage >= 0.99 (coverage = `albedo.a` in every mode) with
+  `SV_Depth` into camera colour + depth (ZTest LEqual, reversed by Unity); stage 1 at
+  `AfterRenderingSkybox + 1` blends 0.01 <= coverage < 0.99 (`Blend One OneMinusSrcAlpha`, no depth
+  write). The primary mode (and the path trace motion view) decodes sRGB before output so Unity's
+  own encode shows the stored value once.
+- Motion vectors: with TAA requested the stage-0 pass declares `ScriptableRenderPassInput.Motion`;
+  a third pass at `AfterRenderingSkybox + 1` (after URP's motion vector pass in every depth copy
+  schedule TAA allows) writes `resourceData.motionVectorColor` where coverage >= 0.5 and the voxel
+  depth passes the test against the camera depth. URP's convention
+  (`CalcNdcMotionVectorFromCsPositions`): `(posNDC - prevPosNDC) * 0.5`, y negated with
+  `UNITY_UV_STARTS_AT_TOP`, i.e. current UV minus previous UV with v up, unjittered. Ours (flipped
+  rows, y up, previous - current in pixels): `mv = -motion / size`. URP's TAA reads the live camera
+  depth (`resourceData.cameraDepth`), which stage 0 wrote, for its depth dilation.
+- Options: every Rust host setting is on the component (plus `primarySunDirection`, the Rust host's
+  primary-mode default). The reference mode restarts when the camera (jitter excluded) or an option
+  changes, every lighting mode on a mode change and on `ResetAccumulation()` (context menu).
+- Setup: menu `Caelix/Native Renderer/Setup Scene` (package) adds the component to the `CaelixHost`
+  object, sets encoding Packed on a new component, assigns `Assets/Caelix/titania-materials.json`
+  when it exists, links `CaelixHost.nativeRenderer`, marks the scene dirty and raises
+  `CaelixNativeRendererSetup.SceneSetUp`. Titania's `Assets/Editor/NativeRendererPreference.cs`
+  handles that event and stores the native choice of "graphics/renderer"
+  (`PlayerOptions.NativeRendererChoiceIndex`: 3 with the GI feature present).
+
+Traps met: the ray query renderer component still runs on Vulkan and floods the console with
+`AddInstance failed` (Unity has no RT there); disable it for native sessions. URP post-processing
+with no Volume still changes the primary view (28.7 dB vs 52.2 dB with post-processing off on the
+camera), so primary comparisons run with post-processing off. TAA needs post-processing on: for the
+TAA captures the Global Volume was disabled instead.
+
 ## Open questions for the owner
 
 1. (answered) Loading time: "Load on startup" on the plugin importer; P1 verifies it.

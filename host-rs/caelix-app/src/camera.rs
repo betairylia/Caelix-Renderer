@@ -98,6 +98,7 @@ impl Camera {
             near_z,
             far_z,
             projection: perspective_reverse_z(self.fov_y, aspect, near_z),
+            jitter: [0.0; 2],
         }
     }
 }

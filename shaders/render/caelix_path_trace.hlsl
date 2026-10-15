@@ -4,7 +4,9 @@
 //
 // Every mode writes the host's geometry targets that are present
 // (CaelixFrameConstants::target_mask): albedo, normal, device depth, motion and
-// linear view depth.
+// linear view depth. With kRenderFlagFlipY every HOST target write goes to the
+// mirrored row (CaelixOutputPixel) and the host motion's y is negated; the ray,
+// the random stream and the internal targets use the unflipped pixel.
 //   kModePrimary:   the colour target gets a debug view of the primary hit.
 //   kModePathTrace, kModeReference: the path tracer of Unity's
 //                   CaelixPathTraceCommon.hlsl (opaque surfaces): the primary hit
@@ -466,6 +468,9 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   const bool hit = primary.hit;
   const uint targets = fc.target_mask;
   const bool lighting = fc.mode != kModePrimary;
+  // The host targets' pixel (kRenderFlagFlipY mirrors the rows).
+  const uint2 out_pixel = CaelixOutputPixel(fc, thread_id.xy);
+  const bool flip_y = (fc.flags & kRenderFlagFlipY) != 0u;
 
   // The delta chain (lighting modes; the primary mode and budget 0 leave the primary
   // hit as the surface without drawing a random number, so an opaque scene consumes
@@ -508,18 +513,18 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
       }
     }
     // Opaque everywhere, so that a host can present the image directly.
-    g_color[thread_id.xy] = float4(color, 1.0f);
+    g_color[out_pixel] = float4(color, 1.0f);
   }
 
   const float coverage = hit ? 1.0f : 0.0f;
   CAELIX_BRANCH
   if ((targets & kTargetAlbedo) != 0u) {
-    g_albedo[thread_id.xy] = float4(albedo, coverage);
+    g_albedo[out_pixel] = float4(albedo, coverage);
   }
   CAELIX_BRANCH
   if ((targets & kTargetNormal) != 0u) {
     const float3 stored = (hit && (targets & kTargetNormalUnorm) != 0u) ? normal * 0.5f + 0.5f : normal;
-    g_normal[thread_id.xy] = float4(stored, coverage);
+    g_normal[out_pixel] = float4(stored, coverage);
   }
 
   // View space of the current camera: the (virtual) hit is position + direction * T.
@@ -532,11 +537,11 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
       const float4 view = float4(dot(rel, fc.right.xyz), dot(rel, fc.up.xyz), view_z, 1.0f);
       depth = dot(fc.projection[2], view) / dot(fc.projection[3], view);
     }
-    g_depth[thread_id.xy] = float4(depth, 0.0f, 0.0f, 0.0f);
+    g_depth[out_pixel] = float4(depth, 0.0f, 0.0f, 0.0f);
   }
   CAELIX_BRANCH
   if ((targets & kTargetViewZ) != 0u) {
-    g_view_z[thread_id.xy] = float4(hit ? view_z : fc.miss_view_z, 0.0f, 0.0f, 0.0f);
+    g_view_z[out_pixel] = float4(hit ? view_z : fc.miss_view_z, 0.0f, 0.0f, 0.0f);
   }
 
   // Motion: the host target and the internal one of the lighting modes.
@@ -567,14 +572,18 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     float2 prev_pixel;
     float prev_view_z;
     if (PreviousPixel(fc, prev_world, prev_pixel, prev_view_z)) {
-      motion = prev_pixel - (float2(thread_id.xy) + 0.5f);
+      // The current pixel is the jittered sample position, where the current camera's
+      // unjittered pinhole sees the hit; the previous pixel uses the previous camera's
+      // unjittered pinhole. So the motion is the surface's own motion, free of jitter.
+      motion = prev_pixel - CaelixSamplePosition(fc, thread_id.xy);
       motion_view_z = prev_view_z - view_z;
     }
   }
   CAELIX_BRANCH
   if ((targets & kTargetMotion) != 0u) {
     // w: the delta checkerboard flag (RGBA formats only; RG formats drop z and w).
-    g_motion[thread_id.xy] = float4(motion, 0.0f, split_flag);
+    // kRenderFlagFlipY: y grows upward in the flipped image, so its motion y is negated.
+    g_motion[out_pixel] = float4(motion.x, flip_y ? -motion.y : motion.y, 0.0f, split_flag);
   }
 
   CAELIX_BRANCH

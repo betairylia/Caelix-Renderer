@@ -19,6 +19,10 @@
 //   coverage, without exposure and without the sRGB encode: a hit without motion is
 //   grey (0.5, 0.5, 0.5), a miss (0.5, 0.5, 0).
 //
+//   kRenderFlagFlipY: the host colour target is written at the mirrored row
+//   (CaelixOutputPixel), and the motion view shows the motion with y negated (the host
+//   motion target's convention); every internal target is read at the unflipped pixel.
+//
 //   Delta checkerboard (motion.w = 1): the trace stored half the albedo (the split
 //   weight can reach 2); the composite doubles it.
 //   fc.cross_resolve (path trace mode with kRenderFlagDeltaCheckerboard): the output
@@ -55,14 +59,15 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   const bool path_trace = fc.mode == kModePathTrace;
   CAELIX_BRANCH
   if (path_trace && fc.debug_view == kViewMotion) {
-    const float2 motion = motion_flag.xy;
+    const float2 motion =
+        (fc.flags & kRenderFlagFlipY) != 0u ? float2(motion_flag.x, -motion_flag.y) : motion_flag.xy;
     const float coverage = hit ? 1.0f : 0.0f;
     const float2 shown = saturate(motion / kMotionViewRange * 0.5f + 0.5f);
     const float4 value = float4(shown, 0.5f * coverage, coverage);
     if (fc.cross_resolve != 0u) {
       g_int_resolve[pixel] = value;  // passed through by the cross resolve
     } else {
-      g_color[pixel] = value;
+      g_color[CaelixOutputPixel(fc, pixel)] = value;
     }
     return;
   }
@@ -103,5 +108,5 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     g_int_resolve[pixel] = float4(color, hit ? 1.0f : 0.0f);
     return;
   }
-  g_color[pixel] = float4(CaelixOutputColor(fc, pixel, color), hit ? 1.0f : 0.0f);
+  g_color[CaelixOutputPixel(fc, pixel)] = float4(CaelixOutputColor(fc, pixel, color), hit ? 1.0f : 0.0f);
 }

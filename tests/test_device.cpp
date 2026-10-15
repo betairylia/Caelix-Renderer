@@ -19,9 +19,11 @@ VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(VkDebugUtilsMessageSeverityFlagBits
                                              void* /*user_data*/) {
   const char* message = data != nullptr && data->pMessage != nullptr ? data->pMessage : "";
   const char* id = data != nullptr && data->pMessageIdName != nullptr ? data->pMessageIdName : "";
-  // Implicit layers of other software (Overwolf) and the loader's notes about them
-  // are not this project's problem.
+  // Implicit layers of other software (Overwolf, the Epic Games overlay, whose 32- and
+  // 64-bit manifests share one layer name) and the loader's notes about them are not this
+  // project's problem.
   if (std::strstr(message, "VK_LAYER_OW_") != nullptr || std::strstr(id, "VK_LAYER_OW_") != nullptr ||
+      std::strstr(message, "VK_LAYER_EOS_Overlay") != nullptr ||
       std::strstr(message, "uses API version 1.2") != nullptr) {
     ++g_validation_ignored;
     std::printf("[vulkan ignored] %s\n", message);

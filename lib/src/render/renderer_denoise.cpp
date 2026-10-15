@@ -6,7 +6,9 @@
 #include "core/log.h"
 #include "render/renderer_internal.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -78,8 +80,16 @@ bool Renderer::ConfigureDenoiser(NrdExecutor& executor, const CaelixCamera& came
   common.motionVectorScale[1] = 1.0f / static_cast<float>(height);
   common.motionVectorScale[2] = 1.0f;
   common.isMotionVectorInWorldSpace = false;
-  common.cameraJitter[0] = common.cameraJitter[1] = 0.0f;
-  common.cameraJitterPrev[0] = common.cameraJitterPrev[1] = 0.0f;
+  // NRD's jitter is in pixels, y down ("sampleUv = pixelUv + cameraJitter" with pixelUv in
+  // pixels of the rect), the same convention as CaelixCamera::jitter. NRD rejects values outside
+  // [-0.5, 0.5]; a larger jitter is clamped for NRD only.
+  const auto clamp_jitter = [](float value) {
+    return std::isfinite(value) ? std::clamp(value, -0.5f, 0.5f) : 0.0f;
+  };
+  common.cameraJitter[0] = clamp_jitter(camera.jitter[0]);
+  common.cameraJitter[1] = clamp_jitter(camera.jitter[1]);
+  common.cameraJitterPrev[0] = clamp_jitter(prev.jitter[0]);
+  common.cameraJitterPrev[1] = clamp_jitter(prev.jitter[1]);
   common.resourceSize[0] = common.resourceSizePrev[0] = common.rectSize[0] =
       common.rectSizePrev[0] = static_cast<uint16_t>(width);
   common.resourceSize[1] = common.resourceSizePrev[1] = common.rectSize[1] =

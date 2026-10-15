@@ -1872,3 +1872,249 @@ TEST_CASE("glass: delta checkerboard is stable per pixel; the cross resolve matc
   CHECK(std::abs(checkerboard_mean / reference - 1.0) < 0.02);
   CloseGlassRig(s);
 }
+
+namespace {
+
+// The six geometry and colour targets of one renderer for the flip test.
+struct FlipTargets {
+  Target color, albedo, normal, depth, motion, view_z;
+  TargetSet set;
+  void Create(Gpu& gpu, VkFormat color_format) {
+    color = CreateTarget(gpu, color_format);
+    albedo = CreateTarget(gpu, VK_FORMAT_R8G8B8A8_UNORM);
+    normal = CreateTarget(gpu, VK_FORMAT_R16G16B16A16_SFLOAT);
+    depth = CreateTarget(gpu, VK_FORMAT_R32_SFLOAT);
+    motion = CreateTarget(gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+    view_z = CreateTarget(gpu, VK_FORMAT_R32_SFLOAT);
+    set.t[kColor] = &color;
+    set.t[kAlbedo] = &albedo;
+    set.t[kNormal] = &normal;
+    set.t[kDepth] = &depth;
+    set.t[kMotion] = &motion;
+    set.t[kViewZ] = &view_z;
+  }
+  void Destroy(Gpu& gpu) {
+    for (Target* t : {&color, &albedo, &normal, &depth, &motion, &view_z}) {
+      DestroyTarget(gpu, *t);
+    }
+  }
+};
+
+// Rows of `flipped` that differ from the rows of `plain` mirrored in y (byte compare).
+uint32_t MirrorMismatchRows(const Target& plain, const Target& flipped) {
+  REQUIRE(plain.width == flipped.width);
+  REQUIRE(plain.height == flipped.height);
+  const size_t row_bytes = static_cast<size_t>(plain.width) * plain.bytes_per_pixel;
+  uint32_t rows = 0;
+  for (uint32_t y = 0; y < plain.height; ++y) {
+    if (std::memcmp(plain.at(0, y), flipped.at(0, plain.height - 1 - y), row_bytes) != 0) {
+      ++rows;
+    }
+  }
+  return rows;
+}
+
+// Pixels of an RGBA32F motion target whose flipped value is not (x, -y, z, w) of the plain one.
+uint32_t MotionMirrorMismatches(const Target& plain, const Target& flipped) {
+  uint32_t bad = 0;
+  for (uint32_t y = 0; y < plain.height; ++y) {
+    for (uint32_t x = 0; x < plain.width; ++x) {
+      const uint32_t fy = plain.height - 1 - y;
+      if (flipped.F32(x, fy, 0) != plain.F32(x, y, 0) || flipped.F32(x, fy, 1) != -plain.F32(x, y, 1) ||
+          flipped.F32(x, fy, 2) != plain.F32(x, y, 2) || flipped.F32(x, fy, 3) != plain.F32(x, y, 3)) {
+        ++bad;
+      }
+    }
+  }
+  return bad;
+}
+
+// Leftmost hit column of row y, top hit row of column x (albedo coverage); the size when none.
+uint32_t FirstHitColumn(const Target& albedo, uint32_t y) {
+  for (uint32_t x = 0; x < albedo.width; ++x) {
+    if (albedo.at(x, y)[3] == 255) return x;
+  }
+  return albedo.width;
+}
+uint32_t FirstHitRow(const Target& albedo, uint32_t x) {
+  for (uint32_t y = 0; y < albedo.height; ++y) {
+    if (albedo.at(x, y)[3] == 255) return y;
+  }
+  return albedo.height;
+}
+
+}  // namespace
+
+TEST_CASE("flip y: host targets mirrored, motion y negated; jitter moves the sample, not the motion") {
+  constexpr uint32_t cx = kSize / 2;
+  constexpr uint32_t cy = kSize / 2;
+
+  // (1) Two renderers on one scene, the same cameras and options; B sets CAELIX_RENDER_FLAG_FLIP_Y.
+  {
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadRedBrick(rig);
+    CaelixRenderer* plain = nullptr;
+    CaelixRenderer* flipped = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &plain) == CAELIX_OK);
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &flipped) == CAELIX_OK);
+    FlipTargets a;
+    FlipTargets b;
+    a.Create(rig.gpu, VK_FORMAT_R8G8B8A8_UNORM);
+    b.Create(rig.gpu, VK_FORMAT_R8G8B8A8_UNORM);
+    const auto render_both = [&](const CaelixCamera& camera, CaelixRenderOptions options) {
+      Render(rig, plain, a.set, camera, options);
+      options.flags |= CAELIX_RENDER_FLAG_FLIP_Y;
+      Render(rig, flipped, b.set, camera, options);
+    };
+    // Off-centre camera, so the image is not symmetric in y; then the camera moves +1 up.
+    const CaelixCamera c0 = LookPlusZ(2.0f, 5.0f, -20.0f);
+    const CaelixCamera c1 = LookPlusZ(2.0f, 6.0f, -20.0f);
+    render_both(c0, Options(CAELIX_VIEW_ALBEDO));
+    render_both(c1, Options(CAELIX_VIEW_ALBEDO));
+    const uint32_t mismatch_color = MirrorMismatchRows(a.color, b.color);
+    const uint32_t mismatch_albedo = MirrorMismatchRows(a.albedo, b.albedo);
+    const uint32_t mismatch_normal = MirrorMismatchRows(a.normal, b.normal);
+    const uint32_t mismatch_depth = MirrorMismatchRows(a.depth, b.depth);
+    const uint32_t mismatch_view_z = MirrorMismatchRows(a.view_z, b.view_z);
+    const uint32_t mismatch_motion = MotionMirrorMismatches(a.motion, b.motion);
+    // A camera that moved +1 up sees a static point LOWER on the screen (larger y, rows go
+    // down): the previous pixel is above, motion.y = -pixels per unit. Flipped: +.
+    const float view_z = a.view_z.F32(cx, cy, 0);
+    const float pixels_per_unit = static_cast<float>(kSize) / (2.0f * c1.tan_half_fov_y * view_z);
+    std::printf("flip, camera +1 up: mismatched rows colour %u albedo %u normal %u depth %u view_z %u, "
+                "motion pixels %u; centre motion plain %.5f %.5f, flipped %.5f %.5f, expected 0 %.5f\n",
+                mismatch_color, mismatch_albedo, mismatch_normal, mismatch_depth, mismatch_view_z,
+                mismatch_motion, a.motion.F32(cx, cy, 0), a.motion.F32(cx, cy, 1),
+                b.motion.F32(cx, kSize - 1 - cy, 0), b.motion.F32(cx, kSize - 1 - cy, 1), -pixels_per_unit);
+    REQUIRE(a.albedo.at(cx, cy)[3] == 255);
+    CHECK(MirrorMismatchRows(a.albedo, a.albedo) > 0);  // the image is not symmetric in y
+    CHECK(mismatch_color == 0);
+    CHECK(mismatch_albedo == 0);
+    CHECK(mismatch_normal == 0);
+    CHECK(mismatch_depth == 0);
+    CHECK(mismatch_view_z == 0);
+    CHECK(mismatch_motion == 0);
+    CHECK(std::abs(a.motion.F32(cx, cy, 0)) < 1e-3f);
+    CHECK(std::abs(a.motion.F32(cx, cy, 1) + pixels_per_unit) < 1e-2f);
+    CHECK(std::abs(b.motion.F32(cx, kSize - 1 - cy, 1) - pixels_per_unit) < 1e-2f);
+
+    // Path trace mode (one bounce, sky on miss, no NRD): the composite's output is mirrored too.
+    CaelixRenderOptions pt = LightOptions(CAELIX_MODE_PATH_TRACE, 1, 4242);
+    pt.flags |= CAELIX_RENDER_FLAG_SKY_ON_MISS;
+    render_both(c1, pt);
+    const uint32_t mismatch_pt = MirrorMismatchRows(a.color, b.color);
+    // The motion view shows the host motion's convention: green = saturate(motion.y / 64 + 0.5)
+    // with motion.y negated when flipped, so the two greens sum to about 255. The camera moves
+    // down 1 here: motion.y = +pixels per unit in the plain image.
+    CaelixRenderOptions motion_view = pt;
+    motion_view.debug_view = CAELIX_VIEW_MOTION;
+    render_both(c0, motion_view);
+    const int green_sum = a.color.at(cx, cy)[1] + b.color.at(cx, kSize - 1 - cy)[1];
+    std::printf("flip, path trace: %u mismatched colour rows; motion view green plain %u flipped %u\n",
+                mismatch_pt, a.color.at(cx, cy)[1], b.color.at(cx, kSize - 1 - cy)[1]);
+    CHECK(mismatch_pt == 0);
+    CHECK(a.color.at(cx, cy)[1] > 140);
+    CHECK(std::abs(green_sum - 255) <= 1);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(plain);
+    caelix_renderer_release_target_views(flipped);
+    caelix_renderer_destroy(plain);
+    caelix_renderer_destroy(flipped);
+    a.Destroy(rig.gpu);
+    b.Destroy(rig.gpu);
+    CloseRig(rig);
+  }
+
+  // (2) The delta checkerboard and its cross resolve under the flip: the glass slab, path trace
+  //     mode, checkerboard on. The resolve taps read unflipped internal images; the output is the
+  //     plain image mirrored, bit for bit.
+  {
+    GlassRig g;
+    OpenGlassRig(g, 0);
+    UploadSlab(g.rig);
+    CaelixRenderer* flipped = nullptr;
+    REQUIRE(caelix_renderer_create(g.rig.device, g.rig.scene, &flipped) == CAELIX_OK);
+    Target flipped_color = CreateTarget(g.rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+    TargetSet flipped_set;
+    flipped_set.t[kColor] = &flipped_color;
+    const double pos[3] = {0.5, 0.5, -30.0};
+    const double dir[3] = {0.0, 0.0, 1.0};
+    const CaelixCamera camera = LookAlong(pos, dir, std::tan(4.0 * kPi / 180.0));
+    CaelixRenderOptions options = GlassOptions(CAELIX_MODE_PATH_TRACE, 1, 5, 777);
+    options.flags |= CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD;
+    Render(g.rig, g.renderer, g.set, camera, options);
+    options.flags |= CAELIX_RENDER_FLAG_FLIP_Y;
+    Render(g.rig, flipped, flipped_set, camera, options);
+    const uint32_t mismatch = MirrorMismatchRows(g.color, flipped_color);
+    std::printf("flip, glass checkerboard + cross resolve: %u mismatched rows, centre %.5f\n", mismatch,
+                g.color.F32(cx, cy, 0));
+    CHECK(mismatch == 0);
+    CHECK(g.color.F32(cx, cy, 0) > 0.0f);
+    REQUIRE(vkDeviceWaitIdle(g.rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(flipped);
+    caelix_renderer_destroy(flipped);
+    DestroyTarget(g.rig.gpu, flipped_color);
+    CloseGlassRig(g);
+  }
+
+  // (3) Jitter. Camera (4, 4, -20) looking +Z at the red brick [0, 8)^3: the brick's left face
+  //     projects to pixel x = (1 - 4 / (20 tan 30)) / 2 * 256 = 83.66, its top face to y = 83.66
+  //     (rows down). A pixel hits when its sample position px + 0.5 + jitter.x >= 83.66, so the
+  //     leftmost hit column is ceil(83.16 - jitter.x): 84 at jitter 0, 83 at jitter 0.4; likewise
+  //     the top hit row with jitter.y (y down). The motion stays the surface motion: 0 for a static
+  //     camera whatever the jitter.
+  {
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadRedBrick(rig);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    FlipTargets t;
+    t.Create(rig.gpu, VK_FORMAT_R16G16B16A16_SFLOAT);
+    CaelixCamera camera = LookPlusZ(4.0f, 4.0f, -20.0f);
+    Render(rig, renderer, t.set, camera, Options(CAELIX_VIEW_ALBEDO));
+    const uint32_t column0 = FirstHitColumn(t.albedo, cy);
+    const uint32_t row0 = FirstHitRow(t.albedo, cx);
+    camera.jitter[0] = 0.4f;
+    camera.jitter[1] = 0.4f;
+    Render(rig, renderer, t.set, camera, Options(CAELIX_VIEW_ALBEDO));
+    const uint32_t column1 = FirstHitColumn(t.albedo, cy);
+    const uint32_t row1 = FirstHitRow(t.albedo, cx);
+    float max_motion = 0.0f;
+    for (uint32_t y = 0; y < kSize; ++y) {
+      for (uint32_t x = 0; x < kSize; ++x) {
+        if (t.albedo.at(x, y)[3] == 255) {
+          max_motion = std::max(max_motion, std::max(std::abs(t.motion.F32(x, y, 0)),
+                                                     std::abs(t.motion.F32(x, y, 1))));
+        }
+      }
+    }
+    std::printf("jitter 0 -> (0.4, 0.4): leftmost hit column %u -> %u, top hit row %u -> %u, max "
+                "|motion| on hits %.6f px\n",
+                column0, column1, row0, row1, max_motion);
+    CHECK(column0 == 84);
+    CHECK(column1 == 83);
+    CHECK(row0 == 84);
+    CHECK(row1 == 83);
+    CHECK(max_motion < 1e-3f);
+    // NRD accepts a jitter that changes every frame (cameraJitter / cameraJitterPrev).
+    for (uint32_t i = 0; i < 4; ++i) {
+      camera.jitter[0] = (i & 1u) != 0 ? 0.25f : -0.25f;
+      camera.jitter[1] = (i & 2u) != 0 ? 0.25f : -0.25f;
+      CaelixRenderOptions options = LightOptions(CAELIX_MODE_PATH_TRACE, 1, 50 + i);
+      options.denoise = 1;
+      Render(rig, renderer, t.set, camera, options, i == 3);
+    }
+    CaelixNrdInfo nrd{};
+    REQUIRE(caelix_renderer_get_nrd_info(renderer, &nrd) == CAELIX_OK);
+    CHECK(nrd.failed == 0);
+    CHECK(nrd.dispatch_count > 0);
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    t.Destroy(rig.gpu);
+    CloseRig(rig);
+  }
+}

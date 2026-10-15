@@ -75,6 +75,7 @@ struct RenderThreadState {
   bool logged_access_fallback = false;
   bool logged_level = false;
   bool warned_encoding = false;
+  uint32_t dropped_target_logs = 0;
   bool scene_busy = false;  // the scene had uploads, pending bricks or pending builds
   uint32_t scene_encoding = kNoScene;
   uint64_t error_logs = 0;
@@ -200,6 +201,36 @@ bool AccessTarget(const CaelixUnityTarget& target, UnityVulkanImage& image) {
     return true;
   }
   return false;
+}
+
+// An optional geometry target of the packet: accessed and checked like the colour target, but a
+// failure only drops the target (logged a few times), the frame still renders.
+bool AccessOptionalTarget(const CaelixUnityTarget& target, const char* name, uint32_t width,
+                          uint32_t height, CaelixTargetImage& out) {
+  out = CaelixTargetImage{};
+  if (target.native_texture == nullptr && target.native_render_buffer == nullptr) return false;
+  UnityVulkanImage image{};
+  const char* problem = nullptr;
+  if (!AccessTarget(target, image)) {
+    problem = "AccessTexture failed";
+  } else if ((image.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0) {
+    problem = "no STORAGE usage (RenderTexture.enableRandomWrite is off)";
+  } else if (image.extent.width != width || image.extent.height != height) {
+    problem = "its size differs from the colour target";
+  }
+  if (problem != nullptr) {
+    if (g_rt.dropped_target_logs < 8) {
+      ++g_rt.dropped_target_logs;
+      Log(LogLevel::Warning, "the %s target is dropped: %s", name, problem);
+    }
+    return false;
+  }
+  out.image = reinterpret_cast<uint64_t>(image.image);
+  out.format = static_cast<uint32_t>(image.format);
+  out.width = image.extent.width;
+  out.height = image.extent.height;
+  out.layout = static_cast<uint32_t>(image.layout);
+  return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -602,6 +633,12 @@ void RenderEvent(void* data) {
     Fail(CAELIX_ERROR_INVALID_ARGUMENT,
          "the colour target has no STORAGE usage (RenderTexture.enableRandomWrite is off)");
   }
+  CaelixRenderTargets targets{};
+  if (color_ok) {
+    AccessOptionalTarget(packet.depth, "depth", color.extent.width, color.extent.height, targets.depth);
+    AccessOptionalTarget(packet.motion, "motion", color.extent.width, color.extent.height, targets.motion);
+    AccessOptionalTarget(packet.albedo, "albedo", color.extent.width, color.extent.height, targets.albedo);
+  }
   UnityVulkanRecordingState recording{};
   const bool recording_ok =
       state.vulkan->CommandRecordingState(&recording, kUnityVulkanGraphicsQueueAccess_DontCare);
@@ -653,7 +690,6 @@ void RenderEvent(void* data) {
     return;
   }
 
-  CaelixRenderTargets targets{};
   targets.color.image = reinterpret_cast<uint64_t>(color.image);
   targets.color.format = static_cast<uint32_t>(color.format);
   targets.color.width = color.extent.width;

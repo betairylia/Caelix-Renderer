@@ -49,7 +49,7 @@ extern "C" {
 #endif
 
 /* Bumped on every change of CaelixUnityPacket, its records or CaelixUnityStatus. */
-#define CAELIX_UNITY_PACKET_VERSION 2u
+#define CAELIX_UNITY_PACKET_VERSION 3u
 
 /* A render target, given as Unity's native texture pointer. */
 typedef struct CaelixUnityTarget {
@@ -126,7 +126,13 @@ typedef struct CaelixUnityPacket {
   uint32_t target_generation; /* changes whenever C# replaced a target texture (see the release
                                  event); the plugin warns when it changes without a release */
   CaelixUnityTarget color;    /* RGBA16F with random write (STORAGE usage) */
-  CaelixCamera camera;
+  /* Version 3: optional geometry targets (native_texture NULL = absent), each with random write and
+     the size of the colour target. The plugin passes them as CaelixRenderTargets::depth, motion and
+     albedo; a target that AccessTexture refuses or that has no STORAGE usage is dropped (logged). */
+  CaelixUnityTarget depth;    /* R32F: device depth of camera.projection */
+  CaelixUnityTarget motion;   /* RGBA16F: previous - current pixel, w = delta checkerboard flag */
+  CaelixUnityTarget albedo;   /* RGBA8 UNORM: albedo, a = coverage */
+  CaelixCamera camera;        /* version 3: CaelixCamera::jitter appended */
   CaelixRenderOptions options;
 
   /* Scene section (version 2). */

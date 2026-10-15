@@ -56,7 +56,9 @@ extern "C" {
    CaelixRenderOptions::bounce_count_transparent, CAELIX_MAX_BOUNCES_TRANSPARENT and the debug views
    CAELIX_VIEW_MATERIAL and CAELIX_VIEW_NRD_SPEC, also without a bump; its follow-up added
    CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD (a new flag bit) and the RGBA formats of the motion target
-   (w = the checkerboard flag), also without a bump. A host
+   (w = the checkerboard flag), also without a bump. The Unity plugin step (P3) appended
+   CaelixCamera::jitter and added CAELIX_RENDER_FLAG_FLIP_Y (a new flag bit), also without a
+   bump. A host
    built against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -529,8 +531,10 @@ CAELIX_API void caelix_renderer_destroy(CaelixRenderer* renderer);
 /* The camera of one render call, in world space. The voxel world is Y up and uses Unity's
    convention: +X right, +Y up, +Z forward. right, up and forward must form an orthonormal basis.
    Pixel (px, py), row 0 = the TOP row of the image, traces the ray from `position` in direction
-     ndc = ((px + 0.5) / width * 2 - 1, 1 - (py + 0.5) / height * 2)
-     dir = normalize(right * ndc.x * tan_half_fov_y * aspect + up * ndc.y * tan_half_fov_y + forward) */
+     s   = (px + 0.5 + jitter[0], py + 0.5 + jitter[1])          (the sample position, pixels)
+     ndc = (s.x / width * 2 - 1, 1 - s.y / height * 2)
+     dir = normalize(right * ndc.x * tan_half_fov_y * aspect + up * ndc.y * tan_half_fov_y + forward)
+   (CAELIX_RENDER_FLAG_FLIP_Y changes only where the result is stored, not this mapping.) */
 typedef struct CaelixCamera {
   float position[3];
   float pad0;
@@ -549,8 +553,17 @@ typedef struct CaelixCamera {
      It must describe the same frustum as tan_half_fov_y and aspect; the library does not check.
      Used only for the depth target (device depth = clip.z / clip.w). A normal-Z host passes, for
      example, clip.z = far / (far - near) * (z - near), clip.w = z; a reverse-Z infinite host
-     clip.z = near, clip.w = z. */
+     clip.z = near, clip.w = z. Pass the projection WITHOUT jitter (NRD's viewToClipMatrix). */
   float projection[16];
+  /* Sub-pixel offset of the primary sample in pixels, x right and y DOWN (the row order of the
+     unflipped image), typically in [-0.5, 0.5]; {0, 0} = the pixel centre. For temporal
+     anti-aliasing the host varies it per frame. It moves the primary rays only: the motion target
+     stays the motion of the surface itself (previous pixel - the sample position, both through
+     the unjittered pinhole mappings), so a static camera over a static scene writes motion 0 for
+     any jitter. NRD receives it as CommonSettings::cameraJitter (and the previous call's as
+     cameraJitterPrev), clamped to [-0.5, 0.5]. A host that renders into a y-up image
+     (CAELIX_RENDER_FLAG_FLIP_Y) still passes y down here. */
+  float jitter[2];
 } CaelixCamera;
 
 /* CaelixRenderOptions::mode */
@@ -629,6 +642,18 @@ typedef enum CaelixDebugView {
                                                 keep the random choice. CAELIX_MODE_REFERENCE ignores
                                                 the flag (a fixed per-pixel branch would converge to
                                                 a checkerboard, not to the image). Unity parity. */
+#define CAELIX_RENDER_FLAG_FLIP_Y (1u << 4) /* every mode: the HOST targets (CaelixRenderTargets) are
+                                                stored bottom row first: the result of pixel
+                                                (px, py) is written at (px, height - 1 - py), for a
+                                                host whose images have row 0 at the bottom (Unity
+                                                render textures). The motion target's y is
+                                                negated (y grows upward in the stored image, so
+                                                motion stays previous - current in the stored
+                                                rows), and so is the motion debug view. Ray
+                                                generation, the random stream, the jitter and the
+                                                internal targets (also NRD's inputs) are not
+                                                flipped: an image rendered with the flag is the
+                                                image rendered without it, mirrored in y. */
 
 /* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
 typedef struct CaelixRenderOptions {
@@ -719,8 +744,9 @@ typedef struct CaelixRenderTargets {
      first transparent interface, see CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD, and needs a cross
      resolve with its flagged neighbours; 0 otherwise). xy = previous_pixel - current_pixel, in
      pixels of the current target size: the hit point is moved back by the entity's previous transform and projected with the
-     previous render call's camera (same pinhole mapping as the ray generation); the current pixel is
-     the pixel centre (px + 0.5, py + 0.5). Example: a camera that moved +1 unit along `right` sees
+     previous render call's camera (the unjittered pinhole mapping of the ray generation); the current pixel is
+     the sample position (px + 0.5 + jitter[0], py + 0.5 + jitter[1]); with CAELIX_RENDER_FLAG_FLIP_Y
+     y is negated. Example: a camera that moved +1 unit along `right` sees
      a static point move LEFT on the screen, so motion.x > 0 (the point was to the right).
      0 on a miss, on the first render call of the renderer, and when the point was behind the
      previous camera. */
