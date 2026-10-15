@@ -12,6 +12,7 @@
 #include "IUnityLog.h"
 
 #include <caelix/caelix.h>
+#include <caelix_unity.h>
 
 #include <atomic>
 #include <cstdint>
@@ -73,7 +74,9 @@ struct State {
   // Render thread only (device events and plugin events).
   CaelixDevice* device = nullptr;
   CaelixScene* scene = nullptr;
-  CaelixRenderer* renderer = nullptr;
+  // One renderer per view (CaelixUnityPacket::view), all over `scene`. Created on the first
+  // render event of the view.
+  CaelixRenderer* renderers[CAELIX_UNITY_MAX_VIEWS] = {};
   VkDevice vk_device = VK_NULL_HANDLE;
   VkQueue vk_queue = VK_NULL_HANDLE;
   PFN_vkDeviceWaitIdle device_wait_idle = nullptr;
@@ -90,7 +93,7 @@ PFN_vkGetInstanceProcAddr UNITY_INTERFACE_API InterceptVulkanInitialization(
 void UNITY_INTERFACE_API OnPluginEvent(int event_id, void* data);
 // Configures the two plugin events (IUnityGraphicsVulkanV2::ConfigureEvent).
 void ConfigureEvents();
-// Destroys renderer and scene (device idle) and forgets the frame mapping, the entity map and the
+// Destroys every view's renderer and the scene (device idle) and forgets the frame mapping, the entity map and the
 // pending uploads.
 void DestroyRenderObjects();
 

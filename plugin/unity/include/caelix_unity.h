@@ -27,10 +27,14 @@
  * the cached view would then show a destroyed image. So whenever C# replaces a target, it issues
  * the release event (status.release_event_id) BEFORE the first render event that uses the new
  * target. That event runs with graphics queue access: it waits for the graphics queue to be idle
- * and calls caelix_renderer_release_target_views. Its data is NULL or the packet of the render
- * event that follows it: when that packet's encoding differs from the live scene's, the release
- * event also destroys the renderer and the scene, and the render event creates them again with
- * the new encoding. C# issues the release event for that reason too.
+ * and calls caelix_renderer_release_target_views on every view's renderer. Its data is NULL or the
+ * packet of the render event that follows it: when that packet's encoding differs from the live
+ * scene's, the release event also destroys every renderer and the scene, and the render events
+ * create them again with the new encoding. C# issues the release event for that reason too.
+ *
+ * Views (version 4): every packet names a view (CaelixUnityPacket::view). Each view has its own
+ * renderer over the one shared scene, so its internal targets and denoiser history do not mix
+ * with another view's. The scene records of a packet apply to the shared scene, whatever its view.
  */
 #include <stdint.h>
 #include <caelix/caelix.h>
@@ -48,8 +52,12 @@ extern "C" {
   #define CAELIX_UNITY_API __attribute__((visibility("default")))
 #endif
 
-/* Bumped on every change of CaelixUnityPacket, its records or CaelixUnityStatus. */
-#define CAELIX_UNITY_PACKET_VERSION 3u
+/* Bumped on every change of CaelixUnityPacket, its records or CaelixUnityStatus.
+   Version 4: CaelixUnityPacket::view (was a pad field; same size). */
+#define CAELIX_UNITY_PACKET_VERSION 4u
+
+/* Number of views (CaelixUnityPacket::view). Each view has its own renderer over the shared scene. */
+#define CAELIX_UNITY_MAX_VIEWS 4u
 
 /* A render target, given as Unity's native texture pointer. */
 typedef struct CaelixUnityTarget {
@@ -147,7 +155,10 @@ typedef struct CaelixUnityPacket {
   uint32_t material_mode;     /* CAELIX_UNITY_MATERIALS_* */
   uint32_t material_count;    /* entries at materials_offset (layout per material_mode) */
   uint32_t materials_offset;
-  uint32_t pad;
+  uint32_t view;              /* version 4: view index 0 .. CAELIX_UNITY_MAX_VIEWS-1; each view has
+                                 its own renderer (internal targets, NRD history) over the shared
+                                 scene. C#: 0 = Game view, 1 = Scene view. The status timings are
+                                 those of view 0. */
 } CaelixUnityPacket;
 
 /* Plugin state for C#. Counters are monotonic. */

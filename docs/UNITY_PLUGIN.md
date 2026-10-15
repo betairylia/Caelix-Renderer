@@ -218,6 +218,47 @@ with no Volume still changes the primary view (28.7 dB vs 52.2 dB with post-proc
 camera), so primary comparisons run with post-processing off. TAA needs post-processing on: for the
 TAA captures the Global Volume was disabled instead.
 
+## Views as built (2026-10-15)
+
+Packet version 4 (still 448 B): the last field of the scene section, `pad`, is now `view`, an index
+below `CAELIX_UNITY_MAX_VIEWS` (4; C# `CaelixNativeBridge.MaxViews`). The plugin keeps one scene
+and one renderer per view (`State::renderers[]`). Reason: a renderer recreates its internal
+targets (and loses its NRD history) whenever its target size changes, and a primary-mode render
+marks its NRD history invalid, so a Game view and a Scene view on one renderer would destroy each
+other's history every frame.
+
+Plugin (`unity_bridge.cpp`): `EnsureScene(encoding)` creates the shared scene where the render
+event used to create both objects; `EnsureRenderer(view)` creates the view's renderer lazily, just
+before `caelix_renderer_render` ("renderer created for view N"). The scene records of a packet are
+applied, flushed and consumed whatever its view: a view out of range or a failed renderer creation
+fails only the render (`Fail` + `PublishSceneStats`). The status GPU timings are those of view 0.
+The release event releases the cached target views of every renderer, and on an encoding change
+destroys every renderer and the scene. Plugin frames stay one counter per render event, so a Unity
+frame with two views is two plugin frames; `SafePluginFrame` already pops every entry of a Unity
+frame at once.
+
+C# (`CaelixNativeRenderer`, `CaelixNativeRendererFeature`): view 0 is the Game view, view 1 the
+Scene view. The component has a `sceneView` setting: `Off` (not drawn), `Lit` (default: the Game
+view's mode and debug view, own denoiser history) and `Primary` (albedo debug view, no denoiser).
+Each view has its own four targets ("Caelix Native Colour (view 1)", ...), its own reset state
+(previous camera, options and mode) and its own reset request; `ResetAccumulation()` resets every
+view. The target generation stays ONE counter for all views, because one release event releases
+the views of every renderer; per-view generations would make the plugin warn about a generation
+change without a release. The scene section that `Tick` filled goes with whichever view prepares
+first in the frame; the other view gets a free slot with an empty scene section. The frame seed
+and the jitter warning stay shared; `LastJitter` follows view 0. Scene view cameras have no TAA,
+so the motion pass does not run for them. The packet ring grew from 3 to 6 slots: every view
+issues one packet per frame and the render thread may be a frame behind, so two views need about
+four slots in flight.
+
+Known limitation: several Scene views share view 1. When their sizes differ, the view's targets
+are recreated at every change of size, which costs a release event (queue idle) per frame.
+
+Quiet logs: a `verboseLogging` setting (default off) gates the three informational C# logs: the
+encoding change in `Tick`, "stream complete after N frames" (the stream statistics still run) and
+"N material entries from ...". Warnings, errors, the periodic status log (`statusLogInterval`) and
+the one-time plugin status line stay as they were.
+
 ## Open questions for the owner
 
 1. (answered) Loading time: "Load on startup" on the plugin importer; P1 verifies it.

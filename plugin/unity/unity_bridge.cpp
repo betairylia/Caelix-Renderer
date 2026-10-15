@@ -11,10 +11,15 @@
 // are copied into a plugin-owned pending queue and uploaded first at the next event; while the
 // queue is not empty, new uploads are appended to it, so the bricks of one entity reach the
 // library in the order C# sent them.
+//
+// Views (packet version 4): one scene, one renderer per view (CaelixUnityPacket::view). A packet
+// applies its scene records and flushes the scene whatever its view; only the render call uses
+// the view's renderer, which is created on the view's first render event.
 #include "plugin_state.h"
 
 #include <caelix_unity.h>
 
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <unordered_map>
@@ -77,6 +82,7 @@ struct RenderThreadState {
   bool warned_encoding = false;
   uint32_t dropped_target_logs = 0;
   bool scene_busy = false;  // the scene had uploads, pending bricks or pending builds
+  uint64_t scene_busy_since = 0;  // plugin frame of the first busy packet of the current burst
   uint32_t scene_encoding = kNoScene;
   uint64_t error_logs = 0;
   uint32_t access_logs = 0;
@@ -130,7 +136,8 @@ void ForgetSceneContents() {
   GetState().bricks_pending_plugin.store(0);
 }
 
-bool EnsureRenderObjects(uint32_t encoding) {
+// Creates the shared scene with `encoding` when there is none.
+bool EnsureScene(uint32_t encoding) {
   State& state = GetState();
   if (state.scene == nullptr) {
     CaelixSceneDesc desc{};
@@ -154,16 +161,31 @@ bool EnsureRenderObjects(uint32_t encoding) {
         "recreated the scene; the scene keeps %u", encoding, g_rt.scene_encoding,
         g_rt.scene_encoding);
   }
-  if (state.renderer == nullptr) {
-    const CaelixResult result = caelix_renderer_create(state.device, state.scene, &state.renderer);
+  return true;
+}
+
+// Creates the renderer of `view` over the shared scene when there is none. The scene must exist
+// and `view` must be < CAELIX_UNITY_MAX_VIEWS.
+bool EnsureRenderer(uint32_t view) {
+  State& state = GetState();
+  if (state.renderers[view] == nullptr) {
+    const CaelixResult result = caelix_renderer_create(state.device, state.scene, &state.renderers[view]);
     if (result != CAELIX_OK) {
-      state.renderer = nullptr;
+      state.renderers[view] = nullptr;
       Fail(result, "caelix_renderer_create failed");
       return false;
     }
-    Log(LogLevel::Info, "renderer created");
+    Log(LogLevel::Info, "renderer created for view %u", view);
   }
   return true;
+}
+
+bool HasRenderer() {
+  const State& state = GetState();
+  for (const CaelixRenderer* renderer : state.renderers) {
+    if (renderer != nullptr) return true;
+  }
+  return false;
 }
 
 // Maps Unity's safe frame to the newest safe plugin frame.
@@ -536,7 +558,10 @@ void ApplyScene(const CaelixUnityPacket& packet, const uint8_t* base) {
   UpdatePendingCount();
 
   ApplyMaterials(packet, base);
-  if (has_records) g_rt.scene_busy = true;
+  if (has_records && !g_rt.scene_busy) {
+    g_rt.scene_busy = true;
+    g_rt.scene_busy_since = g_rt.plugin_frame;
+  }
 }
 
 // Publishes the scene statistics and the GPU timings for C#. Logs once when the scene becomes
@@ -551,9 +576,10 @@ void PublishSceneStats() {
   state.as_builds_pending.store(stats.as_builds_pending);
   state.record_bytes.store(stats.record_bytes);
   state.blas_bytes.store(stats.blas_bytes);
-  if (state.renderer != nullptr) {
+  // The timings are those of view 0 (the Game view in C#).
+  if (state.renderers[0] != nullptr) {
     CaelixGpuTimings timings{};
-    caelix_renderer_get_gpu_timings(state.renderer, &timings);
+    caelix_renderer_get_gpu_timings(state.renderers[0], &timings);
     state.flush_ms.store(timings.flush_ms);
     state.trace_ms.store(timings.trace_ms);
     state.composite_ms.store(timings.composite_ms);
@@ -563,6 +589,10 @@ void PublishSceneStats() {
   const bool busy = g_rt.pending_bricks != 0 || stats.as_builds_pending != 0 || stats.pending_bricks != 0;
   if (g_rt.scene_busy && !busy) {
     g_rt.scene_busy = false;
+    // Only a burst that lasted a while is worth a line: a world that changes every frame goes
+    // busy and idle once per frame and would write one line per frame to the Editor log.
+    constexpr uint64_t kIdleLogMinFrames = 30;
+    if (g_rt.plugin_frame - g_rt.scene_busy_since < kIdleLogMinFrames) return;
     Log(LogLevel::Info, "scene idle after plugin frame %llu: %u entities, %u groups, %llu bricks "
         "resident, %llu uploaded so far, records %.1f MiB, BLAS %.1f MiB",
         static_cast<unsigned long long>(g_rt.plugin_frame), stats.entities, stats.groups,
@@ -618,7 +648,7 @@ void RenderEvent(void* data) {
   }
   g_rt.released_since_generation = false;
 
-  if (!EnsureRenderObjects(packet.encoding)) {
+  if (!EnsureScene(packet.encoding)) {
     PublishConsumed(packet.sequence);
     return;
   }
@@ -701,8 +731,22 @@ void RenderEvent(void* data) {
           color.extent.width, color.extent.height, packet.color.width, packet.color.height);
     }
   }
-  result = caelix_renderer_render(state.renderer, &frame_desc, &targets, &packet.camera,
-                                  &packet.options);
+  // The scene records are applied and flushed above whatever the view is; only the render needs
+  // the view's renderer.
+  if (packet.view >= CAELIX_UNITY_MAX_VIEWS) {
+    char what[96];
+    std::snprintf(what, sizeof(what), "packet view %u out of range (max %u)", packet.view,
+                  CAELIX_UNITY_MAX_VIEWS - 1);
+    Fail(CAELIX_ERROR_INVALID_ARGUMENT, what);
+    PublishSceneStats();
+    return;
+  }
+  if (!EnsureRenderer(packet.view)) {
+    PublishSceneStats();
+    return;
+  }
+  result = caelix_renderer_render(state.renderers[packet.view], &frame_desc, &targets,
+                                  &packet.camera, &packet.options);
   PublishSceneStats();
   if (result != CAELIX_OK) {
     Fail(result, "caelix_renderer_render failed");
@@ -737,7 +781,7 @@ void ReleaseEvent(void* data) {
       encoding = packet.encoding;
     }
   }
-  if (state.renderer == nullptr && !recreate) {
+  if (!HasRenderer() && !recreate) {
     g_rt.released_since_generation = true;
     return;
   }
@@ -745,12 +789,14 @@ void ReleaseEvent(void* data) {
     state.queue_wait_idle(state.vk_queue);
   }
   if (recreate) {
-    // The device is idle for this queue: renderer and scene can go now. The render event that
-    // follows creates both with the packet's encoding.
-    Log(LogLevel::Info, "encoding change %u -> %u: destroying renderer and scene (%zu entities)",
+    // The device is idle for this queue: renderers and scene can go now. The render events that
+    // follow create them again with the packet's encoding.
+    Log(LogLevel::Info, "encoding change %u -> %u: destroying renderers and scene (%zu entities)",
         g_rt.scene_encoding, encoding, g_rt.entities.size());
-    caelix_renderer_destroy(state.renderer);
-    state.renderer = nullptr;
+    for (CaelixRenderer*& renderer : state.renderers) {
+      caelix_renderer_destroy(renderer);
+      renderer = nullptr;
+    }
     caelix_scene_destroy(state.scene);
     state.scene = nullptr;
     g_rt.scene_encoding = kNoScene;
@@ -758,7 +804,9 @@ void ReleaseEvent(void* data) {
     ForgetSceneContents();
     state.scene_recreations.fetch_add(1);
   } else {
-    caelix_renderer_release_target_views(state.renderer);
+    for (CaelixRenderer* renderer : state.renderers) {
+      if (renderer != nullptr) caelix_renderer_release_target_views(renderer);
+    }
   }
   g_rt.released_since_generation = true;
   state.view_releases.fetch_add(1);
@@ -798,8 +846,10 @@ void ConfigureEvents() {
 
 void DestroyRenderObjects() {
   State& state = GetState();
-  caelix_renderer_destroy(state.renderer);
-  state.renderer = nullptr;
+  for (CaelixRenderer*& renderer : state.renderers) {
+    caelix_renderer_destroy(renderer);
+    renderer = nullptr;
+  }
   caelix_scene_destroy(state.scene);
   state.scene = nullptr;
   state.scene_encoding.store(kNoScene);
