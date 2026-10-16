@@ -886,6 +886,25 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   primary ray misses.
 - `--no-sun-nee`: lighting modes, no sun next-event estimation (the 6a
   behaviour: the sun is found only by the bounce rays).
+- `--sky <PATH>`: lighting modes, a lat-long (equirectangular) sky image,
+  `.exr` or `.hdr`, converted on the CPU (`caelix-app/src/sky.rs`) to a
+  mipmapped RGBA32F cubemap, uploaded once at start (`caelix-vk`
+  `Context::create_sky_cubemap`) and passed as `CaelixRenderOptions::sky`
+  instead of the procedural sky. Orientation (world Y up): the image centre
+  faces +Z, u grows toward +X, the top row is up. The image must not contain
+  the sun disk: the sun is `--sun` / `--sun-radiance` (a sun baked into the
+  image is found by chance only and flickers); a "puresky" HDRI usually
+  contains the sun. `--sky-size <N>`: face size, a power of two in 4..2048
+  (default 256). `--sky-rotation <DEGREES>`: turns the image around Y
+  (`u = 0.5 + atan2(d.x, d.z) / (2 pi) + DEGREES / 360`, default 0).
+- `--fog-density <F>` (default 0 = no fog) and `--fog-color <R,G,B>` (default
+  0.6,0.7,0.8): lighting modes, extinction of the air per world unit and the
+  fog radiance (`CaelixRenderOptions::fog_density` / `fog_color`).
+- `--emission-scale <F>`: multiplies the emission of every material
+  (`CaelixRenderOptions::emission_scale`; the library treats 0 as 1). Default 1.
+- `--load-on-key`: needs `--world`; the world file is not opened at start, the
+  `L` key opens it (once). The camera starts at `--pose` or the fixed default
+  pose; without `--pose` the file's player pose is applied when `L` opens it.
 - `--accumulate <N>`: reference mode; the accumulation restarts whenever the
   camera changes or the world is not complete yet, and `--screenshot` is taken
   after N accumulated frames. The frame seed is the frame number.
@@ -954,7 +973,9 @@ vectors and NRD under a moving entity and under brick edits over time.
   (`Artifacts/native-renderer-motion-20261014/`).
 
 In the window, press `P` to log the current camera as a
-`--pose ... --fov ...` line.
+`--pose ... --fov ...` line. With `--load-on-key`, press `L` to open the
+`--world` file (the Stats window's world line says "press L to load <file>"
+until then).
 
 ### Debug UI
 
@@ -980,7 +1001,10 @@ can be dragged and collapsed, and each has collapsible sections:
   0.05..8); the sun as pitch (elevation, positive up) and yaw (0 = +Z, 90 =
   +X) in degrees with the resulting direction, colour plus intensity
   (logarithmic, 0..1e5; radiance = colour x intensity) and angular radius
-  (0.1..10 degrees); the sky zenith, horizon and ground colours.
+  (0.1..10 degrees); the sky: "cubemap (--sky)" (disabled without `--sky`;
+  the face size and mip count) and the zenith, horizon and ground colours
+  (greyed out while the cubemap is in use); fog density (logarithmic, 0..1
+  per unit) and colour; the materials' emission scale (logarithmic, 0..64).
   "Reset accumulation" sets `reset_accumulation` for one frame (reference and
   NRD history); in reference mode the accumulated frame count is shown.
   "Screenshot" writes `screenshot-<frame>.png` to `--screenshot-dir`.

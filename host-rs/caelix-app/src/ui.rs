@@ -407,6 +407,23 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
     });
 
     CollapsingHeader::new("Sky").default_open(demo).show(ui, |ui| {
+        let cubemap = settings.sky_cubemap;
+        ui.horizontal(|ui| {
+            let checkbox = ui.add_enabled(
+                lighting && cubemap.is_some(),
+                egui::Checkbox::new(&mut settings.use_sky_cubemap, "cubemap (--sky)"),
+            );
+            match cubemap {
+                Some(c) => {
+                    ui.label(format!("face {}, {} mips", c.size, c.mip_levels));
+                }
+                None => {
+                    checkbox.on_disabled_hover_text("no --sky file");
+                }
+            }
+        });
+        // The procedural colours are greyed out while the cubemap replaces them.
+        let procedural = lighting && !(cubemap.is_some() && settings.use_sky_cubemap);
         Grid::new("render_sky").num_columns(2).show(ui, |ui| {
             for (name, color) in [
                 ("zenith", &mut settings.sky_zenith),
@@ -415,11 +432,43 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             ] {
                 ui.label(name);
                 ui.horizontal(|ui| {
-                    ui.add_enabled(lighting, |ui: &mut egui::Ui| ui.color_edit_button_rgb(color));
+                    ui.add_enabled(procedural, |ui: &mut egui::Ui| ui.color_edit_button_rgb(color));
                     ui.label(format!("{:.3}, {:.3}, {:.3}", color[0], color[1], color[2]));
                 });
                 ui.end_row();
             }
+        });
+    });
+
+    CollapsingHeader::new("Fog").default_open(demo).show(ui, |ui| {
+        Grid::new("render_fog").num_columns(2).show(ui, |ui| {
+            ui.label("density");
+            ui.add_enabled(
+                lighting,
+                Slider::new(&mut settings.fog_density, 0.0..=1.0)
+                    .logarithmic(true)
+                    .smallest_positive(1e-5)
+                    .suffix(" /unit"),
+            );
+            ui.end_row();
+            ui.label("colour");
+            ui.horizontal(|ui| {
+                let color = &mut settings.fog_color;
+                ui.add_enabled(lighting, |ui: &mut egui::Ui| ui.color_edit_button_rgb(color));
+                ui.label(format!("{:.3}, {:.3}, {:.3}", color[0], color[1], color[2]));
+            });
+            ui.end_row();
+        });
+    });
+
+    CollapsingHeader::new("Materials").default_open(demo).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("emission scale");
+            ui.add_enabled(
+                lighting,
+                Slider::new(&mut settings.emission_scale, 0.01..=64.0).logarithmic(true),
+            )
+            .on_hover_text("multiplies every material's emission (0.01 = almost off; the library treats exactly 0 as 1)");
         });
     });
 

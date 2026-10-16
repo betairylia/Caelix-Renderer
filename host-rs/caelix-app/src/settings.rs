@@ -2,6 +2,7 @@
 //! converted to `CaelixRenderOptions` every frame.
 
 use caelix_sys::*;
+use caelix_vk::SkyCubemap;
 use clap::ValueEnum;
 
 /// Primary mode: direction toward the sun of the Lambert term (normalized by the library).
@@ -165,6 +166,16 @@ pub struct RenderSettings {
     pub sky_zenith: [f32; 3],
     pub sky_horizon: [f32; 3],
     pub sky_ground: [f32; 3],
+    /// The uploaded `--sky` cubemap; `None` without `--sky` (and before the upload).
+    pub sky_cubemap: Option<SkyCubemap>,
+    /// Lighting modes: the cubemap instead of the procedural sky (when one is loaded).
+    pub use_sky_cubemap: bool,
+    /// Lighting modes: extinction of the air per world unit (0 = no fog).
+    pub fog_density: f32,
+    /// Lighting modes: linear RGB radiance of the fog.
+    pub fog_color: [f32; 3],
+    /// Every mode: multiplies the emission of every material.
+    pub emission_scale: f32,
 }
 
 impl RenderSettings {
@@ -224,6 +235,26 @@ impl RenderSettings {
             sky_ground: self.sky_ground,
             frame_seed,
             bounce_count_transparent: self.bounces_transparent,
+            emission_scale: self.emission_scale,
+            fog_density: self.fog_density,
+            fog_color: self.fog_color,
+            pad3: 0.0,
+            sky: self.sky(),
+        }
+    }
+
+    /// The cubemap that the library receives: zero (the procedural sky) in the primary mode, without
+    /// a loaded cubemap or with the cubemap switched off.
+    fn sky(&self) -> CaelixSkyCubemap {
+        match self.sky_cubemap.filter(|_| self.lighting() && self.use_sky_cubemap) {
+            Some(c) => CaelixSkyCubemap {
+                image: c.image,
+                format: c.format,
+                layout: c.layout,
+                size: c.size,
+                mip_levels: c.mip_levels,
+            },
+            None => CaelixSkyCubemap { image: 0, format: 0, layout: 0, size: 0, mip_levels: 0 },
         }
     }
 }
@@ -244,4 +275,8 @@ pub fn same_options(a: &CaelixRenderOptions, b: &CaelixRenderOptions) -> bool {
         && a.sky_zenith == b.sky_zenith
         && a.sky_horizon == b.sky_horizon
         && a.sky_ground == b.sky_ground
+        && a.emission_scale == b.emission_scale
+        && a.fog_density == b.fog_density
+        && a.fog_color == b.fog_color
+        && a.sky.image == b.sky.image
 }

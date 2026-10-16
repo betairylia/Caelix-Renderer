@@ -12,12 +12,17 @@
 //! (`--mode ref`). Debug windows (egui, `ui.rs`, F1) are drawn over the image by
 //! `caelix-vk` after the render; a screenshot is copied before them.
 //!
+//! `--sky` converts a lat-long sky image into a cubemap (`sky.rs`) that `caelix-vk` uploads once;
+//! the library samples it instead of the procedural sky. `--load-on-key` opens the world on the L
+//! key instead of at start.
+//!
 //! `--test-entity` and `--test-edits` add a synthetic moving box and timed brick edits
 //! (`testscene.rs`, Test window) to judge the motion vectors and NRD.
 
 mod camera;
 mod materials;
 mod settings;
+mod sky;
 mod testscene;
 mod ui;
 mod world;
@@ -67,6 +72,8 @@ const UI_DEMO_FRAME: u64 = 60;
 const UI_DEMO_YAW: f32 = 15.0;
 /// An absent render target (image 0): the library does not write it.
 const NO_TARGET: CaelixTargetImage = CaelixTargetImage { image: 0, format: 0, width: 0, height: 0, layout: 0 };
+/// `--sky-size`: the largest face size (2048: 512 MiB of RGBA32F with the mips).
+const MAX_SKY_SIZE: u32 = 2048;
 
 /// Parses "x,y,z" into three floats.
 fn parse_vec3(text: &str) -> Result<[f32; 3], String> {
@@ -215,6 +222,34 @@ struct Args {
     /// bounce rays, as in step 6a).
     #[arg(long)]
     no_sun_nee: bool,
+    /// Lighting modes: a lat-long (equirectangular) sky image, .exr or .hdr, converted to a
+    /// mipmapped cubemap and used instead of the procedural sky (the Render window switches back).
+    /// Orientation (world Y up): the image centre faces +Z, u grows toward +X, the top row is up;
+    /// --sky-rotation turns it around Y. The image must not contain the sun disk: the sun is
+    /// --sun / --sun-radiance (a sun baked into the image is found by chance only and flickers); a
+    /// 'puresky' HDRI usually contains the sun.
+    #[arg(long, value_name = "PATH")]
+    sky: Option<PathBuf>,
+    /// Face size of the --sky cubemap in texels (a power of two, 4..2048).
+    #[arg(long, value_name = "N", default_value_t = 256)]
+    sky_size: u32,
+    /// Turns the --sky image around Y (world Y up): u = 0.5 + atan2(d.x, d.z) / (2 pi) + DEGREES /
+    /// 360, v = acos(d.y) / pi, so at 0 the image centre faces +Z and u grows toward +X.
+    #[arg(long, value_name = "DEGREES", default_value_t = 0.0, allow_hyphen_values = true)]
+    sky_rotation: f32,
+    /// Lighting modes: extinction of the air per world unit (0 = no fog). A segment of length t
+    /// that ends on a surface keeps exp(-density * t) and adds the fog colour times the rest.
+    #[arg(long, value_name = "F", default_value_t = 0.0)]
+    fog_density: f32,
+    /// Lighting modes: linear RGB radiance of the fog.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_vec3, default_value = "0.6,0.7,0.8")]
+    fog_color: [f32; 3],
+    /// Multiplies the emission of every material (0 acts as 1 in the library).
+    #[arg(long, value_name = "F", default_value_t = 1.0)]
+    emission_scale: f32,
+    /// Do not open the --world file at start: the L key opens it (once).
+    #[arg(long, requires = "world")]
+    load_on_key: bool,
     /// Reference mode: take the --screenshot after N accumulated frames. The accumulation
     /// restarts whenever the camera changes or the world is not complete yet.
     #[arg(long, value_name = "N")]
@@ -347,6 +382,17 @@ struct Timing {
     fps: f64,
 }
 
+/// The --sky cubemap, converted on the CPU before the window exists and uploaded in `create_state`.
+struct SkySource {
+    path: PathBuf,
+    /// Size of the lat-long image.
+    width: u32,
+    height: u32,
+    cubemap: sky::Cubemap,
+    /// Decode and conversion time in milliseconds.
+    convert_ms: f64,
+}
+
 /// Reference accumulation as the host sees it.
 struct Accumulation {
     /// The camera of the previous frame, to detect changes.
@@ -366,6 +412,8 @@ struct App {
     entities: Vec<ui::EntityRow>,
     /// The test entity and its edits (--test-entity, --test-edits, Test window).
     test: TestScene,
+    /// --sky: taken by `create_state` for the upload.
+    sky: Option<SkySource>,
     /// --screenshot-every: the presented-frame count of the first capture.
     every_base: Option<u64>,
     /// The debug UI's Screenshot button was pressed; the copy is recorded when no readback is pending.
@@ -476,10 +524,36 @@ impl App {
             bail!("caelix_renderer_create failed: CaelixResult {result}");
         }
 
+        // The sky does not depend on the world: upload it once, before the first frame.
+        if let Some(source) = self.sky.take() {
+            let start = Instant::now();
+            let cubemap = state
+                .context
+                .create_sky_cubemap(source.cubemap.size, &source.cubemap.mips)
+                .context("cannot upload the sky cubemap")?;
+            log::info!(
+                "sky cubemap uploaded: {} ({}x{} lat-long), face {}, {} mips, {:.1} MiB, \
+                 decode + convert {:.1} ms, upload {:.1} ms",
+                source.path.display(),
+                source.width,
+                source.height,
+                cubemap.size,
+                cubemap.mip_levels,
+                source.cubemap.byte_size() as f64 / (1024.0 * 1024.0),
+                source.convert_ms,
+                start.elapsed().as_secs_f64() * 1e3
+            );
+            self.settings.sky_cubemap = Some(cubemap);
+        }
+
         if let Some(path) = self.args.world.as_deref() {
-            let loader = world::WorldLoader::open(state.scene, path)?;
-            self.entities = loader.entities().iter().map(ui::EntityRow::new).collect();
-            state.loader = Some(loader);
+            if self.args.load_on_key {
+                log::info!("world {}: not opened yet, press L to load it", path.display());
+            } else {
+                let loader = world::WorldLoader::open(state.scene, path)?;
+                self.entities = loader.entities().iter().map(ui::EntityRow::new).collect();
+                state.loader = Some(loader);
+            }
         }
         // Camera: --pose, else the world's player pose, else a fixed pose.
         self.camera = match (self.args.pose, state.loader.as_ref().and_then(|l| l.player_pose())) {
@@ -538,7 +612,14 @@ impl App {
                     target: (frame.width, frame.height),
                     scene: scene_stats(state.scene),
                     nrd: nrd_info(state.renderer),
-                    load_state: state.loader.as_ref().map_or_else(|| "no world".into(), |l| l.status_line()),
+                    load_state: match (state.loader.as_ref(), self.args.world.as_deref()) {
+                        (Some(loader), _) => loader.status_line(),
+                        (None, Some(path)) if self.args.load_on_key => format!(
+                            "press L to load {}",
+                            path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into())
+                        ),
+                        (None, _) => "no world".into(),
+                    },
                     accumulated: self.accumulation.frames,
                     screenshot_note: self.screenshot_note.clone(),
                 };
@@ -839,6 +920,36 @@ impl App {
         self.camera.translate(forward * step, right * step, up * step);
     }
 
+    /// --load-on-key: opens the --world file (once), adds its entity rows before the test entity's,
+    /// and takes the file's player pose when no --pose was given.
+    fn load_world_on_key(&mut self) -> anyhow::Result<()> {
+        let (true, Some(path)) = (self.args.load_on_key, self.args.world.as_deref()) else {
+            return Ok(());
+        };
+        let Some(state) = self.state.as_mut() else {
+            return Ok(());
+        };
+        if state.loader.is_some() {
+            return Ok(());
+        }
+        log::info!("world load requested by key: {}", path.display());
+        let loader = world::WorldLoader::open(state.scene, path)?;
+        // The draw loop pairs the first rows with the loader's entities, in file order.
+        let rows: Vec<ui::EntityRow> = loader.entities().iter().map(ui::EntityRow::new).collect();
+        self.entities.splice(0..0, rows);
+        if let (None, Some(player)) = (self.args.pose, loader.player_pose()) {
+            self.camera = Camera::from_quaternion(player.position, player.rotation, self.args.fov);
+            log::info!(
+                "camera from the world's player pose: position {:?}, pitch {:.4}, yaw {:.4}",
+                self.camera.position,
+                self.camera.pitch,
+                self.camera.yaw
+            );
+        }
+        state.loader = Some(loader);
+        Ok(())
+    }
+
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
         log::error!("{error:#}");
         self.error = Some(error);
@@ -899,6 +1010,12 @@ impl ApplicationHandler for App {
                         // P prints the pose in --pose form so a view can be reproduced.
                         if code == KeyCode::KeyP && !event.repeat {
                             log::info!("pose: {}", self.camera.pose_args());
+                        }
+                        // L opens the world with --load-on-key.
+                        if code == KeyCode::KeyL && !event.repeat {
+                            if let Err(e) = self.load_world_on_key() {
+                                self.fail(event_loop, e);
+                            }
                         }
                     }
                 }
@@ -1162,9 +1279,18 @@ fn main() -> anyhow::Result<()> {
     if args.view == View::Material && mode != Mode::Primary {
         bail!("--view material needs --mode primary");
     }
+    if !(4..=MAX_SKY_SIZE).contains(&args.sky_size) || !args.sky_size.is_power_of_two() {
+        bail!("--sky-size {} must be a power of two in 4..{MAX_SKY_SIZE}", args.sky_size);
+    }
+    if !args.fog_density.is_finite() || args.fog_density < 0.0 {
+        bail!("--fog-density {} must be a finite value >= 0", args.fog_density);
+    }
+    if !args.emission_scale.is_finite() || args.emission_scale < 0.0 {
+        bail!("--emission-scale {} must be a finite value >= 0", args.emission_scale);
+    }
     log::info!(
         "mode {mode:?}, bounces {}, transparent bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, \
-         sun NEE {}, denoise {}, \
+         sun NEE {}, denoise {}, sky {}, fog density {} colour {:?}, emission scale {}, \
          window {}x{}",
         args.bounces,
         args.bounces_transparent,
@@ -1173,9 +1299,30 @@ fn main() -> anyhow::Result<()> {
         args.sun_radiance,
         !args.no_sun_nee,
         mode == Mode::Pt && !args.no_denoise,
+        args.sky.as_deref().map_or_else(|| "procedural".into(), |p| p.display().to_string()),
+        args.fog_density,
+        args.fog_color,
+        args.emission_scale,
         args.size.0,
         args.size.1
     );
+
+    // The sky image is decoded and converted before the window exists, so a bad file fails early.
+    let sky = match args.sky.as_deref() {
+        Some(path) => {
+            let start = Instant::now();
+            let latlong = sky::load_latlong(path)?;
+            let cubemap = sky::to_cubemap(&latlong, args.sky_size, args.sky_rotation);
+            Some(SkySource {
+                path: path.to_path_buf(),
+                width: latlong.width,
+                height: latlong.height,
+                cubemap,
+                convert_ms: start.elapsed().as_secs_f64() * 1e3,
+            })
+        }
+        None => None,
+    };
 
     let (sun_color, sun_intensity) = RenderSettings::split_radiance(args.sun_radiance);
     let settings = RenderSettings {
@@ -1197,6 +1344,12 @@ fn main() -> anyhow::Result<()> {
         sky_zenith: args.sky_zenith,
         sky_horizon: args.sky_horizon,
         sky_ground: args.sky_ground,
+        // Set by create_state after the upload.
+        sky_cubemap: None,
+        use_sky_cubemap: args.sky.is_some(),
+        fog_density: args.fog_density,
+        fog_color: args.fog_color,
+        emission_scale: args.emission_scale,
     };
 
     if !(1..=120).contains(&args.test_edit_interval) {
@@ -1224,6 +1377,7 @@ fn main() -> anyhow::Result<()> {
         accumulation: Accumulation { last_camera: None, frames: 0 },
         entities: Vec::new(),
         test,
+        sky,
         every_base: None,
         ui_screenshot_requested: false,
         readback_owner: None,

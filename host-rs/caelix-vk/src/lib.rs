@@ -20,7 +20,11 @@
 //!    in `GENERAL`. A readback recorded before the overlay excludes the overlay.
 //! 4. [`Context::end_frame`] transitions the image to `PRESENT_SRC_KHR`, submits
 //!    and presents.
+//!
+//! [`Context::create_sky_cubemap`] uploads a sky cubemap once (outside the frame
+//! loop); the image lives until the context is dropped.
 
+mod cubemap;
 mod debug;
 mod device;
 mod overlay;
@@ -33,6 +37,7 @@ use ash::vk;
 use ash::vk::Handle;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
+pub use cubemap::SkyCubemap;
 use swapchain::Swapchain;
 
 /// Number of frames the CPU may record ahead of the GPU.
@@ -119,6 +124,8 @@ pub enum Error {
     NoFrameInFlight,
     #[error("egui overlay: {0}")]
     Overlay(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 pub(crate) fn vk_error(call: &'static str) -> impl FnOnce(vk::Result) -> Error {
@@ -170,6 +177,8 @@ pub struct Context {
     readback: Option<readback::PendingReadback>,
     /// The egui overlay renderer, after `init_overlay`. Dropped first in Drop.
     overlay: Option<overlay::Overlay>,
+    /// Images created by the context for the caller (the sky cubemap), destroyed in Drop.
+    owned_images: Vec<cubemap::OwnedImage>,
 }
 
 impl Context {
@@ -244,6 +253,7 @@ impl Context {
             swapchain_generation: 0,
             readback: None,
             overlay: None,
+            owned_images: Vec::new(),
         };
         context.create_frame_sync()?;
         context.ensure_render_finished_semaphores()?;
@@ -650,6 +660,9 @@ impl Drop for Context {
             self.overlay = None;
             if let Some(pending) = self.readback.take() {
                 pending.destroy(&self.device);
+            }
+            for image in self.owned_images.drain(..) {
+                image.destroy(&self.device);
             }
             for semaphore in self.render_finished.drain(..) {
                 self.device.destroy_semaphore(semaphore, None);
