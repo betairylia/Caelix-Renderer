@@ -10,7 +10,8 @@
 //   kModePathTrace: output raw; debug view kViewNrdDiff outputs diffuse instead,
 //                   kViewNrdSpec specular
 //   colour = output * exposure; a miss is SkyRadiance(primary direction) * exposure
-//   with kRenderFlagSkyOnMiss, else 0; alpha = coverage; linear -> sRGB when the
+//   (the host's cubemap at mip 0 when it gave one, else the procedural sky; plus the
+//   sun disk) with kRenderFlagSkyOnMiss, else 0; alpha = coverage; linear -> sRGB when the
 //   colour target is a UNORM format (output_srgb).
 //   kModePathTrace, debug view kViewNrdValidation, denoised frame: NRD's validation
 //   layer (binding 6, RGBA8, a = opacity) is blended over the encoded colour.
@@ -36,8 +37,9 @@
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
 #include "common/caelix_material.hlsl"
-#include "render/caelix_shading.hlsl"
+// Before the shading helpers: the set defines the sky bindings (9, 10) they declare.
 #include "render/caelix_composite_set.hlsl"
+#include "render/caelix_shading.hlsl"
 #include "NRD.hlsli"
 
 // kViewMotion: motion (pixels) that maps to full red or green.
@@ -49,6 +51,7 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   if (any(thread_id.xy >= fc.size)) {
     return;
   }
+  g_emissionScale = fc.emission_scale;  // not used here; keeps the shading globals set
   const uint2 pixel = thread_id.xy;
   float4 albedo = g_int_albedo[pixel];
   const bool hit = albedo.a > 0.5f;

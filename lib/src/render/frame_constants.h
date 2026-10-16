@@ -6,7 +6,7 @@ namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
 // together. One per render call, in a host-visible buffer; its device address is
-// the only push constant of the trace and composite kernels. 512 bytes. Every field sits at an offset
+// the only push constant of the trace and composite kernels. 528 bytes. Every field sits at an offset
 // that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
 // std430 and scalar layout rules give the same offsets.
 struct FrameConstants {
@@ -63,9 +63,16 @@ struct FrameConstants {
   uint32_t cross_resolve;   // 464  1 = the composite writes the resolve image, the cross resolve the target
   uint32_t pad_468;         // 468
   float jitter[2];          // 472  CaelixCamera::jitter (pixels, y down)
-  uint32_t pad[8];          // 480
+  float fog_color[4];       // 480  rgb = fog radiance, w = fog density per unit (0 = no fog)
+  uint64_t sky_sh;          // 496  address of 9 float4 (rgb, 0): irradiance SH coefficients (sky_cubemap = 1)
+  float emission_scale;     // 504  multiplies every material's emission (0 already replaced by 1)
+  uint32_t sky_cubemap;     // 508  1 = the kernels sample the host cubemap, 0 = the procedural sky
+  float sky_max_lod;        // 512  mip_levels - 1 of the cubemap
+  float sky_sh_lod;         // 516  the mip the SH kernel samples (face about 32 px)
+  uint32_t pad_520;         // 520
+  uint32_t pad_524;         // 524
 };
-static_assert(sizeof(FrameConstants) == 512);
+static_assert(sizeof(FrameConstants) == 528);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -90,6 +97,12 @@ static_assert(offsetof(FrameConstants, materials) == 440);
 static_assert(offsetof(FrameConstants, hit_dist_params) == 448);
 static_assert(offsetof(FrameConstants, cross_resolve) == 464);
 static_assert(offsetof(FrameConstants, jitter) == 472);
+static_assert(offsetof(FrameConstants, fog_color) == 480);
+static_assert(offsetof(FrameConstants, sky_sh) == 496);
+static_assert(offsetof(FrameConstants, emission_scale) == 504);
+static_assert(offsetof(FrameConstants, sky_cubemap) == 508);
+static_assert(offsetof(FrameConstants, sky_max_lod) == 512);
+static_assert(offsetof(FrameConstants, sky_sh_lod) == 516);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

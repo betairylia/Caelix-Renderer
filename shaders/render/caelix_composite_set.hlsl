@@ -6,10 +6,16 @@
 // bindings 1..8 internal targets: albedo (a = coverage), deterministic, diffuse,
 // specular, the reference accumulation, NRD's validation layer, the motion (w = the
 // delta checkerboard flag) and the resolve image (the composite's linear output when
-// the cross resolve runs). The push constant is the device address of the frame
-// constants (same block as the trace).
+// the cross resolve runs); binding 9 the sky cubemap (sampled image: the host's
+// cubemap or the renderer's fallback cube) and binding 10 its sampler, declared by
+// render/caelix_shading.hlsl through CAELIX_SKY_BINDING_IMAGE / _SAMPLER, which this
+// file defines: include it BEFORE caelix_shading.hlsl. The push constant is the device
+// address of the frame constants (same block as the trace).
 #ifndef CAELIX_COMPOSITE_SET_HLSL
 #define CAELIX_COMPOSITE_SET_HLSL
+
+#define CAELIX_SKY_BINDING_IMAGE 9
+#define CAELIX_SKY_BINDING_SAMPLER 10
 
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_frame.hlsl"

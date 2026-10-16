@@ -9,9 +9,21 @@
 #include "rhi/gpu_buffer.h"
 #include "scene/scene.h"
 
+#include <cstddef>
 #include <exception>
 #include <memory>
 #include <new>
+
+// Layout of the structs that hosts embed by value (the Unity plugin's render packet holds a
+// CaelixRenderOptions): appended fields must keep these offsets.
+static_assert(sizeof(CaelixSkyCubemap) == 24);
+static_assert(offsetof(CaelixRenderOptions, bounce_count_transparent) == 124);
+static_assert(offsetof(CaelixRenderOptions, emission_scale) == 128);
+static_assert(offsetof(CaelixRenderOptions, fog_density) == 132);
+static_assert(offsetof(CaelixRenderOptions, fog_color) == 136);
+static_assert(offsetof(CaelixRenderOptions, pad3) == 148);
+static_assert(offsetof(CaelixRenderOptions, sky) == 152);
+static_assert(sizeof(CaelixRenderOptions) == 176);
 
 // The opaque handle behind CaelixDevice*.
 struct CaelixDevice {

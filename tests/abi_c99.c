@@ -11,6 +11,10 @@ size_t caelix_abi_c99_touch(void);
 
 /* CaelixMaterial is the GPU table layout: 48 bytes (C99 has no static_assert). */
 typedef char caelix_material_is_48_bytes[(sizeof(CaelixMaterial) == 48) ? 1 : -1];
+/* CaelixRenderOptions is embedded by value in host packets (the Unity plugin): 176 bytes, the sky
+   cubemap at offset 152. */
+typedef char caelix_render_options_is_176_bytes[(sizeof(CaelixRenderOptions) == 176) ? 1 : -1];
+typedef char caelix_sky_cubemap_at_152[(offsetof(CaelixRenderOptions, sky) == 152) ? 1 : -1];
 
 size_t caelix_abi_c99_touch(void) {
   CaelixVersion version = {0, 0, 0, CAELIX_ABI_VERSION};
@@ -54,7 +58,8 @@ size_t caelix_abi_c99_touch(void) {
                sizeof(level) + sizeof(result) + sizeof(camera) + sizeof(options) +
                sizeof(targets) + sizeof(timings) + sizeof(view) + sizeof(renderer) +
                sizeof(mode) + sizeof(nrd_info) + sizeof(read_bit) + sizeof(material) +
-               sizeof(caelix_material_is_48_bytes);
+               sizeof(caelix_material_is_48_bytes) + sizeof(caelix_render_options_is_176_bytes) +
+               sizeof(caelix_sky_cubemap_at_152);
   /* Take the address of every function so a declaration typo fails to compile. Casts between
      function pointer types are valid C; the pointers are never called. */
   AnyFn functions[27];

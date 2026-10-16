@@ -310,3 +310,68 @@ Findings for 6c and later:
    fps; the host at 144 Hz.
 4. Barriers are global per dispatch; per-resource read-after-write barriers could let
    independent passes overlap (worth measuring at 1440p, where NRD is 1 to 1.4 ms).
+
+## Sky cubemap, fog, emission scale (2026-10-16)
+
+Three per-call features of `CaelixRenderOptions`, appended after `bounce_count_transparent`
+without an ABI bump: `emission_scale` (128), `fog_density` (132), `fog_color[3]` (136), `pad3`
+(148), `sky` (`CaelixSkyCubemap`: image, format, layout, size, mip_levels; 152, 24 bytes). The
+struct is 176 bytes (`static_assert`s in `lib/src/abi/caelix.cpp`, a C99 size check in
+`tests/abi_c99.c`). Zero-initialized options keep the old behaviour. `CaelixFrameConstants` grew to
+528 bytes (`fog_color` 480 with the density in w, `sky_sh` 496, `emission_scale` 504,
+`sky_cubemap` 508, `sky_max_lod` 512, `sky_sh_lod` 516).
+
+- **Sky cubemap.** The host passes a cube image (6 layers, Vulkan face order, SAMPLED, a
+  filterable format, without the sun disk) in a layout it keeps for the whole call; the library
+  caches a cube view (sampled usage, every mip) next to the target views and never transitions the
+  image. Primary misses (composite) and a delta chain that ends in the sky sample mip 0
+  (`SkyRadiance`); a specular bounce that misses samples mip `roughness * (mip_levels - 1)`
+  (`SkySpecularMiss`, roughness = 1 - smoothness of the lobe, 0 for the delta lobes); a diffuse
+  bounce that misses receives `SkyIrradianceOverPi(segment normal)` (`SkyDiffuseMiss`). The sun disk
+  stays analytic in every case (added when the segment sees the sun, as before). Without a cubemap
+  every function is the procedural sky, unchanged.
+- **SH method.** `caelix_sky_sh.hlsl` (one workgroup of 256, before the trace, inside the trace
+  timestamps) samples 6 x 32 x 32 texel centres at the mip whose face is about 32 px
+  (`sky_sh_lod = clamp(log2(size) - 5, 0, mip_levels - 1)`), weights each by its solid angle
+  `(2/32)^2 / (1 + s^2 + t^2)^1.5`, projects onto the 9 real SH of bands 0..2 (`CaelixShBasis`,
+  shared with the lookup), reduces over the workgroup in shared memory, renormalizes by
+  `4 pi / sum of weights` (a constant sky projects exactly) and multiplies by the clamped-cosine
+  factors pi, 2 pi / 3, pi / 4. The 9 float4 live in one 144-byte device buffer per renderer
+  (frames run in queue order: the lighting modes' first barrier orders the previous frame's reads
+  before the write, a compute-to-compute barrier orders the write before the trace).
+  **Bias:** a diffuse bounce that misses receives the irradiance of the WHOLE sky divided by pi,
+  whatever its direction, instead of the radiance in its direction. Over many samples this gives
+  E(n) / pi times the fraction of cosine-weighted rays that escape, instead of the integral of the
+  sky over the visible directions only: the estimate is low-noise (no sky variance per ray) but
+  biased where the scene hides a bright part of the sky (for example a bright horizon behind a
+  wall). L2 also smooths sharp sky features (small bright sources ring; a negative irradiance is
+  clamped to 0). The sun is not affected: it stays analytic and must not be in the cubemap.
+- **Fog.** The air (medium 0) is a homogeneous absorbing and emitting medium: a segment of length
+  t that ends on a surface has the transmission `exp(-fog_density t)` and adds
+  `fog_color (1 - transmission)` times the throughput before it (`TraverseSegment`). It applies to
+  the camera ray and every air gap of the delta chain (the in-scattering goes to the deterministic
+  target with the primary emission) and to every bounce segment (the stochastic radiance, so NRD
+  denoises it). A miss (t = 0) is untouched: the sky stays sharp. Glass interiors keep their own
+  extinction only; shadow rays ignore the fog. In the primary mode `fog_color` is 0 in the
+  constants.
+- **Emission scale.** `ShadeVoxelHit` multiplies every material's emission by
+  `g_emissionScale` (= `emission_scale`, 0 treated as 1), so primary and bounce emission of both
+  encodings scale together.
+- **Bindings.** Trace set: 14 the sky cubemap (SAMPLED_IMAGE), 15 its sampler (SAMPLER). Composite
+  set (also the cross resolve's): 9 and 10. Sky SH set: 0 and 1. `caelix_shading.hlsl` declares
+  `g_sky` / `g_sky_sampler` when the kernel defines `CAELIX_SKY_BINDING_IMAGE` /
+  `CAELIX_SKY_BINDING_SAMPLER` before the include (`caelix_composite_set.hlsl` defines 9 and 10, so
+  it is included before the shading helpers). The sampler is the renderer's (linear, mipmapped,
+  clamp to edge, maxLod `VK_LOD_CLAMP_NONE`). Without a host cubemap the sky bindings hold a
+  1 x 1 RGBA8 fallback cube (moved to `GENERAL` once in the first render call, never sampled).
+- **Validation.** `CAELIX_ERROR_INVALID_ARGUMENT` for a sky image with format UNDEFINED, size 0,
+  mip_levels 0 or layout UNDEFINED, and for a negative or non-finite `fog_density` or
+  `emission_scale`.
+- **Test** (`tests/trace_test.cpp`, "sky cubemap, fog and emission scale"): a uniform RGBA16F
+  8 x 8 cubemap L = (0.5, 1, 2) shows exactly L on a primary miss (the procedural sky returns with
+  image 0); with one bounce every pixel on the red brick is `albedo * L` (every diffuse ray misses,
+  E / pi = L), the same in two reference frames; a linear sky `a + b w.z` gives
+  `a - 2 b / 3` on the -Z face (band 1 and orientation; 0.6021 for 0.6); fog 0.05 with colour
+  (1, 0.5, 0.25) gives `fog_color (1 - exp(-0.05 t))` at the centre (t = 20.0001) and leaves the
+  sky corner unchanged; `emission_scale` 3 triples the emissive brick, 0 behaves as 1; the three
+  argument errors.

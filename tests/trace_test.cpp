@@ -5,7 +5,9 @@
 // checked against a CPU Monte Carlo estimate (an emissive ceiling over a grey
 // floor), the procedural sky, primary emission and the reference accumulation;
 // sun next-event estimation against the analytic irradiance of the sun cone, the
-// sun found by bounce sampling only, and a shadow under a floating block.
+// sun found by bounce sampling only, and a shadow under a floating block; a host
+// sky cubemap (primary miss, SH irradiance of diffuse bounces), the fog of the air
+// and the emission scale against closed forms.
 // Uses the public C ABI only.
 #include "test_scenes.h"
 
@@ -2117,4 +2119,359 @@ TEST_CASE("flip y: host targets mirrored, motion y negated; jitter moves the sam
     t.Destroy(rig.gpu);
     CloseRig(rig);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Sky cubemap, fog and emission scale (CaelixRenderOptions::sky, fog_*, emission_scale)
+
+namespace {
+
+// IEEE half of a float that is a normal half value (the test's exact radiances).
+uint16_t FloatToHalf(float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, 4);
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  const int32_t exponent = static_cast<int32_t>((bits >> 23) & 0xFFu) - 127 + 15;
+  if (value == 0.0f || exponent <= 0) {
+    return static_cast<uint16_t>(sign);
+  }
+  REQUIRE(exponent < 31);
+  const uint32_t mantissa = (bits >> 13) & 0x3FFu;
+  return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | mantissa);
+}
+
+// A host sky cubemap: RGBA16F (linear filtering is a required feature of the format),
+// `size` x `size` faces, 1 mip, texel = radiance(direction of the texel centre), left in
+// SHADER_READ_ONLY_OPTIMAL.
+struct SkyCube {
+  VkImage image = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  uint32_t size = 0;
+
+  CaelixSkyCubemap Abi() const {
+    CaelixSkyCubemap out{};
+    out.image = reinterpret_cast<uint64_t>(image);
+    out.format = static_cast<uint32_t>(VK_FORMAT_R16G16B16A16_SFLOAT);
+    out.layout = static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    out.size = size;
+    out.mip_levels = 1;
+    return out;
+  }
+};
+
+// The world direction (not normalized) of the texel centre (s, t in [-1, 1], t down the face)
+// of cube face `face` in the Vulkan face order +X, -X, +Y, -Y, +Z, -Z.
+void CubeTexelDirection(uint32_t face, float s, float t, float out[3]) {
+  const float directions[6][3] = {{1.0f, -t, -s}, {-1.0f, -t, s}, {s, 1.0f, t},
+                                  {s, -1.0f, -t}, {s, -t, 1.0f},  {-s, -t, -1.0f}};
+  Set3(out, directions[face]);
+}
+
+template <typename Radiance>
+SkyCube CreateSkyCube(Gpu& gpu, uint32_t size, Radiance radiance) {
+  const VkDevice device = gpu.device.device;
+  SkyCube cube;
+  cube.size = size;
+  VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+  info.imageType = VK_IMAGE_TYPE_2D;
+  info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+  info.extent = {size, size, 1};
+  info.mipLevels = 1;
+  info.arrayLayers = 6;
+  info.samples = VK_SAMPLE_COUNT_1_BIT;
+  info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  REQUIRE(vkCreateImage(device, &info, nullptr, &cube.image) == VK_SUCCESS);
+  VkMemoryRequirements requirements{};
+  vkGetImageMemoryRequirements(device, cube.image, &requirements);
+  VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  allocate.allocationSize = requirements.size;
+  allocate.memoryTypeIndex =
+      FindMemoryType(gpu, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  REQUIRE(vkAllocateMemory(device, &allocate, nullptr, &cube.memory) == VK_SUCCESS);
+  REQUIRE(vkBindImageMemory(device, cube.image, cube.memory, 0) == VK_SUCCESS);
+
+  // Staging buffer: 6 faces of size x size RGBA16F texels.
+  const VkDeviceSize face_bytes = static_cast<VkDeviceSize>(size) * size * 8;
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+  VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  buffer_info.size = face_bytes * 6;
+  buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  REQUIRE(vkCreateBuffer(device, &buffer_info, nullptr, &staging) == VK_SUCCESS);
+  VkMemoryRequirements buffer_requirements{};
+  vkGetBufferMemoryRequirements(device, staging, &buffer_requirements);
+  VkMemoryAllocateInfo buffer_allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  buffer_allocate.allocationSize = buffer_requirements.size;
+  buffer_allocate.memoryTypeIndex =
+      FindMemoryType(gpu, buffer_requirements.memoryTypeBits,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  REQUIRE(vkAllocateMemory(device, &buffer_allocate, nullptr, &staging_memory) == VK_SUCCESS);
+  REQUIRE(vkBindBufferMemory(device, staging, staging_memory, 0) == VK_SUCCESS);
+  void* mapped = nullptr;
+  REQUIRE(vkMapMemory(device, staging_memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS);
+  uint16_t* halves = static_cast<uint16_t*>(mapped);
+  for (uint32_t face = 0; face < 6; ++face) {
+    for (uint32_t y = 0; y < size; ++y) {
+      for (uint32_t x = 0; x < size; ++x) {
+        float direction[3];
+        CubeTexelDirection(face, (static_cast<float>(x) + 0.5f) / static_cast<float>(size) * 2.0f - 1.0f,
+                           (static_cast<float>(y) + 0.5f) / static_cast<float>(size) * 2.0f - 1.0f,
+                           direction);
+        const float length = std::sqrt(direction[0] * direction[0] + direction[1] * direction[1] +
+                                       direction[2] * direction[2]);
+        for (float& d : direction) {
+          d /= length;
+        }
+        float value[3];
+        radiance(direction, value);
+        const uint16_t texel[4] = {FloatToHalf(value[0]), FloatToHalf(value[1]),
+                                   FloatToHalf(value[2]), FloatToHalf(1.0f)};
+        std::memcpy(halves + ((static_cast<size_t>(face) * size + y) * size + x) * 4, texel,
+                    sizeof(texel));
+      }
+    }
+  }
+  vkUnmapMemory(device, staging_memory);
+
+  SubmitAndWait(gpu, [&](VkCommandBuffer cmd) {
+    VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    barrier.srcAccessMask = VK_ACCESS_2_NONE;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = cube.image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+    VkBufferImageCopy regions[6] = {};
+    for (uint32_t face = 0; face < 6; ++face) {
+      regions[face].bufferOffset = face_bytes * face;
+      regions[face].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, face, 1};
+      regions[face].imageExtent = {size, size, 1};
+    }
+    vkCmdCopyBufferToImage(cmd, staging, cube.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 6,
+                           regions);
+    // The copy -> the renderer's compute-shader sampled reads (the host's duty).
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+  });
+  vkDestroyBuffer(device, staging, nullptr);
+  vkFreeMemory(device, staging_memory, nullptr);
+  return cube;
+}
+
+void DestroySkyCube(Gpu& gpu, SkyCube& cube) {
+  vkDestroyImage(gpu.device.device, cube.image, nullptr);
+  vkFreeMemory(gpu.device.device, cube.memory, nullptr);
+}
+
+}  // namespace
+
+TEST_CASE("sky cubemap, fog and emission scale") {
+  Rig rig;
+  OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+  UploadRedBrick(rig);
+  CaelixRenderer* renderer = nullptr;
+  REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+  Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+  TargetSet set;
+  set.t[kColor] = &color;
+  const CaelixCamera camera = LookPlusZ(4.0f, 4.0f, -20.0f);
+  constexpr uint32_t cx = kSize / 2;
+  constexpr uint32_t cy = kSize / 2;
+  float corner_dir[3];
+  PrimaryDirection(camera, 0, 0, kSize, kSize, corner_dir);
+  float corner_sky[3];
+  SkyRadiance(corner_dir, corner_sky);
+
+  constexpr float kL[3] = {0.5f, 1.0f, 2.0f};
+  SkyCube cube = CreateSkyCube(rig.gpu, 8, [&](const float*, float out[3]) { Set3(out, kL); });
+
+  // 1. Uniform cubemap, primary miss: the corner is L (alpha 0), the brick is black.
+  CaelixRenderOptions options = LightOptions(CAELIX_MODE_PATH_TRACE, 0, 1);
+  options.sky = cube.Abi();
+  Render(rig, renderer, set, camera, options);
+  std::printf("sky cubemap, 0 bounces: corner %.6f %.6f %.6f %.6f (expected %.1f %.1f %.1f), centre "
+              "%.6f %.6f %.6f %.6f\n",
+              color.F32(0, 0, 0), color.F32(0, 0, 1), color.F32(0, 0, 2), color.F32(0, 0, 3), kL[0],
+              kL[1], kL[2], color.F32(cx, cy, 0), color.F32(cx, cy, 1), color.F32(cx, cy, 2),
+              color.F32(cx, cy, 3));
+  for (uint32_t c = 0; c < 3; ++c) {
+    CHECK(std::abs(color.F32(0, 0, c) - kL[c]) < 1e-4f);
+    CHECK(color.F32(cx, cy, c) == 0.0f);
+  }
+  CHECK(color.F32(0, 0, 3) == 0.0f);
+  CHECK(color.F32(cx, cy, 3) == 1.0f);
+  // Without the cubemap the procedural sky is back.
+  options.sky = CaelixSkyCubemap{};
+  Render(rig, renderer, set, camera, options);
+  for (uint32_t c = 0; c < 3; ++c) {
+    CHECK(std::abs(color.F32(0, 0, c) - corner_sky[c]) < 1e-4f);
+  }
+
+  // 2. SH irradiance: one bounce, every diffuse bounce ray from the brick's front face
+  //    misses the one-brick scene and receives E(n) / pi = L of the constant sky, so a
+  //    pixel on the red brick (albedo (1, 0, 0), RGBA8 255) is albedo * L exactly, with no
+  //    variance (YCoCg packing in RGBA16F: tolerance 2e-3).
+  const float expected_sh[3] = {kL[0], 0.0f, 0.0f};
+  options = LightOptions(CAELIX_MODE_PATH_TRACE, 1, 2);
+  options.sky = cube.Abi();
+  Render(rig, renderer, set, camera, options);
+  const uint32_t probes[5][2] = {{cx, cy}, {cx - 7, cy}, {cx + 7, cy}, {cx, cy - 7}, {cx, cy + 7}};
+  float max_sh_error = 0.0f;
+  for (const auto& probe : probes) {
+    std::printf("sky SH, 1 bounce: pixel (%u, %u) = %.6f %.6f %.6f %.6f, expected %.6f %.6f %.6f\n",
+                probe[0], probe[1], color.F32(probe[0], probe[1], 0),
+                color.F32(probe[0], probe[1], 1), color.F32(probe[0], probe[1], 2),
+                color.F32(probe[0], probe[1], 3), expected_sh[0], expected_sh[1], expected_sh[2]);
+    CHECK(color.F32(probe[0], probe[1], 3) == 1.0f);
+    for (uint32_t c = 0; c < 3; ++c) {
+      max_sh_error =
+          std::max(max_sh_error, std::abs(color.F32(probe[0], probe[1], c) - expected_sh[c]));
+    }
+  }
+  std::printf("sky SH, 1 bounce: max error %.3g\n", max_sh_error);
+  CHECK(max_sh_error < 2e-3f);
+  // Reference mode: two frames with different seeds give the same value (no variance).
+  float reference[2] = {0.0f, 0.0f};
+  for (uint32_t n = 0; n < 2; ++n) {
+    CaelixRenderOptions ref = LightOptions(CAELIX_MODE_REFERENCE, 1, 100 + n);
+    ref.reset_accumulation = n == 0 ? 1u : 0u;
+    ref.sky = cube.Abi();
+    Render(rig, renderer, set, camera, ref);
+    reference[n] = color.F32(cx, cy, 0);
+  }
+  std::printf("sky SH, reference: frame 1 %.6f, frame 2 %.6f\n", reference[0], reference[1]);
+  CHECK(std::abs(reference[0] - expected_sh[0]) < 2e-3f);
+  CHECK(std::abs(reference[1] - reference[0]) < 1e-6f);
+  // A linear sky L(w) = a + b w.z is exactly band 0 + band 1: E(n) / pi = a + (2 / 3) b n.z, so the
+  // front face (n = -Z) receives a - 2 b / 3 (checks the band-1 factor and the orientation; the
+  // 8 x 8 cubemap interpolates a + b w.z only approximately: tolerance 1e-2).
+  {
+    constexpr float kA = 1.0f;
+    constexpr float kB = 0.6f;
+    SkyCube gradient = CreateSkyCube(rig.gpu, 8, [&](const float* direction, float out[3]) {
+      out[0] = out[1] = out[2] = kA + kB * direction[2];
+    });
+    CaelixRenderOptions linear = LightOptions(CAELIX_MODE_PATH_TRACE, 1, 5);
+    linear.sky = gradient.Abi();
+    Render(rig, renderer, set, camera, linear);
+    const float expected_linear = kA - 2.0f * kB / 3.0f;
+    std::printf("sky SH, linear sky a + b w.z: centre %.6f, expected %.6f\n", color.F32(cx, cy, 0),
+                expected_linear);
+    CHECK(std::abs(color.F32(cx, cy, 0) - expected_linear) < 1e-2f);
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    DestroySkyCube(rig.gpu, gradient);
+  }
+
+  // 3. Fog: no cubemap, 0 bounces. The centre ray reaches the brick's front face (z = 0)
+  //    at t = 20 / dir.z; the brick has no emission, so the centre is the fog's emission
+  //    fog_color (1 - exp(-density t)) (RGBA16F deterministic target: 1e-3 relative).
+  //    The corner (a miss) is the procedural sky, unchanged.
+  float centre_dir[3];
+  PrimaryDirection(camera, cx, cy, kSize, kSize, centre_dir);
+  const double t_centre = 20.0 / centre_dir[2];
+  constexpr float kFogColor[3] = {1.0f, 0.5f, 0.25f};
+  constexpr float kFogDensity = 0.05f;
+  options = LightOptions(CAELIX_MODE_PATH_TRACE, 0, 3);
+  options.fog_density = kFogDensity;
+  Set3(options.fog_color, kFogColor);
+  Render(rig, renderer, set, camera, options);
+  const double fog_weight = 1.0 - std::exp(-static_cast<double>(kFogDensity) * t_centre);
+  std::printf("fog: t %.5f, centre %.6f %.6f %.6f %.6f, expected %.6f %.6f %.6f; corner %.6f %.6f "
+              "%.6f\n",
+              t_centre, color.F32(cx, cy, 0), color.F32(cx, cy, 1), color.F32(cx, cy, 2),
+              color.F32(cx, cy, 3), kFogColor[0] * fog_weight, kFogColor[1] * fog_weight,
+              kFogColor[2] * fog_weight, color.F32(0, 0, 0), color.F32(0, 0, 1), color.F32(0, 0, 2));
+  for (uint32_t c = 0; c < 3; ++c) {
+    const double expected = kFogColor[c] * fog_weight;
+    CHECK(std::abs(color.F32(cx, cy, c) - expected) <= 1e-3 * expected);
+    CHECK(std::abs(color.F32(0, 0, c) - corner_sky[c]) < 1e-4f);
+  }
+  CHECK(color.F32(cx, cy, 3) == 1.0f);
+  CHECK(color.F32(0, 0, 3) == 0.0f);
+  options.fog_density = 0.0f;
+  Render(rig, renderer, set, camera, options);
+  for (uint32_t c = 0; c < 3; ++c) {
+    CHECK(color.F32(cx, cy, c) == 0.0f);
+  }
+
+  // 4. Emission scale: the emissive red brick (rgb4 (15, 0, 0), strength 0) is (1, 0, 0) at
+  //    scale 1 (and at 0, which means 1), (3, 0, 0) at scale 3.
+  {
+    World world;
+    Brick brick{};
+    brick.fill(static_cast<uint16_t>(0x4000u | (15u << 10)));
+    world.bricks[{0, 0, 0}] = brick;
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+  }
+  float emitted[3] = {0.0f, 0.0f, 0.0f};
+  const float scales[3] = {1.0f, 3.0f, 0.0f};
+  for (uint32_t i = 0; i < 3; ++i) {
+    options = LightOptions(CAELIX_MODE_PATH_TRACE, 0, 4);
+    options.emission_scale = scales[i];
+    Render(rig, renderer, set, camera, options);
+    emitted[i] = color.F32(cx, cy, 0);
+    CHECK(color.F32(cx, cy, 1) == 0.0f);
+    CHECK(color.F32(cx, cy, 2) == 0.0f);
+  }
+  std::printf("emission scale 1 / 3 / 0: centre red %.6f / %.6f / %.6f\n", emitted[0], emitted[1],
+              emitted[2]);
+  CHECK(std::abs(emitted[0] - 1.0f) < 1e-4f);
+  CHECK(std::abs(emitted[1] - 3.0f * emitted[0]) <= 1e-4f * 3.0f * emitted[0]);
+  CHECK(emitted[2] == emitted[0]);
+
+  // 5. Argument checks: a sky image without mip levels, a negative fog density, a negative
+  //    emission scale.
+  const auto expect_invalid = [&](const CaelixRenderOptions& bad) {
+    ExpectLibraryErrors(1, [&] {
+      CaelixFrameDesc desc{};
+      desc.command_buffer = 1;
+      desc.frame_number = rig.frames.next;
+      const CaelixRenderTargets targets = ToAbi(set);
+      REQUIRE(caelix_renderer_render(renderer, &desc, &targets, &camera, &bad) ==
+              CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+  };
+  CaelixRenderOptions bad = LightOptions(CAELIX_MODE_PATH_TRACE, 1, 0);
+  bad.sky = cube.Abi();
+  bad.sky.mip_levels = 0;
+  expect_invalid(bad);
+  bad = LightOptions(CAELIX_MODE_PATH_TRACE, 1, 0);
+  bad.fog_density = -1.0f;
+  expect_invalid(bad);
+  bad = LightOptions(CAELIX_MODE_PATH_TRACE, 1, 0);
+  bad.emission_scale = -1.0f;
+  expect_invalid(bad);
+
+  CaelixGpuTimings timings{};
+  caelix_renderer_get_gpu_timings(renderer, &timings);
+  std::printf("timings: trace %.4f ms (with the sky SH dispatch in the cubemap frames), composite "
+              "%.4f ms\n",
+              timings.trace_ms, timings.composite_ms);
+
+  REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+  caelix_renderer_release_target_views(renderer);  // also the cube view of the sky
+  caelix_renderer_destroy(renderer);
+  DestroySkyCube(rig.gpu, cube);
+  DestroyTarget(rig.gpu, color);
+  CloseRig(rig);
 }

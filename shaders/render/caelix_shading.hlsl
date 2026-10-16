@@ -1,8 +1,19 @@
 // Shading helpers of the trace and composite kernels: block colours (debug views),
 // the random number stream, the shading rule of Unity's path tracer
 // (CaelixShadeVoxelHit, opaque and transparent branches), the interface decision of
-// the delta chain, the medium extinction and the procedural sky. Materials come
-// from the scene's material table (common/caelix_material.hlsl, GET_MATERIAL).
+// the delta chain, the medium extinction and the fog of the air (TraverseSegment),
+// and the sky. Materials come from the scene's material table
+// (common/caelix_material.hlsl, GET_MATERIAL); every emission is multiplied by
+// g_emissionScale (CaelixRenderOptions::emission_scale).
+//
+// Sky: the host's cubemap when fc.sky_cubemap = 1 (mip 0 for primary misses and the
+// delta chain, a roughness-chosen mip for specular bounces, the irradiance SH of
+// caelix_sky_sh.hlsl for diffuse bounces), else the procedural sky. A kernel that
+// samples the cubemap defines CAELIX_SKY_BINDING_IMAGE and CAELIX_SKY_BINDING_SAMPLER
+// (set 0 bindings of g_sky and g_sky_sampler) before it includes this file; without
+// them the sky functions are procedural only.
+// Fog: the air (medium 0) is a homogeneous absorbing and emitting medium of density
+// fc.fog_color.w and radiance fc.fog_color.rgb on every segment that ends on a surface.
 //
 // Ported from Unity (Caelix/Runtime/Rendering/Shaders):
 //   Utils/Utils.hlsl                      K_T_MAX, K_RAY_ORIGIN_PUSH_OFF, FresnelReflectAmountOpaque,
@@ -11,8 +22,9 @@
 //   PathTrace_full/CaelixPathTraceCommon.hlsl  CaelixShadeVoxelHit, AdvanceDeltaRay (interface),
 //                                         CaelixMediumExtinction, CaelixSanitizeRadiance
 // Differences, all marked NATIVE: the random stream is a hash + xorshift per pixel
-// (Unity samples a spatio-temporal blue-noise texture); the sky is procedural
-// (Unity samples a cubemap).
+// (Unity samples a spatio-temporal blue-noise texture); the sky is procedural or the
+// host's cubemap, and diffuse bounces that miss see the cubemap's irradiance SH (Unity
+// samples its cubemap directly); the fog of the air has no Unity counterpart.
 #ifndef CAELIX_SHADING_HLSL
 #define CAELIX_SHADING_HLSL
 
@@ -21,6 +33,14 @@
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
 #include "common/caelix_material.hlsl"
+
+#ifdef CAELIX_SKY_BINDING_IMAGE
+CAELIX_BINDING(CAELIX_SKY_BINDING_IMAGE, 0) TextureCube<float4> g_sky;
+CAELIX_BINDING(CAELIX_SKY_BINDING_SAMPLER, 0) SamplerState g_sky_sampler;
+#endif
+
+// Set by every kernel from CaelixFrameConstants::emission_scale before the first shade.
+static float g_emissionScale;
 
 static const float K_PI = 3.1415926535f;
 static const float K_TWO_PI = 6.283185307f;
@@ -150,14 +170,27 @@ float FresnelReflectAmountTransparent(float n1, float n2, float3 incident, float
 }
 
 // Unity CaelixMediumExtinction: the transmission of a straight segment of length t
-// inside the transparent medium `medium` (a face-free transparent id; 0 = air:
-// nothing). A miss has t = 0, so the sky is never attenuated.
-float3 MediumExtinction(uint medium, float t) {
+// inside the transparent medium `medium` (a face-free transparent id; 0 = air: the
+// fog, exp(-fog density * t), 1 without fog). A miss has t = 0, so the sky is never
+// attenuated.
+float3 MediumExtinction(CaelixFrameConstants fc, uint medium, float t) {
   if (medium == 0u) {
-    return float3(1.0f, 1.0f, 1.0f);
+    return exp(-fc.fog_color.w * t).xxx;
   }
   const CaelixMaterial m = GET_MATERIAL(medium);
   return exp(-(1.0f - m.albedo) * t * m.extinction);
+}
+
+// One segment of length t in `medium` that ENDS ON A SURFACE (t = 0 for a miss): the throughput
+// loses the transmission; in the air with fog, the fog's emission along the segment,
+// fog_color (1 - transmission), is added to `radiance` with the throughput before the segment.
+void TraverseSegment(CaelixFrameConstants fc, uint medium, float t, inout float3 throughput,
+                     inout float3 radiance) {
+  const float3 transmission = MediumExtinction(fc, medium, t);
+  if (medium == 0u && fc.fog_color.w > 0.0f) {
+    radiance += throughput * fc.fog_color.rgb * (1.0f - transmission);
+  }
+  throughput *= transmission;
 }
 
 // One reflect-or-refract decision at a transparent interface, shared by the delta
@@ -245,7 +278,7 @@ CaelixShadeResult ShadeVoxelHit(uint block, float3 hit_position, float3 ray_dire
                                 float3 normal, inout uint rng, inout uint medium) {
   const CaelixMaterial material = GET_MATERIAL(block);
   CaelixShadeResult shade;
-  shade.emission = material.emission;
+  shade.emission = material.emission * g_emissionScale;
   shade.k = 1.0f;
   CAELIX_BRANCH
   if (!IsOpaque(int(block))) {
@@ -286,24 +319,96 @@ float3 SanitizeRadiance(float3 radiance) {
 }
 
 // ---------------------------------------------------------------------------
-// Sky (NATIVE: procedural; Unity samples a PBR sky cubemap)
+// Sky (NATIVE: the host's cubemap or a procedural sky; Unity samples a PBR sky cubemap)
 
-// Above the horizon lerp(horizon, zenith, sqrt(dir.y)), below it
+// The 9 real spherical harmonics basis functions (bands 0..2, Ramamoorthi and Hanrahan
+// 2001) at the unit direction d. Shared by the SH projection kernel (caelix_sky_sh.hlsl)
+// and the irradiance lookup below, so both use the same order and constants.
+void CaelixShBasis(float3 d, out float basis[9]) {
+  basis[0] = 0.282095f;
+  basis[1] = 0.488603f * d.y;
+  basis[2] = 0.488603f * d.z;
+  basis[3] = 0.488603f * d.x;
+  basis[4] = 1.092548f * d.x * d.y;
+  basis[5] = 1.092548f * d.y * d.z;
+  basis[6] = 0.315392f * (3.0f * d.z * d.z - 1.0f);
+  basis[7] = 1.092548f * d.x * d.z;
+  basis[8] = 0.546274f * (d.x * d.x - d.y * d.y);
+}
+
+// Procedural sky: above the horizon lerp(horizon, zenith, sqrt(dir.y)), below it
 // lerp(horizon, ground, sqrt(-dir.y)). No sun disk.
-float3 SkyRadianceNoSun(CaelixFrameConstants fc, float3 direction) {
+float3 ProceduralSky(CaelixFrameConstants fc, float3 direction) {
   if (direction.y >= 0.0f) {
     return lerp(fc.sky_horizon.xyz, fc.sky_zenith.xyz, sqrt(saturate(direction.y)));
   }
   return lerp(fc.sky_horizon.xyz, fc.sky_ground.xyz, sqrt(saturate(-direction.y)));
 }
 
-// The sky plus the sun radiance inside the sun disk (dot(direction, sun_dir) > cos r).
-float3 SkyRadiance(CaelixFrameConstants fc, float3 direction) {
-  float3 sky = SkyRadianceNoSun(fc, direction);
-  if (dot(direction, fc.sun_dir.xyz) > fc.sun_cos_radius) {
-    sky += fc.sun_radiance.xyz;
+// The sky without the sun disk: the cubemap at mip `lod` (clamped to the last mip) when
+// the host gave one, else the procedural sky (lod ignored).
+float3 SkyRadianceNoSunLod(CaelixFrameConstants fc, float3 direction, float lod) {
+#ifdef CAELIX_SKY_BINDING_IMAGE
+  CAELIX_BRANCH
+  if (fc.sky_cubemap != 0u) {
+    return g_sky.SampleLevel(g_sky_sampler, direction, min(lod, fc.sky_max_lod)).rgb;
   }
-  return sky;
+#endif
+  return ProceduralSky(fc, direction);
+}
+
+// The sky without the sun disk at full resolution (mip 0).
+float3 SkyRadianceNoSun(CaelixFrameConstants fc, float3 direction) {
+  return SkyRadianceNoSunLod(fc, direction, 0.0f);
+}
+
+// The sun radiance inside the sun disk (dot(direction, sun_dir) > cos r), else 0.
+float3 SunDisk(CaelixFrameConstants fc, float3 direction) {
+  return dot(direction, fc.sun_dir.xyz) > fc.sun_cos_radius ? fc.sun_radiance.xyz
+                                                              : float3(0.0f, 0.0f, 0.0f);
+}
+
+// The sky plus the sun radiance inside the sun disk.
+float3 SkyRadiance(CaelixFrameConstants fc, float3 direction) {
+  return SkyRadianceNoSun(fc, direction) + SunDisk(fc, direction);
+}
+
+// The irradiance of the cubemap sky at a surface with unit normal `normal`, divided by
+// pi: the 9 coefficients at fc.sky_sh (already convolved with the clamped cosine) at the
+// normal. Only valid when fc.sky_cubemap = 1.
+float3 SkyIrradianceOverPi(CaelixFrameConstants fc, float3 normal) {
+  float basis[9];
+  CaelixShBasis(normal, basis);
+  float3 sum = float3(0.0f, 0.0f, 0.0f);
+  CAELIX_UNROLL
+  for (uint i = 0; i < 9; ++i) {
+    sum += asfloat(CAELIX_LOAD_U32x4(fc.sky_sh + uint64_t(i) * 16)).rgb * basis[i];
+  }
+  return max(sum, 0.0f) * (1.0f / K_PI);
+}
+
+// The radiance that a DIFFUSE bounce ray (cosine-weighted around `normal`, direction
+// `direction`) receives when it misses. Cubemap: the SH irradiance / pi, the same value
+// for every direction (a low-noise estimate of the cosine-weighted sky; it ignores which
+// part of the sky the scene hides, so it is biased by the sky visibility), plus the sun
+// disk when `sees_sun` (the cubemap has no sun). Procedural: the sky in `direction`,
+// with the sun disk when `sees_sun` (unchanged from before the cubemap).
+float3 SkyDiffuseMiss(CaelixFrameConstants fc, float3 normal, float3 direction, bool sees_sun) {
+  const float3 sun = sees_sun ? SunDisk(fc, direction) : float3(0.0f, 0.0f, 0.0f);
+  CAELIX_BRANCH
+  if (fc.sky_cubemap != 0u) {
+    return SkyIrradianceOverPi(fc, normal) + sun;
+  }
+  return ProceduralSky(fc, direction) + sun;
+}
+
+// The radiance that a SPECULAR bounce ray of a lobe with roughness `roughness` (1 -
+// smoothness, 0 for a delta lobe) receives when it misses: the sky at the mip
+// roughness * (mip_levels - 1) (the procedural sky ignores it), plus the sun disk when
+// `sees_sun`.
+float3 SkySpecularMiss(CaelixFrameConstants fc, float3 direction, float roughness, bool sees_sun) {
+  const float3 sun = sees_sun ? SunDisk(fc, direction) : float3(0.0f, 0.0f, 0.0f);
+  return SkyRadianceNoSunLod(fc, direction, roughness * fc.sky_max_lod) + sun;
 }
 
 // ---------------------------------------------------------------------------

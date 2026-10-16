@@ -30,6 +30,18 @@
 //                   primary hit (PSR): G-buffer, shading and emission, all times the
 //                   chain's transmission, depth = chain length along the camera ray.
 //                   Materials come from the scene's material table (GET_MATERIAL).
+//                   Fog (fog_color.w > 0): every segment in the air that ends on
+//                   a surface (the camera ray, the air gaps of the delta chain,
+//                   every bounce segment) is attenuated by exp(-density t) and
+//                   gains fog_color (1 - that) (TraverseSegment): the chain's in-
+//                   scattering goes to the deterministic target, a bounce
+//                   segment's to the stochastic radiance. Misses and shadow rays
+//                   see no fog. Sky (sky_cubemap = 1): primary misses and the
+//                   chain's sky end sample the host cubemap at mip 0, a specular
+//                   bounce that misses at the mip of its roughness, a diffuse
+//                   bounce that misses receives the irradiance SH / pi that
+//                   caelix_sky_sh.hlsl projected before this dispatch
+//                   (SkyDiffuseMiss, SkySpecularMiss).
 //
 // Inputs: the push constant is the device address of the frame constants; the
 // scene's tables (page table, slot rows, group infos, entity infos) are read
@@ -37,10 +49,13 @@
 // six host targets (bindings 1..6, no format qualifier: format Unknown in SPIR-V,
 // needs shaderStorageImageWriteWithoutFormat, so every write is a float4 and the
 // image keeps the components its format has) and the internal targets of the
-// lighting modes (bindings 7..13, fixed formats). Every binding is
-// PARTIALLY_BOUND: the library writes only the TLAS (when the scene has one), the
-// present targets and, in the lighting modes, the internal targets, and the
-// kernel touches a binding only then (has_tlas, target_mask, mode).
+// lighting modes (bindings 7..13, fixed formats), the sky cubemap (binding 14,
+// sampled image) and its sampler (binding 15). Every binding is PARTIALLY_BOUND:
+// the library writes only the TLAS (when the scene has one), the present targets
+// and, in the lighting modes, the internal targets, and the kernel touches a
+// binding only then (has_tlas, target_mask, mode). Bindings 14 and 15 are written
+// every frame (the host's cubemap, or a 1 x 1 fallback cube that is never sampled
+// because sky_cubemap is 0).
 //
 // Instances: instanceCustomIndex (CandidateInstanceID()) is the scene-wide group
 // index, the primitive index is the dense brick id inside the group, and the
@@ -51,6 +66,9 @@
 #include "common/caelix_block.hlsl"
 #include "render/caelix_brick_trace.hlsl"
 #include "common/caelix_material.hlsl"
+// The sky cubemap and its sampler (caelix_shading.hlsl declares them).
+#define CAELIX_SKY_BINDING_IMAGE 14
+#define CAELIX_SKY_BINDING_SAMPLER 15
 #include "render/caelix_shading.hlsl"
 // NRD's front-end packing (normal + roughness, radiance + normalized hit distance);
 // NRDConfig.hlsli next to it fixes the encodings NRD was built with.
@@ -270,6 +288,7 @@ struct DeltaChain {
                          // (the primary miss when the camera ray hit nothing)
   RayDesc ray;           // the ray that found `surface`
   float3 throughput;     // transmission of the chain (extinction; k = 1 at every interface)
+  float3 inscatter;      // fog emission gathered along the chain's air segments (radiance)
   float t_virtual;       // chain length up to `geometry` (PSR depth along the camera ray)
   uint medium;           // the medium `ray` travels in (face-free transparent id, 0 = air)
   uint interfaces;       // interfaces crossed
@@ -287,6 +306,7 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
   c.geometry = primary;
   c.ray = ray;
   c.throughput = float3(1.0f, 1.0f, 1.0f);
+  c.inscatter = float3(0.0f, 0.0f, 0.0f);
   c.t_virtual = 0.0f;
   c.medium = 0u;
   c.interfaces = 0u;
@@ -297,8 +317,8 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
     if (!c.surface.hit) {
       break;
     }
-    // The segment that found this hit ran inside c.medium.
-    c.throughput *= MediumExtinction(c.medium, c.surface.T);
+    // The segment that found this hit ran inside c.medium (the air: fog).
+    TraverseSegment(fc, c.medium, c.surface.T, c.throughput, c.inscatter);
     c.t_virtual += c.surface.T;
     c.geometry = c.surface;
     if (c.interfaces >= budget) {
@@ -343,8 +363,11 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // The path tracer at the primary surface (Unity CaelixPathTraceMain, "Further
 // Bounces"): shades the surface `surface` found by `ray` (the last ray of the delta
 // chain) in medium `medium`, then traces up to bounce_count stochastic segments.
-// Every segment is attenuated by the medium it runs in (MediumExtinction; a miss has
-// T = 0). Returns the surface's shade result; `stochastic` receives (incident
+// Every segment is attenuated by the medium it runs in and gains the fog's emission
+// in the air (TraverseSegment; a miss has T = 0). A segment that misses receives the
+// sky of its lobe: SkyDiffuseMiss (the irradiance SH of a cubemap sky) after a
+// diffuse vertex, SkySpecularMiss (the cubemap mip of the lobe's roughness) after a
+// specular one. Returns the surface's shade result; `stochastic` receives (incident
 // radiance, hit distance of the first segment). The incident radiance does not
 // include the delta chain's throughput: the caller applies it to the albedo.
 //
@@ -376,6 +399,11 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
   float first_segment_t = fc.bounce_count >= 1u ? fc.t_max : 0.0f;
   bool first_segment = true;
 
+  // The lobe of the current segment (the sky it receives on a miss).
+  float3 segment_normal = surface.normal;
+  bool segment_diffuse = !primary_shade.specular_lobe;
+  float segment_roughness = primary_shade.roughness;
+
   // NEE at the primary vertex (demodulated: throughput 1 / k).
   bool segment_sees_sun = true;
   CAELIX_BRANCH
@@ -397,11 +425,14 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
   CAELIX_LOOP
   for (; bounce_index <= fc.bounce_count;) {
     const TraceResult hit = TraceScene(fc, bounce);
-    // The segment ran inside `medium` (a miss has T = 0: the sky is not attenuated).
-    throughput *= MediumExtinction(medium, hit.T);
+    // The segment ran inside `medium` (a miss has T = 0: the sky is not attenuated and
+    // the fog adds nothing).
+    TraverseSegment(fc, medium, hit.T, throughput, radiance);
     if (!hit.hit) {
-      radiance += (segment_sees_sun ? SkyRadiance(fc, bounce.Direction)
-                                    : SkyRadianceNoSun(fc, bounce.Direction)) * throughput;
+      radiance += (segment_diffuse
+                       ? SkyDiffuseMiss(fc, segment_normal, bounce.Direction, segment_sees_sun)
+                       : SkySpecularMiss(fc, bounce.Direction, segment_roughness, segment_sees_sun)) *
+                  throughput;
       break;
     }
     if (first_segment) {
@@ -433,6 +464,9 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
 
     bounce.Origin = shade.bounce_origin;
     bounce.Direction = shade.bounce_direction;
+    segment_normal = hit.normal;
+    segment_diffuse = !shade.specular_lobe;
+    segment_roughness = shade.roughness;
   }
   stochastic = float4(SanitizeRadiance(radiance), first_segment_t);
   return primary_shade;
@@ -456,6 +490,7 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
   }
   g_blockEncoding = fc.encoding;
   g_materialTable = fc.materials;
+  g_emissionScale = fc.emission_scale;
 
   // Pixel -> ray. Row 0 is the top row of the image.
   RayDesc ray;
@@ -620,8 +655,9 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
       if (chain.split) {
         material_albedo *= 0.5f;
       }
-      // Primary emission is deterministic: nothing was sampled to obtain it.
-      deterministic = chain.throughput * shade.emission;
+      // Primary emission is deterministic: nothing was sampled to obtain it; so is the
+      // fog's emission along the chain.
+      deterministic = chain.throughput * shade.emission + chain.inscatter;
       bool specular_target = shade.specular_lobe;
       float nrd_roughness = shade.roughness;
 #if CAELIX_PSR_LOBE == 0
@@ -648,7 +684,7 @@ void main(uint3 thread_id : SV_DispatchThreadID) {
     } else if (hit) {
       // The chain went through at least one interface and left the scene: the sky in
       // the last direction times the transmission (Unity: delta miss).
-      deterministic = chain.throughput * SkyRadiance(fc, chain.ray.Direction);
+      deterministic = chain.throughput * SkyRadiance(fc, chain.ray.Direction) + chain.inscatter;
     }
     g_int_normal_roughness[pixel] = normal_roughness;
     // Coverage is albedo.a.

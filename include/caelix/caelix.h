@@ -58,7 +58,8 @@ extern "C" {
    CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD (a new flag bit) and the RGBA formats of the motion target
    (w = the checkerboard flag), also without a bump. The Unity plugin step (P3) appended
    CaelixCamera::jitter and added CAELIX_RENDER_FLAG_FLIP_Y (a new flag bit), also without a
-   bump. A host
+   bump. The sky/fog/emission step appended emission_scale, fog_density, fog_color, pad3 and sky
+   (CaelixSkyCubemap) to CaelixRenderOptions, also without a bump. A host
    built against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -482,6 +483,11 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
  *                          into an internal RGBA32F image (running mean since the last reset) and
  *                          writes the mean. Use a static camera and a new frame_seed every frame.
  *                          Never denoised.
+ * Sky and fog of the lighting modes: the host can pass a sky cubemap per render call
+ * (CaelixRenderOptions::sky, CaelixSkyCubemap); without it the procedural sky (sky_zenith,
+ * sky_horizon, sky_ground) is used. CaelixRenderOptions::fog_density / fog_color make the air a
+ * homogeneous absorbing and emitting medium for every segment that ends on a surface;
+ * emission_scale multiplies every material's emission in every mode.
  * In the two lighting modes the renderer owns internal targets (about 90 bytes per pixel) sized to
  * the host's targets; they are created at the first lighting render and recreated when the target
  * size changes. The NRD instance (its own pools, see caelix_renderer_get_nrd_info) is created at the
@@ -655,6 +661,30 @@ typedef enum CaelixDebugView {
                                                 flipped: an image rendered with the flag is the
                                                 image rendered without it, mirrored in y. */
 
+/* A cubemap of the sky for the lighting modes, given per render call like a target. A cube image
+   (VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, 6 layers in the Vulkan face order +X, -X, +Y, -Y, +Z,
+   -Z, SAMPLED usage, a colour format that supports linear filtering), sampled with the world
+   direction (Y up, +Z forward, as CaelixCamera). It must NOT contain the sun disk: the sun stays
+   CaelixRenderOptions::sun_dir / sun_radiance (with CAELIX_RENDER_FLAG_SUN_NEE). Where it is used:
+   a primary miss and a delta chain that ends in the sky sample mip 0; a specular bounce that
+   misses samples mip roughness * (mip_levels - 1) (roughness = 1 - smoothness of the lobe);
+   a diffuse bounce that misses receives irradiance(normal) / pi from a 9-coefficient spherical
+   harmonic (L2) that the renderer projects from the cubemap every render call (one compute
+   dispatch over a 32 x 32 x 6 sampling of the cubemap, part of trace_ms): a low-noise,
+   slightly biased estimate (irradiance times cosine-weighted sky visibility). The library creates
+   and caches a cube image view (as for the targets) and does NOT transition the image: the host
+   gives it in `layout`, with its own writes made visible to compute-shader sampled reads, and
+   keeps it there for the whole render call. With image 0 the renderer
+   uses the procedural sky (sky_zenith, sky_horizon, sky_ground) everywhere, as before. */
+typedef struct CaelixSkyCubemap {
+  uint64_t image;       /* VkImage; 0 = no cubemap */
+  uint32_t format;      /* VkFormat */
+  uint32_t layout;      /* VkImageLayout the image is in during the render call
+                           (SHADER_READ_ONLY_OPTIMAL or GENERAL) */
+  uint32_t size;        /* face width = height in pixels (>= 1) */
+  uint32_t mip_levels;  /* mip levels of the image (>= 1); the library samples up to the last */
+} CaelixSkyCubemap;
+
 /* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
 typedef struct CaelixRenderOptions {
   uint32_t debug_view;  /* CaelixDebugView; read in CAELIX_MODE_PRIMARY (views 0..5, 9) and
@@ -710,6 +740,18 @@ typedef struct CaelixRenderOptions {
                                   radiance times the transmission (coverage 1). Opaque surfaces always
                                   end the chain (smooth metals reflect through the stochastic
                                   specular lobe, as in Unity). */
+  float emission_scale;  /* every mode: multiplies the emission of every material (both encodings)
+                            at every hit, primary and bounce. 0 is treated as 1. */
+  float fog_density;     /* lighting modes: extinction of the air (the medium outside glass) per
+                            world unit. 0 = no fog. A segment of length t that ends on a surface
+                            has the transmission exp(-fog_density * t) and adds
+                            fog_color * (1 - that); the camera ray, the air gaps of the delta chain
+                            and every bounce segment. A segment that leaves the scene (a miss) is not
+                            affected: the sky stays sharp, so choose a fog colour near the horizon
+                            colour. No fog inside glass (its own extinction). Shadow rays ignore it. */
+  float fog_color[3];    /* radiance of the fog, linear RGB (exposure applies) */
+  float pad3;
+  CaelixSkyCubemap sky;  /* lighting modes: the sky cubemap; image 0 = the procedural sky */
 } CaelixRenderOptions;
 
 /* The images of one render call. A target is PRESENT when its `image` is nonzero; an absent target
@@ -767,10 +809,15 @@ typedef struct CaelixRenderTargets {
    Returns CAELIX_ERROR_INVALID_ARGUMENT for a null argument, no present target, a present target
    without format or size, present targets of different sizes, one image in two targets, a geometry
    target format outside its list above, an unknown debug view, an unknown mode, a bounce_count above
-   CAELIX_MAX_BOUNCES, a bounce_count_transparent above CAELIX_MAX_BOUNCES_TRANSPARENT, a frame number not above safe_frame_number, or a ninth frame in flight;
+   CAELIX_MAX_BOUNCES, a bounce_count_transparent above CAELIX_MAX_BOUNCES_TRANSPARENT, a frame number not above safe_frame_number, a ninth frame in flight,
+   a sky image (CaelixRenderOptions::sky) with format VK_FORMAT_UNDEFINED, size 0, mip_levels 0 or
+   layout VK_IMAGE_LAYOUT_UNDEFINED, or a negative or non-finite fog_density or emission_scale;
    CAELIX_ERROR_OUT_OF_MEMORY when the internal targets of the lighting modes or the NRD instance
    cannot be allocated (nothing is recorded); CAELIX_ERROR_UNSUPPORTED when a target format
    cannot be written as a storage image without a format qualifier.
+   Sky cubemap (lighting modes with CaelixRenderOptions::sky.image != 0): before the trace the call
+   records one small compute dispatch that projects the cubemap onto the irradiance SH and a
+   barrier; both lie inside the trace timestamps (trace_ms).
    Denoising (CaelixRenderOptions::denoise): between the trace and the composite the call records
    NRD's dispatches (about 30 per frame, each after a global compute-to-compute memory barrier)
    between two timestamps. When NRD itself reports an error (instance creation, settings, dispatch
@@ -785,14 +832,17 @@ CAELIX_API CaelixResult caelix_renderer_render(CaelixRenderer* renderer, const C
 /* Destroys every cached image view. Call it before the host destroys target images, for example
    when it recreates its swapchain: a new image can get the handle of a destroyed one, and the
    cache would then hand out a view of the destroyed image. Every frame that used the views must
-   have completed (for example after vkDeviceWaitIdle). NULL is ignored. */
+   have completed (for example after vkDeviceWaitIdle). The cached cube views of sky cubemaps
+   (CaelixRenderOptions::sky) are released too: a host that recreates its cubemap calls it the same
+   way. NULL is ignored. */
 CAELIX_API void caelix_renderer_release_target_views(CaelixRenderer* renderer);
 
 /* GPU times of the newest frame whose timestamps were read back. The renderer reads them in a
    render call whose safe_frame_number has reached that frame, so the values trail the current
    frame by the number of frames in flight. */
 typedef struct CaelixGpuTimings {
-  float trace_ms;         /* the trace dispatch of that frame */
+  float trace_ms;         /* the trace dispatch of that frame (with a sky cubemap, the sky SH
+                             dispatch before it too) */
   float flush_ms;         /* caelix_scene_flush of that frame; 0 when the flush recorded no work */
   uint64_t frame_number;  /* the frame the values belong to; 0 = none yet */
   float composite_ms;     /* the composite dispatch of that frame; 0 when it had none (primary mode) */

@@ -1,5 +1,5 @@
 // Renderer::Render: validation, descriptors, frame constants, barriers and the
-// pass sequence (trace, NRD, composite).
+// pass sequence (sky SH, trace, NRD, composite).
 #include "render/renderer.h"
 
 #include "core/log.h"
@@ -7,6 +7,7 @@
 #include "render/renderer_internal.h"
 #include "scene/scene.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iterator>
@@ -52,12 +53,13 @@ bool IsUnormFormat(VkFormat format) {
   }
 }
 
-// The barriers of one vkCmdPipelineBarrier2: image barriers (any layout -> GENERAL)
-// and at most one global memory barrier.
+// The barriers of one vkCmdPipelineBarrier2: image barriers (any layout -> GENERAL; mip 0,
+// `layer_count` layers) and at most one global memory barrier.
 class Barriers {
  public:
   void Image(VkImage image, VkImageLayout old_layout, VkPipelineStageFlags2 src_stage,
-             VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+             VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
+             uint32_t layer_count = 1) {
     VkImageMemoryBarrier2& barrier = images_[image_count_++];
     barrier = VkImageMemoryBarrier2{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     barrier.srcStageMask = src_stage;
@@ -70,6 +72,7 @@ class Barriers {
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
     barrier.subresourceRange = kColorRange;
+    barrier.subresourceRange.layerCount = layer_count;
   }
   void Memory(VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
               VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
@@ -93,7 +96,8 @@ class Barriers {
   }
 
  private:
-  VkImageMemoryBarrier2 images_[std::size(kTargetSpecs) + std::size(kInternalSpecs)] = {};
+  // The targets, the internal targets and the fallback sky cube.
+  VkImageMemoryBarrier2 images_[std::size(kTargetSpecs) + std::size(kInternalSpecs) + 1] = {};
   uint32_t image_count_ = 0;
   VkMemoryBarrier2 memory_{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
   bool has_memory_ = false;
@@ -139,7 +143,28 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                 options.bounce_count_transparent, CAELIX_MAX_BOUNCES_TRANSPARENT);
     return CAELIX_ERROR_INVALID_ARGUMENT;
   }
+  if (!std::isfinite(options.fog_density) || options.fog_density < 0.0f) {
+    CAELIX_LOGE("%s: fog_density %g must be finite and >= 0", kFunction,
+                static_cast<double>(options.fog_density));
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  if (!std::isfinite(options.emission_scale) || options.emission_scale < 0.0f) {
+    CAELIX_LOGE("%s: emission_scale %g must be finite and >= 0", kFunction,
+                static_cast<double>(options.emission_scale));
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
+  if (options.sky.image != 0 &&
+      (options.sky.format == VK_FORMAT_UNDEFINED || options.sky.size == 0 ||
+       options.sky.mip_levels == 0 || options.sky.layout == VK_IMAGE_LAYOUT_UNDEFINED)) {
+    CAELIX_LOGE("%s: the sky cubemap needs a format, a size, mip levels and a layout (VkFormat %u, "
+                "size %u, mip_levels %u, VkImageLayout %u)",
+                kFunction, options.sky.format, options.sky.size, options.sky.mip_levels,
+                options.sky.layout);
+    return CAELIX_ERROR_INVALID_ARGUMENT;
+  }
   const bool lighting = options.mode != CAELIX_MODE_PRIMARY;
+  // The host's sky cubemap (lighting modes only; the primary mode never samples the sky).
+  const bool sky = lighting && options.sky.image != 0;
 
   // The present targets (image != 0), in binding order.
   const CaelixTargetImage* const all[kTargetCount] = {&targets.color,  &targets.albedo,
@@ -253,21 +278,40 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
       VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
   as_write.accelerationStructureCount = 1;
   as_write.pAccelerationStructures = &tlas;
-  constexpr uint32_t kMaxWrites =
-      1 + kTargetCount + kTraceInternalCount + kCompositeBindingCount;
+  // The trace set (TLAS, targets, internal targets, sky image + sampler) and the sky
+  // set (sky image + sampler) in one update; the composite set in a second one.
+  constexpr uint32_t kMaxWrites = kTraceBindingCount + 2;
+  static_assert(kMaxWrites >= kCompositeBindingCount);
   VkDescriptorImageInfo image_infos[kMaxWrites];
   VkWriteDescriptorSet writes[kMaxWrites];
   uint32_t write_count = 0;
-  const auto write_image = [&](VkDescriptorSet set, uint32_t binding, VkImageView view) {
-    image_infos[write_count] = {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
+  const auto write_descriptor = [&](VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+                                    const VkDescriptorImageInfo& info) {
+    image_infos[write_count] = info;
     VkWriteDescriptorSet& write = writes[write_count];
     write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = set;
     write.dstBinding = binding;
     write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.descriptorType = type;
     write.pImageInfo = &image_infos[write_count];
     ++write_count;
+  };
+  const auto write_image = [&](VkDescriptorSet set, uint32_t binding, VkImageView view) {
+    write_descriptor(set, binding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                     {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
+  };
+  // The sky cubemap: the host's (in its layout) or the fallback cube (GENERAL, never
+  // sampled: sky_cubemap = 0); the sampler is the renderer's.
+  const VkImageView sky_view =
+      sky ? SkyViewFor(options.sky, frame.frame_number, safe) : fallback_sky_.view();
+  const VkImageLayout sky_layout =
+      sky ? static_cast<VkImageLayout>(options.sky.layout) : VK_IMAGE_LAYOUT_GENERAL;
+  const auto write_sky = [&](VkDescriptorSet set, uint32_t binding) {
+    write_descriptor(set, binding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                     {VK_NULL_HANDLE, sky_view, sky_layout});
+    write_descriptor(set, binding + 1, VK_DESCRIPTOR_TYPE_SAMPLER,
+                     {sky_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
   };
   if (tlas != VK_NULL_HANDLE) {
     VkWriteDescriptorSet& write = writes[write_count++];
@@ -295,6 +339,10 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     for (uint32_t i = 0; i < kTraceInternalCount; ++i) {
       write_image(slot->set, 1 + kTargetCount + i, internal_[i].view());
     }
+  }
+  write_sky(slot->set, kTraceSkyBinding);
+  if (sky) {
+    write_sky(slot->sky_set, 0);
   }
   vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
 
@@ -382,11 +430,27 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
   constants.hit_dist_params[0] = hit_distance.A;
   constants.hit_dist_params[1] = hit_distance.B;
   constants.hit_dist_params[2] = hit_distance.C;
+  // Fog (lighting modes), emission scale (every mode), sky cubemap (lighting modes).
+  if (lighting) {
+    Copy3(options.fog_color, constants.fog_color);
+    constants.fog_color[3] = options.fog_density;
+  }
+  constants.emission_scale = options.emission_scale > 0.0f ? options.emission_scale : 1.0f;
+  constants.sky_sh = sky_sh_buffer_.address();
+  if (sky) {
+    constants.sky_cubemap = 1;
+    constants.sky_max_lod = static_cast<float>(options.sky.mip_levels - 1);
+    // The mip whose face is about 32 px (the SH kernel's 32 x 32 sampling per face).
+    constants.sky_sh_lod = std::clamp(std::log2(static_cast<float>(options.sky.size)) - 5.0f, 0.0f,
+                                      constants.sky_max_lod);
+  }
 
   // Any earlier use of the host targets (the host's acquire chains into
   // ALL_COMMANDS) -> the kernels' writes. Lighting modes: the internal targets'
   // first use (UNDEFINED -> GENERAL), else a memory barrier that orders the
-  // previous frame's kernel reads and writes before this frame's.
+  // previous frame's kernel reads and writes before this frame's (also the previous
+  // frame's reads of sky_sh_buffer_ before this frame's SH write). The first render
+  // call moves the fallback sky cube to GENERAL.
   {
     Barriers before;
     for (uint32_t p = 0; p < present_count; ++p) {
@@ -409,18 +473,37 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
+    if (fallback_sky_needs_init_) {
+      before.Image(fallback_sky_.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_NONE,
+                   VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, fallback_sky_.layers());
+    }
     before.Record(cmd);
+    fallback_sky_needs_init_ = false;
   }
   const TracePush push{slot->constants.address()};
 
+  const uint32_t groups_x = (width + kWorkgroupSize - 1) / kWorkgroupSize;
+  const uint32_t groups_y = (height + kWorkgroupSize - 1) / kWorkgroupSize;
+  timer_.Begin(cmd, frame.frame_number, safe);
+  // Sky SH (host cubemap): one workgroup projects the cubemap into sky_sh_buffer_; the
+  // barrier orders that write before the trace's reads. Inside the trace timestamps.
+  if (sky) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sky_sh_.pipeline());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sky_sh_.layout(), 0, 1,
+                            &slot->sky_set, 0, nullptr);
+    vkCmdPushConstants(cmd, sky_sh_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    Barriers sh_written;
+    sh_written.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    sh_written.Record(cmd);
+  }
   // Trace.
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace_.pipeline());
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace_.layout(), 0, 1, &slot->set,
                           0, nullptr);
   vkCmdPushConstants(cmd, trace_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-  const uint32_t groups_x = (width + kWorkgroupSize - 1) / kWorkgroupSize;
-  const uint32_t groups_y = (height + kWorkgroupSize - 1) / kWorkgroupSize;
-  timer_.Begin(cmd, frame.frame_number, safe);
   vkCmdDispatch(cmd, groups_x, groups_y, 1);
   timer_.End(cmd);
 
@@ -456,7 +539,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
 
   // Composite (lighting modes with a colour target). Bindings 3 and 4 hold NRD's
   // outputs when this frame was denoised, else the raw radiance.
-  // Binding 7 is the motion of the primary hit (CAELIX_VIEW_MOTION).
+  // Binding 7 is the motion of the primary hit (CAELIX_VIEW_MOTION); 9 and 10 the sky.
   if (composite) {
     write_count = 0;
     write_image(slot->composite_set, 0, color_view);
@@ -464,10 +547,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         kInternalAlbedo, kInternalDeterministic, denoised ? kInternalDiffOut : kInternalDiff,
         denoised ? kInternalSpecOut : kInternalSpec, kInternalAccum, kInternalValidation,
         kInternalMotion, kInternalResolve};
-    static_assert(std::size(composite_internals) + 1 == kCompositeBindingCount);
+    static_assert(std::size(composite_internals) + 1 == kCompositeStorageCount);
     for (uint32_t i = 0; i < std::size(composite_internals); ++i) {
       write_image(slot->composite_set, 1 + i, internal_[composite_internals[i]].view());
     }
+    write_sky(slot->composite_set, kCompositeSkyBinding);
     vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
 
     Barriers between;

@@ -1,7 +1,6 @@
 // Per-frame constants of the trace and composite kernels. Mirrors
 // lib/src/render/frame_constants.h; change both together. The kernel's only push constant is the device address of
-// one CaelixFrameConstants (512 bytes on the CPU side; the tail is padding and is
-// not declared here). Every field sits at an offset that is a multiple of its
+// one CaelixFrameConstants (528 bytes). Every field sits at an offset that is a multiple of its
 // size, so std430 and scalar layout rules give the same offsets.
 #ifndef CAELIX_FRAME_HLSL
 #define CAELIX_FRAME_HLSL
@@ -62,6 +61,14 @@ struct CaelixFrameConstants {
   uint cross_resolve;       // 464  1 = composite -> resolve image -> caelix_cross_resolve -> colour
   uint pad_468;             // 468
   float2 jitter;            // 472  CaelixCamera::jitter: sub-pixel offset of the primary sample (pixels, y down)
+  float4 fog_color;         // 480  rgb = fog radiance, w = fog density per unit (0 = no fog)
+  uint64_t sky_sh;          // 496  address of 9 float4 (rgb, 0): irradiance SH coefficients, valid when sky_cubemap = 1
+  float emission_scale;     // 504  multiplies every material's emission (>= 0, never 0)
+  uint sky_cubemap;         // 508  1 = sample the host cubemap (g_sky), 0 = procedural sky
+  float sky_max_lod;        // 512  mip_levels - 1 of the cubemap
+  float sky_sh_lod;         // 516  the mip the SH kernel samples (face about 32 px)
+  uint pad_520;             // 520
+  uint pad_524;             // 524  -> 528
 };
 
 struct CaelixTracePush {

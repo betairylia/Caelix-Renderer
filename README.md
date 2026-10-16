@@ -294,10 +294,14 @@ flush builds the TLAS that the render binds.
 - NRD (`lib/src/render/nrd_executor.*`, path trace mode with `denoise = 1`): NRD's
   own compute dispatches between the trace and the composite (see "Denoising
   (step 6b)" below).
+- Sky SH kernel `shaders/render/caelix_sky_sh.hlsl`, one workgroup of 256, lighting
+  modes with a host sky cubemap only: projects the cubemap onto 9 irradiance SH
+  coefficients before the trace (see "Sky cubemap, fog, emission scale" below).
 - Shading helpers `shaders/render/caelix_shading.hlsl`: block colours (debug
   views), the random stream, the shading rule (opaque and transparent), the
-  interface decision of the delta chain, the medium extinction and the
-  procedural sky. Materials come from the scene's material table
+  interface decision of the delta chain, the medium extinction, the fog of the
+  air and the sky (procedural or the host's cubemap). Materials come from the
+  scene's material table
   (`shaders/common/caelix_material.hlsl`, see "Materials and glass (step 6d)").
 - Brick DDA `shaders/render/caelix_brick_trace.hlsl`: a copy of Unity's
   `CaelixBrickTrace.hlsl` (2-level occupancy DDA on the 8^3 brick, tight
@@ -311,26 +315,30 @@ flush builds the TLAS that the render binds.
 - Inputs: one descriptor set (binding 0 the TLAS, bindings 1..6 the colour,
   albedo, normal, depth, motion and view_z targets as storage images without a
   format qualifier, bindings 7..13 the internal targets of the lighting modes
-  with fixed formats) and one push constant, the device address of a 512-byte
+  with fixed formats, binding 14 the sky cubemap as a sampled image and 15 its
+  sampler) and one push constant, the device address of a 528-byte
   `CaelixFrameConstants` block (`shaders/common/caelix_frame.hlsl`,
   `lib/src/render/frame_constants.h`): camera, target size, the addresses of the page
   table, slot tables, group infos, entity infos and the material table, the record layout, group
   shift, encoding, view, flags, sun and sky, the rows of the host projection,
   the previous render call's camera, the present-target mask, the miss values,
   `has_prev_camera` / `has_tlas`, and the lighting parameters (mode, bounces,
-  seed, accumulation count, exposure, sun and sky, sRGB output, `t_max`). The
-  composite kernel has its own set (binding 0 the colour target, bindings 1..7
-  internal targets) and the same push constant. Every binding is `PARTIALLY_BOUND`
+  seed, accumulation count, exposure, sun and sky, sRGB output, `t_max`, fog,
+  emission scale, sky cubemap parameters and the SH buffer address). The
+  composite kernel has its own set (binding 0 the colour target, bindings 1..8
+  internal targets, 9 the sky cubemap, 10 its sampler) and the same push
+  constant. Every binding is `PARTIALLY_BOUND`
   (`VkDescriptorSetLayoutBindingFlagsCreateInfo`): a render call writes only the
   TLAS (when the scene has one) and the present targets, and the kernel touches
   a binding only when its bit is set. Absent targets and a scene without a TLAS
-  therefore need no dummy descriptors.
-- Per-frame resources: a ring of slots (two descriptor sets + host-visible
-  constants buffer), 3 at first, grown up to 8 when a slot's frame is not safe
-  yet.
-- Image views: one per target image, cached (16; the least recently used view
-  is destroyed once its frame is safe). `caelix_renderer_release_target_views`
-  destroys all of them; call it before the host destroys target images (a new
+  therefore need no dummy descriptors. The sky bindings are written every call
+  (the host's cubemap or a 1 x 1 fallback cube that is never sampled).
+- Per-frame resources: a ring of slots (three descriptor sets: trace, composite,
+  sky SH; + host-visible constants buffer), 3 at first, grown up to 8 when a
+  slot's frame is not safe yet.
+- Image views: one per target image and one cube view per sky cubemap, cached
+  (16; the least recently used view is destroyed once its frame is safe).
+  `caelix_renderer_release_target_views` destroys all of them; call it before the host destroys target images (a new
   image can reuse the handle of a destroyed one).
 - Before the scene's first TLAS build, the kernel still runs but does not
   start a ray query (`has_tlas` = 0): every pixel gets the sky colour and the
@@ -346,7 +354,8 @@ flush builds the TLAS that the render binds.
   for transparent codes, 50 % with white for emitters, air magenta.
 - GPU timings: two timestamps around each dispatch, read back in
   a later render call whose safe frame has reached that frame;
-  `caelix_renderer_get_gpu_timings` returns `trace_ms`, `denoise_ms` (0 for
+  `caelix_renderer_get_gpu_timings` returns `trace_ms` (with the sky SH dispatch
+  when there is a cubemap), `denoise_ms` (0 for
   a frame without NRD), `composite_ms` (0 in the primary mode; includes the
   cross resolve), `flush_ms` and
   the frame they belong to.
@@ -397,6 +406,13 @@ mean of the raw estimate.
   disk (`sun_angular_radius` r, default 0.5 degrees). The disk subtends
   `omega = 2 pi (1 - cos r)` (2.39e-4 sr at 0.5 degrees), so a surface facing
   the sun receives the irradiance `sun_radiance * omega`.
+- Sky cubemap, fog, emission scale (`CaelixRenderOptions::sky`, `fog_density`,
+  `fog_color`, `emission_scale`): a host cubemap replaces the procedural sky
+  (primary misses and the delta chain's sky end at mip 0, specular bounce misses
+  at mip `roughness * (mip_levels - 1)`, diffuse bounce misses the L2 SH irradiance
+  / pi); the air is a homogeneous fog on every segment that ends on a surface;
+  every material emission is multiplied by `emission_scale`. See
+  `docs/STEP6_LIGHTING.md`, "Sky cubemap, fog, emission scale (2026-10-16)".
 - Sun next-event estimation (`CAELIX_RENDER_FLAG_SUN_NEE`, the host's
   default; skipped when `sun_radiance` is 0): every vertex that sampled the
   diffuse lobe and has a next segment (the primary hit when

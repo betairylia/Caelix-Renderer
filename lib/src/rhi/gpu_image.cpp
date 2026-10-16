@@ -8,12 +8,27 @@ namespace caelix {
 
 GpuImage::GpuImage(VmaAllocator allocator, VkDevice device, uint32_t width, uint32_t height,
                    VkFormat format, VkImageUsageFlags usage, const char* name) {
+  Create(allocator, device, width, height, format, usage, 1, false, name);
+}
+
+GpuImage GpuImage::Cube(VmaAllocator allocator, VkDevice device, uint32_t size, VkFormat format,
+                        VkImageUsageFlags usage, uint32_t mip_levels, const char* name) {
+  GpuImage image;
+  image.Create(allocator, device, size, size, format, usage, mip_levels, true, name);
+  return image;
+}
+
+void GpuImage::Create(VmaAllocator allocator, VkDevice device, uint32_t width, uint32_t height,
+                      VkFormat format, VkImageUsageFlags usage, uint32_t mip_levels, bool cube,
+                      const char* name) {
+  const uint32_t layers = cube ? 6u : 1u;
   VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  image_info.flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
   image_info.imageType = VK_IMAGE_TYPE_2D;
   image_info.format = format;
   image_info.extent = {width, height, 1};
-  image_info.mipLevels = 1;
-  image_info.arrayLayers = 1;
+  image_info.mipLevels = mip_levels;
+  image_info.arrayLayers = layers;
   image_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_info.usage = usage;
@@ -36,13 +51,15 @@ GpuImage::GpuImage(VmaAllocator allocator, VkDevice device, uint32_t width, uint
   format_ = format;
   width_ = width;
   height_ = height;
+  mip_levels_ = mip_levels;
+  layers_ = layers;
   allocation_bytes_ = info.size;
 
   VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   view_info.image = image_;
-  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
   view_info.format = format;
-  view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, layers};
   result = vkCreateImageView(device, &view_info, nullptr, &view_);
   if (result != VK_SUCCESS) {
     view_ = VK_NULL_HANDLE;
@@ -63,6 +80,8 @@ GpuImage::GpuImage(GpuImage&& other) noexcept
       format_(std::exchange(other.format_, VK_FORMAT_UNDEFINED)),
       width_(std::exchange(other.width_, 0)),
       height_(std::exchange(other.height_, 0)),
+      mip_levels_(std::exchange(other.mip_levels_, 0)),
+      layers_(std::exchange(other.layers_, 0)),
       allocation_bytes_(std::exchange(other.allocation_bytes_, 0)) {}
 
 GpuImage& GpuImage::operator=(GpuImage&& other) noexcept {
@@ -76,6 +95,8 @@ GpuImage& GpuImage::operator=(GpuImage&& other) noexcept {
     format_ = std::exchange(other.format_, VK_FORMAT_UNDEFINED);
     width_ = std::exchange(other.width_, 0);
     height_ = std::exchange(other.height_, 0);
+    mip_levels_ = std::exchange(other.mip_levels_, 0);
+    layers_ = std::exchange(other.layers_, 0);
     allocation_bytes_ = std::exchange(other.allocation_bytes_, 0);
   }
   return *this;
@@ -96,6 +117,8 @@ void GpuImage::Reset() {
   format_ = VK_FORMAT_UNDEFINED;
   width_ = 0;
   height_ = 0;
+  mip_levels_ = 0;
+  layers_ = 0;
   allocation_bytes_ = 0;
 }
 

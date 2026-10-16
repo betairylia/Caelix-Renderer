@@ -23,17 +23,27 @@ class Scene;
 // scene's tables through buffer device addresses in the frame constants; the
 // TLAS and the images are its only descriptors (set 0: binding 0 acceleration
 // structure, bindings 1..6 the host targets colour, albedo, normal, depth,
-// motion, view_z, bindings 7..13 the internal targets of the lighting modes;
-// every binding PARTIALLY_BOUND, so absent targets and a missing TLAS are simply
+// motion, view_z, bindings 7..13 the internal targets of the lighting modes,
+// binding 14 the sky cubemap (sampled image), binding 15 its sampler; every
+// binding PARTIALLY_BOUND, so absent targets and a missing TLAS are simply
 // not written). In the lighting modes the composite kernel
 // (shaders/render/caelix_composite.hlsl, its own set: binding 0 the host colour target,
-// bindings 1..7 internal targets) writes the colour target. In the path trace
+// bindings 1..8 internal targets, 9 the sky cubemap, 10 its sampler) writes the colour
+// target. Sky cubemap (CaelixRenderOptions::sky, lighting modes): before the trace,
+// the sky SH kernel (shaders/render/caelix_sky_sh.hlsl, one workgroup, a third set:
+// binding 0 the cubemap, 1 the sampler) projects it onto 9 irradiance SH coefficients
+// in sky_sh_buffer_ (one per renderer: frames execute in queue order, the lighting
+// modes' first barrier orders the previous frame's reads before the write, a barrier
+// after the dispatch orders the write before the trace); its time is part of the
+// trace timestamps. The sampler is the renderer's own (linear, mipmapped, clamp to
+// edge). Without a host cubemap every sky binding holds fallback_sky_ (a 1 x 1 cube
+// in GENERAL, never sampled because sky_cubemap is 0). In the path trace
 // mode with denoising, NRD (NrdExecutor, REBLUR_DIFFUSE_SPECULAR) runs between
 // the two and the composite reads its outputs instead of the raw radiance; the
 // executor is created at the first denoised render and recreated (history lost)
 // when the size changes, the old one is destroyed once its last frame is safe.
 // Per-frame resources
-// live in a ring of slots (two descriptor sets + 512-byte constants buffer); a
+// live in a ring of slots (three descriptor sets + 528-byte constants buffer); a
 // slot is reused only when its frame is safe. The camera of each successful
 // render call is kept as the previous camera of the next one (motion targets).
 //
@@ -77,9 +87,15 @@ class Renderer {
     kInternalCount
   };
   static constexpr uint32_t kTraceInternalCount = kInternalAccum;  // bindings 7..13
+  // Trace set: binding 14 the sky cubemap (sampled image), 15 its sampler.
+  static constexpr uint32_t kTraceSkyBinding = 1 + kTargetCount + kTraceInternalCount;
+  static constexpr uint32_t kTraceBindingCount = kTraceSkyBinding + 2;
   // Composite set (also bound by the cross resolve kernel): binding 0 the host colour
-  // target, bindings 1..8 internal targets (8 = the resolve image).
-  static constexpr uint32_t kCompositeBindingCount = 9;
+  // target, bindings 1..8 internal targets (8 = the resolve image), binding 9 the sky
+  // cubemap (sampled image), 10 its sampler.
+  static constexpr uint32_t kCompositeStorageCount = 9;  // bindings 0..8
+  static constexpr uint32_t kCompositeSkyBinding = kCompositeStorageCount;
+  static constexpr uint32_t kCompositeBindingCount = kCompositeSkyBinding + 2;
 
   struct FrameSlot {
     uint32_t index = 0;  // position in slots_ (the NRD executor's frame slot)
@@ -87,11 +103,16 @@ class Renderer {
     VkDescriptorPool pool = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE;            // trace
     VkDescriptorSet composite_set = VK_NULL_HANDLE;  // composite
+    VkDescriptorSet sky_set = VK_NULL_HANDLE;        // sky SH kernel
     GpuBuffer constants;  // host-visible, mapped, one FrameConstants
   };
+  // A target's 2D storage view, or a sky cubemap's cube sampled view (cube = true, all
+  // mips). The key is image + format + cube + mip_levels.
   struct CachedView {
     VkImage image = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    bool cube = false;
+    uint32_t mip_levels = 1;
     VkImageView view = VK_NULL_HANDLE;
     uint64_t last_frame = 0;
   };
@@ -118,6 +139,11 @@ class Renderer {
   // The cached view of `target` (created on a miss); evicts the least recently
   // used view when the cache is over its size and that view's frame is safe.
   VkImageView ViewFor(const CaelixTargetImage& target, uint64_t frame, uint64_t safe_frame);
+  // The cached cube view (sampled usage, every mip, 6 layers) of the host's sky cubemap.
+  VkImageView SkyViewFor(const CaelixSkyCubemap& sky, uint64_t frame, uint64_t safe_frame);
+  // The cache behind both: the view of (image, format, cube, mip_levels), created on a miss.
+  VkImageView CachedViewFor(VkImage image, VkFormat format, bool cube, uint32_t mip_levels,
+                            uint64_t frame, uint64_t safe_frame);
   bool FormatSupported(VkFormat format);
   // Creates the internal targets when they are missing or have another size; the
   // old ones are retired until `frame` is safe. Returns true when it created them.
@@ -137,9 +163,15 @@ class Renderer {
   Scene& scene_;
   VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout composite_layout_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout sky_layout_ = VK_NULL_HANDLE;  // sky SH kernel: cubemap, sampler
   ComputePipeline trace_;
   ComputePipeline composite_;
   ComputePipeline cross_resolve_;  // shaders/render/caelix_cross_resolve.hlsl, composite set
+  ComputePipeline sky_sh_;         // shaders/render/caelix_sky_sh.hlsl, sky set
+  VkSampler sky_sampler_ = VK_NULL_HANDLE;  // linear, mipmapped, clamp to edge
+  GpuImage fallback_sky_;                   // 1 x 1 RGBA8 cube bound without a host cubemap
+  bool fallback_sky_needs_init_ = true;     // fallback_sky_ still in VK_IMAGE_LAYOUT_UNDEFINED
+  GpuBuffer sky_sh_buffer_;                 // 9 float4: the irradiance SH of the host cubemap
   std::vector<std::unique_ptr<FrameSlot>> slots_;
   uint32_t next_slot_ = 0;
   std::vector<CachedView> views_;
