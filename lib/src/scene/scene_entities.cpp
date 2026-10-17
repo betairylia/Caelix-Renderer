@@ -186,6 +186,7 @@ void Scene::ListEntity(CaelixEntityId id) {
 
 CaelixResult Scene::AddEntity(const CaelixEntityDesc& desc, CaelixEntityId& out_id) {
   uint32_t id;
+  // Reuse free entity IDs if possible
   if (!free_entities_.empty()) {
     id = free_entities_.back();
     free_entities_.pop_back();
