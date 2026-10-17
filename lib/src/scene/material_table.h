@@ -56,6 +56,9 @@ public:
     // caelix_scene_set_materials: entries [0, count) from the host, the rest the
     // built-in default. The caller has validated the entries.
     void Replace(const CaelixMaterial* entries, uint32_t count);
+    // caelix_scene_set_material_entries: one entry at `code` (< kEntries), stored with pad
+    // zeroed. The caller has validated the code and the entry.
+    void Set(uint32_t code, const CaelixMaterial& material);
     // caelix_scene_set_glass_palette (packed only): palette ids 1 .. count - 1, then
     // every transparent code of those ids. The caller has validated the entries.
     void SetGlassPalette(const CaelixMaterial* entries, uint32_t count);

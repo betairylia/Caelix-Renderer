@@ -2,6 +2,7 @@
 #include "scene/scene.h"
 
 #include "core/log.h"
+#include "scene/scene_internal.h"
 
 #include <cstring>
 #include <new>
@@ -9,11 +10,6 @@
 
 namespace caelix {
 namespace {
-
-// Staging alignment of records. Records are 8-byte multiples, so consecutive
-// records stay contiguous in the ring and their copies merge. vkCmdCopyBuffer
-// itself has no offset alignment rule.
-constexpr uint64_t kRecordAlignment = 8;
 
 // The group index is the instance's 24-bit instanceCustomIndex.
 constexpr size_t kMaxGroups = size_t{1} << 24;

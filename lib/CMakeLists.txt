@@ -44,10 +44,12 @@ add_library(caelix_renderer SHARED
   src/scene/glass_palette_default.inc
   src/scene/scene_internal.h
   src/scene/slot_table_pool.h
-  # The renderer: render targets, the pass sequence, NRD.
+  # The renderer: per-device kernels, render targets, the pass sequence, NRD.
   src/render/frame_constants.h
   src/render/nrd_executor.cpp
   src/render/nrd_executor.h
+  src/render/render_kernels.cpp
+  src/render/render_kernels.h
   src/render/renderer.h
   src/render/renderer_denoise.cpp
   src/render/renderer_internal.h

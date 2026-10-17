@@ -140,6 +140,16 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                     static_cast<unsigned long long>(frame.frame_number));
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    // One render per renderer per frame: the frame slot, the previous camera, the NRD
+    // history and the accumulation all advance once per frame number.
+    if (has_rendered_ && frame.frame_number <= last_frame_)
+    {
+        CAELIX_LOGE("%s: frame_number %llu is not above frame %llu of this renderer's previous render "
+                    "(a renderer renders at most once per frame)",
+                    kFunction, static_cast<unsigned long long>(frame.frame_number),
+                    static_cast<unsigned long long>(last_frame_));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
     if (options.debug_view >= kDebugViewCount)
     {
         CAELIX_LOGE("%s: unknown debug view %u", kFunction, options.debug_view);
@@ -340,17 +350,18 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         write_descriptor(set, binding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                          {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
     };
-    // The sky cubemap: the host's (in its layout) or the fallback cube (GENERAL, never
-    // sampled: sky_cubemap = 0); the sampler is the renderer's.
+    // The sky cubemap: the host's (in its layout) or the device's fallback cube (GENERAL,
+    // never sampled: sky_cubemap = 0); the sampler is the device's.
+    const GpuImage& fallback_sky = kernels_.fallback_sky();
     const VkImageView sky_view =
-        sky ? SkyViewFor(options.sky, frame.frame_number, safe) : fallback_sky_.view();
+        sky ? SkyViewFor(options.sky, frame.frame_number, safe) : fallback_sky.view();
     const VkImageLayout sky_layout =
         sky ? static_cast<VkImageLayout>(options.sky.layout) : VK_IMAGE_LAYOUT_GENERAL;
     const auto write_sky = [&](VkDescriptorSet set, uint32_t binding) {
         write_descriptor(set, binding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                          {VK_NULL_HANDLE, sky_view, sky_layout});
         write_descriptor(set, binding + 1, VK_DESCRIPTOR_TYPE_SAMPLER,
-                         {sky_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
+                         {kernels_.sky_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
     };
     if (tlas != VK_NULL_HANDLE)
     {
@@ -503,7 +514,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     // first use (UNDEFINED -> GENERAL), else a memory barrier that orders the
     // previous frame's kernel reads and writes before this frame's (also the previous
     // frame's reads of sky_sh_buffer_ before this frame's SH write). The first render
-    // call moves the fallback sky cube to GENERAL.
+    // call on the device (any renderer) moves the device's fallback sky cube to GENERAL.
     {
         Barriers before;
         for (uint32_t p = 0; p < present_count; ++p)
@@ -530,14 +541,13 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         }
-        if (fallback_sky_needs_init_)
+        if (kernels_.TakeFallbackSkyInit())
         {
-            before.Image(fallback_sky_.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_NONE,
+            before.Image(fallback_sky.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_NONE,
                          VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, fallback_sky_.layers());
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, fallback_sky.layers());
         }
         before.Record(cmd);
-        fallback_sky_needs_init_ = false;
     }
     const TracePush push{slot->constants.address()};
 
@@ -548,10 +558,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     // barrier orders that write before the trace's reads. Inside the trace timestamps.
     if (sky)
     {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sky_sh_.pipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sky_sh_.layout(), 0, 1,
+        const ComputePipeline& sky_sh = kernels_.sky_sh();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sky_sh.pipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sky_sh.layout(), 0, 1,
                                 &slot->sky_set, 0, nullptr);
-        vkCmdPushConstants(cmd, sky_sh_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdPushConstants(cmd, sky_sh.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         vkCmdDispatch(cmd, 1, 1, 1);
         Barriers sh_written;
         sh_written.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
@@ -559,10 +570,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         sh_written.Record(cmd);
     }
     // Trace.
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace_.pipeline());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace_.layout(), 0, 1, &slot->set,
+    const ComputePipeline& trace = kernels_.trace();
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace.pipeline());
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace.layout(), 0, 1, &slot->set,
                             0, nullptr);
-    vkCmdPushConstants(cmd, trace_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdPushConstants(cmd, trace.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
     timer_.End(cmd);
 
@@ -623,10 +635,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         between.Record(cmd);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, composite_.pipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, composite_.layout(), 0, 1,
+        const ComputePipeline& composite_kernel = kernels_.composite();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, composite_kernel.pipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, composite_kernel.layout(), 0, 1,
                                 &slot->composite_set, 0, nullptr);
-        vkCmdPushConstants(cmd, composite_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+        vkCmdPushConstants(cmd, composite_kernel.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                            &push);
         composite_timer_.Begin(cmd, frame.frame_number, safe);
         vkCmdDispatch(cmd, groups_x, groups_y, 1);
@@ -639,10 +652,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
             resolve.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
             resolve.Record(cmd);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cross_resolve_.pipeline());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cross_resolve_.layout(), 0, 1,
+            const ComputePipeline& resolve_kernel = kernels_.cross_resolve();
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_kernel.pipeline());
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_kernel.layout(), 0, 1,
                                     &slot->composite_set, 0, nullptr);
-            vkCmdPushConstants(cmd, cross_resolve_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+            vkCmdPushConstants(cmd, resolve_kernel.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                                &push);
             vkCmdDispatch(cmd, groups_x, groups_y, 1);
         }
@@ -663,6 +677,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
 
     prev_camera_ = camera;
     has_prev_camera_ = true;
+    last_frame_ = frame.frame_number;
+    has_rendered_ = true;
     last_mode_ = options.mode;
     if (lighting)
     {

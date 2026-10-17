@@ -378,6 +378,29 @@ TEST_CASE("NRD executor: instance, pools and pipelines; recreated on a size chan
                 timings.trace_ms, timings.denoise_ms, timings.composite_ms);
     CHECK(timings.denoise_ms > 0.0f);
 
+    // A second renderer over the same scene: its NRD instance borrows the device's shared NRD
+    // kernels (the first instance built them; this one's desc must match).
+    {
+        CaelixRenderer* second = nullptr;
+        REQUIRE(caelix_renderer_create(rig.device, rig.scene, &second) == CAELIX_OK);
+        ColorTarget second_target = CreateColorTarget(rig.gpu, 320, 240);
+        Render(rig, second, second_target, FrontCamera(320.0f / 240.0f),
+               LightOptions(CAELIX_MODE_PATH_TRACE, 150, 1), true);
+        const CaelixNrdInfo second_info = NrdInfo(second);
+        std::printf("second renderer: NRD instance %ux%u, %u pipelines, failed %u, %u dispatches\n",
+                    second_info.width, second_info.height, second_info.pipeline_count, second_info.failed,
+                    second_info.dispatch_count);
+        CHECK(second_info.pipeline_count == 14);
+        CHECK(second_info.failed == 0);
+        CHECK(second_info.width == 320);
+        CHECK(second_info.dispatch_count > 0);
+        CHECK(HitMean(second_target) > 0.0);
+        REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+        caelix_renderer_release_target_views(second);
+        caelix_renderer_destroy(second);
+        DestroyColorTarget(rig.gpu, second_target);
+    }
+
     // Another size: the instance is replaced (the old one is destroyed once its frame is safe).
     ColorTarget other = CreateColorTarget(rig.gpu, 256, 192);
     for (uint32_t i = 0; i < 2; ++i)

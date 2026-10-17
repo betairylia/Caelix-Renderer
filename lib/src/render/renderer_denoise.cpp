@@ -57,7 +57,8 @@ NrdExecutor* Renderer::EnsureDenoiser(uint32_t width, uint32_t height, bool& err
     const nrd::DenoiserDesc denoiser{kReblurIdentifier, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR};
     try
     {
-        nrd_ = std::make_unique<NrdExecutor>(device_, width, height, std::span(&denoiser, 1));
+        nrd_ = std::make_unique<NrdExecutor>(device_, kernels_, width, height,
+                                             std::span(&denoiser, 1));
     }
     catch (const NrdError& e)
     {

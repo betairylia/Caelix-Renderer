@@ -4,6 +4,7 @@
 
 #include "core/log.h"
 #include "core/vk_common.h"
+#include "render/render_kernels.h"
 #include "render/renderer.h"
 #include "rhi/device.h"
 #include "rhi/gpu_buffer.h"
@@ -24,11 +25,14 @@ static_assert(offsetof(CaelixRenderOptions, fog_color) == 136);
 static_assert(offsetof(CaelixRenderOptions, pad3) == 148);
 static_assert(offsetof(CaelixRenderOptions, sky) == 152);
 static_assert(sizeof(CaelixRenderOptions) == 176);
+static_assert(sizeof(CaelixMaterialEntry) == 52);
 
-// The opaque handle behind CaelixDevice*.
+// The opaque handle behind CaelixDevice*. Members are destroyed in reverse order: the
+// kernels go before the device.
 struct CaelixDevice
 {
     std::unique_ptr<caelix::Device> impl;
+    std::unique_ptr<caelix::RenderKernels> kernels;  // created by the first caelix_renderer_create
 };
 
 // The opaque handle behind CaelixScene*.
@@ -155,7 +159,7 @@ CAELIX_API CaelixResult caelix_device_adopt(const CaelixDeviceAdoptDesc* desc,
         {
             return result;
         }
-        *out_device = new CaelixDevice{std::move(impl)};
+        *out_device = new CaelixDevice{std::move(impl), nullptr};
         return CAELIX_OK;
     }
     catch (const std::bad_alloc&)
@@ -486,6 +490,26 @@ CAELIX_API CaelixResult caelix_scene_set_glass_palette(CaelixScene* scene,
     }
 }
 
+CAELIX_API CaelixResult caelix_scene_set_material_entries(CaelixScene* scene,
+                                                          const CaelixMaterialEntry* entries,
+                                                          uint32_t count)
+{
+    constexpr const char* kFunction = "caelix_scene_set_material_entries";
+    caelix::Scene* impl = SceneFor(scene, kFunction);
+    if (impl == nullptr)
+    {
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    try
+    {
+        return impl->SetMaterialEntries(entries, count);
+    }
+    catch (...)
+    {
+        return TranslateException(kFunction);
+    }
+}
+
 CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint32_t code,
                                                   CaelixMaterial* out)
 {
@@ -525,8 +549,15 @@ CAELIX_API CaelixResult caelix_renderer_create(CaelixDevice* device, CaelixScene
     }
     try
     {
+        // The device's shared kernels: created by the first renderer (a throw leaves them null,
+        // and the next call tries again).
+        if (device->kernels == nullptr)
+        {
+            device->kernels = std::make_unique<caelix::RenderKernels>(*device->impl);
+        }
         std::unique_ptr<caelix::Renderer> impl;
-        const CaelixResult result = caelix::Renderer::Create(*device->impl, *scene->impl, impl);
+        const CaelixResult result =
+            caelix::Renderer::Create(*device->impl, *device->kernels, *scene->impl, impl);
         if (result != CAELIX_OK)
         {
             return result;

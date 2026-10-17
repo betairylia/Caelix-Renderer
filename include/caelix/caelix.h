@@ -59,9 +59,12 @@ extern "C" {
    (w = the checkerboard flag), also without a bump. The Unity plugin step (P3) appended
    CaelixCamera::jitter and added CAELIX_RENDER_FLAG_FLIP_Y (a new flag bit), also without a
    bump. The sky/fog/emission step appended emission_scale, fog_density, fog_color, pad3 and sky
-   (CaelixSkyCubemap) to CaelixRenderOptions, also without a bump. A host
-   built against an older version-2 header must be rebuilt (the library reads and writes the larger
-   structs). */
+   (CaelixSkyCubemap) to CaelixRenderOptions, also without a bump. The plugin refactor step added
+   CaelixMaterialEntry and caelix_scene_set_material_entries, appended
+   CaelixSceneStats::upload_bricks_free and made a second caelix_renderer_render of one renderer with a
+   frame_number not above its previous one an error (CAELIX_ERROR_INVALID_ARGUMENT), also without a
+   bump. A host built against an older version-2 header must be rebuilt (the library reads and writes
+   the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
 typedef struct CaelixVersion
@@ -337,7 +340,8 @@ CAELIX_API CaelixResult caelix_scene_flush(CaelixScene* scene, const CaelixFrame
 CAELIX_API CaelixResult caelix_scene_recycle(CaelixScene* scene, uint64_t safe_frame_number);
 
 /* Fields are only appended. finalized_bricks_total .. grid_bytes were added to ABI version 2 by the
-   finalize step, blas_count .. as_builds_pending by the acceleration structure step. */
+   finalize step, blas_count .. as_builds_pending by the acceleration structure step,
+   material_table_bytes by the materials step, upload_bricks_free by the plugin refactor step. */
 typedef struct CaelixSceneStats
 {
     uint32_t entities, groups;                              /* live entities and render groups */
@@ -358,6 +362,11 @@ typedef struct CaelixSceneStats
     uint64_t as_builds_pending;    /* groups whose BLAS is out of date (waiting for finalization,
                                       scratch or ring space), plus 1 when the TLAS is out of date */
     uint64_t material_table_bytes; /* GPU size of the material table (65536 * 48 = 3 MiB) */
+    uint64_t upload_bricks_free; /* upper bound of the bricks that caelix_scene_upload_bricks accepts
+                                    before the next flush, from the free staging space minus the row
+                                    reserve (wrap fragmentation can make the real number smaller;
+                                    *consumed is the truth). Read it after a flush to size the next
+                                    frame's uploads. */
 } CaelixSceneStats;
 
 /* Fills *out. A NULL argument is ignored. */
@@ -464,6 +473,24 @@ CAELIX_API CaelixResult caelix_scene_set_materials(CaelixScene* scene, const Cae
    transparent code with such an id. count <= 256. Same value checks as caelix_scene_set_materials. */
 CAELIX_API CaelixResult caelix_scene_set_glass_palette(CaelixScene* scene,
                                                        const CaelixMaterial* entries, uint32_t count);
+
+/* One entry of caelix_scene_set_material_entries: a 16-bit block code and its table entry. 52 bytes. */
+typedef struct CaelixMaterialEntry
+{
+    uint32_t code; /* 0 .. 0xFFFF */
+    CaelixMaterial material;
+} CaelixMaterialEntry;
+
+/* Writes entries[i].material at table entry entries[i].code, over the CURRENT table (the other
+   entries keep their values; nothing is reset to the built-in default). Every code must be
+   <= 0xFFFF and every material valid (same checks as caelix_scene_set_materials): one bad entry
+   returns CAELIX_ERROR_INVALID_ARGUMENT (logged) and changes nothing. count 0 is a no-op. Like the
+   other setters, the change reaches the GPU at the next caelix_scene_flush. For a transparent code
+   write the face-free code (the kernels look up code & id mask); an entry stored at a code with face
+   bits is never read. */
+CAELIX_API CaelixResult caelix_scene_set_material_entries(CaelixScene* scene,
+                                                          const CaelixMaterialEntry* entries,
+                                                          uint32_t count);
 /* Inspection: the current table entry of a raw block code (code <= 0xFFFF; face bits of a
    transparent code are removed first, as the kernels do). The value is the CPU copy: it reaches the
    GPU at the next flush. */
@@ -526,7 +553,10 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
  * same command buffer and with the same CaelixFrameDesc: the flush builds the TLAS that the render
  * binds, and the TLAS handle can change at any flush. The renderer keeps its per-frame resources
  * (descriptor set, constants, timestamp queries) in a ring of 3 slots that grows to at most 8
- * frames in flight; a slot is reused only when its frame is <= safe_frame_number.
+ * frames in flight; a slot is reused only when its frame is <= safe_frame_number. Several renderers
+ * may render the same frame (one flush, one frame desc, N render calls, for example one renderer per
+ * view); one renderer renders at most once per frame number: a second call with a frame_number not
+ * above its previous successful call's returns CAELIX_ERROR_INVALID_ARGUMENT.
  *
  * Layout contract: every present target is received in its CaelixTargetImage::layout and left in
  * VK_IMAGE_LAYOUT_GENERAL. The last barrier of the render call makes the writes available to all
@@ -541,11 +571,15 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
 typedef struct CaelixRenderer CaelixRenderer; /* opaque */
 
 /* Creates a renderer for `scene` (which must belong to `device`). The renderer keeps references to
-   both: destroy it before the scene and the device. */
+   both: destroy it before the scene and the device. The first renderer of a device also creates the
+   device's shared kernels (descriptor set layouts, compute pipelines, the sky sampler and the
+   fallback sky cube; the NRD pipelines at the first denoised render); every later renderer borrows
+   them, and they live until caelix_device_destroy. */
 CAELIX_API CaelixResult caelix_renderer_create(CaelixDevice* device, CaelixScene* scene,
                                                CaelixRenderer** out_renderer);
-/* Destroys the renderer and its GPU objects (pipeline, descriptor pools, constants, timestamp
-   queries, cached image views). NULL is ignored. The device must be idle. */
+/* Destroys the renderer and its GPU objects (descriptor pools, constants, timestamp queries, cached
+   image views, internal targets, NRD instance; the shared kernels stay with the device). NULL is
+   ignored. The device must be idle. */
 CAELIX_API void caelix_renderer_destroy(CaelixRenderer* renderer);
 
 /* The camera of one render call, in world space. The voxel world is Y up and uses Unity's
@@ -829,7 +863,9 @@ typedef struct CaelixRenderTargets
    Returns CAELIX_ERROR_INVALID_ARGUMENT for a null argument, no present target, a present target
    without format or size, present targets of different sizes, one image in two targets, a geometry
    target format outside its list above, an unknown debug view, an unknown mode, a bounce_count above
-   CAELIX_MAX_BOUNCES, a bounce_count_transparent above CAELIX_MAX_BOUNCES_TRANSPARENT, a frame number not above safe_frame_number, a ninth frame in flight,
+   CAELIX_MAX_BOUNCES, a bounce_count_transparent above CAELIX_MAX_BOUNCES_TRANSPARENT, a frame number
+   not above safe_frame_number, a frame number not above this renderer's previous successful call's
+   (one render per renderer per frame), a ninth frame in flight,
    a sky image (CaelixRenderOptions::sky) with format VK_FORMAT_UNDEFINED, size 0, mip_levels 0 or
    layout VK_IMAGE_LAYOUT_UNDEFINED, or a negative or non-finite fog_density or emission_scale;
    CAELIX_ERROR_OUT_OF_MEMORY when the internal targets of the lighting modes or the NRD instance

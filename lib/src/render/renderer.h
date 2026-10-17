@@ -1,6 +1,7 @@
 #pragma once
 #include "caelix/caelix.h"
 #include "render/nrd_executor.h"
+#include "render/render_kernels.h"
 #include "rhi/device.h"
 #include "rhi/gpu_buffer.h"
 #include "rhi/gpu_image.h"
@@ -19,6 +20,12 @@ class Scene;
 
 // Traces one scene into the host's targets (caelix_renderer_*).
 //
+// Several renderers (one per view) may share one scene. The immutable objects are
+// per device (RenderKernels, borrowed): the descriptor set layouts, the compute
+// pipelines, the sky sampler, the fallback sky cube and the NRD pipelines. Each
+// renderer owns its per-view state: frame slots, cached views, internal targets, the
+// NRD instance, the sky SH buffer, timers and the previous camera.
+//
 // Two kernels. The trace kernel (shaders/render/caelix_path_trace.hlsl) reads the
 // scene's tables through buffer device addresses in the frame constants; the
 // TLAS and the images are its only descriptors (set 0: binding 0 acceleration
@@ -35,17 +42,18 @@ class Scene;
 // in sky_sh_buffer_ (one per renderer: frames execute in queue order, the lighting
 // modes' first barrier orders the previous frame's reads before the write, a barrier
 // after the dispatch orders the write before the trace); its time is part of the
-// trace timestamps. The sampler is the renderer's own (linear, mipmapped, clamp to
-// edge). Without a host cubemap every sky binding holds fallback_sky_ (a 1 x 1 cube
-// in GENERAL, never sampled because sky_cubemap is 0). In the path trace
-// mode with denoising, NRD (NrdExecutor, REBLUR_DIFFUSE_SPECULAR) runs between
+// trace timestamps. The sampler is the device's (RenderKernels: linear, mipmapped,
+// clamp to edge). Without a host cubemap every sky binding holds the device's fallback
+// sky (a 1 x 1 cube in GENERAL, never sampled because sky_cubemap is 0). In the path
+// trace mode with denoising, NRD (NrdExecutor, REBLUR_DIFFUSE_SPECULAR) runs between
 // the two and the composite reads its outputs instead of the raw radiance; the
 // executor is created at the first denoised render and recreated (history lost)
 // when the size changes, the old one is destroyed once its last frame is safe.
 // Per-frame resources
 // live in a ring of slots (three descriptor sets + 528-byte constants buffer); a
 // slot is reused only when its frame is safe. The camera of each successful
-// render call is kept as the previous camera of the next one (motion targets).
+// render call is kept as the previous camera of the next one (motion targets). A
+// renderer renders at most once per frame number (last_frame_).
 //
 // Internal targets (lighting modes only): created at the first lighting render,
 // recreated when the host target size changes (the old images are destroyed once
@@ -54,7 +62,9 @@ class Scene;
 class Renderer
 {
 public:
-    static CaelixResult Create(Device& device, Scene& scene, std::unique_ptr<Renderer>& out);
+    // `kernels` must outlive the renderer.
+    static CaelixResult Create(Device& device, RenderKernels& kernels, Scene& scene,
+                               std::unique_ptr<Renderer>& out);
     ~Renderer();
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
@@ -69,7 +79,6 @@ private:
     static constexpr uint32_t kInitialSlots = 3;
     static constexpr uint32_t kMaxSlots = 8;
     static constexpr size_t kMaxCachedViews = 16;
-    static constexpr uint32_t kTargetCount = 6;  // descriptor bindings 1..6
     // Internal targets of the lighting modes, in trace binding order (binding 7 + index;
     // kInternalAccum is read by the composite only).
     enum Internal : uint32_t
@@ -88,16 +97,8 @@ private:
         kInternalResolve,          // RGBA16F    composite output before the cross resolve (linear)
         kInternalCount
     };
-    static constexpr uint32_t kTraceInternalCount = kInternalAccum;  // bindings 7..13
-    // Trace set: binding 14 the sky cubemap (sampled image), 15 its sampler.
-    static constexpr uint32_t kTraceSkyBinding = 1 + kTargetCount + kTraceInternalCount;
-    static constexpr uint32_t kTraceBindingCount = kTraceSkyBinding + 2;
-    // Composite set (also bound by the cross resolve kernel): binding 0 the host colour
-    // target, bindings 1..8 internal targets (8 = the resolve image), binding 9 the sky
-    // cubemap (sampled image), 10 its sampler.
-    static constexpr uint32_t kCompositeStorageCount = 9;  // bindings 0..8
-    static constexpr uint32_t kCompositeSkyBinding = kCompositeStorageCount;
-    static constexpr uint32_t kCompositeBindingCount = kCompositeSkyBinding + 2;
+    static_assert(kTraceInternalCount == kInternalAccum,
+                  "the trace set binds the internal targets up to kInternalAccum");
 
     struct FrameSlot
     {
@@ -137,7 +138,7 @@ private:
         std::unique_ptr<NrdExecutor> executor;
     };
 
-    Renderer(Device& device, Scene& scene);
+    Renderer(Device& device, RenderKernels& kernels, Scene& scene);
 
     void AddSlot();
     // A slot whose frame is safe (adds one while there are fewer than kMaxSlots),
@@ -167,18 +168,9 @@ private:
                            bool restart);
 
     Device& device_;
+    RenderKernels& kernels_;   // the device's layouts, pipelines, sky sampler, fallback sky, NRD kernels
     Scene& scene_;
-    VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout composite_layout_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout sky_layout_ = VK_NULL_HANDLE;  // sky SH kernel: cubemap, sampler
-    ComputePipeline trace_;
-    ComputePipeline composite_;
-    ComputePipeline cross_resolve_;           // shaders/render/caelix_cross_resolve.hlsl, composite set
-    ComputePipeline sky_sh_;                  // shaders/render/caelix_sky_sh.hlsl, sky set
-    VkSampler sky_sampler_ = VK_NULL_HANDLE;  // linear, mipmapped, clamp to edge
-    GpuImage fallback_sky_;                   // 1 x 1 RGBA8 cube bound without a host cubemap
-    bool fallback_sky_needs_init_ = true;     // fallback_sky_ still in VK_IMAGE_LAYOUT_UNDEFINED
-    GpuBuffer sky_sh_buffer_;                 // 9 float4: the irradiance SH of the host cubemap
+    GpuBuffer sky_sh_buffer_;  // 9 float4: the irradiance SH of the host cubemap
     std::vector<std::unique_ptr<FrameSlot>> slots_;
     uint32_t next_slot_ = 0;
     std::vector<CachedView> views_;
@@ -188,6 +180,8 @@ private:
     GpuTimer denoise_timer_;    // NRD dispatches
     CaelixCamera prev_camera_{};
     bool has_prev_camera_ = false;
+    uint64_t last_frame_ = 0;    // frame number of the newest recorded render call
+    bool has_rendered_ = false;  // last_frame_ is valid
     InternalImages internal_;
     uint64_t internal_last_frame_ = 0;  // the last frame that used internal_
     bool internal_needs_init_ = false;  // internal_ still in VK_IMAGE_LAYOUT_UNDEFINED

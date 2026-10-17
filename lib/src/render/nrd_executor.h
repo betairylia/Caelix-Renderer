@@ -13,6 +13,9 @@
 
 namespace caelix {
 
+class RenderKernels;
+struct NrdKernels;
+
 // An error reported by the NRD library itself (nrd::Result), as opposed to a
 // Vulkan error (VulkanError). The renderer stops denoising after one.
 class NrdError : public std::runtime_error
@@ -23,10 +26,12 @@ public:
 
 // Runs NVIDIA NRD (Real-Time Denoisers) on Vulkan without NRI: the library gives
 // a list of compute dispatches with their resources and constants
-// (nrd::GetComputeDispatches); this class owns the Vulkan objects behind them and
-// records them.
+// (nrd::GetComputeDispatches); this class owns the per-instance Vulkan objects
+// behind them and records them.
 //
-// Objects, from nrd::GetInstanceDesc and nrd::GetLibraryDesc (never hard-coded):
+// Per device (NrdKernels, built by RenderKernels::NrdKernelsFor from the first
+// instance's nrd::InstanceDesc and nrd::GetLibraryDesc, never hard-coded; every
+// executor of the device borrows them, and a later instance's desc must match):
 // - One pipeline layout shared by every NRD pipeline (NRD's recommendation for a
 //   shared root signature). Set 0 (NRD's resources space): perSetTexturesMaxNum
 //   SAMPLED_IMAGE bindings from spirvBindingOffsets.textureOffset +
@@ -38,6 +43,9 @@ public:
 //   constantBufferRegisterIndex.
 // - One compute pipeline per nrd::PipelineDesc (computeShaderSPIRV, entry point
 //   InstanceDesc::shaderEntryPoint).
+//
+// Per instance (owned by the executor, recreated with it on a size change):
+// - The nrd::Instance and its desc.
 // - One GpuImage per pool TextureDesc (permanent and transient), SAMPLED |
 //   STORAGE, size DivideUp(size, downsampleFactor). Every pool image is moved to
 //   VK_IMAGE_LAYOUT_GENERAL once (at the first Denoise) and stays there, for both
@@ -47,7 +55,7 @@ public:
 //   align(constantBufferMaxDataSize, minUniformBufferOffsetAlignment) * setsMaxNum
 //   per frame slot, kMaxSlots slots. Set 1 is written once (the whole ring) and
 //   bound with a dynamic offset per dispatch, so it is allocated once, not per
-//   frame.
+//   frame; its descriptor pool is the executor's.
 // - One descriptor pool per frame slot (setsMaxNum sets of the set 0 layout),
 //   created at the slot's first use and reset at the start of every Denoise with
 //   that slot. The caller reuses a slot only when its previous frame is complete.
@@ -66,8 +74,9 @@ public:
 //
 // Errors: a failing nrd:: call is logged at error level and makes failed() true;
 // the call then returns false and records nothing. The constructor throws NrdError
-// for NRD failures and VulkanError for Vulkan failures. Destroy the executor only
-// when no pending GPU work uses it.
+// for NRD failures (including a desc that does not match the shared NrdKernels) and
+// VulkanError for Vulkan failures. Destroy the executor only when no pending GPU
+// work uses it; the RenderKernels must outlive it.
 class NrdExecutor
 {
 public:
@@ -88,7 +97,7 @@ public:
         VkImageView validation = VK_NULL_HANDLE;        // OUT_VALIDATION
     };
 
-    NrdExecutor(Device& device, uint32_t width, uint32_t height,
+    NrdExecutor(Device& device, RenderKernels& kernels, uint32_t width, uint32_t height,
                 std::span<const nrd::DenoiserDesc> denoisers);
     ~NrdExecutor();
     NrdExecutor(const NrdExecutor&) = delete;
@@ -149,15 +158,11 @@ private:
     VkImageView Resolve(const nrd::ResourceDesc& resource, const Bindings& bindings) const;
 
     Device& device_;
+    const NrdKernels* kernels_ = nullptr;  // the device's shared NRD objects (RenderKernels)
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     nrd::Instance* instance_ = nullptr;
     const nrd::InstanceDesc* desc_ = nullptr;
-    std::vector<VkSampler> samplers_;
-    VkDescriptorSetLayout resources_layout_ = VK_NULL_HANDLE;  // set 0
-    VkDescriptorSetLayout constants_layout_ = VK_NULL_HANDLE;  // set 1
-    VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
-    std::vector<VkPipeline> pipelines_;
     std::vector<GpuImage> permanent_;
     std::vector<GpuImage> transient_;
     bool needs_init_ = true;             // pool images still in VK_IMAGE_LAYOUT_UNDEFINED
@@ -166,8 +171,6 @@ private:
     VkDescriptorPool constants_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet constants_set_ = VK_NULL_HANDLE;
     std::array<VkDescriptorPool, kMaxSlots> slot_pools_{};
-    uint32_t texture_binding_base_ = 0;
-    uint32_t storage_binding_base_ = 0;
     uint32_t last_dispatch_count_ = 0;
     bool failed_ = false;
 };

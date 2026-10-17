@@ -1,6 +1,7 @@
 #include "render/nrd_executor.h"
 
 #include "core/log.h"
+#include "render/render_kernels.h"
 
 #include <algorithm>
 #include <cstring>
@@ -95,7 +96,7 @@ void Check(VkResult result, const char* call)
 
 }  // namespace
 
-NrdExecutor::NrdExecutor(Device& device, uint32_t width, uint32_t height,
+NrdExecutor::NrdExecutor(Device& device, RenderKernels& kernels, uint32_t width, uint32_t height,
                          std::span<const nrd::DenoiserDesc> denoisers)
     : device_(device), width_(width), height_(height)
 {
@@ -126,126 +127,11 @@ NrdExecutor::NrdExecutor(Device& device, uint32_t width, uint32_t height,
         }
         desc_ = nrd::GetInstanceDesc(*instance_);
         const nrd::InstanceDesc& desc = *desc_;
-        const nrd::SPIRVBindingOffsets& offsets = library.spirvBindingOffsets;
-
-        // Samplers, immutable in set 1.
-        for (uint32_t i = 0; i < desc.samplersNum; ++i)
-        {
-            const bool linear = desc.samplers[i] == nrd::Sampler::LINEAR_CLAMP;
-            VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-            info.magFilter = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-            info.minFilter = info.magFilter;
-            info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-            info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            info.maxLod = 0.0f;
-            VkSampler sampler = VK_NULL_HANDLE;
-            Check(vkCreateSampler(vk_device, &info, nullptr, &sampler), "vkCreateSampler");
-            samplers_.push_back(sampler);
-        }
-
-        // Set 0: sampled and storage images, every binding PARTIALLY_BOUND.
         const nrd::DescriptorPoolDesc& pool_desc = desc.descriptorPoolDesc;
-        texture_binding_base_ = offsets.textureOffset + desc.resourcesBaseRegisterIndex;
-        storage_binding_base_ = offsets.storageTextureAndBufferOffset + desc.resourcesBaseRegisterIndex;
-        {
-            std::vector<VkDescriptorSetLayoutBinding> bindings;
-            for (uint32_t i = 0; i < pool_desc.perSetTexturesMaxNum; ++i)
-            {
-                bindings.push_back({texture_binding_base_ + i, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
-                                    VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
-            }
-            for (uint32_t i = 0; i < pool_desc.perSetStorageTexturesMaxNum; ++i)
-            {
-                bindings.push_back({storage_binding_base_ + i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
-                                    VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
-            }
-            const std::vector<VkDescriptorBindingFlags> flags(bindings.size(),
-                                                              VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
-            VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
-                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-            flags_info.bindingCount = static_cast<uint32_t>(flags.size());
-            flags_info.pBindingFlags = flags.data();
-            VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-            info.pNext = &flags_info;
-            info.bindingCount = static_cast<uint32_t>(bindings.size());
-            info.pBindings = bindings.data();
-            Check(vkCreateDescriptorSetLayout(vk_device, &info, nullptr, &resources_layout_),
-                  "vkCreateDescriptorSetLayout (NRD resources)");
-        }
-        // Set 1: immutable samplers and the dynamic constant buffer.
-        const uint32_t constants_binding = offsets.constantBufferOffset + desc.constantBufferRegisterIndex;
-        {
-            std::vector<VkDescriptorSetLayoutBinding> bindings;
-            for (uint32_t i = 0; i < desc.samplersNum; ++i)
-            {
-                bindings.push_back({offsets.samplerOffset + desc.samplersBaseRegisterIndex + i,
-                                    VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT,
-                                    &samplers_[i]});
-            }
-            bindings.push_back({constants_binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
-                                VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
-            VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-            info.bindingCount = static_cast<uint32_t>(bindings.size());
-            info.pBindings = bindings.data();
-            Check(vkCreateDescriptorSetLayout(vk_device, &info, nullptr, &constants_layout_),
-                  "vkCreateDescriptorSetLayout (NRD constants)");
-        }
-        // NRD's register spaces are the descriptor set indices.
-        if (desc.resourcesSpaceIndex != 0 || desc.constantBufferAndSamplersSpaceIndex != 1)
-        {
-            throw NrdError("NRD register spaces are not (resources 0, constants 1)");
-        }
-        {
-            const VkDescriptorSetLayout layouts[2] = {resources_layout_, constants_layout_};
-            VkPipelineLayoutCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-            info.setLayoutCount = 2;
-            info.pSetLayouts = layouts;
-            Check(vkCreatePipelineLayout(vk_device, &info, nullptr, &pipeline_layout_),
-                  "vkCreatePipelineLayout (NRD)");
-        }
 
-        // Pipelines, created in one call.
-        {
-            std::vector<VkShaderModule> modules(desc.pipelinesNum, VK_NULL_HANDLE);
-            std::vector<VkComputePipelineCreateInfo> infos(desc.pipelinesNum);
-            VkResult result = VK_SUCCESS;
-            for (uint32_t i = 0; i < desc.pipelinesNum && result == VK_SUCCESS; ++i)
-            {
-                const nrd::ComputeShaderDesc& spirv = desc.pipelines[i].computeShaderSPIRV;
-                if (spirv.bytecode == nullptr || spirv.size == 0)
-                {
-                    for (VkShaderModule module : modules)
-                    {
-                        vkDestroyShaderModule(vk_device, module, nullptr);
-                    }
-                    throw NrdError("NRD library has no embedded SPIR-V (NRD_EMBEDS_SPIRV_SHADERS)");
-                }
-                VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-                module_info.codeSize = static_cast<size_t>(spirv.size);
-                module_info.pCode = static_cast<const uint32_t*>(spirv.bytecode);
-                result = vkCreateShaderModule(vk_device, &module_info, nullptr, &modules[i]);
-                VkComputePipelineCreateInfo& info = infos[i];
-                info = VkComputePipelineCreateInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-                info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-                info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-                info.stage.module = modules[i];
-                info.stage.pName = desc.shaderEntryPoint;
-                info.layout = pipeline_layout_;
-            }
-            if (result == VK_SUCCESS)
-            {
-                pipelines_.assign(desc.pipelinesNum, VK_NULL_HANDLE);
-                result = vkCreateComputePipelines(vk_device, VK_NULL_HANDLE, desc.pipelinesNum,
-                                                  infos.data(), nullptr, pipelines_.data());
-            }
-            for (VkShaderModule module : modules)
-            {
-                vkDestroyShaderModule(vk_device, module, nullptr);
-            }
-            Check(result, "vkCreateComputePipelines (NRD)");
-        }
+        // Samplers, set layouts, pipeline layout and pipelines: the device's shared objects
+        // (built by the first instance, checked against this desc by the later ones).
+        kernels_ = &kernels.NrdKernelsFor(desc);
 
         // Pools.
         const auto create_pool = [&](const nrd::TextureDesc* textures, uint32_t count, const char* kind,
@@ -302,13 +188,13 @@ NrdExecutor::NrdExecutor(Device& device, uint32_t width, uint32_t height,
             VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
             allocate.descriptorPool = constants_pool_;
             allocate.descriptorSetCount = 1;
-            allocate.pSetLayouts = &constants_layout_;
+            allocate.pSetLayouts = &kernels_->constants_layout;
             Check(vkAllocateDescriptorSets(vk_device, &allocate, &constants_set_),
                   "vkAllocateDescriptorSets (NRD constants)");
             const VkDescriptorBufferInfo buffer{constants_.buffer(), 0, constants_stride_};
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             write.dstSet = constants_set_;
-            write.dstBinding = constants_binding;
+            write.dstBinding = kernels_->constants_binding;
             write.descriptorCount = 1;
             write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             write.pBufferInfo = &buffer;
@@ -320,8 +206,8 @@ NrdExecutor::NrdExecutor(Device& device, uint32_t width, uint32_t height,
         Release();
         throw;
     }
-    CAELIX_LOGI("NRD %u.%u.%u instance created at %ux%u: %u pipelines, %u permanent textures "
-                "(%.1f MiB), %u transient textures (%.1f MiB), constant block %llu bytes",
+    CAELIX_LOGI("NRD %u.%u.%u instance created at %ux%u (shared pipelines): %u pipelines, %u permanent "
+                "textures (%.1f MiB), %u transient textures (%.1f MiB), constant block %llu bytes",
                 lib().versionMajor, lib().versionMinor, lib().versionBuild, width, height,
                 desc_->pipelinesNum, permanent_count(),
                 static_cast<double>(permanent_bytes()) / (1024.0 * 1024.0), transient_count(),
@@ -351,34 +237,8 @@ void NrdExecutor::Release()
         constants_pool_ = VK_NULL_HANDLE;
         constants_set_ = VK_NULL_HANDLE;
     }
-    for (VkPipeline pipeline : pipelines_)
-    {
-        if (pipeline != VK_NULL_HANDLE)
-        {
-            vkDestroyPipeline(device, pipeline, nullptr);
-        }
-    }
-    pipelines_.clear();
-    if (pipeline_layout_ != VK_NULL_HANDLE)
-    {
-        vkDestroyPipelineLayout(device, pipeline_layout_, nullptr);
-        pipeline_layout_ = VK_NULL_HANDLE;
-    }
-    if (resources_layout_ != VK_NULL_HANDLE)
-    {
-        vkDestroyDescriptorSetLayout(device, resources_layout_, nullptr);
-        resources_layout_ = VK_NULL_HANDLE;
-    }
-    if (constants_layout_ != VK_NULL_HANDLE)
-    {
-        vkDestroyDescriptorSetLayout(device, constants_layout_, nullptr);
-        constants_layout_ = VK_NULL_HANDLE;
-    }
-    for (VkSampler sampler : samplers_)
-    {
-        vkDestroySampler(device, sampler, nullptr);
-    }
-    samplers_.clear();
+    // The samplers, layouts and pipelines belong to the RenderKernels.
+    kernels_ = nullptr;
     permanent_.clear();
     transient_.clear();
     constants_.Reset();
@@ -531,7 +391,7 @@ bool NrdExecutor::Denoise(VkCommandBuffer cmd, uint32_t frame_slot, const Bindin
     std::vector<VkDescriptorSet> sets(dispatch_count, VK_NULL_HANDLE);
     if (dispatch_count > 0)
     {
-        const std::vector<VkDescriptorSetLayout> layouts(dispatch_count, resources_layout_);
+        const std::vector<VkDescriptorSetLayout> layouts(dispatch_count, kernels_->resources_layout);
         VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         allocate.descriptorPool = pool;
         allocate.descriptorSetCount = dispatch_count;
@@ -582,7 +442,8 @@ bool NrdExecutor::Denoise(VkCommandBuffer cmd, uint32_t frame_slot, const Bindin
                 VkWriteDescriptorSet& write = writes.emplace_back();
                 write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
                 write.dstSet = sets[i];
-                write.dstBinding = (storage ? storage_binding_base_ : texture_binding_base_) + j;
+                write.dstBinding =
+                    (storage ? kernels_->storage_binding_base : kernels_->texture_binding_base) + j;
                 write.descriptorCount = 1;
                 write.descriptorType =
                     storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -664,10 +525,10 @@ bool NrdExecutor::Denoise(VkCommandBuffer cmd, uint32_t frame_slot, const Bindin
             dependency.pImageMemoryBarriers = init_barriers.data();
         }
         vkCmdPipelineBarrier2(cmd, &dependency);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines_[dispatch.pipelineIndex]);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernels_->pipelines[dispatch.pipelineIndex]);
         const VkDescriptorSet bound[2] = {sets[i], constants_set_};
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 2, bound, 1,
-                                &offsets[i]);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernels_->pipeline_layout, 0, 2, bound,
+                                1, &offsets[i]);
         vkCmdDispatch(cmd, dispatch.gridWidth, dispatch.gridHeight, 1);
     }
     // NRD's outputs -> the caller's next compute pass (the composite reads them).

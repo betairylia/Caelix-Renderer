@@ -391,3 +391,58 @@ TEST_CASE("materials: block-ID table: pastel default, host table round trip")
     FlushOnce(rig);
     CloseRig(rig);
 }
+
+TEST_CASE("materials: sparse entries over the current table")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_material_test", RigDesc(1, 0, 0));
+
+    // Two entries over the default table: an opaque code and transparent id 7.
+    const CaelixMaterial untouched_default = Get(rig, 0x8006);
+    CaelixMaterialEntry entries[2] = {};
+    entries[0].code = 0x8005;
+    entries[0].material = Make(0.9f, 0.1f, 0.2f, 0.5f, 1.0f, 1.5f, 0.0f);
+    entries[1].code = 7;
+    entries[1].material = Make(0.6f, 0.9f, 0.7f, 1.0f, 0.0f, 1.33f, 0.01f);
+    REQUIRE(caelix_scene_set_material_entries(rig.scene, entries, 2) == CAELIX_OK);
+    CHECK(Same(Get(rig, 0x8005), entries[0].material));
+    CHECK(Same(Get(rig, 7), entries[1].material));
+    CHECK(Same(Get(rig, 7 | (0x3Fu << 9)), entries[1].material));  // face bits removed before the lookup
+    CHECK(Same(Get(rig, 0x8006), untouched_default));
+    CHECK(Same(Get(rig, 0x8006), PastelOpaque(HashU32(0x0006u))));
+    // count 0 is a no-op.
+    REQUIRE(caelix_scene_set_material_entries(rig.scene, nullptr, 0) == CAELIX_OK);
+
+    // An invalid batch changes nothing: one entry with ior 0.
+    {
+        CaelixMaterialEntry bad[2] = {};
+        bad[0].code = 0x8005;
+        bad[0].material = Make(0.1f, 0.1f, 0.1f, 0.0f, 0.0f, 1.5f, 0.0f);
+        bad[1].code = 7;
+        bad[1].material = Make(0.2f, 0.2f, 0.2f, 0.0f, 0.0f, 0.0f, 0.0f);
+        ExpectLibraryErrors(1, [&] {
+            CHECK(caelix_scene_set_material_entries(rig.scene, bad, 2) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        CHECK(Same(Get(rig, 0x8005), entries[0].material));
+        CHECK(Same(Get(rig, 7), entries[1].material));
+    }
+    // A code above 0xFFFF is rejected the same way.
+    {
+        CaelixMaterialEntry bad[2] = {};
+        bad[0].code = 0x8005;
+        bad[0].material = Make(0.1f, 0.1f, 0.1f, 0.0f, 0.0f, 1.5f, 0.0f);
+        bad[1].code = 0x10000;
+        bad[1].material = Make(0.2f, 0.2f, 0.2f, 0.0f, 0.0f, 1.5f, 0.0f);
+        ExpectLibraryErrors(1, [&] {
+            CHECK(caelix_scene_set_material_entries(rig.scene, bad, 2) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        CHECK(Same(Get(rig, 0x8005), entries[0].material));
+    }
+    // count > 0 with null entries.
+    ExpectLibraryErrors(1, [&] {
+        CHECK(caelix_scene_set_material_entries(rig.scene, nullptr, 1) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+
+    FlushOnce(rig);
+    CloseRig(rig);
+}

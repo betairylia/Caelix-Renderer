@@ -610,6 +610,17 @@ void Scene::GetStats(CaelixSceneStats& out) const
     }
     out.as_builds_pending = pending;
     out.material_table_bytes = material_buffer_.size();
+    // Bricks that caelix_scene_upload_bricks accepts before the next flush, at most: the record
+    // space of the ring (capacity minus the row reserve) minus what is in use, in record spans
+    // as UploadBricks allocates them (record_bytes at kRecordAlignment). Wrap padding can make
+    // the real number smaller.
+    const uint64_t capacity = staging_.capacity();
+    const uint64_t record_space = capacity - std::min(capacity, StagingRing::RowReserveBytes(capacity));
+    const uint64_t free_bytes = record_space - std::min(record_space, staging_.used());
+    const uint64_t stride =
+        (static_cast<uint64_t>(layout_.record_bytes) + kRecordAlignment - 1) / kRecordAlignment *
+        kRecordAlignment;
+    out.upload_bricks_free = stride > 0 ? free_bytes / stride : 0;
 }
 
 CaelixResult Scene::QueryBrick(CaelixEntityId entity_id, CaelixBrickKey key,

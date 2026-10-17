@@ -7,7 +7,8 @@
 // sun next-event estimation against the analytic irradiance of the sun cone, the
 // sun found by bounce sampling only, and a shadow under a floating block; a host
 // sky cubemap (primary miss, SH irradiance of diffuse bounces), the fog of the air
-// and the emission scale against closed forms.
+// and the emission scale against closed forms. Two renderers over one flush must
+// agree on the motion of a moving entity, and render once per frame each.
 // Uses the public C ABI only.
 #include "test_scenes.h"
 
@@ -727,6 +728,202 @@ TEST_CASE("geometry targets: albedo, normal, depth, motion, view_z")
     for (int i = 0; i < kTargetCount; ++i)
     {
         DestroyTarget(rig.gpu, *all.t[i]);
+    }
+    CloseRig(rig);
+}
+
+namespace {
+
+// Records a copy of `target` (GENERAL, render contract) into `readback`; the target is
+// left in TRANSFER_SRC_OPTIMAL.
+void RecordTargetCopy(VkCommandBuffer cmd, const Target& target, const Readback& readback)
+{
+    VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = target.image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {target.width, target.height, 1};
+    vkCmdCopyImageToBuffer(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1,
+                           &region);
+}
+
+}  // namespace
+
+TEST_CASE("two renderers over one flush: both see the entity motion; one render per renderer per frame")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadRedBrick(rig);
+    constexpr int kRenderers = 2;  // A and B
+    CaelixRenderer* renderers[kRenderers] = {};
+    for (CaelixRenderer*& renderer : renderers)
+    {
+        REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    }
+    // Per renderer: albedo (coverage), motion and view_z targets, in this order.
+    constexpr int kPerRenderer = 3;
+    Target targets[kRenderers][kPerRenderer];
+    for (int r = 0; r < kRenderers; ++r)
+    {
+        targets[r][0] = CreateTarget(rig.gpu, VK_FORMAT_R8G8B8A8_UNORM);
+        targets[r][1] = CreateTarget(rig.gpu, VK_FORMAT_R32G32_SFLOAT);
+        targets[r][2] = CreateTarget(rig.gpu, VK_FORMAT_R32_SFLOAT);
+    }
+    const CaelixCamera camera = LookPlusZ(4.0f, 4.0f, -20.0f);
+    const CaelixRenderOptions options = Options(CAELIX_VIEW_ALBEDO);
+    constexpr uint32_t cx = kSize / 2;
+    constexpr uint32_t cy = kSize / 2;
+
+    // One frame: one flush, then A and B render with the same frame desc into the same
+    // command buffer; every target is read back. `used` receives the frame desc.
+    const auto render_frame = [&](CaelixFrameDesc& used) {
+        Readback readbacks[kRenderers][kPerRenderer];
+        for (int r = 0; r < kRenderers; ++r)
+        {
+            for (int t = 0; t < kPerRenderer; ++t)
+            {
+                const Target& target = targets[r][t];
+                CreateReadback(rig.gpu,
+                               static_cast<VkDeviceSize>(target.width) * target.height * target.bytes_per_pixel,
+                               readbacks[r][t]);
+            }
+        }
+        const uint64_t frame = rig.frames.next;
+        SubmitAndWait(rig.gpu, [&](VkCommandBuffer cmd) {
+            CaelixFrameDesc frame_desc{};
+            frame_desc.command_buffer = reinterpret_cast<uint64_t>(cmd);
+            frame_desc.frame_number = frame;
+            frame_desc.safe_frame_number = frame - 1;
+            REQUIRE(caelix_scene_flush(rig.scene, &frame_desc) == CAELIX_OK);
+            for (int r = 0; r < kRenderers; ++r)
+            {
+                CaelixRenderTargets abi{};
+                abi.albedo = Abi(&targets[r][0]);
+                abi.motion = Abi(&targets[r][1]);
+                abi.view_z = Abi(&targets[r][2]);
+                REQUIRE(caelix_renderer_render(renderers[r], &frame_desc, &abi, &camera, &options) ==
+                        CAELIX_OK);
+            }
+            for (int r = 0; r < kRenderers; ++r)
+            {
+                for (int t = 0; t < kPerRenderer; ++t)
+                {
+                    RecordTargetCopy(cmd, targets[r][t], readbacks[r][t]);
+                }
+            }
+            CopyToHostBarrier(cmd);
+            used = frame_desc;
+        });
+        REQUIRE(caelix_scene_recycle(rig.scene, frame) == CAELIX_OK);
+        ++rig.frames.next;
+        for (int r = 0; r < kRenderers; ++r)
+        {
+            for (int t = 0; t < kPerRenderer; ++t)
+            {
+                Target& target = targets[r][t];
+                target.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                const uint8_t* bytes = reinterpret_cast<const uint8_t*>(readbacks[r][t].words);
+                target.bytes.assign(bytes, bytes + static_cast<size_t>(target.width) * target.height *
+                                                       target.bytes_per_pixel);
+                DestroyReadback(rig.gpu, readbacks[r][t]);
+            }
+        }
+    };
+    const auto motion_x = [&](int r) { return targets[r][1].F32(cx, cy, 0); };
+    const auto motion_y = [&](int r) { return targets[r][1].F32(cx, cy, 1); };
+
+    // Frame 1: the first render of both renderers: no previous camera, motion 0 everywhere.
+    CaelixFrameDesc desc{};
+    render_frame(desc);
+    for (int r = 0; r < kRenderers; ++r)
+    {
+        REQUIRE(targets[r][0].at(cx, cy)[3] == 255);  // the centre sees the brick
+        uint32_t nonzero = 0;
+        for (uint32_t y = 0; y < kSize; ++y)
+        {
+            for (uint32_t x = 0; x < kSize; ++x)
+            {
+                if (targets[r][1].F32(x, y, 0) != 0.0f || targets[r][1].F32(x, y, 1) != 0.0f)
+                {
+                    ++nonzero;
+                }
+            }
+        }
+        std::printf("frame 1, renderer %c: %u pixels with nonzero motion\n", 'A' + r, nonzero);
+        CHECK(nonzero == 0);
+    }
+
+    // Frame 2: same camera, nothing moves: motion ~0 at the centre.
+    render_frame(desc);
+    for (int r = 0; r < kRenderers; ++r)
+    {
+        std::printf("frame 2, renderer %c: centre motion %.6f %.6f px\n", 'A' + r, motion_x(r),
+                    motion_y(r));
+        CHECK(std::abs(motion_x(r)) < 1e-3f);
+        CHECK(std::abs(motion_y(r)) < 1e-3f);
+    }
+
+    // Frame 3: the entity moves +2 along X. Both renderers render after the same flush, so
+    // both see the entity's previous transform: motion.x = -2 units at the centre's view z.
+    {
+        const float position[3] = {2.0f, 0.0f, 0.0f};
+        const float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        REQUIRE(caelix_scene_set_entity_transform(rig.scene, rig.entity, position, rotation) ==
+                CAELIX_OK);
+    }
+    render_frame(desc);
+    for (int r = 0; r < kRenderers; ++r)
+    {
+        REQUIRE(targets[r][0].at(cx, cy)[3] == 255);
+        const float view_z = targets[r][2].F32(cx, cy, 0);
+        const float expected =
+            -2.0f * static_cast<float>(kSize) / (2.0f * camera.tan_half_fov_y * camera.aspect * view_z);
+        std::printf("frame 3, renderer %c: centre motion %.5f %.5f px, expected %.5f 0, view_z %.6f\n",
+                    'A' + r, motion_x(r), motion_y(r), expected, view_z);
+        CHECK(std::abs(motion_x(r) - expected) < 2e-2f);
+        CHECK(std::abs(motion_x(r) + 22.17f) < 4e-2f);
+        CHECK(std::abs(motion_y(r)) < 1e-3f);
+    }
+    CHECK(std::abs(motion_x(0) - motion_x(1)) < 1e-4f);
+    CHECK(std::abs(motion_y(0) - motion_y(1)) < 1e-4f);
+
+    // A second render of A with frame 3's desc (a fourth command buffer, no new flush): one
+    // render per renderer per frame.
+    SubmitAndWait(rig.gpu, [&](VkCommandBuffer cmd) {
+        CaelixFrameDesc again = desc;
+        again.command_buffer = reinterpret_cast<uint64_t>(cmd);
+        CaelixRenderTargets abi{};
+        abi.albedo = Abi(&targets[0][0]);
+        abi.motion = Abi(&targets[0][1]);
+        abi.view_z = Abi(&targets[0][2]);
+        ExpectLibraryErrors(1, [&] {
+            CHECK(caelix_renderer_render(renderers[0], &again, &abi, &camera, &options) ==
+                  CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+    });
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    for (int r = 0; r < kRenderers; ++r)
+    {
+        caelix_renderer_release_target_views(renderers[r]);
+        caelix_renderer_destroy(renderers[r]);
+        for (Target& target : targets[r])
+        {
+            DestroyTarget(rig.gpu, target);
+        }
     }
     CloseRig(rig);
 }

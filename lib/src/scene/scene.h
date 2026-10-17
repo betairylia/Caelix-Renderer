@@ -132,6 +132,7 @@ public:
     // the next flush.
     CaelixResult SetMaterials(const CaelixMaterial* entries, uint32_t count);
     CaelixResult SetGlassPalette(const CaelixMaterial* entries, uint32_t count);
+    CaelixResult SetMaterialEntries(const CaelixMaterialEntry* entries, uint32_t count);
     CaelixResult GetMaterial(uint32_t code, CaelixMaterial& out) const;
 
     bool EntityAlive(CaelixEntityId entity) const

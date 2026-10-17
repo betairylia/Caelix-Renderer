@@ -1,5 +1,5 @@
-// The scene's material table: caelix_scene_set_materials, caelix_scene_set_glass_palette and
-// caelix_scene_get_material. The upload is Scene::StageMaterials (scene_flush.cpp).
+// The scene's material table: caelix_scene_set_materials, caelix_scene_set_glass_palette,
+// caelix_scene_set_material_entries and caelix_scene_get_material. The upload is Scene::StageMaterials (scene_flush.cpp).
 #include "scene/scene.h"
 
 #include "core/log.h"
@@ -73,6 +73,41 @@ CaelixResult Scene::SetGlassPalette(const CaelixMaterial* entries, uint32_t coun
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     materials_->SetGlassPalette(entries, count);
+    return CAELIX_OK;
+}
+
+CaelixResult Scene::SetMaterialEntries(const CaelixMaterialEntry* entries, uint32_t count)
+{
+    constexpr const char* kFunction = "caelix_scene_set_material_entries";
+    if (count == 0)
+    {
+        return CAELIX_OK;
+    }
+    if (entries == nullptr)
+    {
+        CAELIX_LOGE("%s: entries is null", kFunction);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    // Every entry is checked before any is written: one bad entry changes nothing.
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (entries[i].code >= MaterialTable::kEntries)
+        {
+            CAELIX_LOGE("%s: entry %u: code 0x%X is above 0xFFFF", kFunction, i, entries[i].code);
+            return CAELIX_ERROR_INVALID_ARGUMENT;
+        }
+        const char* reason = nullptr;
+        if (!MaterialTable::Valid(entries[i].material, reason))
+        {
+            CAELIX_LOGE("%s: entry %u (code 0x%X) is not valid: %s", kFunction, i, entries[i].code,
+                        reason);
+            return CAELIX_ERROR_INVALID_ARGUMENT;
+        }
+    }
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        materials_->Set(entries[i].code, entries[i].material);
+    }
     return CAELIX_OK;
 }
 

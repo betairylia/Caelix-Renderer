@@ -254,6 +254,13 @@ TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]")
     scene_desc.records_per_page = 1024;
     CaelixScene* scene = nullptr;
     REQUIRE(caelix_scene_create(device, &scene_desc, &scene) == CAELIX_OK);
+    // The free staging stat of the empty ring: the record space (8 MiB minus the row reserve
+    // 8 MiB / 16 + 1 MiB) in 1096-byte records.
+    const uint64_t initial_free = Stats(scene).upload_bricks_free;
+    std::printf("upload_bricks_free of the empty ring: %llu\n",
+                static_cast<unsigned long long>(initial_free));
+    REQUIRE(initial_free > 0);
+    REQUIRE(initial_free == ((8ull << 20) - (8ull << 20) / 16 - (1ull << 20)) / kRecordBytes);
 
     ExpectLibraryErrors(4, [&] {
         CaelixScene* bad = nullptr;
@@ -307,6 +314,8 @@ TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]")
     REQUIRE(caelix_scene_upload_bricks(scene, e0, static_cast<uint32_t>(keys0.size()), keys0.data(),
                                        blocks0.data(), &consumed) == CAELIX_OK);
     REQUIRE(consumed == keys0.size());
+    // Without a flush, the 5000 staged records lower the free stat by at least 5000.
+    REQUIRE(Stats(scene).upload_bricks_free + 5000 <= initial_free);
     for (const CaelixBrickKey& key : keys0)
     {
         model.Set(e0, key, 0);
@@ -334,18 +343,22 @@ TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]")
     int iterations = 0;
     while (done < keys1.size())
     {
+        const uint64_t free_before = Stats(scene).upload_bricks_free;
         REQUIRE(caelix_scene_upload_bricks(scene, e1, static_cast<uint32_t>(keys1.size() - done),
                                            keys1.data() + done, blocks1.data() + done * kBlocksPerBrick,
                                            &consumed) == CAELIX_OK);
         std::printf("entity 1 upload %d: consumed %u of %zu\n", iterations, consumed,
                     keys1.size() - done);
         REQUIRE(consumed > 0);
+        REQUIRE(consumed <= free_before);  // the stat is an upper bound
         done += consumed;
         FlushFrame(gpu, scene, frames);
         ++iterations;
         REQUIRE(iterations < 100);
     }
     REQUIRE(iterations > 1);  // the batch did not fit one flush
+    // Every frame was flushed and recycled: the ring is empty again.
+    REQUIRE(Stats(scene).upload_bricks_free == initial_free);
     for (const CaelixBrickKey& key : keys1)
     {
         model.Set(e1, key, 0);

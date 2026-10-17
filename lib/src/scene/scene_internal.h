@@ -9,6 +9,11 @@ namespace caelix {
 constexpr VkDeviceSize kInstanceBytes = sizeof(VkAccelerationStructureInstanceKHR);
 static_assert(kInstanceBytes == 64);
 
+// Staging alignment of records. Records are 8-byte multiples, so consecutive
+// records stay contiguous in the ring and their copies merge. vkCmdCopyBuffer
+// itself has no offset alignment rule.
+constexpr uint64_t kRecordAlignment = 8;
+
 // One global memory barrier.
 inline void MemoryBarrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage,
                           VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,

@@ -165,6 +165,15 @@ void MaterialTable::Replace(const CaelixMaterial* entries, uint32_t count)
     MarkDirty(0, kEntries);
 }
 
+void MaterialTable::Set(uint32_t code, const CaelixMaterial& material)
+{
+    CaelixMaterial m = material;
+    m.pad[0] = 0.0f;
+    m.pad[1] = 0.0f;
+    entries_[code] = m;
+    MarkDirty(code, code + 1);
+}
+
 void MaterialTable::SetGlassPalette(const CaelixMaterial* entries, uint32_t count)
 {
     for (uint32_t id = 1; id < count; ++id)
