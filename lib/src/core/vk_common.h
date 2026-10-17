@@ -29,22 +29,30 @@ namespace caelix {
 // Dispatchable handles are always pointers; non-dispatchable handles are pointers on
 // 64-bit targets and uint64_t on 32-bit targets.
 template <typename T>
-T HandleFromU64(uint64_t value) {
-  if constexpr (std::is_pointer_v<T>) {
-    return reinterpret_cast<T>(static_cast<uintptr_t>(value));
-  } else {
-    return static_cast<T>(value);
-  }
+T HandleFromU64(uint64_t value)
+{
+    if constexpr (std::is_pointer_v<T>)
+    {
+        return reinterpret_cast<T>(static_cast<uintptr_t>(value));
+    }
+    else
+    {
+        return static_cast<T>(value);
+    }
 }
 
 // The inverse of HandleFromU64: a Vulkan handle as the raw uint64_t of the C ABI.
 template <typename T>
-uint64_t HandleToU64(T handle) {
-  if constexpr (std::is_pointer_v<T>) {
-    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
-  } else {
-    return static_cast<uint64_t>(handle);
-  }
+uint64_t HandleToU64(T handle)
+{
+    if constexpr (std::is_pointer_v<T>)
+    {
+        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+    }
+    else
+    {
+        return static_cast<uint64_t>(handle);
+    }
 }
 
 }  // namespace caelix

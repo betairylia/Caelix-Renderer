@@ -46,70 +46,87 @@
 static const float kMotionViewRange = 32.0f;
 
 [numthreads(8, 8, 1)]
-void main(uint3 thread_id : SV_DispatchThreadID) {
-  const CaelixFrameConstants fc = CAELIX_LOAD_STRUCT(CaelixFrameConstants, g_push.frame_constants, 16);
-  if (any(thread_id.xy >= fc.size)) {
-    return;
-  }
-  g_emissionScale = fc.emission_scale;  // not used here; keeps the shading globals set
-  const uint2 pixel = thread_id.xy;
-  float4 albedo = g_int_albedo[pixel];
-  const bool hit = albedo.a > 0.5f;
-  const float4 motion_flag = g_int_motion[pixel];
-  if (motion_flag.w > 0.5f) {
-    albedo.rgb *= 2.0f;  // the trace stored half of a checkerboard pixel's albedo
-  }
-  const bool path_trace = fc.mode == kModePathTrace;
-  CAELIX_BRANCH
-  if (path_trace && fc.debug_view == kViewMotion) {
-    const float2 motion =
-        (fc.flags & kRenderFlagFlipY) != 0u ? float2(motion_flag.x, -motion_flag.y) : motion_flag.xy;
-    const float coverage = hit ? 1.0f : 0.0f;
-    const float2 shown = saturate(motion / kMotionViewRange * 0.5f + 0.5f);
-    const float4 value = float4(shown, 0.5f * coverage, coverage);
-    if (fc.cross_resolve != 0u) {
-      g_int_resolve[pixel] = value;  // passed through by the cross resolve
-    } else {
-      g_color[CaelixOutputPixel(fc, pixel)] = value;
+void main(uint3 thread_id : SV_DispatchThreadID)
+{
+    const CaelixFrameConstants fc = CAELIX_LOAD_STRUCT(CaelixFrameConstants, g_push.frame_constants, 16);
+    if (any(thread_id.xy >= fc.size))
+    {
+        return;
     }
-    return;
-  }
+    g_emissionScale = fc.emission_scale;  // not used here; keeps the shading globals set
+    const uint2 pixel = thread_id.xy;
+    float4 albedo = g_int_albedo[pixel];
+    const bool hit = albedo.a > 0.5f;
+    const float4 motion_flag = g_int_motion[pixel];
+    if (motion_flag.w > 0.5f)
+    {
+        albedo.rgb *= 2.0f;  // the trace stored half of a checkerboard pixel's albedo
+    }
+    const bool path_trace = fc.mode == kModePathTrace;
+    CAELIX_BRANCH
+    if (path_trace && fc.debug_view == kViewMotion)
+    {
+        const float2 motion =
+            (fc.flags & kRenderFlagFlipY) != 0u ? float2(motion_flag.x, -motion_flag.y) : motion_flag.xy;
+        const float coverage = hit ? 1.0f : 0.0f;
+        const float2 shown = saturate(motion / kMotionViewRange * 0.5f + 0.5f);
+        const float4 value = float4(shown, 0.5f * coverage, coverage);
+        if (fc.cross_resolve != 0u)
+        {
+            g_int_resolve[pixel] = value;  // passed through by the cross resolve
+        }
+        else
+        {
+            g_color[CaelixOutputPixel(fc, pixel)] = value;
+        }
+        return;
+    }
 
-  float3 color = float3(0.0f, 0.0f, 0.0f);
-  if (hit) {
-    const float3 diffuse = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_int_diff[pixel]).rgb;
-    const float3 specular = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_int_spec[pixel]).rgb;
-    const float3 raw = g_int_deterministic[pixel].rgb + albedo.rgb * (diffuse + specular);
-    color = raw;
-    if (path_trace && fc.debug_view == kViewNrdDiff) {
-      color = diffuse;
-    } else if (path_trace && fc.debug_view == kViewNrdSpec) {
-      color = specular;
+    float3 color = float3(0.0f, 0.0f, 0.0f);
+    if (hit)
+    {
+        const float3 diffuse = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_int_diff[pixel]).rgb;
+        const float3 specular = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_int_spec[pixel]).rgb;
+        const float3 raw = g_int_deterministic[pixel].rgb + albedo.rgb * (diffuse + specular);
+        color = raw;
+        if (path_trace && fc.debug_view == kViewNrdDiff)
+        {
+            color = diffuse;
+        }
+        else if (path_trace && fc.debug_view == kViewNrdSpec)
+        {
+            color = specular;
+        }
+        CAELIX_BRANCH
+        if (fc.mode == kModeReference)
+        {
+            // The first frame after a reset is exactly the raw frame.
+            const float3 mean = fc.accum_count == 0u
+                                    ? raw
+                                    : lerp(g_int_accum[pixel].rgb, raw, 1.0f / float(fc.accum_count + 1u));
+            g_int_accum[pixel] = float4(mean, 1.0f);
+            color = mean;
+        }
     }
+    else
+    {
+        CAELIX_BRANCH
+        if (fc.mode == kModeReference)
+        {
+            g_int_accum[pixel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        if ((fc.flags & kRenderFlagSkyOnMiss) != 0u)
+        {
+            color = SkyRadiance(fc, CaelixPrimaryDirection(fc, pixel));
+        }
+    }
+    color *= fc.exposure;
     CAELIX_BRANCH
-    if (fc.mode == kModeReference) {
-      // The first frame after a reset is exactly the raw frame.
-      const float3 mean = fc.accum_count == 0u
-                              ? raw
-                              : lerp(g_int_accum[pixel].rgb, raw, 1.0f / float(fc.accum_count + 1u));
-      g_int_accum[pixel] = float4(mean, 1.0f);
-      color = mean;
+    if (fc.cross_resolve != 0u)
+    {
+        // Linear: the cross resolve blends, then encodes.
+        g_int_resolve[pixel] = float4(color, hit ? 1.0f : 0.0f);
+        return;
     }
-  } else {
-    CAELIX_BRANCH
-    if (fc.mode == kModeReference) {
-      g_int_accum[pixel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
-    }
-    if ((fc.flags & kRenderFlagSkyOnMiss) != 0u) {
-      color = SkyRadiance(fc, CaelixPrimaryDirection(fc, pixel));
-    }
-  }
-  color *= fc.exposure;
-  CAELIX_BRANCH
-  if (fc.cross_resolve != 0u) {
-    // Linear: the cross resolve blends, then encodes.
-    g_int_resolve[pixel] = float4(color, hit ? 1.0f : 0.0f);
-    return;
-  }
-  g_color[CaelixOutputPixel(fc, pixel)] = float4(CaelixOutputColor(fc, pixel, color), hit ? 1.0f : 0.0f);
+    g_color[CaelixOutputPixel(fc, pixel)] = float4(CaelixOutputColor(fc, pixel, color), hit ? 1.0f : 0.0f);
 }

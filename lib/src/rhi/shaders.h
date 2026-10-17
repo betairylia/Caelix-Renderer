@@ -8,10 +8,11 @@ namespace caelix {
 
 // One SPIR-V module compiled from shaders/ at build time (cmake/Shaders.cmake)
 // and embedded into the library.
-struct EmbeddedShader {
-  const char* name;  // file name without extension, e.g. "caelix_finalize"
-  const uint32_t* words;
-  size_t word_count;
+struct EmbeddedShader
+{
+    const char* name;  // file name without extension, e.g. "caelix_finalize"
+    const uint32_t* words;
+    size_t word_count;
 };
 
 // Defined in the generated caelix_shaders_embedded.cpp.

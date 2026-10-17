@@ -43,13 +43,13 @@
 extern "C" {
 #endif
 #if defined(_WIN32)
-  #if defined(CAELIX_UNITY_BUILD)
-    #define CAELIX_UNITY_API __declspec(dllexport)
-  #else
-    #define CAELIX_UNITY_API __declspec(dllimport)
-  #endif
+#if defined(CAELIX_UNITY_BUILD)
+#define CAELIX_UNITY_API __declspec(dllexport)
 #else
-  #define CAELIX_UNITY_API __attribute__((visibility("default")))
+#define CAELIX_UNITY_API __declspec(dllimport)
+#endif
+#else
+#define CAELIX_UNITY_API __attribute__((visibility("default")))
 #endif
 
 /* Bumped on every change of CaelixUnityPacket, its records or CaelixUnityStatus.
@@ -60,13 +60,14 @@ extern "C" {
 #define CAELIX_UNITY_MAX_VIEWS 4u
 
 /* A render target, given as Unity's native texture pointer. */
-typedef struct CaelixUnityTarget {
-  void* native_texture;        /* Texture.GetNativeTexturePtr(); NULL = the target is absent */
-  void* native_render_buffer;  /* RenderTexture.colorBuffer.GetNativeRenderBufferPtr(); the
-                                  fallback when AccessTexture does not accept native_texture.
-                                  May be NULL. */
-  uint32_t width;              /* must match the texture's size */
-  uint32_t height;
+typedef struct CaelixUnityTarget
+{
+    void* native_texture;       /* Texture.GetNativeTexturePtr(); NULL = the target is absent */
+    void* native_render_buffer; /* RenderTexture.colorBuffer.GetNativeRenderBufferPtr(); the
+                                   fallback when AccessTexture does not accept native_texture.
+                                   May be NULL. */
+    uint32_t width;             /* must match the texture's size */
+    uint32_t height;
 } CaelixUnityTarget;
 
 /* CaelixUnityEntity::flags. 0 = a reference only (a brick remove or upload names the entity). */
@@ -76,32 +77,36 @@ typedef struct CaelixUnityTarget {
 #define CAELIX_UNITY_ENTITY_TRANSFORM 4u  /* set the entity transform */
 
 /* One entity record. 48 bytes. The plugin maps guid -> CaelixEntityId. */
-typedef struct CaelixUnityEntity {
-  uint8_t guid[16];
-  float position[3];  /* world position of the entity origin (ADD, TRANSFORM) */
-  float rotation[4];  /* unit quaternion x, y, z, w (ADD, TRANSFORM) */
-  uint32_t flags;     /* CAELIX_UNITY_ENTITY_* */
+typedef struct CaelixUnityEntity
+{
+    uint8_t guid[16];
+    float position[3]; /* world position of the entity origin (ADD, TRANSFORM) */
+    float rotation[4]; /* unit quaternion x, y, z, w (ADD, TRANSFORM) */
+    uint32_t flags;    /* CAELIX_UNITY_ENTITY_* */
 } CaelixUnityEntity;
 
 /* One brick removal. 16 bytes. */
-typedef struct CaelixUnityBrickRemove {
-  uint32_t entity_index;  /* index into this packet's entity records */
-  CaelixBrickKey key;
+typedef struct CaelixUnityBrickRemove
+{
+    uint32_t entity_index; /* index into this packet's entity records */
+    CaelixBrickKey key;
 } CaelixUnityBrickRemove;
 
 /* One upload batch of one entity. 16 bytes. Offsets are bytes from the packet start. */
-typedef struct CaelixUnityUpload {
-  uint32_t entity_index;   /* index into this packet's entity records */
-  uint32_t brick_count;
-  uint32_t keys_offset;    /* brick_count CaelixBrickKey, 4-byte aligned */
-  uint32_t blocks_offset;  /* brick_count * 512 uint16 block values (raw storage values, voxel
-                              index x + 8 y + 64 z), 16-byte aligned */
+typedef struct CaelixUnityUpload
+{
+    uint32_t entity_index; /* index into this packet's entity records */
+    uint32_t brick_count;
+    uint32_t keys_offset;   /* brick_count CaelixBrickKey, 4-byte aligned */
+    uint32_t blocks_offset; /* brick_count * 512 uint16 block values (raw storage values, voxel
+                               index x + 8 y + 64 z), 16-byte aligned */
 } CaelixUnityUpload;
 
 /* One entry of a partial material table (CAELIX_UNITY_MATERIALS_PARTIAL). 52 bytes. */
-typedef struct CaelixUnityMaterialEntry {
-  uint32_t code;  /* 16-bit block code, 0 .. 0xFFFF */
-  CaelixMaterial material;
+typedef struct CaelixUnityMaterialEntry
+{
+    uint32_t code; /* 16-bit block code, 0 .. 0xFFFF */
+    CaelixMaterial material;
 } CaelixUnityMaterialEntry;
 
 /* CaelixUnityPacket::material_mode */
@@ -125,82 +130,84 @@ typedef struct CaelixUnityMaterialEntry {
    entity records in list order, the plugin's pending uploads of earlier packets, the brick
    removes, the uploads (appended to the pending uploads while some are still waiting, so the
    order per entity is kept), the materials, then flush and render. */
-typedef struct CaelixUnityPacket {
-  uint32_t size;          /* sizeof(CaelixUnityPacket); the plugin rejects any other value */
-  uint32_t version;       /* CAELIX_UNITY_PACKET_VERSION */
-  uint64_t sequence;      /* > 0, strictly increasing per issued packet */
-  uint32_t encoding;      /* scene block encoding: 0 packed scene colour, 1 block-ID. See the
-                             release event for a change of encoding. */
-  uint32_t target_generation; /* changes whenever C# replaced a target texture (see the release
-                                 event); the plugin warns when it changes without a release */
-  CaelixUnityTarget color;    /* RGBA16F with random write (STORAGE usage) */
-  /* Version 3: optional geometry targets (native_texture NULL = absent), each with random write and
-     the size of the colour target. The plugin passes them as CaelixRenderTargets::depth, motion and
-     albedo; a target that AccessTexture refuses or that has no STORAGE usage is dropped (logged). */
-  CaelixUnityTarget depth;    /* R32F: device depth of camera.projection */
-  CaelixUnityTarget motion;   /* RGBA16F: previous - current pixel, w = delta checkerboard flag */
-  CaelixUnityTarget albedo;   /* RGBA8 UNORM: albedo, a = coverage */
-  CaelixCamera camera;        /* version 3: CaelixCamera::jitter appended */
-  CaelixRenderOptions options;
+typedef struct CaelixUnityPacket
+{
+    uint32_t size;              /* sizeof(CaelixUnityPacket); the plugin rejects any other value */
+    uint32_t version;           /* CAELIX_UNITY_PACKET_VERSION */
+    uint64_t sequence;          /* > 0, strictly increasing per issued packet */
+    uint32_t encoding;          /* scene block encoding: 0 packed scene colour, 1 block-ID. See the
+                                   release event for a change of encoding. */
+    uint32_t target_generation; /* changes whenever C# replaced a target texture (see the release
+                                   event); the plugin warns when it changes without a release */
+    CaelixUnityTarget color;    /* RGBA16F with random write (STORAGE usage) */
+    /* Version 3: optional geometry targets (native_texture NULL = absent), each with random write and
+       the size of the colour target. The plugin passes them as CaelixRenderTargets::depth, motion and
+       albedo; a target that AccessTexture refuses or that has no STORAGE usage is dropped (logged). */
+    CaelixUnityTarget depth;  /* R32F: device depth of camera.projection */
+    CaelixUnityTarget motion; /* RGBA16F: previous - current pixel, w = delta checkerboard flag */
+    CaelixUnityTarget albedo; /* RGBA8 UNORM: albedo, a = coverage */
+    CaelixCamera camera;      /* version 3: CaelixCamera::jitter appended */
+    CaelixRenderOptions options;
 
-  /* Scene section (version 2). */
-  uint32_t scene_flags;       /* CAELIX_UNITY_SCENE_* */
-  uint32_t total_bytes;       /* the whole block: this struct plus every record */
-  uint32_t entity_count;      /* CaelixUnityEntity[entity_count] at entities_offset */
-  uint32_t entities_offset;
-  uint32_t remove_count;      /* CaelixUnityBrickRemove[remove_count] at removes_offset */
-  uint32_t removes_offset;
-  uint32_t upload_count;      /* CaelixUnityUpload[upload_count] at uploads_offset */
-  uint32_t uploads_offset;
-  uint32_t material_mode;     /* CAELIX_UNITY_MATERIALS_* */
-  uint32_t material_count;    /* entries at materials_offset (layout per material_mode) */
-  uint32_t materials_offset;
-  uint32_t view;              /* version 4: view index 0 .. CAELIX_UNITY_MAX_VIEWS-1; each view has
-                                 its own renderer (internal targets, NRD history) over the shared
-                                 scene. C#: 0 = Game view, 1 = Scene view. The status timings are
-                                 those of view 0. */
+    /* Scene section (version 2). */
+    uint32_t scene_flags;  /* CAELIX_UNITY_SCENE_* */
+    uint32_t total_bytes;  /* the whole block: this struct plus every record */
+    uint32_t entity_count; /* CaelixUnityEntity[entity_count] at entities_offset */
+    uint32_t entities_offset;
+    uint32_t remove_count; /* CaelixUnityBrickRemove[remove_count] at removes_offset */
+    uint32_t removes_offset;
+    uint32_t upload_count; /* CaelixUnityUpload[upload_count] at uploads_offset */
+    uint32_t uploads_offset;
+    uint32_t material_mode;  /* CAELIX_UNITY_MATERIALS_* */
+    uint32_t material_count; /* entries at materials_offset (layout per material_mode) */
+    uint32_t materials_offset;
+    uint32_t view; /* version 4: view index 0 .. CAELIX_UNITY_MAX_VIEWS-1; each view has
+                      its own renderer (internal targets, NRD history) over the shared
+                      scene. C#: 0 = Game view, 1 = Scene view. The status timings are
+                      those of view 0. */
 } CaelixUnityPacket;
 
 /* Plugin state for C#. Counters are monotonic. */
-typedef struct CaelixUnityStatus {
-  uint32_t size;                  /* sizeof(CaelixUnityStatus) */
-  uint32_t packet_size;           /* sizeof(CaelixUnityPacket) as compiled into the plugin */
-  uint32_t packet_version;        /* CAELIX_UNITY_PACKET_VERSION */
-  uint32_t unity_renderer;        /* UnityGfxRenderer at the last check (21 = Vulkan) */
-  uint32_t intercept_registered;  /* 1: InterceptInitialization returned true */
-  uint32_t intercept_called;      /* 1: Unity called the init callback (Vulkan initialization) */
-  uint32_t instance_patched;      /* 1: vkCreateInstance succeeded with the plugin's api version */
-  uint32_t device_patched;        /* 1: vkCreateDevice succeeded with the plugin's extensions and
-                                     features */
-  uint32_t device_adopted;        /* 1: caelix_device_adopt returned CAELIX_OK */
-  int32_t last_error;             /* CaelixResult of the newest failure (0 = none) */
-  int32_t render_event_id;        /* event id of the render event */
-  int32_t release_event_id;       /* event id of the target-view release event */
-  uint64_t last_consumed_sequence; /* sequence of the newest packet the render thread is done with */
-  uint64_t last_unity_frame;      /* Unity's currentFrameNumber at the newest render event */
-  uint64_t last_safe_frame;       /* Unity's safeFrameNumber at the newest render event */
-  uint64_t last_plugin_frame;     /* the newest frame number the plugin passed to the library */
-  uint64_t renders;               /* render events that recorded a render */
-  uint64_t failed_events;         /* render events that failed (see the Unity log) */
-  uint64_t view_releases;         /* release events that ran */
-  /* Version 2: the scene, as of the newest flush. */
-  uint32_t scene_encoding;        /* encoding of the live scene; 0xFFFFFFFF = no scene */
-  uint32_t entities;              /* CaelixSceneStats::entities */
-  uint32_t groups;                /* CaelixSceneStats::groups */
-  uint32_t scene_recreations;     /* scenes destroyed for an encoding change */
-  uint64_t bricks_resident;       /* CaelixSceneStats::bricks_resident */
-  uint64_t bricks_pending_plugin; /* bricks the plugin holds because the staging ring was full */
-  uint64_t as_builds_pending;     /* CaelixSceneStats::as_builds_pending */
-  uint64_t uploaded_total;        /* bricks accepted by caelix_scene_upload_bricks so far */
-  uint64_t removed_total;         /* brick removes passed to caelix_scene_remove_bricks so far */
-  uint64_t scene_packets;         /* render events whose packet carried scene records */
-  uint64_t record_bytes;          /* CaelixSceneStats::record_bytes */
-  uint64_t blas_bytes;            /* CaelixSceneStats::blas_bytes */
-  float flush_ms;                 /* CaelixGpuTimings of the newest frame read back */
-  float trace_ms;
-  float composite_ms;
-  float denoise_ms;
-  uint64_t timings_frame;         /* CaelixGpuTimings::frame_number */
+typedef struct CaelixUnityStatus
+{
+    uint32_t size;                   /* sizeof(CaelixUnityStatus) */
+    uint32_t packet_size;            /* sizeof(CaelixUnityPacket) as compiled into the plugin */
+    uint32_t packet_version;         /* CAELIX_UNITY_PACKET_VERSION */
+    uint32_t unity_renderer;         /* UnityGfxRenderer at the last check (21 = Vulkan) */
+    uint32_t intercept_registered;   /* 1: InterceptInitialization returned true */
+    uint32_t intercept_called;       /* 1: Unity called the init callback (Vulkan initialization) */
+    uint32_t instance_patched;       /* 1: vkCreateInstance succeeded with the plugin's api version */
+    uint32_t device_patched;         /* 1: vkCreateDevice succeeded with the plugin's extensions and
+                                        features */
+    uint32_t device_adopted;         /* 1: caelix_device_adopt returned CAELIX_OK */
+    int32_t last_error;              /* CaelixResult of the newest failure (0 = none) */
+    int32_t render_event_id;         /* event id of the render event */
+    int32_t release_event_id;        /* event id of the target-view release event */
+    uint64_t last_consumed_sequence; /* sequence of the newest packet the render thread is done with */
+    uint64_t last_unity_frame;       /* Unity's currentFrameNumber at the newest render event */
+    uint64_t last_safe_frame;        /* Unity's safeFrameNumber at the newest render event */
+    uint64_t last_plugin_frame;      /* the newest frame number the plugin passed to the library */
+    uint64_t renders;                /* render events that recorded a render */
+    uint64_t failed_events;          /* render events that failed (see the Unity log) */
+    uint64_t view_releases;          /* release events that ran */
+    /* Version 2: the scene, as of the newest flush. */
+    uint32_t scene_encoding;        /* encoding of the live scene; 0xFFFFFFFF = no scene */
+    uint32_t entities;              /* CaelixSceneStats::entities */
+    uint32_t groups;                /* CaelixSceneStats::groups */
+    uint32_t scene_recreations;     /* scenes destroyed for an encoding change */
+    uint64_t bricks_resident;       /* CaelixSceneStats::bricks_resident */
+    uint64_t bricks_pending_plugin; /* bricks the plugin holds because the staging ring was full */
+    uint64_t as_builds_pending;     /* CaelixSceneStats::as_builds_pending */
+    uint64_t uploaded_total;        /* bricks accepted by caelix_scene_upload_bricks so far */
+    uint64_t removed_total;         /* brick removes passed to caelix_scene_remove_bricks so far */
+    uint64_t scene_packets;         /* render events whose packet carried scene records */
+    uint64_t record_bytes;          /* CaelixSceneStats::record_bytes */
+    uint64_t blas_bytes;            /* CaelixSceneStats::blas_bytes */
+    float flush_ms;                 /* CaelixGpuTimings of the newest frame read back */
+    float trace_ms;
+    float composite_ms;
+    float denoise_ms;
+    uint64_t timings_frame; /* CaelixGpuTimings::frame_number */
 } CaelixUnityStatus;
 
 /* The UnityRenderingEventAndData callback for CommandBuffer.IssuePluginEventAndData. Never NULL. */

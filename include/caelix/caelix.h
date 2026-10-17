@@ -27,13 +27,13 @@
 extern "C" {
 #endif
 #if defined(_WIN32)
-  #if defined(CAELIX_BUILD_SHARED)
-    #define CAELIX_API __declspec(dllexport)
-  #else
-    #define CAELIX_API __declspec(dllimport)
-  #endif
+#if defined(CAELIX_BUILD_SHARED)
+#define CAELIX_API __declspec(dllexport)
 #else
-  #define CAELIX_API __attribute__((visibility("default")))
+#define CAELIX_API __declspec(dllimport)
+#endif
+#else
+#define CAELIX_API __attribute__((visibility("default")))
 #endif
 
 /* Bumped on every breaking change of this header. Exception: version 2 is still in development;
@@ -64,11 +64,12 @@ extern "C" {
    structs). */
 #define CAELIX_ABI_VERSION 2u
 
-typedef struct CaelixVersion {
-  uint32_t major;
-  uint32_t minor;
-  uint32_t patch;
-  uint32_t abi;   /* == CAELIX_ABI_VERSION of the built library */
+typedef struct CaelixVersion
+{
+    uint32_t major;
+    uint32_t minor;
+    uint32_t patch;
+    uint32_t abi; /* == CAELIX_ABI_VERSION of the built library */
 } CaelixVersion;
 
 /* Fills *out with the library's version. Never fails. */
@@ -77,23 +78,25 @@ CAELIX_API void caelix_get_version(CaelixVersion* out);
 CAELIX_API const char* caelix_version_string(void);
 
 /* Result of every fallible ABI call. */
-typedef enum CaelixResult {
-  CAELIX_OK = 0,
-  CAELIX_ERROR_INVALID_ARGUMENT = 1,
-  CAELIX_ERROR_UNSUPPORTED = 2,      /* the adopted device lacks a requirement; see log */
-  CAELIX_ERROR_VULKAN = 3,           /* a Vulkan call failed; see log */
-  CAELIX_ERROR_OUT_OF_MEMORY = 4
+typedef enum CaelixResult
+{
+    CAELIX_OK = 0,
+    CAELIX_ERROR_INVALID_ARGUMENT = 1,
+    CAELIX_ERROR_UNSUPPORTED = 2, /* the adopted device lacks a requirement; see log */
+    CAELIX_ERROR_VULKAN = 3,      /* a Vulkan call failed; see log */
+    CAELIX_ERROR_OUT_OF_MEMORY = 4
 } CaelixResult;
 
 /* ---------------------------------------------------------------------------
  * Logging
  * ------------------------------------------------------------------------- */
 
-typedef enum CaelixLogLevel {
-  CAELIX_LOG_DEBUG = 0,
-  CAELIX_LOG_INFO = 1,
-  CAELIX_LOG_WARNING = 2,
-  CAELIX_LOG_ERROR = 3
+typedef enum CaelixLogLevel
+{
+    CAELIX_LOG_DEBUG = 0,
+    CAELIX_LOG_INFO = 1,
+    CAELIX_LOG_WARNING = 2,
+    CAELIX_LOG_ERROR = 3
 } CaelixLogLevel;
 
 /* `message` is a NUL-terminated UTF-8 string, valid only during the call. */
@@ -107,42 +110,45 @@ CAELIX_API void caelix_set_log_callback(CaelixLogCallback callback, void* user_d
 
 /* Device features the library needs ENABLED on the adopted device. Vulkan 1.3 core features are
    listed too because the host must still enable them at vkCreateDevice. */
-typedef enum CaelixDeviceFeatureBits {
-  CAELIX_FEATURE_BUFFER_DEVICE_ADDRESS   = 1u << 0, /* VkPhysicalDeviceVulkan12Features::bufferDeviceAddress */
-  CAELIX_FEATURE_DESCRIPTOR_INDEXING     = 1u << 1, /* runtimeDescriptorArray, shaderStorageBufferArrayNonUniformIndexing, descriptorBindingPartiallyBound, descriptorBindingVariableDescriptorCount */
-  CAELIX_FEATURE_SYNCHRONIZATION2        = 1u << 2, /* VkPhysicalDeviceVulkan13Features::synchronization2 */
-  CAELIX_FEATURE_DYNAMIC_RENDERING       = 1u << 3, /* VkPhysicalDeviceVulkan13Features::dynamicRendering */
-  CAELIX_FEATURE_TIMELINE_SEMAPHORE      = 1u << 4, /* VkPhysicalDeviceVulkan12Features::timelineSemaphore */
-  CAELIX_FEATURE_ACCELERATION_STRUCTURE  = 1u << 5, /* VkPhysicalDeviceAccelerationStructureFeaturesKHR::accelerationStructure */
-  CAELIX_FEATURE_RAY_QUERY               = 1u << 6, /* VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery */
-  CAELIX_FEATURE_SHADER_INT64            = 1u << 7, /* VkPhysicalDeviceFeatures::shaderInt64 */
-  CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT     = 1u << 8, /* VkPhysicalDeviceVulkan12Features::scalarBlockLayout */
-  CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT = 1u << 9, /* VkPhysicalDeviceFeatures::shaderStorageImageWriteWithoutFormat */
-  CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT = 1u << 10  /* VkPhysicalDeviceFeatures::shaderStorageImageReadWithoutFormat
-                                                                   (NRD's temporal stabilization and validation passes) */
+typedef enum CaelixDeviceFeatureBits
+{
+    CAELIX_FEATURE_BUFFER_DEVICE_ADDRESS = 1u << 0,              /* VkPhysicalDeviceVulkan12Features::bufferDeviceAddress */
+    CAELIX_FEATURE_DESCRIPTOR_INDEXING = 1u << 1,                /* runtimeDescriptorArray, shaderStorageBufferArrayNonUniformIndexing, descriptorBindingPartiallyBound, descriptorBindingVariableDescriptorCount */
+    CAELIX_FEATURE_SYNCHRONIZATION2 = 1u << 2,                   /* VkPhysicalDeviceVulkan13Features::synchronization2 */
+    CAELIX_FEATURE_DYNAMIC_RENDERING = 1u << 3,                  /* VkPhysicalDeviceVulkan13Features::dynamicRendering */
+    CAELIX_FEATURE_TIMELINE_SEMAPHORE = 1u << 4,                 /* VkPhysicalDeviceVulkan12Features::timelineSemaphore */
+    CAELIX_FEATURE_ACCELERATION_STRUCTURE = 1u << 5,             /* VkPhysicalDeviceAccelerationStructureFeaturesKHR::accelerationStructure */
+    CAELIX_FEATURE_RAY_QUERY = 1u << 6,                          /* VkPhysicalDeviceRayQueryFeaturesKHR::rayQuery */
+    CAELIX_FEATURE_SHADER_INT64 = 1u << 7,                       /* VkPhysicalDeviceFeatures::shaderInt64 */
+    CAELIX_FEATURE_SCALAR_BLOCK_LAYOUT = 1u << 8,                /* VkPhysicalDeviceVulkan12Features::scalarBlockLayout */
+    CAELIX_FEATURE_STORAGE_IMAGE_WRITE_WITHOUT_FORMAT = 1u << 9, /* VkPhysicalDeviceFeatures::shaderStorageImageWriteWithoutFormat */
+    CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT = 1u << 10  /* VkPhysicalDeviceFeatures::shaderStorageImageReadWithoutFormat
+                                                                     (NRD's temporal stabilization and validation passes) */
 } CaelixDeviceFeatureBits;
 
-typedef struct CaelixDeviceRequirements {
-  uint32_t api_version;                 /* VK_MAKE_API_VERSION(0,1,3,0) */
-  uint32_t device_extension_count;
-  const char* const* device_extensions; /* static strings owned by the library */
-  uint32_t feature_flags;               /* CaelixDeviceFeatureBits */
+typedef struct CaelixDeviceRequirements
+{
+    uint32_t api_version; /* VK_MAKE_API_VERSION(0,1,3,0) */
+    uint32_t device_extension_count;
+    const char* const* device_extensions; /* static strings owned by the library */
+    uint32_t feature_flags;               /* CaelixDeviceFeatureBits */
 } CaelixDeviceRequirements;
 
 /* Fills *out with what the host must request at vkCreateInstance / vkCreateDevice.
    Call before creating the device. Never fails; a NULL `out` is ignored. */
 CAELIX_API void caelix_get_device_requirements(CaelixDeviceRequirements* out);
 
-typedef struct CaelixDeviceAdoptDesc {
-  void*    get_instance_proc_addr;  /* PFN_vkGetInstanceProcAddr */
-  uint64_t instance;                /* VkInstance */
-  uint64_t physical_device;         /* VkPhysicalDevice */
-  uint64_t device;                  /* VkDevice */
-  uint64_t graphics_queue;          /* VkQueue, graphics + compute capable */
-  uint32_t graphics_queue_family;
+typedef struct CaelixDeviceAdoptDesc
+{
+    void* get_instance_proc_addr; /* PFN_vkGetInstanceProcAddr */
+    uint64_t instance;            /* VkInstance */
+    uint64_t physical_device;     /* VkPhysicalDevice */
+    uint64_t device;              /* VkDevice */
+    uint64_t graphics_queue;      /* VkQueue, graphics + compute capable */
+    uint32_t graphics_queue_family;
 } CaelixDeviceAdoptDesc;
 
-typedef struct CaelixDevice CaelixDevice;  /* opaque */
+typedef struct CaelixDevice CaelixDevice; /* opaque */
 
 /* Adopts the host's device. Checks that the physical device supports every requirement of
    caelix_get_device_requirements, and that its subgroups support quad operations in compute shaders
@@ -163,12 +169,13 @@ CAELIX_API void caelix_device_destroy(CaelixDevice* device);
 
 /* An image that the library writes (see CaelixRenderTargets). The host owns it; the library only
    creates and caches image views of it (see caelix_renderer_release_target_views). */
-typedef struct CaelixTargetImage {
-  uint64_t image;   /* VkImage */
-  uint32_t format;  /* VkFormat */
-  uint32_t width;
-  uint32_t height;
-  uint32_t layout;  /* VkImageLayout of the image when the library starts recording */
+typedef struct CaelixTargetImage
+{
+    uint64_t image;  /* VkImage */
+    uint32_t format; /* VkFormat */
+    uint32_t width;
+    uint32_t height;
+    uint32_t layout; /* VkImageLayout of the image when the library starts recording */
 } CaelixTargetImage;
 
 /* ---------------------------------------------------------------------------
@@ -229,20 +236,21 @@ typedef struct CaelixTargetImage {
  * replaced GPU buffers are released only when their frame is <= that number.
  * ------------------------------------------------------------------------- */
 
-typedef struct CaelixScene CaelixScene;  /* opaque */
+typedef struct CaelixScene CaelixScene; /* opaque */
 
-typedef struct CaelixSceneDesc {
-  uint64_t staging_bytes;      /* host-visible upload ring. 0 = 64 MiB. Must be >= 4 MiB. */
-  uint32_t records_per_page;   /* record pool page size in bricks, power of two. 0 = 1 << 18. */
-  uint32_t group_shift;        /* render group edge in bricks = 1 << group_shift. 0 = 4 (16^3). Max 8.
+typedef struct CaelixSceneDesc
+{
+    uint64_t staging_bytes;    /* host-visible upload ring. 0 = 64 MiB. Must be >= 4 MiB. */
+    uint32_t records_per_page; /* record pool page size in bricks, power of two. 0 = 1 << 18. */
+    uint32_t group_shift;      /* render group edge in bricks = 1 << group_shift. 0 = 4 (16^3). Max 8.
                                   Only 1..5 are implemented in this version: 6..8 return
                                   CAELIX_ERROR_UNSUPPORTED (dense brick ids are 16-bit). */
-  uint32_t block_bytes;        /* bytes per block value. 0 = 2. Only 2 is implemented in this version;
+    uint32_t block_bytes;      /* bytes per block value. 0 = 2. Only 2 is implemented in this version;
                                   4 returns CAELIX_ERROR_UNSUPPORTED. */
-  uint32_t encoding;           /* block encoding for finalization: 0 = packed scene colour (the
+    uint32_t encoding;         /* block encoding for finalization: 0 = packed scene colour (the
                                   default, what Caelix worlds use), 1 = block-ID. Other values
                                   return CAELIX_ERROR_INVALID_ARGUMENT. See the encodings above. */
-  uint64_t scratch_bytes;      /* scratch buffer of the acceleration structure builds of one flush.
+    uint64_t scratch_bytes;    /* scratch buffer of the acceleration structure builds of one flush.
                                   0 = 128 MiB. A flush builds as many BLASes as fit (the TLAS
                                   first); the rest wait. The buffer grows when the TLAS and the
                                   largest single BLAS do not fit together. */
@@ -260,10 +268,11 @@ CAELIX_API void caelix_scene_destroy(CaelixScene* scene);
 typedef uint32_t CaelixEntityId;
 #define CAELIX_INVALID_ENTITY 0xFFFFFFFFu
 
-typedef struct CaelixEntityDesc {
-  uint8_t guid[16];      /* stored for the host; the library does not interpret it */
-  float position[3];     /* world position of the entity origin */
-  float rotation[4];     /* unit quaternion x, y, z, w */
+typedef struct CaelixEntityDesc
+{
+    uint8_t guid[16];  /* stored for the host; the library does not interpret it */
+    float position[3]; /* world position of the entity origin */
+    float rotation[4]; /* unit quaternion x, y, z, w */
 } CaelixEntityDesc;
 
 /* Adds an entity with no bricks. */
@@ -276,8 +285,9 @@ CAELIX_API CaelixResult caelix_scene_set_entity_transform(CaelixScene* scene, Ca
                                                           const float rotation[4]);
 
 /* Entity-local brick key = block >> 3 per axis. Each axis must be in [-2^20, 2^20). */
-typedef struct CaelixBrickKey {
-  int32_t x, y, z;
+typedef struct CaelixBrickKey
+{
+    int32_t x, y, z;
 } CaelixBrickKey;
 
 /* Raw bricks, borrowed for the duration of the call. `blocks` holds count * 512 block values of
@@ -298,11 +308,12 @@ CAELIX_API CaelixResult caelix_scene_upload_bricks(CaelixScene* scene, CaelixEnt
 CAELIX_API CaelixResult caelix_scene_remove_bricks(CaelixScene* scene, CaelixEntityId entity,
                                                    uint32_t count, const CaelixBrickKey* keys);
 
-typedef struct CaelixFrameDesc {
-  uint64_t command_buffer;     /* VkCommandBuffer in the recording state, graphics queue */
-  uint64_t frame_number;       /* strictly increasing across flushes. Must be > safe_frame_number,
-                                  so the first frame number is 1 or higher. */
-  uint64_t safe_frame_number;  /* every frame <= this has completed on the GPU. 0 = none yet. */
+typedef struct CaelixFrameDesc
+{
+    uint64_t command_buffer;    /* VkCommandBuffer in the recording state, graphics queue */
+    uint64_t frame_number;      /* strictly increasing across flushes. Must be > safe_frame_number,
+                                   so the first frame number is 1 or higher. */
+    uint64_t safe_frame_number; /* every frame <= this has completed on the GPU. 0 = none yet. */
 } CaelixFrameDesc;
 
 /* Records into the command buffer all copies from staging to the pools for everything uploaded or
@@ -327,25 +338,26 @@ CAELIX_API CaelixResult caelix_scene_recycle(CaelixScene* scene, uint64_t safe_f
 
 /* Fields are only appended. finalized_bricks_total .. grid_bytes were added to ABI version 2 by the
    finalize step, blas_count .. as_builds_pending by the acceleration structure step. */
-typedef struct CaelixSceneStats {
-  uint32_t entities, groups;                               /* live entities and render groups */
-  uint64_t bricks_resident, bricks_known;                  /* with a GPU record; with a slot */
-  uint64_t record_bytes, slot_table_bytes, staging_bytes;  /* GPU allocation sizes */
-  uint64_t uploaded_bricks_total, pending_bricks;          /* pending = staged, not yet flushed */
-  uint64_t record_pages;
-  uint64_t finalized_bricks_total;  /* finalize kernel invocations (bricks) recorded so far */
-  uint64_t reverse_table_bytes;     /* GPU allocation sizes of the finalize lookup tables: */
-  uint64_t aabb_bytes;              /*   reverse tables, AABB rows, group grids */
-  uint64_t grid_bytes;
-  uint64_t blas_count;              /* live groups that have a BLAS */
-  uint64_t blas_bytes;              /* BLAS storage blocks, including blocks whose release waits for
-                                       a safe frame */
-  uint64_t tlas_bytes;              /* TLAS storage block(s), same rule */
-  uint64_t scratch_bytes;           /* capacity of the build scratch buffer */
-  uint64_t as_builds_total;         /* BLAS and TLAS builds recorded so far */
-  uint64_t as_builds_pending;       /* groups whose BLAS is out of date (waiting for finalization,
-                                       scratch or ring space), plus 1 when the TLAS is out of date */
-  uint64_t material_table_bytes;    /* GPU size of the material table (65536 * 48 = 3 MiB) */
+typedef struct CaelixSceneStats
+{
+    uint32_t entities, groups;                              /* live entities and render groups */
+    uint64_t bricks_resident, bricks_known;                 /* with a GPU record; with a slot */
+    uint64_t record_bytes, slot_table_bytes, staging_bytes; /* GPU allocation sizes */
+    uint64_t uploaded_bricks_total, pending_bricks;         /* pending = staged, not yet flushed */
+    uint64_t record_pages;
+    uint64_t finalized_bricks_total; /* finalize kernel invocations (bricks) recorded so far */
+    uint64_t reverse_table_bytes;    /* GPU allocation sizes of the finalize lookup tables: */
+    uint64_t aabb_bytes;             /*   reverse tables, AABB rows, group grids */
+    uint64_t grid_bytes;
+    uint64_t blas_count;           /* live groups that have a BLAS */
+    uint64_t blas_bytes;           /* BLAS storage blocks, including blocks whose release waits for
+                                      a safe frame */
+    uint64_t tlas_bytes;           /* TLAS storage block(s), same rule */
+    uint64_t scratch_bytes;        /* capacity of the build scratch buffer */
+    uint64_t as_builds_total;      /* BLAS and TLAS builds recorded so far */
+    uint64_t as_builds_pending;    /* groups whose BLAS is out of date (waiting for finalization,
+                                      scratch or ring space), plus 1 when the TLAS is out of date */
+    uint64_t material_table_bytes; /* GPU size of the material table (65536 * 48 = 3 MiB) */
 } CaelixSceneStats;
 
 /* Fills *out. A NULL argument is ignored. */
@@ -359,29 +371,30 @@ CAELIX_API void caelix_scene_get_stats(const CaelixScene* scene, CaelixSceneStat
    Slot table row (16 bytes): uint32 pos_state (bits 0..23 group-local position, bits 24..31 state:
    0 free, 1 resident, 2 summary-only, 3 requested), uint32 summary, uint32 record_index
    (0xFFFFFFFF when not resident), uint32 last_used. */
-typedef struct CaelixBrickInfo {
-  uint32_t resident;                  /* 1 when the brick has a GPU record */
-  uint32_t group_index;               /* scene-wide render group index */
-  uint32_t group_local_id;            /* dense brick id inside the group = slot table row */
-  uint32_t record_index;              /* global record index = page << log2(records_per_page) | slot */
-  uint64_t record_page_address;       /* VkDeviceAddress of the record's page buffer */
-  uint64_t record_page_buffer;        /* VkBuffer of the record's page */
-  uint64_t record_page_offset_bytes;  /* byte offset of the record inside its page */
-  uint64_t slot_table_buffer;         /* VkBuffer that holds every slot table of the scene */
-  uint64_t slot_row_offset_bytes;     /* byte offset of the brick's slot table row */
-  uint64_t aabb_buffer;               /* VkBuffer that holds every AABB row of the scene */
-  uint64_t aabb_row_offset_bytes;     /* byte offset of the brick's AABB row (24 bytes: float min[3],
-                                         float max[3], entity-local block coordinates, all NaN
-                                         when the brick has no occupied voxel) */
-  uint64_t blas_address;              /* VkDeviceAddress of the group's BLAS, 0 when not built yet */
-  uint64_t blas_handle;               /* VkAccelerationStructureKHR of the group's BLAS, 0 when not
-                                         built yet. Owned by the library. */
-  uint64_t entity_info_buffer;        /* VkBuffer that holds the entity info rows */
-  uint64_t entity_info_offset_bytes;  /* byte offset of the entity's info row (128 bytes: int32
-                                         grid_min[3], uint32 grid_base, int32 grid_dims[3], uint32
-                                         pad, float cur_rows[3][4], float prev_rows[3][4]; the rows
-                                         are the object-to-world matrix, rotation | position, of the
-                                         current and of the previous frame's transform) */
+typedef struct CaelixBrickInfo
+{
+    uint32_t resident;                 /* 1 when the brick has a GPU record */
+    uint32_t group_index;              /* scene-wide render group index */
+    uint32_t group_local_id;           /* dense brick id inside the group = slot table row */
+    uint32_t record_index;             /* global record index = page << log2(records_per_page) | slot */
+    uint64_t record_page_address;      /* VkDeviceAddress of the record's page buffer */
+    uint64_t record_page_buffer;       /* VkBuffer of the record's page */
+    uint64_t record_page_offset_bytes; /* byte offset of the record inside its page */
+    uint64_t slot_table_buffer;        /* VkBuffer that holds every slot table of the scene */
+    uint64_t slot_row_offset_bytes;    /* byte offset of the brick's slot table row */
+    uint64_t aabb_buffer;              /* VkBuffer that holds every AABB row of the scene */
+    uint64_t aabb_row_offset_bytes;    /* byte offset of the brick's AABB row (24 bytes: float min[3],
+                                          float max[3], entity-local block coordinates, all NaN
+                                          when the brick has no occupied voxel) */
+    uint64_t blas_address;             /* VkDeviceAddress of the group's BLAS, 0 when not built yet */
+    uint64_t blas_handle;              /* VkAccelerationStructureKHR of the group's BLAS, 0 when not
+                                          built yet. Owned by the library. */
+    uint64_t entity_info_buffer;       /* VkBuffer that holds the entity info rows */
+    uint64_t entity_info_offset_bytes; /* byte offset of the entity's info row (128 bytes: int32
+                                          grid_min[3], uint32 grid_base, int32 grid_dims[3], uint32
+                                          pad, float cur_rows[3][4], float prev_rows[3][4]; the rows
+                                          are the object-to-world matrix, rotation | position, of the
+                                          current and of the previous frame's transform) */
 } CaelixBrickInfo;
 
 CAELIX_API CaelixResult caelix_scene_query_brick(const CaelixScene* scene, CaelixEntityId entity,
@@ -420,19 +433,20 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * ------------------------------------------------------------------------- */
 
 /* One material table entry. 48 bytes, the layout of the GPU table. All values are linear. */
-typedef struct CaelixMaterial {
-  float albedo[3];    /* diffuse / base colour; for a transparent medium its tint */
-  float smoothness;   /* 0..1. NRD roughness = 1 - smoothness. A transparent entry with smoothness
-                         >= 0.99 is a delta interface (reflection and refraction in the delta chain,
-                         CaelixRenderOptions::bounce_count_transparent); a rougher one is shaded
-                         stochastically (still a perfect reflection or refraction, as in Unity) */
-  float emission[3];  /* emitted radiance */
-  float metallic;     /* 0..1; opaque entries: specular chance lerp(metallic, 1, fresnel * smoothness) */
-  float ior;          /* index of refraction; must be > 0 (transparent entries use it at interfaces,
-                         opaque entries for the Fresnel term of the specular chance) */
-  float extinction;   /* transparent entries: per voxel unit; a segment of length t inside the medium
-                         transmits exp(-(1 - albedo) * t * extinction). Must be >= 0. */
-  float pad[2];       /* ignored; stored as 0 */
+typedef struct CaelixMaterial
+{
+    float albedo[3];   /* diffuse / base colour; for a transparent medium its tint */
+    float smoothness;  /* 0..1. NRD roughness = 1 - smoothness. A transparent entry with smoothness
+                          >= 0.99 is a delta interface (reflection and refraction in the delta chain,
+                          CaelixRenderOptions::bounce_count_transparent); a rougher one is shaded
+                          stochastically (still a perfect reflection or refraction, as in Unity) */
+    float emission[3]; /* emitted radiance */
+    float metallic;    /* 0..1; opaque entries: specular chance lerp(metallic, 1, fresnel * smoothness) */
+    float ior;         /* index of refraction; must be > 0 (transparent entries use it at interfaces,
+                          opaque entries for the Fresnel term of the specular chance) */
+    float extinction;  /* transparent entries: per voxel unit; a segment of length t inside the medium
+                          transmits exp(-(1 - albedo) * t * extinction). Must be >= 0. */
+    float pad[2];      /* ignored; stored as 0 */
 } CaelixMaterial;
 
 /* Replaces the whole material table: entries [0, count) come from `entries`, entries [count, 65536)
@@ -524,7 +538,7 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
  * call of a renderer has no previous camera and writes motion 0.
  * ------------------------------------------------------------------------- */
 
-typedef struct CaelixRenderer CaelixRenderer;  /* opaque */
+typedef struct CaelixRenderer CaelixRenderer; /* opaque */
 
 /* Creates a renderer for `scene` (which must belong to `device`). The renderer keeps references to
    both: destroy it before the scene and the device. */
@@ -541,42 +555,44 @@ CAELIX_API void caelix_renderer_destroy(CaelixRenderer* renderer);
      ndc = (s.x / width * 2 - 1, 1 - s.y / height * 2)
      dir = normalize(right * ndc.x * tan_half_fov_y * aspect + up * ndc.y * tan_half_fov_y + forward)
    (CAELIX_RENDER_FLAG_FLIP_Y changes only where the result is stored, not this mapping.) */
-typedef struct CaelixCamera {
-  float position[3];
-  float pad0;
-  float right[3];
-  float pad1;
-  float up[3];
-  float pad2;
-  float forward[3];
-  float pad3;
-  float tan_half_fov_y;  /* tangent of half the VERTICAL field of view */
-  float aspect;          /* width / height */
-  float near_z, far_z;   /* distance range of the depth debug view only (no clipping) */
-  /* The host's projection, column-major 4x4 (row r, column c = projection[c * 4 + r]):
-     clip = projection * (view.x, view.y, view.z, 1) with the view space of this camera,
-       view = (dot(p - position, right), dot(p - position, up), dot(p - position, forward)).
-     It must describe the same frustum as tan_half_fov_y and aspect; the library does not check.
-     Used only for the depth target (device depth = clip.z / clip.w). A normal-Z host passes, for
-     example, clip.z = far / (far - near) * (z - near), clip.w = z; a reverse-Z infinite host
-     clip.z = near, clip.w = z. Pass the projection WITHOUT jitter (NRD's viewToClipMatrix). */
-  float projection[16];
-  /* Sub-pixel offset of the primary sample in pixels, x right and y DOWN (the row order of the
-     unflipped image), typically in [-0.5, 0.5]; {0, 0} = the pixel centre. For temporal
-     anti-aliasing the host varies it per frame. It moves the primary rays only: the motion target
-     stays the motion of the surface itself (previous pixel - the sample position, both through
-     the unjittered pinhole mappings), so a static camera over a static scene writes motion 0 for
-     any jitter. NRD receives it as CommonSettings::cameraJitter (and the previous call's as
-     cameraJitterPrev), clamped to [-0.5, 0.5]. A host that renders into a y-up image
-     (CAELIX_RENDER_FLAG_FLIP_Y) still passes y down here. */
-  float jitter[2];
+typedef struct CaelixCamera
+{
+    float position[3];
+    float pad0;
+    float right[3];
+    float pad1;
+    float up[3];
+    float pad2;
+    float forward[3];
+    float pad3;
+    float tan_half_fov_y; /* tangent of half the VERTICAL field of view */
+    float aspect;         /* width / height */
+    float near_z, far_z;  /* distance range of the depth debug view only (no clipping) */
+    /* The host's projection, column-major 4x4 (row r, column c = projection[c * 4 + r]):
+       clip = projection * (view.x, view.y, view.z, 1) with the view space of this camera,
+         view = (dot(p - position, right), dot(p - position, up), dot(p - position, forward)).
+       It must describe the same frustum as tan_half_fov_y and aspect; the library does not check.
+       Used only for the depth target (device depth = clip.z / clip.w). A normal-Z host passes, for
+       example, clip.z = far / (far - near) * (z - near), clip.w = z; a reverse-Z infinite host
+       clip.z = near, clip.w = z. Pass the projection WITHOUT jitter (NRD's viewToClipMatrix). */
+    float projection[16];
+    /* Sub-pixel offset of the primary sample in pixels, x right and y DOWN (the row order of the
+       unflipped image), typically in [-0.5, 0.5]; {0, 0} = the pixel centre. For temporal
+       anti-aliasing the host varies it per frame. It moves the primary rays only: the motion target
+       stays the motion of the surface itself (previous pixel - the sample position, both through
+       the unjittered pinhole mappings), so a static camera over a static scene writes motion 0 for
+       any jitter. NRD receives it as CommonSettings::cameraJitter (and the previous call's as
+       cameraJitterPrev), clamped to [-0.5, 0.5]. A host that renders into a y-up image
+       (CAELIX_RENDER_FLAG_FLIP_Y) still passes y down here. */
+    float jitter[2];
 } CaelixCamera;
 
 /* CaelixRenderOptions::mode */
-typedef enum CaelixRenderMode {
-  CAELIX_MODE_PRIMARY = 0,     /* debug views of the primary hit (CaelixDebugView) */
-  CAELIX_MODE_PATH_TRACE = 1,  /* path-traced lighting, raw 1 sample per pixel */
-  CAELIX_MODE_REFERENCE = 2    /* path-traced lighting, accumulated over frames (reference image) */
+typedef enum CaelixRenderMode
+{
+    CAELIX_MODE_PRIMARY = 0,    /* debug views of the primary hit (CaelixDebugView) */
+    CAELIX_MODE_PATH_TRACE = 1, /* path-traced lighting, raw 1 sample per pixel */
+    CAELIX_MODE_REFERENCE = 2   /* path-traced lighting, accumulated over frames (reference image) */
 } CaelixRenderMode;
 
 /* Largest CaelixRenderOptions::bounce_count (Unity's path tracer has the same limit). */
@@ -584,35 +600,36 @@ typedef enum CaelixRenderMode {
 /* Largest CaelixRenderOptions::bounce_count_transparent. */
 #define CAELIX_MAX_BOUNCES_TRANSPARENT 15u
 
-typedef enum CaelixDebugView {
-  CAELIX_VIEW_ALBEDO = 0,  /* material albedo; Lambert-shaded with CAELIX_RENDER_FLAG_SHADING */
-  CAELIX_VIEW_NORMAL = 1,  /* world normal * 0.5 + 0.5 */
-  CAELIX_VIEW_DEPTH = 2,   /* grey (t - near_z) / (far_z - near_z), clamped to [0, 1] */
-  CAELIX_VIEW_GROUP = 3,   /* hash colour of the render group of the hit */
-  CAELIX_VIEW_BRICK = 4,   /* hash colour of the brick of the hit (group and dense brick id) */
-  CAELIX_VIEW_STEPS = 5,   /* heat map of the procedural candidates of the ray, 0 .. 64 */
-  /* Views 6, 7, 8 and 10 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo view
-     for them, CAELIX_MODE_REFERENCE ignores debug_view); view 9 to CAELIX_MODE_PRIMARY (the lighting
-     modes ignore it). */
-  CAELIX_VIEW_NRD_VALIDATION = 6, /* NRD's validation layer (CommonSettings::enableValidation) blended
-                                     over the image by its alpha (after the sRGB encode); the normal
-                                     image when the frame was not denoised */
-  CAELIX_VIEW_NRD_DIFF = 7,       /* the denoised diffuse radiance without the albedo (the raw diffuse
-                                     radiance when the frame was not denoised), exposure applied */
-  CAELIX_VIEW_MOTION = 8,         /* the motion vector of the primary hit (the motion target's value):
-                                     rgb = (saturate(motion.x / 32 * 0.5 + 0.5),
-                                     saturate(motion.y / 32 * 0.5 + 0.5), 0.5 * coverage), alpha =
-                                     coverage, written as is (no exposure, no sRGB encode). A hit
-                                     without motion is grey (0.5, 0.5, 0.5), a miss (0.5, 0.5, 0);
-                                     +-32 px saturate. */
-  CAELIX_VIEW_MATERIAL = 9,       /* CAELIX_MODE_PRIMARY: the material table's albedo of the primary
-                                     hit, mixed 50 % with blue (0.2, 0.45, 1) for a transparent code
-                                     and 50 % with white for an emissive entry (any emission > 0);
-                                     an air code is magenta. Lambert-shaded with
-                                     CAELIX_RENDER_FLAG_SHADING. */
-  CAELIX_VIEW_NRD_SPEC = 10       /* CAELIX_MODE_PATH_TRACE: the denoised specular radiance without
-                                     the albedo (the raw specular radiance when the frame was not
-                                     denoised), exposure applied; like CAELIX_VIEW_NRD_DIFF */
+typedef enum CaelixDebugView
+{
+    CAELIX_VIEW_ALBEDO = 0, /* material albedo; Lambert-shaded with CAELIX_RENDER_FLAG_SHADING */
+    CAELIX_VIEW_NORMAL = 1, /* world normal * 0.5 + 0.5 */
+    CAELIX_VIEW_DEPTH = 2,  /* grey (t - near_z) / (far_z - near_z), clamped to [0, 1] */
+    CAELIX_VIEW_GROUP = 3,  /* hash colour of the render group of the hit */
+    CAELIX_VIEW_BRICK = 4,  /* hash colour of the brick of the hit (group and dense brick id) */
+    CAELIX_VIEW_STEPS = 5,  /* heat map of the procedural candidates of the ray, 0 .. 64 */
+    /* Views 6, 7, 8 and 10 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo view
+       for them, CAELIX_MODE_REFERENCE ignores debug_view); view 9 to CAELIX_MODE_PRIMARY (the lighting
+       modes ignore it). */
+    CAELIX_VIEW_NRD_VALIDATION = 6, /* NRD's validation layer (CommonSettings::enableValidation) blended
+                                       over the image by its alpha (after the sRGB encode); the normal
+                                       image when the frame was not denoised */
+    CAELIX_VIEW_NRD_DIFF = 7,       /* the denoised diffuse radiance without the albedo (the raw diffuse
+                                       radiance when the frame was not denoised), exposure applied */
+    CAELIX_VIEW_MOTION = 8,         /* the motion vector of the primary hit (the motion target's value):
+                                       rgb = (saturate(motion.x / 32 * 0.5 + 0.5),
+                                       saturate(motion.y / 32 * 0.5 + 0.5), 0.5 * coverage), alpha =
+                                       coverage, written as is (no exposure, no sRGB encode). A hit
+                                       without motion is grey (0.5, 0.5, 0.5), a miss (0.5, 0.5, 0);
+                                       +-32 px saturate. */
+    CAELIX_VIEW_MATERIAL = 9,       /* CAELIX_MODE_PRIMARY: the material table's albedo of the primary
+                                       hit, mixed 50 % with blue (0.2, 0.45, 1) for a transparent code
+                                       and 50 % with white for an emissive entry (any emission > 0);
+                                       an air code is magenta. Lambert-shaded with
+                                       CAELIX_RENDER_FLAG_SHADING. */
+    CAELIX_VIEW_NRD_SPEC = 10       /* CAELIX_MODE_PATH_TRACE: the denoised specular radiance without
+                                       the albedo (the raw specular radiance when the frame was not
+                                       denoised), exposure applied; like CAELIX_VIEW_NRD_DIFF */
 } CaelixDebugView;
 
 /* CaelixRenderOptions::flags */
@@ -676,82 +693,84 @@ typedef enum CaelixDebugView {
    gives it in `layout`, with its own writes made visible to compute-shader sampled reads, and
    keeps it there for the whole render call. With image 0 the renderer
    uses the procedural sky (sky_zenith, sky_horizon, sky_ground) everywhere, as before. */
-typedef struct CaelixSkyCubemap {
-  uint64_t image;       /* VkImage; 0 = no cubemap */
-  uint32_t format;      /* VkFormat */
-  uint32_t layout;      /* VkImageLayout the image is in during the render call
-                           (SHADER_READ_ONLY_OPTIMAL or GENERAL) */
-  uint32_t size;        /* face width = height in pixels (>= 1) */
-  uint32_t mip_levels;  /* mip levels of the image (>= 1); the library samples up to the last */
+typedef struct CaelixSkyCubemap
+{
+    uint64_t image;      /* VkImage; 0 = no cubemap */
+    uint32_t format;     /* VkFormat */
+    uint32_t layout;     /* VkImageLayout the image is in during the render call
+                            (SHADER_READ_ONLY_OPTIMAL or GENERAL) */
+    uint32_t size;       /* face width = height in pixels (>= 1) */
+    uint32_t mip_levels; /* mip levels of the image (>= 1); the library samples up to the last */
 } CaelixSkyCubemap;
 
 /* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
-typedef struct CaelixRenderOptions {
-  uint32_t debug_view;  /* CaelixDebugView; read in CAELIX_MODE_PRIMARY (views 0..5, 9) and
-                           CAELIX_MODE_PATH_TRACE (views 6, 7, 8, 10), checked in every mode */
-  uint32_t flags;       /* CAELIX_RENDER_FLAG_* */
-  float sun_dir[3];     /* world-space direction TOWARD the sun; the library normalizes it ((0, 1, 0)
-                           when zero). Every mode: the Lambert term of the primary mode and the sun
-                           disk of the lighting modes. */
-  float pad;
-  float sky_color[3];   /* CAELIX_MODE_PRIMARY: colour of rays that hit nothing (every view) */
-  float pad2;
-  float miss_depth;     /* depth target value of a miss: 1.0 for a normal-Z host, 0.0 for reverse Z */
-  float miss_view_z;    /* view_z target value of a miss, for example 1e30 */
+typedef struct CaelixRenderOptions
+{
+    uint32_t debug_view; /* CaelixDebugView; read in CAELIX_MODE_PRIMARY (views 0..5, 9) and
+                            CAELIX_MODE_PATH_TRACE (views 6, 7, 8, 10), checked in every mode */
+    uint32_t flags;      /* CAELIX_RENDER_FLAG_* */
+    float sun_dir[3];    /* world-space direction TOWARD the sun; the library normalizes it ((0, 1, 0)
+                            when zero). Every mode: the Lambert term of the primary mode and the sun
+                            disk of the lighting modes. */
+    float pad;
+    float sky_color[3]; /* CAELIX_MODE_PRIMARY: colour of rays that hit nothing (every view) */
+    float pad2;
+    float miss_depth;  /* depth target value of a miss: 1.0 for a normal-Z host, 0.0 for reverse Z */
+    float miss_view_z; /* view_z target value of a miss, for example 1e30 */
 
-  /* Lighting (CAELIX_MODE_PATH_TRACE and CAELIX_MODE_REFERENCE). All radiance values are linear RGB. */
-  uint32_t mode;               /* CaelixRenderMode */
-  uint32_t bounce_count;       /* stochastic bounces after the primary hit, 0 .. CAELIX_MAX_BOUNCES
-                                  (Unity default 4). 0 = primary emission only. */
-  uint32_t denoise;            /* CAELIX_MODE_PATH_TRACE with a colour target: 1 = NRD denoises the
-                                  frame (REBLUR_DIFFUSE_SPECULAR), 0 = raw 1 spp. Ignored in the other
-                                  modes. */
-  uint32_t reset_accumulation; /* 1 = restart the CAELIX_MODE_REFERENCE accumulation, and drop the NRD
-                                  history (accumulation mode RESTART), with this frame. Both are also
-                                  restarted by a mode change, a target size change and the first
-                                  render; the NRD history also after a frame without denoising.
-                                  Reference mode: set it when the camera or the scene changed. Path
-                                  trace mode: NRD follows camera and entity motion through the motion
-                                  vectors; set it only for a cut (a teleport, a new scene). */
-  float exposure;              /* the composite multiplies the colour (sky included) by it before the
-                                  sRGB encode; 0 is treated as 1 */
-  float sun_radiance[3];       /* radiance of the sun disk (constant over the disk). The irradiance
-                                  of a surface facing the sun is sun_radiance * 2 pi (1 - cos r),
-                                  r = sun_angular_radius: about 2.39e-4 * sun_radiance at 0.5 degrees */
-  float sun_angular_radius;    /* angular radius of the sun disk in radians; 0 = 0.00873 (0.5 degrees) */
-  float sky_zenith[3];         /* sky radiance straight up */
-  float sky_horizon[3];        /* sky radiance at the horizon */
-  float sky_ground[3];         /* radiance straight down (below the horizon) */
-  uint32_t frame_seed;         /* random seed of the frame: the per-pixel random stream is a function of
-                                  the pixel and this value only. Increment it every frame. */
-  uint32_t bounce_count_transparent; /* lighting modes: the delta chain of the primary ray, 0 ..
-                                  CAELIX_MAX_BOUNCES_TRANSPARENT (Unity default 5; 0 = off). The camera
-                                  ray crosses up to this many smooth transparent interfaces (materials
-                                  with smoothness >= 0.99): at each it reflects or refracts, chosen at
-                                  random with the Fresnel reflectance as the reflection probability
-                                  (Schlick; total internal reflection always reflects), and the
-                                  medium's extinction attenuates every segment inside it. The first hit
-                                  that is not such an interface (an opaque or rough surface, or any hit
-                                  after the budget) is the primary surface for everything that follows
-                                  (primary surface replacement): albedo and normal targets, shading,
-                                  emission and bounces, all times the chain's transmission; the depth
-                                  and view_z targets get the distance along the whole chain, measured
-                                  along the camera ray. A chain that ends in the sky writes the sky
-                                  radiance times the transmission (coverage 1). Opaque surfaces always
-                                  end the chain (smooth metals reflect through the stochastic
-                                  specular lobe, as in Unity). */
-  float emission_scale;  /* every mode: multiplies the emission of every material (both encodings)
-                            at every hit, primary and bounce. 0 is treated as 1. */
-  float fog_density;     /* lighting modes: extinction of the air (the medium outside glass) per
-                            world unit. 0 = no fog. A segment of length t that ends on a surface
-                            has the transmission exp(-fog_density * t) and adds
-                            fog_color * (1 - that); the camera ray, the air gaps of the delta chain
-                            and every bounce segment. A segment that leaves the scene (a miss) is not
-                            affected: the sky stays sharp, so choose a fog colour near the horizon
-                            colour. No fog inside glass (its own extinction). Shadow rays ignore it. */
-  float fog_color[3];    /* radiance of the fog, linear RGB (exposure applies) */
-  float pad3;
-  CaelixSkyCubemap sky;  /* lighting modes: the sky cubemap; image 0 = the procedural sky */
+    /* Lighting (CAELIX_MODE_PATH_TRACE and CAELIX_MODE_REFERENCE). All radiance values are linear RGB. */
+    uint32_t mode;                     /* CaelixRenderMode */
+    uint32_t bounce_count;             /* stochastic bounces after the primary hit, 0 .. CAELIX_MAX_BOUNCES
+                                          (Unity default 4). 0 = primary emission only. */
+    uint32_t denoise;                  /* CAELIX_MODE_PATH_TRACE with a colour target: 1 = NRD denoises the
+                                          frame (REBLUR_DIFFUSE_SPECULAR), 0 = raw 1 spp. Ignored in the other
+                                          modes. */
+    uint32_t reset_accumulation;       /* 1 = restart the CAELIX_MODE_REFERENCE accumulation, and drop the NRD
+                                          history (accumulation mode RESTART), with this frame. Both are also
+                                          restarted by a mode change, a target size change and the first
+                                          render; the NRD history also after a frame without denoising.
+                                          Reference mode: set it when the camera or the scene changed. Path
+                                          trace mode: NRD follows camera and entity motion through the motion
+                                          vectors; set it only for a cut (a teleport, a new scene). */
+    float exposure;                    /* the composite multiplies the colour (sky included) by it before the
+                                          sRGB encode; 0 is treated as 1 */
+    float sun_radiance[3];             /* radiance of the sun disk (constant over the disk). The irradiance
+                                          of a surface facing the sun is sun_radiance * 2 pi (1 - cos r),
+                                          r = sun_angular_radius: about 2.39e-4 * sun_radiance at 0.5 degrees */
+    float sun_angular_radius;          /* angular radius of the sun disk in radians; 0 = 0.00873 (0.5 degrees) */
+    float sky_zenith[3];               /* sky radiance straight up */
+    float sky_horizon[3];              /* sky radiance at the horizon */
+    float sky_ground[3];               /* radiance straight down (below the horizon) */
+    uint32_t frame_seed;               /* random seed of the frame: the per-pixel random stream is a function of
+                                          the pixel and this value only. Increment it every frame. */
+    uint32_t bounce_count_transparent; /* lighting modes: the delta chain of the primary ray, 0 ..
+                                    CAELIX_MAX_BOUNCES_TRANSPARENT (Unity default 5; 0 = off). The camera
+                                    ray crosses up to this many smooth transparent interfaces (materials
+                                    with smoothness >= 0.99): at each it reflects or refracts, chosen at
+                                    random with the Fresnel reflectance as the reflection probability
+                                    (Schlick; total internal reflection always reflects), and the
+                                    medium's extinction attenuates every segment inside it. The first hit
+                                    that is not such an interface (an opaque or rough surface, or any hit
+                                    after the budget) is the primary surface for everything that follows
+                                    (primary surface replacement): albedo and normal targets, shading,
+                                    emission and bounces, all times the chain's transmission; the depth
+                                    and view_z targets get the distance along the whole chain, measured
+                                    along the camera ray. A chain that ends in the sky writes the sky
+                                    radiance times the transmission (coverage 1). Opaque surfaces always
+                                    end the chain (smooth metals reflect through the stochastic
+                                    specular lobe, as in Unity). */
+    float emission_scale;              /* every mode: multiplies the emission of every material (both encodings)
+                                          at every hit, primary and bounce. 0 is treated as 1. */
+    float fog_density;                 /* lighting modes: extinction of the air (the medium outside glass) per
+                                          world unit. 0 = no fog. A segment of length t that ends on a surface
+                                          has the transmission exp(-fog_density * t) and adds
+                                          fog_color * (1 - that); the camera ray, the air gaps of the delta chain
+                                          and every bounce segment. A segment that leaves the scene (a miss) is not
+                                          affected: the sky stays sharp, so choose a fog colour near the horizon
+                                          colour. No fog inside glass (its own extinction). Shadow rays ignore it. */
+    float fog_color[3];                /* radiance of the fog, linear RGB (exposure applies) */
+    float pad3;
+    CaelixSkyCubemap sky; /* lighting modes: the sky cubemap; image 0 = the procedural sky */
 } CaelixRenderOptions;
 
 /* The images of one render call. A target is PRESENT when its `image` is nonzero; an absent target
@@ -761,41 +780,42 @@ typedef struct CaelixRenderOptions {
    qualifier, so its format must support VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT with
    optimal tiling). It arrives in CaelixTargetImage::layout and is left in VK_IMAGE_LAYOUT_GENERAL.
    Every pixel of a present target is written on every render call, a miss included. */
-typedef struct CaelixRenderTargets {
-  /* Any storage format, typically RGBA8, BGRA8, RGBA16F or RGBA32F.
-     CAELIX_MODE_PRIMARY: rgb = the debug view of CaelixRenderOptions::debug_view; a miss is
-     sky_color. alpha = 1 everywhere (opaque, also on a miss, so that a host can present the image
-     directly; the coverage is in the albedo and normal targets).
-     Lighting modes: rgb = premultiplied colour (times exposure), a = coverage (1 hit, 0 miss). A miss
-     is the procedural sky in the primary direction with CAELIX_RENDER_FLAG_SKY_ON_MISS (alpha still
-     0), else (0, 0, 0, 0). For a UNORM format (RGBA8, BGRA8, A2B10G10R10, ...) the library encodes
-     rgb linear -> sRGB before the write; float formats receive linear values.
-     A lighting render without a colour target runs the trace only (no composite, no accumulation). */
-  CaelixTargetImage color;
-  /* R8G8B8A8_UNORM or R16G16B16A16_SFLOAT. rgb = the material albedo as stored in the block (sRGB
-     encoded, no shading), a = coverage (1 hit, 0 miss). A miss is (0, 0, 0, 0). */
-  CaelixTargetImage albedo;
-  /* R16G16B16A16_SFLOAT, or R8G8B8A8_UNORM (then xyz is stored as n * 0.5 + 0.5). xyz = world-space
-     face normal (unit length), w = coverage. A miss is (0, 0, 0, 0). */
-  CaelixTargetImage normal;
-  /* R32_SFLOAT (a storage image, not a depth attachment). Device depth clip.z / clip.w of
-     CaelixCamera::projection at the hit; a miss is CaelixRenderOptions::miss_depth. */
-  CaelixTargetImage depth;
-  /* R16G16_SFLOAT or R32G32_SFLOAT; or R16G16B16A16_SFLOAT / R32G32B32A32_SFLOAT, which also receive
-     z = 0 and w = the delta checkerboard flag (1 = this pixel traced one branch of the split at the
-     first transparent interface, see CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD, and needs a cross
-     resolve with its flagged neighbours; 0 otherwise). xy = previous_pixel - current_pixel, in
-     pixels of the current target size: the hit point is moved back by the entity's previous transform and projected with the
-     previous render call's camera (the unjittered pinhole mapping of the ray generation); the current pixel is
-     the sample position (px + 0.5 + jitter[0], py + 0.5 + jitter[1]); with CAELIX_RENDER_FLAG_FLIP_Y
-     y is negated. Example: a camera that moved +1 unit along `right` sees
-     a static point move LEFT on the screen, so motion.x > 0 (the point was to the right).
-     0 on a miss, on the first render call of the renderer, and when the point was behind the
-     previous camera. */
-  CaelixTargetImage motion;
-  /* R32_SFLOAT. Linear view depth dot(hit - position, forward) (NRD's IN_VIEWZ); a miss is
-     CaelixRenderOptions::miss_view_z. */
-  CaelixTargetImage view_z;
+typedef struct CaelixRenderTargets
+{
+    /* Any storage format, typically RGBA8, BGRA8, RGBA16F or RGBA32F.
+       CAELIX_MODE_PRIMARY: rgb = the debug view of CaelixRenderOptions::debug_view; a miss is
+       sky_color. alpha = 1 everywhere (opaque, also on a miss, so that a host can present the image
+       directly; the coverage is in the albedo and normal targets).
+       Lighting modes: rgb = premultiplied colour (times exposure), a = coverage (1 hit, 0 miss). A miss
+       is the procedural sky in the primary direction with CAELIX_RENDER_FLAG_SKY_ON_MISS (alpha still
+       0), else (0, 0, 0, 0). For a UNORM format (RGBA8, BGRA8, A2B10G10R10, ...) the library encodes
+       rgb linear -> sRGB before the write; float formats receive linear values.
+       A lighting render without a colour target runs the trace only (no composite, no accumulation). */
+    CaelixTargetImage color;
+    /* R8G8B8A8_UNORM or R16G16B16A16_SFLOAT. rgb = the material albedo as stored in the block (sRGB
+       encoded, no shading), a = coverage (1 hit, 0 miss). A miss is (0, 0, 0, 0). */
+    CaelixTargetImage albedo;
+    /* R16G16B16A16_SFLOAT, or R8G8B8A8_UNORM (then xyz is stored as n * 0.5 + 0.5). xyz = world-space
+       face normal (unit length), w = coverage. A miss is (0, 0, 0, 0). */
+    CaelixTargetImage normal;
+    /* R32_SFLOAT (a storage image, not a depth attachment). Device depth clip.z / clip.w of
+       CaelixCamera::projection at the hit; a miss is CaelixRenderOptions::miss_depth. */
+    CaelixTargetImage depth;
+    /* R16G16_SFLOAT or R32G32_SFLOAT; or R16G16B16A16_SFLOAT / R32G32B32A32_SFLOAT, which also receive
+       z = 0 and w = the delta checkerboard flag (1 = this pixel traced one branch of the split at the
+       first transparent interface, see CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD, and needs a cross
+       resolve with its flagged neighbours; 0 otherwise). xy = previous_pixel - current_pixel, in
+       pixels of the current target size: the hit point is moved back by the entity's previous transform and projected with the
+       previous render call's camera (the unjittered pinhole mapping of the ray generation); the current pixel is
+       the sample position (px + 0.5 + jitter[0], py + 0.5 + jitter[1]); with CAELIX_RENDER_FLAG_FLIP_Y
+       y is negated. Example: a camera that moved +1 unit along `right` sees
+       a static point move LEFT on the screen, so motion.x > 0 (the point was to the right).
+       0 on a miss, on the first render call of the renderer, and when the point was behind the
+       previous camera. */
+    CaelixTargetImage motion;
+    /* R32_SFLOAT. Linear view depth dot(hit - position, forward) (NRD's IN_VIEWZ); a miss is
+       CaelixRenderOptions::miss_view_z. */
+    CaelixTargetImage view_z;
 } CaelixRenderTargets;
 
 /* Records the frame's rendering into frame->command_buffer: one barrier per present target from its
@@ -840,13 +860,14 @@ CAELIX_API void caelix_renderer_release_target_views(CaelixRenderer* renderer);
 /* GPU times of the newest frame whose timestamps were read back. The renderer reads them in a
    render call whose safe_frame_number has reached that frame, so the values trail the current
    frame by the number of frames in flight. */
-typedef struct CaelixGpuTimings {
-  float trace_ms;         /* the trace dispatch of that frame (with a sky cubemap, the sky SH
-                             dispatch before it too) */
-  float flush_ms;         /* caelix_scene_flush of that frame; 0 when the flush recorded no work */
-  uint64_t frame_number;  /* the frame the values belong to; 0 = none yet */
-  float composite_ms;     /* the composite dispatch of that frame; 0 when it had none (primary mode) */
-  float denoise_ms;       /* NRD's dispatches of that frame; 0 when it was not denoised */
+typedef struct CaelixGpuTimings
+{
+    float trace_ms;        /* the trace dispatch of that frame (with a sky cubemap, the sky SH
+                              dispatch before it too) */
+    float flush_ms;        /* caelix_scene_flush of that frame; 0 when the flush recorded no work */
+    uint64_t frame_number; /* the frame the values belong to; 0 = none yet */
+    float composite_ms;    /* the composite dispatch of that frame; 0 when it had none (primary mode) */
+    float denoise_ms;      /* NRD's dispatches of that frame; 0 when it was not denoised */
 } CaelixGpuTimings;
 
 /* Fills *out. A NULL argument is ignored. All zero when the queue has no timestamp support. */
@@ -856,18 +877,19 @@ CAELIX_API void caelix_renderer_get_gpu_timings(const CaelixRenderer* renderer,
 /* The NRD library and the renderer's NRD instance. The instance fields are 0 until the first
    denoised render created the instance; they describe the newest instance (a target size change
    replaces it). */
-typedef struct CaelixNrdInfo {
-  uint32_t version_major;            /* NRD library version (nrd::GetLibraryDesc) */
-  uint32_t version_minor;
-  uint32_t version_build;
-  uint32_t width, height;            /* size of the instance; 0 = no instance yet */
-  uint32_t pipeline_count;           /* compute pipelines of the instance */
-  uint32_t permanent_texture_count;  /* NRD's permanent pool (history, kept between frames) */
-  uint32_t transient_texture_count;  /* NRD's transient pool (scratch within a frame) */
-  uint64_t permanent_bytes;          /* GPU memory of the permanent pool images */
-  uint64_t transient_bytes;          /* GPU memory of the transient pool images */
-  uint32_t dispatch_count;           /* NRD dispatches of the newest denoised frame */
-  uint32_t failed;                   /* 1 after an NRD error: the renderer no longer denoises */
+typedef struct CaelixNrdInfo
+{
+    uint32_t version_major; /* NRD library version (nrd::GetLibraryDesc) */
+    uint32_t version_minor;
+    uint32_t version_build;
+    uint32_t width, height;           /* size of the instance; 0 = no instance yet */
+    uint32_t pipeline_count;          /* compute pipelines of the instance */
+    uint32_t permanent_texture_count; /* NRD's permanent pool (history, kept between frames) */
+    uint32_t transient_texture_count; /* NRD's transient pool (scratch within a frame) */
+    uint64_t permanent_bytes;         /* GPU memory of the permanent pool images */
+    uint64_t transient_bytes;         /* GPU memory of the transient pool images */
+    uint32_t dispatch_count;          /* NRD dispatches of the newest denoised frame */
+    uint32_t failed;                  /* 1 after an NRD error: the renderer no longer denoises */
 } CaelixNrdInfo;
 
 /* Fills *out. Returns CAELIX_ERROR_INVALID_ARGUMENT (logged) for a NULL argument. */

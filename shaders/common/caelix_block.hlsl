@@ -11,17 +11,20 @@
 // Set by the kernel from CaelixFrameConstants::encoding before the first trace.
 static uint g_blockEncoding;
 
-inline bool IsOpaque(int blk) {
-  return g_blockEncoding == kEncodingPacked ? (blk & 0xC000) != 0 : (blk & 0x8000) != 0;
+inline bool IsOpaque(int blk)
+{
+    return g_blockEncoding == kEncodingPacked ? (blk & 0xC000) != 0 : (blk & 0x8000) != 0;
 }
 
-inline int GetFaceBits(int blk) {
-  return g_blockEncoding == kEncodingPacked ? ((blk >> 8) & 63) : ((blk >> 9) & 63);
+inline int GetFaceBits(int blk)
+{
+    return g_blockEncoding == kEncodingPacked ? ((blk >> 8) & 63) : ((blk >> 9) & 63);
 }
 
 // The id of a transparent block (face bits removed).
-inline uint CaelixTransparentId(uint blk) {
-  return g_blockEncoding == kEncodingPacked ? (blk & 0xFFu) : (blk & 0x1FFu);
+inline uint CaelixTransparentId(uint blk)
+{
+    return g_blockEncoding == kEncodingPacked ? (blk & 0xFFu) : (blk & 0x1FFu);
 }
 
 #endif  // CAELIX_BLOCK_HLSL

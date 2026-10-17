@@ -31,27 +31,31 @@ CAELIX_BINDING(6, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_validation
 CAELIX_BINDING(7, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_motion;
 CAELIX_BINDING(8, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_resolve;
 
-float3 LinearToSrgb(float3 c) {
-  c = saturate(c);
-  const float3 low = c * 12.92f;
-  const float3 high = 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;
-  return float3(c.x <= 0.0031308f ? low.x : high.x, c.y <= 0.0031308f ? low.y : high.y,
-                c.z <= 0.0031308f ? low.z : high.z);
+float3 LinearToSrgb(float3 c)
+{
+    c = saturate(c);
+    const float3 low = c * 12.92f;
+    const float3 high = 1.055f * pow(c, 1.0f / 2.4f) - 0.055f;
+    return float3(c.x <= 0.0031308f ? low.x : high.x, c.y <= 0.0031308f ? low.y : high.y,
+                  c.z <= 0.0031308f ? low.z : high.z);
 }
 
 // The last stage before the host target: linear -> sRGB for a UNORM target, then (path
 // trace mode, kViewNrdValidation, denoised frame) NRD's display-ready RGBA8 validation
 // layer blended over the encoded colour.
-float3 CaelixOutputColor(CaelixFrameConstants fc, uint2 pixel, float3 color) {
-  if (fc.output_srgb != 0u) {
-    color = LinearToSrgb(color);
-  }
-  CAELIX_BRANCH
-  if (fc.mode == kModePathTrace && fc.debug_view == kViewNrdValidation && fc.denoised != 0u) {
-    const float4 layer = g_int_validation[pixel];
-    color = lerp(color, layer.rgb, layer.a);
-  }
-  return color;
+float3 CaelixOutputColor(CaelixFrameConstants fc, uint2 pixel, float3 color)
+{
+    if (fc.output_srgb != 0u)
+    {
+        color = LinearToSrgb(color);
+    }
+    CAELIX_BRANCH
+    if (fc.mode == kModePathTrace && fc.debug_view == kViewNrdValidation && fc.denoised != 0u)
+    {
+        const float4 layer = g_int_validation[pixel];
+        color = lerp(color, layer.rgb, layer.a);
+    }
+    return color;
 }
 
 #endif  // CAELIX_COMPOSITE_SET_HLSL

@@ -16,8 +16,9 @@ using Key = std::array<int32_t, 3>;
 using Brick = std::array<uint16_t, 512>;  // voxel index x + 8y + 64z
 
 // The host's raw bricks of one entity.
-struct World {
-  std::map<Key, Brick> bricks;
+struct World
+{
+    std::map<Key, Brick> bricks;
 };
 
 std::vector<Key> KeysOf(const World& world);
@@ -36,14 +37,15 @@ World RandomOpaqueWorld(std::mt19937& rng, size_t count);
 World SolidCubeWorld(uint32_t seed);
 
 // One device, one scene, one entity.
-struct Rig {
-  Gpu gpu;
-  CaelixDevice* device = nullptr;
-  CaelixScene* scene = nullptr;
-  CaelixEntityId entity = CAELIX_INVALID_ENTITY;
-  Frames frames;
-  uint32_t group_shift = 4;
-  uint32_t encoding = 0;
+struct Rig
+{
+    Gpu gpu;
+    CaelixDevice* device = nullptr;
+    CaelixScene* scene = nullptr;
+    CaelixEntityId entity = CAELIX_INVALID_ENTITY;
+    Frames frames;
+    uint32_t group_shift = 4;
+    uint32_t encoding = 0;
 };
 
 // An 8 MiB staging ring and the given settings (0 = default).

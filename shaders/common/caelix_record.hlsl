@@ -23,8 +23,9 @@ static const uint kRecordOccupancyWords = 16;
 static const uint kRecordPayloadWord = 18;
 static const uint kRecordWords = 274;
 
-uint RecordPayloadWord(uint x, uint y, uint z) {
-  return kRecordPayloadWord + (x >> 1) + 4 * y + 32 * z;
+uint RecordPayloadWord(uint x, uint y, uint z)
+{
+    return kRecordPayloadWord + (x >> 1) + 4 * y + 32 * z;
 }
 
 // ---------------------------------------------------------------------------
@@ -37,8 +38,14 @@ static const uint kSlotRowBytes = 16;
 static const uint kSlotStateResident = 1;
 static const uint kInvalidRecord = 0xFFFFFFFFu;
 
-uint SlotRowPos(uint pos_state) { return pos_state & 0x00FFFFFFu; }
-uint SlotRowState(uint pos_state) { return pos_state >> 24; }
+uint SlotRowPos(uint pos_state)
+{
+    return pos_state & 0x00FFFFFFu;
+}
+uint SlotRowState(uint pos_state)
+{
+    return pos_state >> 24;
+}
 
 // ---------------------------------------------------------------------------
 // AABB row: 24 bytes per dense brick id, float3 min then float3 max, in
@@ -56,38 +63,41 @@ static const uint kNoGroup = 0xFFFFFFFFu;
 // reads them word by word through buffer device addresses.
 
 // One brick to finalize. 16 bytes.
-struct DirtyEntry {
-  uint group_index;
-  uint id;
-  uint record_index;
-  uint pad;
+struct DirtyEntry
+{
+    uint group_index;
+    uint id;
+    uint record_index;
+    uint pad;
 };
 
 // One render group, indexed by the scene-wide group index. 32 bytes.
-struct GroupInfo {
-  int3 coord;          // group coordinate (brick key >> group_shift)
-  uint entity;
-  uint slot_row_base;  // first slot table row of the group
-  uint reverse_base;   // first u16 entry of the group's reverse table
-  uint aabb_row_base;  // first AABB row of the group
-  uint high_water;     // dense ids in [0, high_water) were handed out
+struct GroupInfo
+{
+    int3 coord;  // group coordinate (brick key >> group_shift)
+    uint entity;
+    uint slot_row_base;  // first slot table row of the group
+    uint reverse_base;   // first u16 entry of the group's reverse table
+    uint aabb_row_base;  // first AABB row of the group
+    uint high_water;     // dense ids in [0, high_water) were handed out
 };
 
 // One entity, indexed by the entity id. 128 bytes.
-struct EntityInfo {
-  int3 grid_min;   // group coordinate of grid cell (0, 0, 0)
-  uint grid_base;  // first u32 cell of the entity's group grid
-  int3 grid_dims;  // cells per axis (powers of two; 0 = no grid)
-  uint pad;
-  // Object-to-world rows (rotation | position) of the current transform and of
-  // the previous frame's transform (equal to cur except for one flush after a
-  // transform change).
-  float4 cur_row0;
-  float4 cur_row1;
-  float4 cur_row2;
-  float4 prev_row0;
-  float4 prev_row1;
-  float4 prev_row2;
+struct EntityInfo
+{
+    int3 grid_min;   // group coordinate of grid cell (0, 0, 0)
+    uint grid_base;  // first u32 cell of the entity's group grid
+    int3 grid_dims;  // cells per axis (powers of two; 0 = no grid)
+    uint pad;
+    // Object-to-world rows (rotation | position) of the current transform and of
+    // the previous frame's transform (equal to cur except for one flush after a
+    // transform change).
+    float4 cur_row0;
+    float4 cur_row1;
+    float4 cur_row2;
+    float4 prev_row0;
+    float4 prev_row1;
+    float4 prev_row2;
 };
 static const uint kEntityInfoBytes = 128;
 

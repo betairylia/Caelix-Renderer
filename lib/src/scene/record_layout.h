@@ -21,26 +21,31 @@ namespace caelix {
 //
 // Lossless rule: the payload always holds the raw block values that the host
 // uploaded. Later kernels add bits in the header words, never in the payload.
-struct RecordLayout {
-  uint32_t block_bytes = 2;
-  uint32_t info_words = 2;
-  uint32_t occupancy_words = 16;
-  uint32_t payload_words = 0;  // 512 * block_bytes / 4
-  uint32_t record_words = 0;   // info + occupancy + payload
-  uint32_t record_bytes = 0;
+struct RecordLayout
+{
+    uint32_t block_bytes = 2;
+    uint32_t info_words = 2;
+    uint32_t occupancy_words = 16;
+    uint32_t payload_words = 0;  // 512 * block_bytes / 4
+    uint32_t record_words = 0;   // info + occupancy + payload
+    uint32_t record_bytes = 0;
 
-  static constexpr uint32_t kBlocksPerBrick = 512;
+    static constexpr uint32_t kBlocksPerBrick = 512;
 
-  static RecordLayout ForBlockBytes(uint32_t block_bytes) {
-    RecordLayout layout;
-    layout.block_bytes = block_bytes;
-    layout.payload_words = kBlocksPerBrick * block_bytes / 4;
-    layout.record_words = layout.info_words + layout.occupancy_words + layout.payload_words;
-    layout.record_bytes = layout.record_words * 4;
-    return layout;
-  }
+    static RecordLayout ForBlockBytes(uint32_t block_bytes)
+    {
+        RecordLayout layout;
+        layout.block_bytes = block_bytes;
+        layout.payload_words = kBlocksPerBrick * block_bytes / 4;
+        layout.record_words = layout.info_words + layout.occupancy_words + layout.payload_words;
+        layout.record_bytes = layout.record_words * 4;
+        return layout;
+    }
 
-  uint32_t payload_first_word() const { return info_words + occupancy_words; }
+    uint32_t payload_first_word() const
+    {
+        return info_words + occupancy_words;
+    }
 };
 
 }  // namespace caelix

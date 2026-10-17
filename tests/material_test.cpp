@@ -26,330 +26,368 @@ namespace {
 
 constexpr uint32_t kEntries = 65536;
 
-CaelixMaterial Get(Rig& rig, uint32_t code) {
-  CaelixMaterial m{};
-  REQUIRE(caelix_scene_get_material(rig.scene, code, &m) == CAELIX_OK);
-  return m;
+CaelixMaterial Get(Rig& rig, uint32_t code)
+{
+    CaelixMaterial m{};
+    REQUIRE(caelix_scene_get_material(rig.scene, code, &m) == CAELIX_OK);
+    return m;
 }
 
-bool Same(const CaelixMaterial& a, const CaelixMaterial& b) {
-  return std::memcmp(&a, &b, sizeof(CaelixMaterial)) == 0;
+bool Same(const CaelixMaterial& a, const CaelixMaterial& b)
+{
+    return std::memcmp(&a, &b, sizeof(CaelixMaterial)) == 0;
 }
 
 CaelixMaterial Make(float r, float g, float b, float smoothness, float metallic, float ior,
-                    float extinction, float emission = 0.0f) {
-  CaelixMaterial m{};
-  m.albedo[0] = r;
-  m.albedo[1] = g;
-  m.albedo[2] = b;
-  m.smoothness = smoothness;
-  m.emission[0] = m.emission[1] = m.emission[2] = emission;
-  m.metallic = metallic;
-  m.ior = ior;
-  m.extinction = extinction;
-  return m;
+                    float extinction, float emission = 0.0f)
+{
+    CaelixMaterial m{};
+    m.albedo[0] = r;
+    m.albedo[1] = g;
+    m.albedo[2] = b;
+    m.smoothness = smoothness;
+    m.emission[0] = m.emission[1] = m.emission[2] = emission;
+    m.metallic = metallic;
+    m.ior = ior;
+    m.extinction = extinction;
+    return m;
 }
 
 // The packed decode of shaders/render/caelix_shading.hlsl DecodeMaterial before
 // step 6d (Unity's GetMaterial_Color), for opaque (bit 15) and emissive (bits
 // 15..14 = 01) codes.
-CaelixMaterial OldPackedDecode(uint32_t v) {
-  CaelixMaterial m{};
-  m.ior = 1.5f;
-  if ((v & 0x8000u) != 0) {
-    m.albedo[0] = static_cast<float>((v >> 10) & 31u) / 31.0f;
-    m.albedo[1] = static_cast<float>((v >> 5) & 31u) / 31.0f;
-    m.albedo[2] = static_cast<float>(v & 31u) / 31.0f;
-  } else {
-    m.albedo[0] = static_cast<float>((v >> 10) & 15u) / 15.0f;
-    m.albedo[1] = static_cast<float>((v >> 6) & 15u) / 15.0f;
-    m.albedo[2] = static_cast<float>((v >> 2) & 15u) / 15.0f;
-    const float strength = std::exp2(3.0f * static_cast<float>(v & 3u));
-    for (int c = 0; c < 3; ++c) {
-      m.emission[c] = m.albedo[c] * strength;
+CaelixMaterial OldPackedDecode(uint32_t v)
+{
+    CaelixMaterial m{};
+    m.ior = 1.5f;
+    if ((v & 0x8000u) != 0)
+    {
+        m.albedo[0] = static_cast<float>((v >> 10) & 31u) / 31.0f;
+        m.albedo[1] = static_cast<float>((v >> 5) & 31u) / 31.0f;
+        m.albedo[2] = static_cast<float>(v & 31u) / 31.0f;
     }
-  }
-  return m;
+    else
+    {
+        m.albedo[0] = static_cast<float>((v >> 10) & 15u) / 15.0f;
+        m.albedo[1] = static_cast<float>((v >> 6) & 15u) / 15.0f;
+        m.albedo[2] = static_cast<float>((v >> 2) & 15u) / 15.0f;
+        const float strength = std::exp2(3.0f * static_cast<float>(v & 3u));
+        for (int c = 0; c < 3; ++c)
+        {
+            m.emission[c] = m.albedo[c] * strength;
+        }
+    }
+    return m;
 }
 
 // The pastel hash colour of the block-ID encoding (caelix_shading.hlsl HashU32, Pastel).
-uint32_t HashU32(uint32_t value) {
-  value ^= value >> 16;
-  value *= 0x7FEB352Du;
-  value ^= value >> 15;
-  value *= 0x846CA68Bu;
-  value ^= value >> 16;
-  return value;
+uint32_t HashU32(uint32_t value)
+{
+    value ^= value >> 16;
+    value *= 0x7FEB352Du;
+    value ^= value >> 15;
+    value *= 0x846CA68Bu;
+    value ^= value >> 16;
+    return value;
 }
 
-CaelixMaterial PastelOpaque(uint32_t hash) {
-  CaelixMaterial m{};
-  m.albedo[0] = 0.35f + 0.6f * (static_cast<float>(hash & 0xFFu) / 255.0f);
-  m.albedo[1] = 0.35f + 0.6f * (static_cast<float>((hash >> 8) & 0xFFu) / 255.0f);
-  m.albedo[2] = 0.35f + 0.6f * (static_cast<float>((hash >> 16) & 0xFFu) / 255.0f);
-  m.ior = 1.5f;
-  return m;
+CaelixMaterial PastelOpaque(uint32_t hash)
+{
+    CaelixMaterial m{};
+    m.albedo[0] = 0.35f + 0.6f * (static_cast<float>(hash & 0xFFu) / 255.0f);
+    m.albedo[1] = 0.35f + 0.6f * (static_cast<float>((hash >> 8) & 0xFFu) / 255.0f);
+    m.albedo[2] = 0.35f + 0.6f * (static_cast<float>((hash >> 16) & 0xFFu) / 255.0f);
+    m.ior = 1.5f;
+    return m;
 }
 
 // One entry of glass-palette.json.
-struct GlassEntry {
-  int id = 0;
-  float tint[3] = {};
-  float ior = 0.0f;
-  float extinction = 0.0f;
-  float smoothness = 0.0f;
+struct GlassEntry
+{
+    int id = 0;
+    float tint[3] = {};
+    float ior = 0.0f;
+    float extinction = 0.0f;
+    float smoothness = 0.0f;
 };
 
 // The numbers after `"key":` in `object` (one, or the elements of an array).
-std::vector<double> Numbers(const std::string& object, const char* key) {
-  std::vector<double> out;
-  const std::string quoted = std::string("\"") + key + "\"";
-  size_t at = object.find(quoted);
-  REQUIRE(at != std::string::npos);
-  at = object.find(':', at) + 1;
-  while (at < object.size() && (object[at] == ' ' || object[at] == '\n' || object[at] == '\r' ||
-                                object[at] == '\t')) {
-    ++at;
-  }
-  const bool array = object[at] == '[';
-  const size_t end = array ? object.find(']', at) : object.find_first_of(",}", at);
-  std::string text = object.substr(array ? at + 1 : at, end - (array ? at + 1 : at));
-  for (char& ch : text) {
-    if (ch == ',') {
-      ch = ' ';
+std::vector<double> Numbers(const std::string& object, const char* key)
+{
+    std::vector<double> out;
+    const std::string quoted = std::string("\"") + key + "\"";
+    size_t at = object.find(quoted);
+    REQUIRE(at != std::string::npos);
+    at = object.find(':', at) + 1;
+    while (at < object.size() && (object[at] == ' ' || object[at] == '\n' || object[at] == '\r' ||
+                                  object[at] == '\t'))
+    {
+        ++at;
     }
-  }
-  std::istringstream stream(text);
-  double value = 0.0;
-  while (stream >> value) {
-    out.push_back(value);
-  }
-  return out;
+    const bool array = object[at] == '[';
+    const size_t end = array ? object.find(']', at) : object.find_first_of(",}", at);
+    std::string text = object.substr(array ? at + 1 : at, end - (array ? at + 1 : at));
+    for (char& ch : text)
+    {
+        if (ch == ',')
+        {
+            ch = ' ';
+        }
+    }
+    std::istringstream stream(text);
+    double value = 0.0;
+    while (stream >> value)
+    {
+        out.push_back(value);
+    }
+    return out;
 }
 
 // A small parser for the known shape of glass-palette.json: {"notes": ..., "entries": [{...}, ...]}.
-std::vector<GlassEntry> ReadPalette() {
-  std::ifstream file(CAELIX_GLASS_PALETTE_JSON, std::ios::binary);
-  REQUIRE(file.good());
-  std::stringstream buffer;
-  buffer << file.rdbuf();
-  const std::string text = buffer.str();
-  std::vector<GlassEntry> entries;
-  size_t at = text.find("\"entries\"");
-  REQUIRE(at != std::string::npos);
-  while ((at = text.find('{', at)) != std::string::npos) {
-    const size_t end = text.find('}', at);
-    const std::string object = text.substr(at, end - at + 1);
-    GlassEntry entry;
-    entry.id = static_cast<int>(Numbers(object, "id").at(0));
-    const std::vector<double> tint = Numbers(object, "tint");
-    REQUIRE(tint.size() == 3);
-    for (int c = 0; c < 3; ++c) {
-      entry.tint[c] = static_cast<float>(tint[c]);
+std::vector<GlassEntry> ReadPalette()
+{
+    std::ifstream file(CAELIX_GLASS_PALETTE_JSON, std::ios::binary);
+    REQUIRE(file.good());
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    const std::string text = buffer.str();
+    std::vector<GlassEntry> entries;
+    size_t at = text.find("\"entries\"");
+    REQUIRE(at != std::string::npos);
+    while ((at = text.find('{', at)) != std::string::npos)
+    {
+        const size_t end = text.find('}', at);
+        const std::string object = text.substr(at, end - at + 1);
+        GlassEntry entry;
+        entry.id = static_cast<int>(Numbers(object, "id").at(0));
+        const std::vector<double> tint = Numbers(object, "tint");
+        REQUIRE(tint.size() == 3);
+        for (int c = 0; c < 3; ++c)
+        {
+            entry.tint[c] = static_cast<float>(tint[c]);
+        }
+        entry.ior = static_cast<float>(Numbers(object, "ior").at(0));
+        entry.extinction = static_cast<float>(Numbers(object, "extinction").at(0));
+        entry.smoothness = static_cast<float>(Numbers(object, "smoothness").at(0));
+        entries.push_back(entry);
+        at = end;
     }
-    entry.ior = static_cast<float>(Numbers(object, "ior").at(0));
-    entry.extinction = static_cast<float>(Numbers(object, "extinction").at(0));
-    entry.smoothness = static_cast<float>(Numbers(object, "smoothness").at(0));
-    entries.push_back(entry);
-    at = end;
-  }
-  return entries;
+    return entries;
 }
 
-void FlushOnce(Rig& rig) { FlushFrame(rig.gpu, rig.scene, rig.frames); }
+void FlushOnce(Rig& rig)
+{
+    FlushFrame(rig.gpu, rig.scene, rig.frames);
+}
 
 }  // namespace
 
-TEST_CASE("materials: packed table matches the old decode, the glass palette and the vacuum entry") {
-  Rig rig;
-  OpenRig(rig, "caelix_material_test", RigDesc(0, 0, 0));
+TEST_CASE("materials: packed table matches the old decode, the glass palette and the vacuum entry")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_material_test", RigDesc(0, 0, 0));
 
-  // Opaque and emissive codes: bit for bit the decode of the shader before 6d.
-  uint32_t mismatches = 0;
-  for (uint32_t code = 0x4000; code < kEntries; ++code) {
-    if (!Same(Get(rig, code), OldPackedDecode(code))) {
-      if (mismatches < 4) {
-        std::printf("packed code 0x%04X differs from the old decode\n", code);
-      }
-      ++mismatches;
+    // Opaque and emissive codes: bit for bit the decode of the shader before 6d.
+    uint32_t mismatches = 0;
+    for (uint32_t code = 0x4000; code < kEntries; ++code)
+    {
+        if (!Same(Get(rig, code), OldPackedDecode(code)))
+        {
+            if (mismatches < 4)
+            {
+                std::printf("packed code 0x%04X differs from the old decode\n", code);
+            }
+            ++mismatches;
+        }
     }
-  }
-  std::printf("packed opaque + emissive codes checked: %u, mismatches %u\n", kEntries - 0x4000u,
-              mismatches);
-  CHECK(mismatches == 0);
-  // Spot checks of the decode itself.
-  {
-    const CaelixMaterial red = Get(rig, 0x8000u | (31u << 10));
-    CHECK(red.albedo[0] == 1.0f);
-    CHECK(red.albedo[1] == 0.0f);
-    CHECK(red.smoothness == 0.0f);
-    CHECK(red.metallic == 0.0f);
-    CHECK(red.ior == 1.5f);
-    const CaelixMaterial emitter = Get(rig, 0x4000u | (15u << 10) | 1u);  // rgb4 red, strength 1
-    CHECK(emitter.albedo[0] == 1.0f);
-    CHECK(emitter.emission[0] == 8.0f);
-    CHECK(emitter.emission[1] == 0.0f);
-  }
-
-  // Glass ids 1..132 against the JSON; every face-bit variant gives the same entry.
-  const std::vector<GlassEntry> palette = ReadPalette();
-  REQUIRE(palette.size() == 132);
-  uint32_t glass_mismatches = 0;
-  for (const GlassEntry& entry : palette) {
-    const CaelixMaterial m = Get(rig, static_cast<uint32_t>(entry.id));
-    const CaelixMaterial expected = Make(entry.tint[0], entry.tint[1], entry.tint[2],
-                                         entry.smoothness, 0.0f, entry.ior, entry.extinction);
-    if (!Same(m, expected)) {
-      std::printf("glass id %d differs from the JSON\n", entry.id);
-      ++glass_mismatches;
+    std::printf("packed opaque + emissive codes checked: %u, mismatches %u\n", kEntries - 0x4000u,
+                mismatches);
+    CHECK(mismatches == 0);
+    // Spot checks of the decode itself.
+    {
+        const CaelixMaterial red = Get(rig, 0x8000u | (31u << 10));
+        CHECK(red.albedo[0] == 1.0f);
+        CHECK(red.albedo[1] == 0.0f);
+        CHECK(red.smoothness == 0.0f);
+        CHECK(red.metallic == 0.0f);
+        CHECK(red.ior == 1.5f);
+        const CaelixMaterial emitter = Get(rig, 0x4000u | (15u << 10) | 1u);  // rgb4 red, strength 1
+        CHECK(emitter.albedo[0] == 1.0f);
+        CHECK(emitter.emission[0] == 8.0f);
+        CHECK(emitter.emission[1] == 0.0f);
     }
-    for (uint32_t faces = 1; faces < 64; faces += 7) {
-      if (!Same(Get(rig, static_cast<uint32_t>(entry.id) | (faces << 8)), expected)) {
-        ++glass_mismatches;
-      }
+
+    // Glass ids 1..132 against the JSON; every face-bit variant gives the same entry.
+    const std::vector<GlassEntry> palette = ReadPalette();
+    REQUIRE(palette.size() == 132);
+    uint32_t glass_mismatches = 0;
+    for (const GlassEntry& entry : palette)
+    {
+        const CaelixMaterial m = Get(rig, static_cast<uint32_t>(entry.id));
+        const CaelixMaterial expected = Make(entry.tint[0], entry.tint[1], entry.tint[2],
+                                             entry.smoothness, 0.0f, entry.ior, entry.extinction);
+        if (!Same(m, expected))
+        {
+            std::printf("glass id %d differs from the JSON\n", entry.id);
+            ++glass_mismatches;
+        }
+        for (uint32_t faces = 1; faces < 64; faces += 7)
+        {
+            if (!Same(Get(rig, static_cast<uint32_t>(entry.id) | (faces << 8)), expected))
+            {
+                ++glass_mismatches;
+            }
+        }
     }
-  }
-  std::printf("glass ids checked against the JSON: %zu, mismatches %u\n", palette.size(),
-              glass_mismatches);
-  CHECK(glass_mismatches == 0);
-  {
-    const CaelixMaterial amber7 = Get(rig, 35);
-    CHECK(amber7.albedo[1] == 0.72f);
-    CHECK(amber7.extinction == 0.032f);
-    CHECK(amber7.ior == 1.55f);
-  }
+    std::printf("glass ids checked against the JSON: %zu, mismatches %u\n", palette.size(),
+                glass_mismatches);
+    CHECK(glass_mismatches == 0);
+    {
+        const CaelixMaterial amber7 = Get(rig, 35);
+        CHECK(amber7.albedo[1] == 0.72f);
+        CHECK(amber7.extinction == 0.032f);
+        CHECK(amber7.ior == 1.55f);
+    }
 
-  // Air (id 0, with or without face bits) and the reserved ids: the vacuum entry.
-  const CaelixMaterial vacuum = Make(1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f);
-  CHECK(Same(Get(rig, 0), vacuum));
-  CHECK(Same(Get(rig, 0x3F00), vacuum));
-  CHECK(Same(Get(rig, 133), vacuum));
-  CHECK(Same(Get(rig, 255 | (5u << 8)), vacuum));
-
-  // Stats and argument checks.
-  CHECK(Stats(rig.scene).material_table_bytes == 65536ull * 48ull);
-  ExpectLibraryErrors(1, [&] {
-    CaelixMaterial m{};
-    CHECK(caelix_scene_get_material(rig.scene, 0x10000u, &m) == CAELIX_ERROR_INVALID_ARGUMENT);
-  });
-  ExpectLibraryErrors(1, [&] {
-    CHECK(caelix_scene_get_material(rig.scene, 1, nullptr) == CAELIX_ERROR_INVALID_ARGUMENT);
-  });
-
-  // The glass palette: ids 1 and 2 replaced, entry 0 ignored, id 3 unchanged.
-  {
-    const CaelixMaterial before3 = Get(rig, 3);
-    CaelixMaterial entries[3] = {Make(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 9.0f, 0.0f),
-                                 Make(0.5f, 0.25f, 0.125f, 1.0f, 0.0f, 1.4f, 0.01f),
-                                 Make(0.1f, 0.2f, 0.3f, 0.5f, 0.0f, 1.2f, 0.0f)};
-    entries[1].pad[0] = 7.0f;  // ignored, stored as 0
-    REQUIRE(caelix_scene_set_glass_palette(rig.scene, entries, 3) == CAELIX_OK);
-    entries[1].pad[0] = 0.0f;
-    CHECK(Same(Get(rig, 1), entries[1]));
-    CHECK(Same(Get(rig, 1 | (0x21u << 8)), entries[1]));
-    CHECK(Same(Get(rig, 2), entries[2]));
-    CHECK(Same(Get(rig, 3), before3));
+    // Air (id 0, with or without face bits) and the reserved ids: the vacuum entry.
+    const CaelixMaterial vacuum = Make(1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f);
     CHECK(Same(Get(rig, 0), vacuum));
-    // An invalid entry: nothing changes.
-    CaelixMaterial bad[2] = {vacuum, Make(1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f)};  // ior 0
-    ExpectLibraryErrors(1, [&] {
-      CHECK(caelix_scene_set_glass_palette(rig.scene, bad, 2) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-    CHECK(Same(Get(rig, 1), entries[1]));
-    ExpectLibraryErrors(1, [&] {
-      CHECK(caelix_scene_set_glass_palette(rig.scene, bad, 257) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-  }
+    CHECK(Same(Get(rig, 0x3F00), vacuum));
+    CHECK(Same(Get(rig, 133), vacuum));
+    CHECK(Same(Get(rig, 255 | (5u << 8)), vacuum));
 
-  // A full host table replaces everything; count 0 restores the built-in table.
-  {
-    std::vector<CaelixMaterial> table(16, Make(0.25f, 0.5f, 0.75f, 0.3f, 0.6f, 1.33f, 0.002f, 2.0f));
-    REQUIRE(caelix_scene_set_materials(rig.scene, table.data(), 16) == CAELIX_OK);
-    CHECK(Same(Get(rig, 15), table[15]));
-    CHECK(Same(Get(rig, 1 | (1u << 8)), table[1]));  // face bits removed before the lookup
-    // Past count: the built-in default (glass id 16 from the JSON, an opaque decode).
-    const GlassEntry& id16 = palette[15];
-    REQUIRE(id16.id == 16);
-    CHECK(Same(Get(rig, 16), Make(id16.tint[0], id16.tint[1], id16.tint[2], id16.smoothness, 0.0f,
-                                  id16.ior, id16.extinction)));
-    CHECK(Same(Get(rig, 0x8000u | 0x1234u), OldPackedDecode(0x8000u | 0x1234u)));
-    // Count 0: the built-in table, whose transparent codes come from the CURRENT glass palette
-    // (id 1 was replaced above, ior 1.4).
-    REQUIRE(caelix_scene_set_materials(rig.scene, nullptr, 0) == CAELIX_OK);
-    CHECK(Get(rig, 1).ior == 1.4f);
-    CHECK(Get(rig, 3).ior == 1.33f);
-    CHECK(Same(Get(rig, 0x8123), OldPackedDecode(0x8123)));
-    table[3].extinction = -1.0f;
+    // Stats and argument checks.
+    CHECK(Stats(rig.scene).material_table_bytes == 65536ull * 48ull);
     ExpectLibraryErrors(1, [&] {
-      CHECK(caelix_scene_set_materials(rig.scene, table.data(), 16) == CAELIX_ERROR_INVALID_ARGUMENT);
+        CaelixMaterial m{};
+        CHECK(caelix_scene_get_material(rig.scene, 0x10000u, &m) == CAELIX_ERROR_INVALID_ARGUMENT);
     });
-    table[3].extinction = 0.0f;
-    table[4].albedo[1] = std::numeric_limits<float>::quiet_NaN();
     ExpectLibraryErrors(1, [&] {
-      CHECK(caelix_scene_set_materials(rig.scene, table.data(), 16) == CAELIX_ERROR_INVALID_ARGUMENT);
+        CHECK(caelix_scene_get_material(rig.scene, 1, nullptr) == CAELIX_ERROR_INVALID_ARGUMENT);
     });
-    CHECK(Get(rig, 1).ior == 1.4f);  // unchanged
-    ExpectLibraryErrors(1, [&] {
-      CHECK(caelix_scene_set_materials(rig.scene, table.data(), kEntries + 1) ==
-            CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-  }
 
-  // The table reaches the GPU at a flush (the upload itself is checked by the trace test).
-  FlushOnce(rig);
-  FlushOnce(rig);
-  CloseRig(rig);
+    // The glass palette: ids 1 and 2 replaced, entry 0 ignored, id 3 unchanged.
+    {
+        const CaelixMaterial before3 = Get(rig, 3);
+        CaelixMaterial entries[3] = {Make(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 9.0f, 0.0f),
+                                     Make(0.5f, 0.25f, 0.125f, 1.0f, 0.0f, 1.4f, 0.01f),
+                                     Make(0.1f, 0.2f, 0.3f, 0.5f, 0.0f, 1.2f, 0.0f)};
+        entries[1].pad[0] = 7.0f;  // ignored, stored as 0
+        REQUIRE(caelix_scene_set_glass_palette(rig.scene, entries, 3) == CAELIX_OK);
+        entries[1].pad[0] = 0.0f;
+        CHECK(Same(Get(rig, 1), entries[1]));
+        CHECK(Same(Get(rig, 1 | (0x21u << 8)), entries[1]));
+        CHECK(Same(Get(rig, 2), entries[2]));
+        CHECK(Same(Get(rig, 3), before3));
+        CHECK(Same(Get(rig, 0), vacuum));
+        // An invalid entry: nothing changes.
+        CaelixMaterial bad[2] = {vacuum, Make(1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f)};  // ior 0
+        ExpectLibraryErrors(1, [&] {
+            CHECK(caelix_scene_set_glass_palette(rig.scene, bad, 2) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        CHECK(Same(Get(rig, 1), entries[1]));
+        ExpectLibraryErrors(1, [&] {
+            CHECK(caelix_scene_set_glass_palette(rig.scene, bad, 257) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+    }
+
+    // A full host table replaces everything; count 0 restores the built-in table.
+    {
+        std::vector<CaelixMaterial> table(16, Make(0.25f, 0.5f, 0.75f, 0.3f, 0.6f, 1.33f, 0.002f, 2.0f));
+        REQUIRE(caelix_scene_set_materials(rig.scene, table.data(), 16) == CAELIX_OK);
+        CHECK(Same(Get(rig, 15), table[15]));
+        CHECK(Same(Get(rig, 1 | (1u << 8)), table[1]));  // face bits removed before the lookup
+        // Past count: the built-in default (glass id 16 from the JSON, an opaque decode).
+        const GlassEntry& id16 = palette[15];
+        REQUIRE(id16.id == 16);
+        CHECK(Same(Get(rig, 16), Make(id16.tint[0], id16.tint[1], id16.tint[2], id16.smoothness, 0.0f,
+                                      id16.ior, id16.extinction)));
+        CHECK(Same(Get(rig, 0x8000u | 0x1234u), OldPackedDecode(0x8000u | 0x1234u)));
+        // Count 0: the built-in table, whose transparent codes come from the CURRENT glass palette
+        // (id 1 was replaced above, ior 1.4).
+        REQUIRE(caelix_scene_set_materials(rig.scene, nullptr, 0) == CAELIX_OK);
+        CHECK(Get(rig, 1).ior == 1.4f);
+        CHECK(Get(rig, 3).ior == 1.33f);
+        CHECK(Same(Get(rig, 0x8123), OldPackedDecode(0x8123)));
+        table[3].extinction = -1.0f;
+        ExpectLibraryErrors(1, [&] {
+            CHECK(caelix_scene_set_materials(rig.scene, table.data(), 16) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        table[3].extinction = 0.0f;
+        table[4].albedo[1] = std::numeric_limits<float>::quiet_NaN();
+        ExpectLibraryErrors(1, [&] {
+            CHECK(caelix_scene_set_materials(rig.scene, table.data(), 16) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        CHECK(Get(rig, 1).ior == 1.4f);  // unchanged
+        ExpectLibraryErrors(1, [&] {
+            CHECK(caelix_scene_set_materials(rig.scene, table.data(), kEntries + 1) ==
+                  CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+    }
+
+    // The table reaches the GPU at a flush (the upload itself is checked by the trace test).
+    FlushOnce(rig);
+    FlushOnce(rig);
+    CloseRig(rig);
 }
 
-TEST_CASE("materials: block-ID table: pastel default, host table round trip") {
-  Rig rig;
-  OpenRig(rig, "caelix_material_test", RigDesc(1, 0, 0));
+TEST_CASE("materials: block-ID table: pastel default, host table round trip")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_material_test", RigDesc(1, 0, 0));
 
-  // Defaults: opaque codes the pastel hash of code & 0x7FFF, transparent ids the pastel hash of
-  // id | 0x10000 (face bits ignored), air the vacuum entry.
-  uint32_t mismatches = 0;
-  for (uint32_t code = 0x8000; code < kEntries; code += 37) {
-    if (!Same(Get(rig, code), PastelOpaque(HashU32(code & 0x7FFFu)))) {
-      ++mismatches;
+    // Defaults: opaque codes the pastel hash of code & 0x7FFF, transparent ids the pastel hash of
+    // id | 0x10000 (face bits ignored), air the vacuum entry.
+    uint32_t mismatches = 0;
+    for (uint32_t code = 0x8000; code < kEntries; code += 37)
+    {
+        if (!Same(Get(rig, code), PastelOpaque(HashU32(code & 0x7FFFu))))
+        {
+            ++mismatches;
+        }
     }
-  }
-  for (uint32_t id = 1; id < 512; ++id) {
-    if (!Same(Get(rig, id | (0x15u << 9)), PastelOpaque(HashU32(id | 0x10000u)))) {
-      ++mismatches;
+    for (uint32_t id = 1; id < 512; ++id)
+    {
+        if (!Same(Get(rig, id | (0x15u << 9)), PastelOpaque(HashU32(id | 0x10000u))))
+        {
+            ++mismatches;
+        }
     }
-  }
-  CHECK(mismatches == 0);
-  CHECK(Same(Get(rig, 0), Make(1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f)));
+    CHECK(mismatches == 0);
+    CHECK(Same(Get(rig, 0), Make(1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f)));
 
-  // The glass palette is a packed-encoding feature.
-  ExpectLibraryErrors(1, [&] {
-    const CaelixMaterial entry = Make(1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.5f, 0.0f);
-    CHECK(caelix_scene_set_glass_palette(rig.scene, &entry, 1) == CAELIX_ERROR_INVALID_ARGUMENT);
-  });
+    // The glass palette is a packed-encoding feature.
+    ExpectLibraryErrors(1, [&] {
+        const CaelixMaterial entry = Make(1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.5f, 0.0f);
+        CHECK(caelix_scene_set_glass_palette(rig.scene, &entry, 1) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
 
-  // A host table over codes [0, 0x8003): read every default, change three entries, write back.
-  const uint32_t count = 0x8003;
-  std::vector<CaelixMaterial> table(count);
-  for (uint32_t code = 0; code < count; ++code) {
-    table[code] = Get(rig, code);
-  }
-  table[0x8001] = Make(0.9f, 0.9f, 0.9f, 1.0f, 1.0f, 1.5f, 0.0f);         // smooth metal
-  table[0x8002] = Make(1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.5f, 0.0f, 4.0f);   // emitter
-  table[7] = Make(0.6f, 0.9f, 0.7f, 1.0f, 0.0f, 1.33f, 0.01f);            // transparent id 7
-  REQUIRE(caelix_scene_set_materials(rig.scene, table.data(), count) == CAELIX_OK);
-  CHECK(Same(Get(rig, 0x8001), table[0x8001]));
-  CHECK(Same(Get(rig, 0x8002), table[0x8002]));
-  CHECK(Same(Get(rig, 7), table[7]));
-  CHECK(Same(Get(rig, 7 | (0x3Fu << 9)), table[7]));  // face bits removed before the lookup
-  CHECK(Same(Get(rig, 0x8003), PastelOpaque(HashU32(0x0003u))));  // past count: default
-  uint32_t round_trip_mismatches = 0;
-  for (uint32_t code = 0; code < count; ++code) {
-    if (!Same(Get(rig, code), table[code]) && (code & 0x8000u) != 0) {
-      ++round_trip_mismatches;
+    // A host table over codes [0, 0x8003): read every default, change three entries, write back.
+    const uint32_t count = 0x8003;
+    std::vector<CaelixMaterial> table(count);
+    for (uint32_t code = 0; code < count; ++code)
+    {
+        table[code] = Get(rig, code);
     }
-  }
-  CHECK(round_trip_mismatches == 0);
+    table[0x8001] = Make(0.9f, 0.9f, 0.9f, 1.0f, 1.0f, 1.5f, 0.0f);        // smooth metal
+    table[0x8002] = Make(1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.5f, 0.0f, 4.0f);  // emitter
+    table[7] = Make(0.6f, 0.9f, 0.7f, 1.0f, 0.0f, 1.33f, 0.01f);           // transparent id 7
+    REQUIRE(caelix_scene_set_materials(rig.scene, table.data(), count) == CAELIX_OK);
+    CHECK(Same(Get(rig, 0x8001), table[0x8001]));
+    CHECK(Same(Get(rig, 0x8002), table[0x8002]));
+    CHECK(Same(Get(rig, 7), table[7]));
+    CHECK(Same(Get(rig, 7 | (0x3Fu << 9)), table[7]));              // face bits removed before the lookup
+    CHECK(Same(Get(rig, 0x8003), PastelOpaque(HashU32(0x0003u))));  // past count: default
+    uint32_t round_trip_mismatches = 0;
+    for (uint32_t code = 0; code < count; ++code)
+    {
+        if (!Same(Get(rig, code), table[code]) && (code & 0x8000u) != 0)
+        {
+            ++round_trip_mismatches;
+        }
+    }
+    CHECK(round_trip_mismatches == 0);
 
-  FlushOnce(rig);
-  CloseRig(rig);
+    FlushOnce(rig);
+    CloseRig(rig);
 }

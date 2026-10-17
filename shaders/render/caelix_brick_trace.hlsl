@@ -92,11 +92,11 @@ struct AttributeData
 };
 
 static half3 objectNormals[6] = {
-    half3( 1, 0, 0),
+    half3(1, 0, 0),
     half3(-1, 0, 0),
-    half3(0,  1, 0),
+    half3(0, 1, 0),
     half3(0, -1, 0),
-    half3(0, 0,  1),
+    half3(0, 0, 1),
     half3(0, 0, -1),
 };
 
@@ -197,19 +197,19 @@ inline uint CaelixBrickRayNormalFlags(uint index, int3 cell, float3 tStart, half
         T = 0;
         return entryNormalFlags;
     }
-    
+
     // This is brutal. Ideas?
     // Ties can happen on voxel edges/corners. Pick one face deterministically,
     // matching the X/Y/Z priority used by the brick AABB entry normal.
-    
+
     float3 sideDist = tStart + float3(cell) * invDir;
     T = min(min(sideDist.x, sideDist.y), sideDist.z);
 
     bool3 axisMask = sideDist <= float3(
-        T + BRICK_RAY_STEP_EPSILON,
-        T + BRICK_RAY_STEP_EPSILON,
-        T + BRICK_RAY_STEP_EPSILON);
-    
+                                     T + BRICK_RAY_STEP_EPSILON,
+                                     T + BRICK_RAY_STEP_EPSILON,
+                                     T + BRICK_RAY_STEP_EPSILON);
+
     uint xUse = axisMask.x ? 0xFFFFFFFFu : 0u;
     uint yUse = (axisMask.y ? 0xFFFFFFFFu : 0u) & ~xUse;
     uint zUse = ~(xUse | yUse);
@@ -266,7 +266,7 @@ inline bool CaelixShouldTerminateBrickRay(uint index, int blockID, uint normalFl
 {
     bool shouldTerminate = IsOpaque(blockID);
     CAELIX_BRANCH if (shouldTerminate) return shouldTerminate;  // NATIVE: was UNITY_BRANCH
-    
+
     // Transparency
     if (index == 0 && entryT == 0) return false;
     shouldTerminate = GetFaceBits(blockID) & normalFlags;
@@ -295,7 +295,7 @@ inline float CaelixTraceBrickRay(uint brickBase, float3 entryPositionInBrick, fl
     float3 origin = clamp(entryPositionInBrick, 0.0f, float3(SIZE_IN_BLOCKS, SIZE_IN_BLOCKS, SIZE_IN_BLOCKS) - BRICK_RAY_GRID_EPSILON);
     int3 cell = int3(floor(origin));
     int3 prevCell = cell;
-    
+
     // attrib.matID_faceNormal = ((entryNormal_coarseOccupancy & 0xFFFF) << 16) + (entryNormal_coarseOccupancy >> 26);
     // attrib.matID_faceNormal = ((0x8D3F & 0xFFFF) << 16) + (entryNormal_coarseOccupancy >> 26);
     // return entryT;
@@ -303,7 +303,10 @@ inline float CaelixTraceBrickRay(uint brickBase, float3 entryPositionInBrick, fl
     [loop] for (uint rayStep = 0; rayStep < BRICK_RAY_MAX_STEPS; rayStep++)
     {
         // Out of bounds
-        if (any(uint3(cell) >= SIZE_IN_BLOCKS)) { break; }
+        if (any(uint3(cell) >= SIZE_IN_BLOCKS))
+        {
+            break;
+        }
 
         // Coarse jumps
         uint3 coarseCell = cell >> BRICK_MICRO_SHIFT;
@@ -316,7 +319,7 @@ inline float CaelixTraceBrickRay(uint brickBase, float3 entryPositionInBrick, fl
             cell = VRTStep(cell, tStart, origin, rayDir, invDir);
             continue;
         }
-        
+
         // Let L1 Cache do its job
         // TODO: Cache prev coarsebit or something?
         CaelixLoadMicroOccupancy(brickBase, coarseBit, occ);
@@ -382,9 +385,10 @@ inline float CaelixTraceBrickPrimitiveCore(uint brickBase, float3 objectRayOrigi
         (tightBounds >> 3u) & BRICK_TIGHT_AXIS_MASK,
         (tightBounds >> 6u) & BRICK_TIGHT_AXIS_MASK);
     float3 tightMax = float3(
-        (tightBounds >> BRICK_TIGHT_MAX_SHIFT) & BRICK_TIGHT_AXIS_MASK,
-        (tightBounds >> (BRICK_TIGHT_MAX_SHIFT + 3u)) & BRICK_TIGHT_AXIS_MASK,
-        (tightBounds >> (BRICK_TIGHT_MAX_SHIFT + 6u)) & BRICK_TIGHT_AXIS_MASK) + 1.0f;
+                          (tightBounds >> BRICK_TIGHT_MAX_SHIFT) & BRICK_TIGHT_AXIS_MASK,
+                          (tightBounds >> (BRICK_TIGHT_MAX_SHIFT + 3u)) & BRICK_TIGHT_AXIS_MASK,
+                          (tightBounds >> (BRICK_TIGHT_MAX_SHIFT + 6u)) & BRICK_TIGHT_AXIS_MASK) +
+                      1.0f;
 
     float3 aabbMin = brickOrigin + tightMin;
     float3 aabbMax = brickOrigin + tightMax;
@@ -429,8 +433,8 @@ inline float CaelixTraceBrickPrimitiveCore(uint brickBase, float3 objectRayOrigi
 
     CaelixBrickHit result = CaelixMakeBrickMiss();
     return CaelixTraceBrickRay(brickBase, entryPositionInBrick, rayDir, t,
-        (normalFlags << 26)  | CaelixGetCoarseOccupancy(brickInfo.x),
-        attrib);
+                               (normalFlags << 26) | CaelixGetCoarseOccupancy(brickInfo.x),
+                               attrib);
 }
 
 #endif
