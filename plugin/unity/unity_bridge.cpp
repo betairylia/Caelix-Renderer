@@ -681,6 +681,13 @@ void FrameEvent(void* data)
         g_rt.scene_busy_since = g_rt.last_flushed_frame;
     }
     // The records are in the library now (the bricks in its staging ring): C# may reuse the memory.
+    // The free staging space goes out first: C# subtracts the bricks of the frame packets it has
+    // issued since the status it reads, so the two must describe the same moment.
+    {
+        CaelixSceneStats stats{};
+        caelix_scene_get_stats(state.scene, &stats);
+        state.upload_bricks_free.store(stats.upload_bricks_free);
+    }
     PublishConsumed(state.last_consumed_frame_sequence, sequence);
 
     UnityVulkanRecordingState recording{};
