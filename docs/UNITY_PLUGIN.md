@@ -251,13 +251,90 @@ so the motion pass does not run for them. The packet ring grew from 3 to 6 slots
 issues one packet per frame and the render thread may be a frame behind, so two views need about
 four slots in flight.
 
-Known limitation: several Scene views share view 1. When their sizes differ, the view's targets
-are recreated at every change of size, which costs a release event (queue idle) per frame.
+Several Scene views no longer share view 1: since packet version 5 every camera has its own view
+(see "Packet v5 as built" below).
 
 Quiet logs: a `verboseLogging` setting (default off) gates the three informational C# logs: the
 encoding change in `Tick`, "stream complete after N frames" (the stream statistics still run) and
 "N material entries from ...". Warnings, errors, the periodic status log (`statusLogInterval`) and
 the one-time plugin status line stay as they were.
+
+## Packet v5 as built (2026-10-18)
+
+Packet version 5 (`plugin/unity/include/caelix_unity.h` is the contract; `unity_bridge.cpp` the
+render-thread side). Every packet starts with the 24-byte `CaelixUnityPacketHeader` (size, version,
+kind, sequence). The plugin rejects a packet whose size, version or kind differs from what it was
+compiled with (logged, rate limited, counted in `failed_events`) and does not publish its sequence.
+Sequences are per kind: `last_consumed_frame_sequence`, `last_consumed_view_sequence`,
+`last_consumed_release_sequence`.
+
+Three plugin events (`ReserveEventIDRange(3)`: frame, render = frame + 1, release = frame + 2;
+`status.frame_event_id` and the two others):
+
+- **Frame event**, `CaelixUnityFramePacket` (80 B + records), once per Unity frame from the
+  per-frame tick, before any camera renders. Order: session reset (`CAELIX_UNITY_FRAME_RESET`),
+  entity records in list order, brick removes in runs per entity, uploads, publish the sequence,
+  then the flush. Same configuration as the render event (outside a render pass, no queue access,
+  `EnsurePreviousFrameSubmission | ModifiesCommandBuffersState`).
+- **Render event**, `CaelixUnityViewPacket` (488 B), once per view per Unity frame from the view's
+  camera pass. Accesses the targets, renders the view's renderer (created lazily), publishes the
+  sequence. A render event before the session's first frame packet publishes its sequence and
+  renders nothing (one warning).
+- **Release event**, `CaelixUnityReleasePacket` (32 B), with graphics queue access (flush, sync
+  worker threads) and `vkQueueWaitIdle` when there is work. Flags: `TARGET_VIEWS` releases the
+  cached image views of every renderer, `VIEW` destroys one view's renderer, `SCENE` destroys every
+  renderer and the scene and forgets the entity map (implies `TARGET_VIEWS`). A NULL packet is an
+  error now.
+
+Sessions: the scene's encoding, staging size and material entries are fixed for a session. C#
+starts a session with a release event (`SCENE`) followed by a frame packet with
+`CAELIX_UNITY_FRAME_RESET`; that packet creates the scene (`CaelixSceneDesc::encoding`,
+`staging_bytes = staging_mib << 20`, 0 = library default) and applies the material entries
+(`caelix_scene_set_material_entries`, 52-byte `CaelixMaterialEntry`, over the built-in table). C#
+ends the session with another `SCENE` release when its component is disabled, so the plugin holds
+no scene between Play sessions. A reset that finds a scene (the release was skipped) logs an
+error, removes every entity, restores the built-in materials and applies the entries; the scene
+keeps its encoding and ring. A frame packet without a reset and without a scene fails (sequence
+published). The plugin no longer has a material mode, a per-packet encoding or an encoding-change
+path in the release event.
+
+Frame numbers come straight from Unity: the flush and every render of a Unity frame use
+`frame_number = currentFrameNumber`, `safe_frame_number = safeFrameNumber`. The plugin frame
+counter and its mapping table are gone. The scene is flushed at most once per Unity frame
+(`last_flushed_frame`); a second frame event in the same Unity frame applies its records, logs a
+warning and leaves them for the next flush. A `frame <= safe` frame is an error (no flush, no
+render). The library allows one render per renderer per frame number, which is why every camera
+has its own view.
+
+Upload sizing: the plugin has no queue for bricks the staging ring refuses. At scene creation it
+reads `CaelixSceneStats::upload_bricks_free` of the empty ring and publishes a quarter of it as
+`upload_bricks_cap` (frames in flight keep their staging space until they complete); after every
+flush it publishes `upload_bricks_free`. C# sizes a frame packet's uploads from that value minus
+the bricks of the frame packets it issued since, capped at `upload_bricks_cap`. Bricks the library
+still refuses are dropped, counted in `bricks_dropped` and logged (rate limited); C# treats a
+growing count as an error and sends the world again.
+
+Views: `CAELIX_UNITY_MAX_VIEWS` is 8, one per camera. `live_views` is the bitmask of the views
+that have a renderer. A `VIEW` release destroys the renderer of a camera that is gone.
+
+Sky cubemap: the view packet's `sky` target (a Cubemap or a cube RenderTexture with mips, no sun
+disk) is observed with `AccessTexture(..., kUnityVulkanResourceAccess_ObserveOnly)`, which records
+nothing and does not change the layout. The plugin accepts an image with 6 layers, a square face,
+at least one mip and the layout `SHADER_READ_ONLY_OPTIMAL` or `GENERAL`, and fills
+`options.sky = {image, format, layout, face size, mip count}` in its copy of the packet's options.
+Any other image is dropped for the frame (warning, at most 8 times, with the reason) and the
+procedural sky is used.
+
+Timings: `CaelixUnityStatus` carries the GPU timings (`flush_ms`, `trace_ms`, `composite_ms`,
+`denoise_ms`, `timings_frame`) of the view whose packet sets `CAELIX_UNITY_VIEW_REPORT_TIMINGS`, and
+`timings_view` names that view. The frame event no longer reads timings.
+
+Status (280 B): the three packet sizes as compiled, the three event ids, the per-kind consumed
+sequences, `last_unity_frame` / `last_safe_frame` / `last_flushed_frame`, counters `frames`
+(frame events that flushed), `renders`, `releases`, `failed_events`, `scene_resets`, the scene
+statistics after the newest flush (plus `staging_bytes`, `upload_bricks_free`), `bricks_dropped`,
+`upload_bricks_cap` and `live_views`. Removed: `bricks_pending_plugin`, `scene_packets`,
+`last_plugin_frame`.
 
 ## Open questions for the owner
 

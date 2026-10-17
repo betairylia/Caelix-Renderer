@@ -40,10 +40,13 @@ struct State
     IUnityGraphics* graphics = nullptr;
     IUnityGraphicsVulkanV2* vulkan = nullptr;
     IUnityLog* log = nullptr;
+    // Plugin event ids (ReserveEventIDRange(3) in UnityPluginLoad): frame, render, release.
+    int frame_event_id = 0;
     int render_event_id = 0;
     int release_event_id = 0;
 
-    // Status for C# (caelix_unity_status).
+    // Status for C# (caelix_unity_status, CaelixUnityStatus). Written on the render thread and in
+    // the device events, read on any thread.
     std::atomic<uint32_t> unity_renderer{0};
     std::atomic<uint32_t> intercept_registered{0};
     std::atomic<uint32_t> intercept_called{0};
@@ -51,37 +54,49 @@ struct State
     std::atomic<uint32_t> device_patched{0};
     std::atomic<uint32_t> device_adopted{0};
     std::atomic<int32_t> last_error{0};
-    std::atomic<uint64_t> last_consumed_sequence{0};
+    // The packets the render thread is done with, one sequence per packet kind.
+    std::atomic<uint64_t> last_consumed_frame_sequence{0};
+    std::atomic<uint64_t> last_consumed_view_sequence{0};
+    std::atomic<uint64_t> last_consumed_release_sequence{0};
+    // Unity's frame numbers at the newest frame or render event, and the newest flushed frame.
     std::atomic<uint64_t> last_unity_frame{0};
     std::atomic<uint64_t> last_safe_frame{0};
-    std::atomic<uint64_t> last_plugin_frame{0};
+    std::atomic<uint64_t> last_flushed_frame{0};
+    std::atomic<uint64_t> frames{0};
     std::atomic<uint64_t> renders{0};
+    std::atomic<uint64_t> releases{0};
     std::atomic<uint64_t> failed_events{0};
-    std::atomic<uint64_t> view_releases{0};
-    // Version 2 status: the scene after the newest flush (CaelixUnityStatus).
+    // The scene after the newest flush.
     std::atomic<uint32_t> scene_encoding{0xFFFFFFFFu};
     std::atomic<uint32_t> scene_entities{0};
     std::atomic<uint32_t> scene_groups{0};
-    std::atomic<uint32_t> scene_recreations{0};
+    std::atomic<uint32_t> scene_resets{0};
+    std::atomic<uint32_t> live_views{0};
     std::atomic<uint64_t> bricks_resident{0};
-    std::atomic<uint64_t> bricks_pending_plugin{0};
     std::atomic<uint64_t> as_builds_pending{0};
     std::atomic<uint64_t> uploaded_total{0};
     std::atomic<uint64_t> removed_total{0};
-    std::atomic<uint64_t> scene_packets{0};
+    std::atomic<uint64_t> bricks_dropped{0};
+    std::atomic<uint64_t> upload_bricks_free{0};
+    std::atomic<uint64_t> upload_bricks_cap{0};
     std::atomic<uint64_t> record_bytes{0};
     std::atomic<uint64_t> blas_bytes{0};
+    std::atomic<uint64_t> staging_bytes{0};
+    // GPU timings of the view that asked for them (CAELIX_UNITY_VIEW_REPORT_TIMINGS).
     std::atomic<float> flush_ms{0.0f};
     std::atomic<float> trace_ms{0.0f};
     std::atomic<float> composite_ms{0.0f};
     std::atomic<float> denoise_ms{0.0f};
     std::atomic<uint64_t> timings_frame{0};
+    std::atomic<uint32_t> timings_view{0};
 
     // Render thread only (device events and plugin events).
     CaelixDevice* device = nullptr;
     CaelixScene* scene = nullptr;
-    // One renderer per view (CaelixUnityPacket::view), all over `scene`. Created on the first
-    // render event of the view.
+    // The scene of the current session: created by the frame packet with CAELIX_UNITY_FRAME_RESET,
+    // destroyed by the release event with CAELIX_UNITY_RELEASE_SCENE.
+    // One renderer per view (CaelixUnityViewPacket::view), all over `scene`. Created on the first
+    // render event of the view, destroyed by a release event (VIEW or SCENE).
     CaelixRenderer* renderers[CAELIX_UNITY_MAX_VIEWS] = {};
     VkDevice vk_device = VK_NULL_HANDLE;
     VkQueue vk_queue = VK_NULL_HANDLE;
@@ -97,10 +112,10 @@ PFN_vkGetInstanceProcAddr UNITY_INTERFACE_API InterceptVulkanInitialization(
 
 // unity_bridge.cpp: plugin events and the render-thread objects.
 void UNITY_INTERFACE_API OnPluginEvent(int event_id, void* data);
-// Configures the two plugin events (IUnityGraphicsVulkanV2::ConfigureEvent).
+// Configures the three plugin events (IUnityGraphicsVulkanV2::ConfigureEvent).
 void ConfigureEvents();
-// Destroys every view's renderer and the scene (device idle) and forgets the frame mapping, the entity map and the
-// pending uploads.
+// Destroys every view's renderer and the scene (device idle) and forgets the render-thread state
+// (the entity map, the newest flushed frame, the log counters).
 void DestroyRenderObjects();
 
 }  // namespace caelix_unity

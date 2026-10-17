@@ -12,29 +12,53 @@
  * inside a plugin event or a graphics device event. The functions below never call the library:
  * they only read atomics, so C# may call them from any thread.
  *
- * Packets: C# owns the packet memory (unmanaged, for example Marshal.AllocHGlobal). It fills one
- * packet per render event and passes its address as the data of
- * CommandBuffer.IssuePluginEventAndData(caelix_unity_get_render_event_func(),
- * status.render_event_id, packet). The render thread reads the packet and its records IN PLACE
- * during the event (the renderer library copies brick data into its staging ring; the plugin
- * copies the bricks the ring cannot take into its own pending buffer) and publishes the packet's
- * sequence number as CaelixUnityStatus::last_consumed_sequence when it is done with the memory,
- * on success and on failure. C# may reuse or free a packet when last_consumed_sequence >= the
- * packet's sequence. The GPU never reads packet memory.
+ * Three plugin events, each with its own packet kind (CaelixUnityPacketHeader::kind), all issued
+ * through CommandBuffer.IssuePluginEventAndData(caelix_unity_get_render_event_func(), event id,
+ * packet):
  *
- * Target views: the renderer caches one image view per target image (CaelixRenderTargets). When
- * C# destroys a target RenderTexture, a later RenderTexture can get the same VkImage handle, and
- * the cached view would then show a destroyed image. So whenever C# replaces a target, it issues
- * the release event (status.release_event_id) BEFORE the first render event that uses the new
- * target. That event runs with graphics queue access: it waits for the graphics queue to be idle
- * and calls caelix_renderer_release_target_views on every view's renderer. Its data is NULL or the
- * packet of the render event that follows it: when that packet's encoding differs from the live
- * scene's, the release event also destroys every renderer and the scene, and the render events
- * create them again with the new encoding. C# issues the release event for that reason too.
+ *   frame event (status.frame_event_id, CaelixUnityFramePacket): ONCE per Unity frame, from the
+ *     main thread's per-frame tick through Graphics.ExecuteCommandBuffer, before any camera of the
+ *     frame renders. The render thread applies the packet's scene records (entities, brick
+ *     removes, brick uploads) and flushes the scene (caelix_scene_flush) with Unity's own frame
+ *     numbers: frame_number = currentFrameNumber and safe_frame_number = safeFrameNumber of
+ *     UnityVulkanRecordingState, no conversion. Every view of the frame then renders the same scene
+ *     state, and entity transforms never lag the camera. A frame packet whose Unity frame was
+ *     already flushed (a second frame event in one Unity frame) applies its records but does not
+ *     flush (logged); they reach the GPU with the next frame's flush.
  *
- * Views (version 4): every packet names a view (CaelixUnityPacket::view). Each view has its own
- * renderer over the one shared scene, so its internal targets and denoiser history do not mix
- * with another view's. The scene records of a packet apply to the shared scene, whatever its view.
+ *   render event (status.render_event_id, CaelixUnityViewPacket): once per view per Unity frame,
+ *     from the view's camera render pass. Renders the view's renderer (created on the view's first
+ *     render event) into the packet's targets with the same Unity frame numbers. A renderer renders
+ *     at most once per Unity frame (library rule): C# gives every camera its own view.
+ *
+ *   release event (status.release_event_id, CaelixUnityReleasePacket): runs with graphics queue
+ *     access and waits for the queue to be idle, then does what its flags say: release the cached
+ *     target image views of every renderer (before the first render event that uses a replaced
+ *     target texture: a new RenderTexture can get the VkImage handle of a destroyed one), destroy
+ *     one view's renderer (the camera is gone), or destroy every renderer and the scene (a session
+ *     ends, or starts: see CAELIX_UNITY_FRAME_RESET).
+ *
+ * Sessions: the scene's block encoding, its material table and its staging ring size are fixed
+ * for a session. A session starts with a frame packet that carries CAELIX_UNITY_FRAME_RESET and the
+ * session config (encoding, staging size, material entries), preceded by a release event with
+ * CAELIX_UNITY_RELEASE_SCENE; it ends with another such release event (C# issues it when its
+ * component is disabled, so the plugin holds no scene between Play sessions). A material or
+ * encoding change during a session is a C# error, not a reset.
+ *
+ * Packets: C# owns the packet memory (unmanaged, for example Marshal.AllocHGlobal) and writes
+ * everything before the event is issued. The render thread reads a packet and its records IN
+ * PLACE during the event and publishes the packet's sequence number as the matching
+ * CaelixUnityStatus::last_consumed_*_sequence when it is done with the memory, on success and on
+ * failure. Sequences are per packet kind, > 0 and strictly increasing. C# may reuse or free a
+ * packet when the published sequence of its kind is >= the packet's sequence. The GPU never reads
+ * packet memory.
+ *
+ * Upload sizing: there is no plugin-side queue for bricks the staging ring cannot take. C# sizes a
+ * frame packet's uploads from CaelixUnityStatus::upload_bricks_free (published after every flush)
+ * minus the bricks of frame packets it has issued since, capped at upload_bricks_cap (the ring's
+ * sustained rate: frames in flight keep their staging space until they complete). Bricks the
+ * library still refuses are dropped and counted in CaelixUnityStatus::bricks_dropped (logged); C#
+ * treats a growing count as an error and sends the world again.
  */
 #include <stdint.h>
 #include <caelix/caelix.h>
@@ -52,29 +76,52 @@ extern "C" {
 #define CAELIX_UNITY_API __attribute__((visibility("default")))
 #endif
 
-/* Bumped on every change of CaelixUnityPacket, its records or CaelixUnityStatus.
-   Version 4: CaelixUnityPacket::view (was a pad field; same size). */
-#define CAELIX_UNITY_PACKET_VERSION 4u
+/* Bumped on every change of the packets, their records or CaelixUnityStatus.
+   Version 5: three packet kinds with a common header (frame, view, release), sessions with a
+   reset config, sky cubemap target, no material mode, no per-packet encoding, 8 views. */
+#define CAELIX_UNITY_PACKET_VERSION 5u
 
-/* Number of views (CaelixUnityPacket::view). Each view has its own renderer over the shared scene. */
-#define CAELIX_UNITY_MAX_VIEWS 4u
+/* Number of views (CaelixUnityViewPacket::view). Each view has its own renderer over the shared
+   scene. C# gives every camera that renders through the plugin its own view. */
+#define CAELIX_UNITY_MAX_VIEWS 8u
 
-/* A render target, given as Unity's native texture pointer. */
+/* CaelixUnityPacketHeader::kind */
+#define CAELIX_UNITY_PACKET_FRAME 1u   /* CaelixUnityFramePacket, frame event */
+#define CAELIX_UNITY_PACKET_VIEW 2u    /* CaelixUnityViewPacket, render event */
+#define CAELIX_UNITY_PACKET_RELEASE 3u /* CaelixUnityReleasePacket, release event */
+
+/* The first 24 bytes of every packet. The plugin rejects (logged, counted in failed_events) a
+   packet whose size or version differs from what it was compiled with, or whose kind is not the
+   kind of the event it came with; such a packet's sequence is not published. */
+typedef struct CaelixUnityPacketHeader
+{
+    uint32_t size;     /* sizeof the packet struct of `kind` */
+    uint32_t version;  /* CAELIX_UNITY_PACKET_VERSION */
+    uint32_t kind;     /* CAELIX_UNITY_PACKET_* */
+    uint32_t pad;
+    uint64_t sequence; /* > 0, strictly increasing per kind */
+} CaelixUnityPacketHeader;
+
+/* A texture, given as Unity's native texture pointer. */
 typedef struct CaelixUnityTarget
 {
     void* native_texture;       /* Texture.GetNativeTexturePtr(); NULL = the target is absent */
     void* native_render_buffer; /* RenderTexture.colorBuffer.GetNativeRenderBufferPtr(); the
                                    fallback when AccessTexture does not accept native_texture.
                                    May be NULL. */
-    uint32_t width;             /* must match the texture's size */
+    uint32_t width;             /* must match the texture's size (a cubemap: its face size) */
     uint32_t height;
 } CaelixUnityTarget;
 
+/* ---------------------------------------------------------------------------------------------
+ * Frame packet
+ * ------------------------------------------------------------------------------------------- */
+
 /* CaelixUnityEntity::flags. 0 = a reference only (a brick remove or upload names the entity). */
-#define CAELIX_UNITY_ENTITY_ADD 1u        /* add the entity; an existing entity with the same guid
-                                             is removed first, with all its bricks */
-#define CAELIX_UNITY_ENTITY_REMOVE 2u     /* remove the entity and all its bricks */
-#define CAELIX_UNITY_ENTITY_TRANSFORM 4u  /* set the entity transform */
+#define CAELIX_UNITY_ENTITY_ADD 1u       /* add the entity; an existing entity with the same guid
+                                            is removed first, with all its bricks */
+#define CAELIX_UNITY_ENTITY_REMOVE 2u    /* remove the entity and all its bricks */
+#define CAELIX_UNITY_ENTITY_TRANSFORM 4u /* set the entity transform */
 
 /* One entity record. 48 bytes. The plugin maps guid -> CaelixEntityId. */
 typedef struct CaelixUnityEntity
@@ -95,119 +142,170 @@ typedef struct CaelixUnityBrickRemove
 /* One upload batch of one entity. 16 bytes. Offsets are bytes from the packet start. */
 typedef struct CaelixUnityUpload
 {
-    uint32_t entity_index; /* index into this packet's entity records */
+    uint32_t entity_index;  /* index into this packet's entity records */
     uint32_t brick_count;
     uint32_t keys_offset;   /* brick_count CaelixBrickKey, 4-byte aligned */
     uint32_t blocks_offset; /* brick_count * 512 uint16 block values (raw storage values, voxel
                                index x + 8 y + 64 z), 16-byte aligned */
 } CaelixUnityUpload;
 
-/* One entry of a partial material table (CAELIX_UNITY_MATERIALS_PARTIAL). 52 bytes. */
-typedef struct CaelixUnityMaterialEntry
+/* CaelixUnityFramePacket::flags */
+#define CAELIX_UNITY_FRAME_RESET 1u /* the first frame packet of a session: the scene config fields
+                                       are read and the scene is created (the release event with
+                                       CAELIX_UNITY_RELEASE_SCENE that C# issues right before it
+                                       destroyed the previous one; when the plugin still has a
+                                       scene here it logs an error, removes every entity and
+                                       restores the built-in materials instead), then the material
+                                       entries are applied, then the records. */
+
+/* One frame event. 80 bytes, followed in the same memory block by the records it points at;
+   total_bytes covers all of it. Offsets are bytes from the packet start. Apply order on the render
+   thread: reset (scene creation + material entries), the entity records in list order, the brick
+   removes, the uploads, then the flush. */
+typedef struct CaelixUnityFramePacket
 {
-    uint32_t code; /* 16-bit block code, 0 .. 0xFFFF */
-    CaelixMaterial material;
-} CaelixUnityMaterialEntry;
+    CaelixUnityPacketHeader header; /* kind CAELIX_UNITY_PACKET_FRAME */
+    uint32_t flags;                 /* CAELIX_UNITY_FRAME_* */
+    uint32_t total_bytes;           /* the whole block: this struct plus every record */
 
-/* CaelixUnityPacket::material_mode */
-#define CAELIX_UNITY_MATERIALS_NONE 0u     /* no material change */
-#define CAELIX_UNITY_MATERIALS_FULL 1u     /* caelix_scene_set_materials(CaelixMaterial
-                                              [material_count]); count 0 restores the built-in
-                                              table */
-#define CAELIX_UNITY_MATERIALS_PARTIAL 2u  /* the built-in table with CaelixUnityMaterialEntry
-                                              [material_count] written over it */
+    /* Session config: read only with CAELIX_UNITY_FRAME_RESET. */
+    uint32_t encoding;         /* scene block encoding: 0 packed scene colour, 1 block-ID */
+    uint32_t staging_mib;      /* CaelixSceneDesc::staging_bytes in MiB; 0 = the library default */
+    uint32_t material_count;   /* CaelixMaterialEntry[material_count] at materials_offset, applied
+                                  over the built-in table of the new scene
+                                  (caelix_scene_set_material_entries); 0 = the built-in table */
+    uint32_t materials_offset; /* 4-byte aligned */
 
-/* CaelixUnityPacket::scene_flags */
-#define CAELIX_UNITY_SCENE_RESET 1u  /* before this packet's records: remove every entity, drop the
-                                        plugin's pending uploads and restore the built-in material
-                                        table. C# sets it on its first scene packet (the plugin's
-                                        scene outlives Play sessions) and when it sends the world
-                                        again. */
-
-/* One render event. The fixed part (this struct) is followed, in the same memory block, by the
-   records it points at; total_bytes covers all of it. Offsets are bytes from the packet start.
-   C# writes everything before the event is issued. Apply order on the render thread: reset, the
-   entity records in list order, the plugin's pending uploads of earlier packets, the brick
-   removes, the uploads (appended to the pending uploads while some are still waiting, so the
-   order per entity is kept), the materials, then flush and render. */
-typedef struct CaelixUnityPacket
-{
-    uint32_t size;              /* sizeof(CaelixUnityPacket); the plugin rejects any other value */
-    uint32_t version;           /* CAELIX_UNITY_PACKET_VERSION */
-    uint64_t sequence;          /* > 0, strictly increasing per issued packet */
-    uint32_t encoding;          /* scene block encoding: 0 packed scene colour, 1 block-ID. See the
-                                   release event for a change of encoding. */
-    uint32_t target_generation; /* changes whenever C# replaced a target texture (see the release
-                                   event); the plugin warns when it changes without a release */
-    CaelixUnityTarget color;    /* RGBA16F with random write (STORAGE usage) */
-    /* Version 3: optional geometry targets (native_texture NULL = absent), each with random write and
-       the size of the colour target. The plugin passes them as CaelixRenderTargets::depth, motion and
-       albedo; a target that AccessTexture refuses or that has no STORAGE usage is dropped (logged). */
-    CaelixUnityTarget depth;  /* R32F: device depth of camera.projection */
-    CaelixUnityTarget motion; /* RGBA16F: previous - current pixel, w = delta checkerboard flag */
-    CaelixUnityTarget albedo; /* RGBA8 UNORM: albedo, a = coverage */
-    CaelixCamera camera;      /* version 3: CaelixCamera::jitter appended */
-    CaelixRenderOptions options;
-
-    /* Scene section (version 2). */
-    uint32_t scene_flags;  /* CAELIX_UNITY_SCENE_* */
-    uint32_t total_bytes;  /* the whole block: this struct plus every record */
-    uint32_t entity_count; /* CaelixUnityEntity[entity_count] at entities_offset */
+    /* Records. */
+    uint32_t entity_count;    /* CaelixUnityEntity[entity_count] at entities_offset */
     uint32_t entities_offset;
-    uint32_t remove_count; /* CaelixUnityBrickRemove[remove_count] at removes_offset */
+    uint32_t remove_count;    /* CaelixUnityBrickRemove[remove_count] at removes_offset */
     uint32_t removes_offset;
-    uint32_t upload_count; /* CaelixUnityUpload[upload_count] at uploads_offset */
+    uint32_t upload_count;    /* CaelixUnityUpload[upload_count] at uploads_offset */
     uint32_t uploads_offset;
-    uint32_t material_mode;  /* CAELIX_UNITY_MATERIALS_* */
-    uint32_t material_count; /* entries at materials_offset (layout per material_mode) */
-    uint32_t materials_offset;
-    uint32_t view; /* version 4: view index 0 .. CAELIX_UNITY_MAX_VIEWS-1; each view has
-                      its own renderer (internal targets, NRD history) over the shared
-                      scene. C#: 0 = Game view, 1 = Scene view. The status timings are
-                      those of view 0. */
-} CaelixUnityPacket;
+    uint32_t brick_count;     /* the bricks of every upload record together (C# accounting) */
+    uint32_t pad;
+} CaelixUnityFramePacket;
 
-/* Plugin state for C#. Counters are monotonic. */
+/* ---------------------------------------------------------------------------------------------
+ * View packet
+ * ------------------------------------------------------------------------------------------- */
+
+/* CaelixUnityViewPacket::flags */
+#define CAELIX_UNITY_VIEW_REPORT_TIMINGS 1u /* this view's GPU timings go to CaelixUnityStatus */
+
+/* One render event. 488 bytes. The plugin accesses every present target (AccessTexture); a
+   target that AccessTexture refuses, without STORAGE usage, or of another size than the colour
+   target is dropped (logged a few times) and the frame renders without it. */
+typedef struct CaelixUnityViewPacket
+{
+    CaelixUnityPacketHeader header; /* kind CAELIX_UNITY_PACKET_VIEW */
+    uint32_t view;                  /* 0 .. CAELIX_UNITY_MAX_VIEWS - 1 */
+    uint32_t flags;                 /* CAELIX_UNITY_VIEW_* */
+    uint32_t target_generation;     /* changes whenever C# replaced a target texture of any view
+                                       (see the release event); the plugin warns when it changes
+                                       without a release */
+    uint32_t pad;
+    CaelixUnityTarget color;  /* RGBA16F with random write (STORAGE usage); required */
+    CaelixUnityTarget depth;  /* R32F: device depth of camera.projection; optional */
+    CaelixUnityTarget motion; /* RGBA16F: previous - current pixel, w = delta checkerboard flag; optional */
+    CaelixUnityTarget albedo; /* RGBA8 UNORM: albedo, a = coverage; optional */
+    /* The sky cubemap of the lighting modes (CaelixSkyCubemap, caelix.h): a Cubemap or a cube
+       RenderTexture with mips, SAMPLED usage, no sun disk. NULL = the procedural sky. The plugin
+       observes the image (AccessTexture, ObserveOnly) and fills options.sky from it (format, face
+       size, mip count, current layout); an image that is not a 6-layer square cube, or whose layout
+       is neither SHADER_READ_ONLY_OPTIMAL nor GENERAL, is dropped for the frame (logged a few
+       times). native_render_buffer is ignored. */
+    CaelixUnityTarget sky;
+    CaelixCamera camera;
+    CaelixRenderOptions options; /* options.sky is written by the plugin (see `sky`) */
+} CaelixUnityViewPacket;
+
+/* ---------------------------------------------------------------------------------------------
+ * Release packet
+ * ------------------------------------------------------------------------------------------- */
+
+/* CaelixUnityReleasePacket::flags. Several may be combined; SCENE implies TARGET_VIEWS. */
+#define CAELIX_UNITY_RELEASE_TARGET_VIEWS 1u /* caelix_renderer_release_target_views on every renderer */
+#define CAELIX_UNITY_RELEASE_VIEW 2u         /* destroy the renderer of `view` (nothing when it has none) */
+#define CAELIX_UNITY_RELEASE_SCENE 4u        /* destroy every renderer and the scene; forget every entity.
+                                                The next frame packet must carry CAELIX_UNITY_FRAME_RESET. */
+
+/* One release event. 32 bytes. */
+typedef struct CaelixUnityReleasePacket
+{
+    CaelixUnityPacketHeader header; /* kind CAELIX_UNITY_PACKET_RELEASE */
+    uint32_t flags;                 /* CAELIX_UNITY_RELEASE_* */
+    uint32_t view;                  /* CAELIX_UNITY_RELEASE_VIEW: the view whose renderer goes */
+} CaelixUnityReleasePacket;
+
+/* ---------------------------------------------------------------------------------------------
+ * Status
+ * ------------------------------------------------------------------------------------------- */
+
+/* Plugin state for C#. 280 bytes. Counters are monotonic. */
 typedef struct CaelixUnityStatus
 {
-    uint32_t size;                   /* sizeof(CaelixUnityStatus) */
-    uint32_t packet_size;            /* sizeof(CaelixUnityPacket) as compiled into the plugin */
-    uint32_t packet_version;         /* CAELIX_UNITY_PACKET_VERSION */
-    uint32_t unity_renderer;         /* UnityGfxRenderer at the last check (21 = Vulkan) */
-    uint32_t intercept_registered;   /* 1: InterceptInitialization returned true */
-    uint32_t intercept_called;       /* 1: Unity called the init callback (Vulkan initialization) */
-    uint32_t instance_patched;       /* 1: vkCreateInstance succeeded with the plugin's api version */
-    uint32_t device_patched;         /* 1: vkCreateDevice succeeded with the plugin's extensions and
-                                        features */
-    uint32_t device_adopted;         /* 1: caelix_device_adopt returned CAELIX_OK */
-    int32_t last_error;              /* CaelixResult of the newest failure (0 = none) */
-    int32_t render_event_id;         /* event id of the render event */
-    int32_t release_event_id;        /* event id of the target-view release event */
-    uint64_t last_consumed_sequence; /* sequence of the newest packet the render thread is done with */
-    uint64_t last_unity_frame;       /* Unity's currentFrameNumber at the newest render event */
-    uint64_t last_safe_frame;        /* Unity's safeFrameNumber at the newest render event */
-    uint64_t last_plugin_frame;      /* the newest frame number the plugin passed to the library */
-    uint64_t renders;                /* render events that recorded a render */
-    uint64_t failed_events;          /* render events that failed (see the Unity log) */
-    uint64_t view_releases;          /* release events that ran */
-    /* Version 2: the scene, as of the newest flush. */
-    uint32_t scene_encoding;        /* encoding of the live scene; 0xFFFFFFFF = no scene */
-    uint32_t entities;              /* CaelixSceneStats::entities */
-    uint32_t groups;                /* CaelixSceneStats::groups */
-    uint32_t scene_recreations;     /* scenes destroyed for an encoding change */
-    uint64_t bricks_resident;       /* CaelixSceneStats::bricks_resident */
-    uint64_t bricks_pending_plugin; /* bricks the plugin holds because the staging ring was full */
-    uint64_t as_builds_pending;     /* CaelixSceneStats::as_builds_pending */
-    uint64_t uploaded_total;        /* bricks accepted by caelix_scene_upload_bricks so far */
-    uint64_t removed_total;         /* brick removes passed to caelix_scene_remove_bricks so far */
-    uint64_t scene_packets;         /* render events whose packet carried scene records */
-    uint64_t record_bytes;          /* CaelixSceneStats::record_bytes */
-    uint64_t blas_bytes;            /* CaelixSceneStats::blas_bytes */
-    float flush_ms;                 /* CaelixGpuTimings of the newest frame read back */
+    uint32_t size;                 /* sizeof(CaelixUnityStatus) */
+    uint32_t packet_version;       /* CAELIX_UNITY_PACKET_VERSION */
+    uint32_t frame_packet_size;    /* sizeof(CaelixUnityFramePacket) as compiled into the plugin */
+    uint32_t view_packet_size;     /* sizeof(CaelixUnityViewPacket) */
+    uint32_t release_packet_size;  /* sizeof(CaelixUnityReleasePacket) */
+    uint32_t unity_renderer;       /* UnityGfxRenderer at the last check (21 = Vulkan) */
+    uint32_t intercept_registered; /* 1: InterceptInitialization returned true */
+    uint32_t intercept_called;     /* 1: Unity called the init callback (Vulkan initialization) */
+    uint32_t instance_patched;     /* 1: vkCreateInstance succeeded with the plugin's api version */
+    uint32_t device_patched;       /* 1: vkCreateDevice succeeded with the plugin's extensions and
+                                      features */
+    uint32_t device_adopted;       /* 1: caelix_device_adopt returned CAELIX_OK */
+    int32_t last_error;            /* CaelixResult of the newest failure (0 = none) */
+    int32_t frame_event_id;        /* event ids (see the top of this header) */
+    int32_t render_event_id;
+    int32_t release_event_id;
+    uint32_t pad0;
+
+    /* Packets the render thread is done with, per kind. */
+    uint64_t last_consumed_frame_sequence;
+    uint64_t last_consumed_view_sequence;
+    uint64_t last_consumed_release_sequence;
+
+    /* Frames. */
+    uint64_t last_unity_frame;  /* Unity's currentFrameNumber at the newest frame or render event */
+    uint64_t last_safe_frame;   /* Unity's safeFrameNumber at that event */
+    uint64_t last_flushed_frame; /* the newest Unity frame the scene was flushed in */
+    uint64_t frames;            /* frame events that flushed */
+    uint64_t renders;           /* render events that recorded a render */
+    uint64_t releases;          /* release events that ran */
+    uint64_t failed_events;     /* events that failed (see the Unity log) */
+
+    /* The scene, as of the newest flush. */
+    uint32_t scene_encoding;    /* encoding of the live scene; 0xFFFFFFFF = no scene */
+    uint32_t entities;          /* CaelixSceneStats::entities */
+    uint32_t groups;            /* CaelixSceneStats::groups */
+    uint32_t scene_resets;      /* scenes created by CAELIX_UNITY_FRAME_RESET so far */
+    uint32_t live_views;        /* bit v = view v has a renderer */
+    uint32_t pad1;
+    uint64_t bricks_resident;   /* CaelixSceneStats::bricks_resident */
+    uint64_t as_builds_pending; /* CaelixSceneStats::as_builds_pending */
+    uint64_t uploaded_total;    /* bricks accepted by caelix_scene_upload_bricks so far */
+    uint64_t removed_total;     /* brick removes passed to caelix_scene_remove_bricks so far */
+    uint64_t bricks_dropped;    /* bricks the staging ring refused (see "Upload sizing" above) */
+    uint64_t upload_bricks_free; /* CaelixSceneStats::upload_bricks_free after the newest flush */
+    uint64_t upload_bricks_cap;  /* a quarter of the empty ring's upload_bricks_free: the most
+                                    bricks one frame packet should carry */
+    uint64_t record_bytes;      /* CaelixSceneStats::record_bytes */
+    uint64_t blas_bytes;        /* CaelixSceneStats::blas_bytes */
+    uint64_t staging_bytes;     /* CaelixSceneStats::staging_bytes (the ring's capacity) */
+
+    /* GPU timings of the view that set CAELIX_UNITY_VIEW_REPORT_TIMINGS (CaelixGpuTimings of the
+       newest frame read back). */
+    float flush_ms;
     float trace_ms;
     float composite_ms;
     float denoise_ms;
     uint64_t timings_frame; /* CaelixGpuTimings::frame_number */
+    uint32_t timings_view;  /* the view the timings belong to */
+    uint32_t pad2;
 } CaelixUnityStatus;
 
 /* The UnityRenderingEventAndData callback for CommandBuffer.IssuePluginEventAndData. Never NULL. */

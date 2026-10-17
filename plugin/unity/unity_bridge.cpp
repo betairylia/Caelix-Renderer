@@ -1,38 +1,52 @@
 // The plugin's C API for C# and the render-thread work of the plugin events.
 //
-// Frame numbers: the library needs one strictly increasing frame number per flush, and a safe
-// frame number below it. Unity's currentFrameNumber is not strictly increasing per event (two
-// cameras render in one Unity frame), so the plugin counts its own frames: every render event is
-// plugin frame n + 1, and the plugin remembers the Unity frame of each one. The safe plugin frame
-// is the newest plugin frame whose Unity frame is <= Unity's safeFrameNumber.
+// Packet version 5: three plugin events, each with its own packet kind (caelix_unity.h).
 //
-// Scene feed (packet version 2): each render event applies the packet's scene records (entities,
-// brick removes, brick uploads, materials) before the flush. Bricks the staging ring cannot take
-// are copied into a plugin-owned pending queue and uploaded first at the next event; while the
-// queue is not empty, new uploads are appended to it, so the bricks of one entity reach the
-// library in the order C# sent them.
+// Frame event (once per Unity frame, before any camera renders): applies the frame packet's scene
+// records (entities, brick removes, brick uploads) and flushes the scene. A packet with
+// CAELIX_UNITY_FRAME_RESET starts a session: it creates the scene with the packet's encoding and
+// staging size and applies its material entries first. The plugin holds no scene between
+// sessions: the release event with CAELIX_UNITY_RELEASE_SCENE destroys it.
 //
-// Views (packet version 4): one scene, one renderer per view (CaelixUnityPacket::view). A packet
-// applies its scene records and flushes the scene whatever its view; only the render call uses
-// the view's renderer, which is created on the view's first render event.
+// Frame numbers: Unity's own, no conversion. The flush and every render of a Unity frame use
+// frame_number = currentFrameNumber and safe_frame_number = safeFrameNumber of the recording
+// state. The scene is flushed at most once per Unity frame; a second frame event in the same Unity
+// frame applies its records and leaves them for the next frame's flush.
+//
+// Uploads: the plugin has no queue of its own. Bricks the staging ring refuses are dropped and
+// counted (CaelixUnityStatus::bricks_dropped); C# sizes its uploads from upload_bricks_free and
+// upload_bricks_cap so that this does not happen.
+//
+// Render event (once per view per Unity frame): renders the view's renderer (created on the
+// view's first render event) over the shared scene into the packet's targets, with the sky
+// cubemap target when the packet has one.
+//
+// Release event (graphics queue access, queue idle): releases cached target views, one view's
+// renderer, or every renderer and the scene.
 #include "plugin_state.h"
 
 #include <caelix_unity.h>
 
 #include <cstdio>
 #include <cstring>
-#include <deque>
 #include <unordered_map>
-#include <unordered_set>
-#include <utility>
 #include <vector>
 
 namespace caelix_unity {
 namespace {
 
 constexpr uint32_t kBlocksPerBrick = 512;
-constexpr uint32_t kMaterialEntries = 65536;
 constexpr uint32_t kNoScene = 0xFFFFFFFFu;
+
+// The sizes caelix_unity.h states, which C# mirrors.
+static_assert(sizeof(CaelixUnityPacketHeader) == 24, "CaelixUnityPacketHeader is 24 bytes");
+static_assert(sizeof(CaelixUnityFramePacket) == 80, "CaelixUnityFramePacket is 80 bytes");
+static_assert(sizeof(CaelixUnityViewPacket) == 488, "CaelixUnityViewPacket is 488 bytes");
+static_assert(sizeof(CaelixUnityReleasePacket) == 32, "CaelixUnityReleasePacket is 32 bytes");
+static_assert(sizeof(CaelixUnityStatus) == 280, "CaelixUnityStatus is 280 bytes");
+static_assert(sizeof(CaelixUnityEntity) == 48 && sizeof(CaelixUnityBrickRemove) == 16 &&
+                  sizeof(CaelixUnityUpload) == 16 && sizeof(CaelixMaterialEntry) == 52,
+              "record sizes of caelix_unity.h");
 
 struct Guid
 {
@@ -52,56 +66,27 @@ struct GuidHash
     }
 };
 
-struct KeyHash
-{
-    size_t operator()(const CaelixBrickKey& key) const
-    {
-        return static_cast<size_t>(static_cast<uint32_t>(key.x) * 73856093u ^
-                                   static_cast<uint32_t>(key.y) * 19349663u ^
-                                   static_cast<uint32_t>(key.z) * 83492791u);
-    }
-};
-
-struct KeyEqual
-{
-    bool operator()(const CaelixBrickKey& a, const CaelixBrickKey& b) const
-    {
-        return a.x == b.x && a.y == b.y && a.z == b.z;
-    }
-};
-
-// Bricks the staging ring could not take, copied out of a packet. `offset` is the first brick not
-// uploaded yet.
-struct PendingBatch
-{
-    CaelixEntityId entity = CAELIX_INVALID_ENTITY;
-    std::vector<CaelixBrickKey> keys;
-    std::vector<uint16_t> blocks;
-    size_t offset = 0;
-};
-
 // Render thread only.
 struct RenderThreadState
 {
-    std::deque<std::pair<uint64_t, uint64_t>> frames;  // (plugin frame, Unity frame), oldest first
-    uint64_t plugin_frame = 0;
-    uint64_t safe_plugin_frame = 0;
+    const char* event_name = "plugin";  // the event that runs now, for the error log
     uint32_t last_generation = 0;
     bool released_since_generation = true;
     bool logged_first_render = false;
     bool logged_access_fallback = false;
     bool logged_level = false;
-    bool warned_encoding = false;
+    bool warned_render_without_scene = false;
     uint32_t dropped_target_logs = 0;
-    bool scene_busy = false;        // the scene had uploads, pending bricks or pending builds
-    uint64_t scene_busy_since = 0;  // plugin frame of the first busy packet of the current burst
+    uint32_t sky_logs = 0;
+    bool scene_busy = false;        // the scene had records, staged bricks or pending builds
+    uint64_t scene_busy_since = 0;  // the newest flushed Unity frame when the current burst began
     uint32_t scene_encoding = kNoScene;
+    uint64_t last_flushed_frame = 0;  // the newest Unity frame the scene was flushed in
+    uint64_t renders_without_scene = 0;
     uint64_t error_logs = 0;
     uint32_t access_logs = 0;
 
     std::unordered_map<Guid, CaelixEntityId, GuidHash> entities;
-    std::deque<PendingBatch> pending;
-    uint64_t pending_bricks = 0;
     std::vector<CaelixEntityId> packet_ids;      // scratch: entity id per packet entity record
     std::vector<CaelixBrickKey> remove_scratch;  // scratch: keys of one remove run
 };
@@ -124,7 +109,8 @@ void Fail(CaelixResult result, const char* what)
     }
     if (ShouldLogError())
     {
-        Log(LogLevel::Error, "render event: %s (CaelixResult %d)", what, static_cast<int>(result));
+        Log(LogLevel::Error, "%s event: %s (CaelixResult %d)", g_rt.event_name, what,
+            static_cast<int>(result));
     }
 }
 
@@ -138,57 +124,80 @@ void SceneError(CaelixResult result, const char* what)
     }
 }
 
-// Publishes the packet's sequence: C# may reuse its memory from now on.
-void PublishConsumed(uint64_t sequence)
+// Publishes a packet's sequence as the consumed sequence of its kind: C# may reuse its memory from
+// now on.
+void PublishConsumed(std::atomic<uint64_t>& last_consumed, uint64_t sequence)
 {
-    State& state = GetState();
-    uint64_t consumed = state.last_consumed_sequence.load();
-    while (sequence > consumed &&
-           !state.last_consumed_sequence.compare_exchange_weak(consumed, sequence))
+    uint64_t consumed = last_consumed.load();
+    while (sequence > consumed && !last_consumed.compare_exchange_weak(consumed, sequence))
     {
     }
 }
 
-void ForgetSceneContents()
+// Reads the fixed struct of a packet of `kind` (the memory may not be aligned for it). False
+// (logged, rate limited) when the header's size, version or kind differs from what the plugin was
+// compiled with; the packet's sequence cannot be trusted then and is not published.
+template <typename Packet>
+bool ReadPacket(const void* data, uint32_t kind, Packet& packet)
 {
-    g_rt.entities.clear();
-    g_rt.pending.clear();
-    g_rt.pending_bricks = 0;
-    GetState().bricks_pending_plugin.store(0);
-}
-
-// Creates the shared scene with `encoding` when there is none.
-bool EnsureScene(uint32_t encoding)
-{
-    State& state = GetState();
-    if (state.scene == nullptr)
+    CaelixUnityPacketHeader header;
+    std::memcpy(&header, data, sizeof(header));
+    if (header.size != sizeof(Packet) || header.version != CAELIX_UNITY_PACKET_VERSION ||
+        header.kind != kind)
     {
-        CaelixSceneDesc desc{};
-        desc.encoding = encoding;
-        const CaelixResult result = caelix_scene_create(state.device, &desc, &state.scene);
-        if (result != CAELIX_OK)
+        if (ShouldLogError())
         {
-            state.scene = nullptr;
-            Fail(result, "caelix_scene_create failed");
-            return false;
+            Log(LogLevel::Error, "%s event: packet size %u version %u kind %u, the plugin expects size "
+                                 "%u version %u kind %u (C# and plugin differ)",
+                g_rt.event_name, header.size, header.version, header.kind,
+                static_cast<unsigned>(sizeof(Packet)), CAELIX_UNITY_PACKET_VERSION, kind);
         }
-        Log(LogLevel::Info, "scene created (encoding %u)", encoding);
-        g_rt.scene_encoding = encoding;
-        g_rt.warned_encoding = false;
-        state.scene_encoding.store(encoding);
-        ForgetSceneContents();
+        return false;
     }
-    else if (encoding != g_rt.scene_encoding && !g_rt.warned_encoding)
+    std::memcpy(&packet, data, sizeof(packet));
+    return true;
+}
+
+// Unity's recording state for the current event. Logs the command buffer once.
+bool GetRecordingState(UnityVulkanRecordingState& recording)
+{
+    State& state = GetState();
+    if (!state.vulkan->CommandRecordingState(&recording, kUnityVulkanGraphicsQueueAccess_DontCare))
     {
-        // The release event before this packet should have destroyed the scene (C# issues it when the
-        // encoding changes). Without it the scene keeps its encoding.
-        g_rt.warned_encoding = true;
-        Log(LogLevel::Warning, "packet encoding %u differs from the scene's %u and no release event "
-                               "recreated the scene; the scene keeps %u",
-            encoding, g_rt.scene_encoding,
-            g_rt.scene_encoding);
+        return false;
+    }
+    if (!g_rt.logged_level)
+    {
+        g_rt.logged_level = true;
+        Log(LogLevel::Info, "%s event: command buffer %p level %s, render pass %p, framebuffer %p, "
+                            "subpass %d, Unity frame %llu, safe %llu",
+            g_rt.event_name, static_cast<void*>(recording.commandBuffer),
+            recording.commandBufferLevel == VK_COMMAND_BUFFER_LEVEL_PRIMARY ? "primary" : "secondary",
+            static_cast<void*>(recording.renderPass), static_cast<void*>(recording.framebuffer),
+            recording.subPassIndex, recording.currentFrameNumber, recording.safeFrameNumber);
     }
     return true;
+}
+
+void UpdateLiveViews()
+{
+    State& state = GetState();
+    uint32_t mask = 0;
+    for (uint32_t view = 0; view < CAELIX_UNITY_MAX_VIEWS; ++view)
+    {
+        if (state.renderers[view] != nullptr) mask |= 1u << view;
+    }
+    state.live_views.store(mask);
+}
+
+bool HasRenderer()
+{
+    const State& state = GetState();
+    for (const CaelixRenderer* renderer : state.renderers)
+    {
+        if (renderer != nullptr) return true;
+    }
+    return false;
 }
 
 // Creates the renderer of `view` over the shared scene when there is none. The scene must exist
@@ -205,30 +214,35 @@ bool EnsureRenderer(uint32_t view)
             Fail(result, "caelix_renderer_create failed");
             return false;
         }
+        UpdateLiveViews();
         Log(LogLevel::Info, "renderer created for view %u", view);
     }
     return true;
 }
 
-bool HasRenderer()
+// Destroys every renderer and the scene and forgets the scene's contents. The device must be idle
+// (or the GPU done with every frame that used them).
+void DestroySceneObjects()
 {
-    const State& state = GetState();
-    for (const CaelixRenderer* renderer : state.renderers)
+    State& state = GetState();
+    for (CaelixRenderer*& renderer : state.renderers)
     {
-        if (renderer != nullptr) return true;
+        caelix_renderer_destroy(renderer);
+        renderer = nullptr;
     }
-    return false;
-}
-
-// Maps Unity's safe frame to the newest safe plugin frame.
-uint64_t SafePluginFrame(uint64_t unity_safe)
-{
-    while (!g_rt.frames.empty() && g_rt.frames.front().second <= unity_safe)
-    {
-        g_rt.safe_plugin_frame = g_rt.frames.front().first;
-        g_rt.frames.pop_front();
-    }
-    return g_rt.safe_plugin_frame;
+    caelix_scene_destroy(state.scene);
+    state.scene = nullptr;
+    g_rt.entities.clear();
+    g_rt.scene_encoding = kNoScene;
+    g_rt.scene_busy = false;
+    state.scene_encoding.store(kNoScene);
+    state.upload_bricks_free.store(0);
+    state.upload_bricks_cap.store(0);
+    state.scene_entities.store(0);
+    state.scene_groups.store(0);
+    state.bricks_resident.store(0);
+    state.as_builds_pending.store(0);
+    state.live_views.store(0);
 }
 
 bool AccessTarget(const CaelixUnityTarget& target, UnityVulkanImage& image)
@@ -301,133 +315,65 @@ bool AccessOptionalTarget(const CaelixUnityTarget& target, const char* name, uin
     return true;
 }
 
+// The sky cubemap target of a view packet: observed (ObserveOnly records nothing and ignores the
+// layout, stage and access arguments, so the image stays in the layout Unity keeps it in) and
+// described in `sky`. An image that is not a 6-layer square cube, or whose layout the library cannot
+// sample in, is dropped for the frame (logged a few times): the renderer then uses the procedural
+// sky.
+void AccessSky(const CaelixUnityTarget& target, CaelixSkyCubemap& sky)
+{
+    sky = CaelixSkyCubemap{};
+    if (target.native_texture == nullptr) return;
+    State& state = GetState();
+    const VkImageSubresource subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+    UnityVulkanImage image{};
+    char problem[96] = {};
+    if (!state.vulkan->AccessTexture(target.native_texture, &subresource, VK_IMAGE_LAYOUT_UNDEFINED, 0, 0,
+                                     kUnityVulkanResourceAccess_ObserveOnly, &image))
+    {
+        std::snprintf(problem, sizeof(problem), "AccessTexture refused it");
+    }
+    else if (image.layers != 6 || image.extent.width != image.extent.height || image.extent.width == 0 ||
+             image.mipCount < 1)
+    {
+        std::snprintf(problem, sizeof(problem), "not a cube (%d layers, %ux%u, %d mips)", image.layers,
+                      image.extent.width, image.extent.height, image.mipCount);
+    }
+    else if (image.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && image.layout != VK_IMAGE_LAYOUT_GENERAL)
+    {
+        std::snprintf(problem, sizeof(problem), "layout %d (neither SHADER_READ_ONLY_OPTIMAL nor GENERAL)",
+                      static_cast<int>(image.layout));
+    }
+    if (problem[0] != '\0')
+    {
+        if (g_rt.sky_logs < 8)
+        {
+            ++g_rt.sky_logs;
+            Log(LogLevel::Warning, "the sky cubemap is dropped for this frame: %s; the procedural sky "
+                                   "is used",
+                problem);
+        }
+        return;
+    }
+    sky.image = reinterpret_cast<uint64_t>(image.image);
+    sky.format = static_cast<uint32_t>(image.format);
+    sky.layout = static_cast<uint32_t>(image.layout);
+    sky.size = image.extent.width;
+    sky.mip_levels = static_cast<uint32_t>(image.mipCount);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Scene feed
 
-// True when [offset, offset + count * stride) lies inside the packet and offset is aligned.
-bool InPacket(const CaelixUnityPacket& packet, uint32_t offset, uint32_t count, uint32_t stride,
+// True when [offset, offset + count * stride) lies inside the frame packet's memory block, after
+// the fixed struct, and offset is aligned.
+bool InPacket(const CaelixUnityFramePacket& packet, uint32_t offset, uint32_t count, uint32_t stride,
               uint32_t alignment)
 {
     if (count == 0) return true;
-    if (offset % alignment != 0 || offset < sizeof(CaelixUnityPacket)) return false;
+    if (offset % alignment != 0 || offset < sizeof(CaelixUnityFramePacket)) return false;
     const uint64_t end = static_cast<uint64_t>(offset) + static_cast<uint64_t>(count) * stride;
     return end <= packet.total_bytes;
-}
-
-void UpdatePendingCount()
-{
-    uint64_t total = 0;
-    for (const PendingBatch& batch : g_rt.pending) total += batch.keys.size() - batch.offset;
-    g_rt.pending_bricks = total;
-    GetState().bricks_pending_plugin.store(total);
-}
-
-void QueuePending(CaelixEntityId entity, uint32_t count, const CaelixBrickKey* keys,
-                  const uint16_t* blocks)
-{
-    PendingBatch batch;
-    batch.entity = entity;
-    batch.keys.assign(keys, keys + count);
-    batch.blocks.assign(blocks, blocks + static_cast<size_t>(count) * kBlocksPerBrick);
-    g_rt.pending.push_back(std::move(batch));
-}
-
-// Uploads as much as the staging ring takes. Returns the number of bricks accepted; false in
-// `ok` when the library returned an error.
-uint32_t Upload(CaelixEntityId entity, uint32_t count, const CaelixBrickKey* keys,
-                const uint16_t* blocks, bool& ok)
-{
-    State& state = GetState();
-    uint32_t consumed = 0;
-    const CaelixResult result =
-        caelix_scene_upload_bricks(state.scene, entity, count, keys, blocks, &consumed);
-    ok = result == CAELIX_OK;
-    // TODO: VibeReview: can we log the error code also instead of a bool?
-    if (!ok) SceneError(result, "caelix_scene_upload_bricks failed"); 
-    if (consumed > count) consumed = count;
-    state.uploaded_total.fetch_add(consumed);
-    return consumed;
-}
-
-// Uploads the pending queue in order until the staging ring is full.
-void RetryPending()
-{
-    while (!g_rt.pending.empty())
-    {
-        PendingBatch& batch = g_rt.pending.front();
-        const size_t remaining = batch.keys.size() - batch.offset;
-        bool ok = true;
-        const uint32_t consumed =
-            Upload(batch.entity, static_cast<uint32_t>(remaining), batch.keys.data() + batch.offset,
-                   batch.blocks.data() + batch.offset * kBlocksPerBrick, ok);
-        batch.offset += consumed;
-        if (batch.offset < batch.keys.size())
-        {
-            if (!ok)
-            {
-                // An invalid batch would block the queue forever: drop it (the error is logged).
-                g_rt.pending.pop_front();
-                continue;
-            }
-            break;
-        }
-        g_rt.pending.pop_front();
-    }
-}
-
-// Uploads a packet batch, or queues it behind the pending bricks.
-void UploadOrQueue(CaelixEntityId entity, uint32_t count, const CaelixBrickKey* keys,
-                   const uint16_t* blocks)
-{
-    if (!g_rt.pending.empty())
-    {
-        QueuePending(entity, count, keys, blocks);
-        return;
-    }
-    bool ok = true;
-    const uint32_t consumed = Upload(entity, count, keys, blocks, ok);
-    if (consumed < count && ok)
-    {
-        QueuePending(entity, count - consumed, keys + consumed,
-                     blocks + static_cast<size_t>(consumed) * kBlocksPerBrick);
-    }
-}
-
-void DropPendingOf(CaelixEntityId entity)
-{
-    // TODO: VibeReview: Is the pending queue required? This loop also seems inefficient
-    for (auto it = g_rt.pending.begin(); it != g_rt.pending.end();)
-    {
-        it = it->entity == entity ? g_rt.pending.erase(it) : it + 1;
-    }
-}
-
-// Removes the keys from the pending batches of `entity` (they were removed after being queued).
-void FilterPending(CaelixEntityId entity, const std::vector<CaelixBrickKey>& removed)
-{
-    std::unordered_set<CaelixBrickKey, KeyHash, KeyEqual> set(removed.begin(), removed.end());
-    for (PendingBatch& batch : g_rt.pending)
-    {
-        if (batch.entity != entity) continue;
-        size_t write = batch.offset;
-        for (size_t read = batch.offset; read < batch.keys.size(); ++read)
-        {
-            if (set.count(batch.keys[read]) != 0) continue;
-            if (write != read)
-            {
-                batch.keys[write] = batch.keys[read];
-                std::memcpy(batch.blocks.data() + write * kBlocksPerBrick,
-                            batch.blocks.data() + read * kBlocksPerBrick, kBlocksPerBrick * 2);
-            }
-            ++write;
-        }
-        batch.keys.resize(write);
-        batch.blocks.resize(write * kBlocksPerBrick);
-    }
-    for (auto it = g_rt.pending.begin(); it != g_rt.pending.end();)
-    {
-        it = it->offset >= it->keys.size() ? g_rt.pending.erase(it) : it + 1;
-    }
 }
 
 void RemoveEntity(const Guid& guid)
@@ -435,121 +381,116 @@ void RemoveEntity(const Guid& guid)
     State& state = GetState();
     auto it = g_rt.entities.find(guid);
     if (it == g_rt.entities.end()) return;
-    DropPendingOf(it->second);
     const CaelixResult result = caelix_scene_remove_entity(state.scene, it->second);
     if (result != CAELIX_OK) SceneError(result, "caelix_scene_remove_entity failed");
     g_rt.entities.erase(it);
 }
 
-void ResetScene()
+// Applies the session config of a frame packet with CAELIX_UNITY_FRAME_RESET: creates the scene
+// (or, when the release event that should have destroyed the previous one did not run, empties the
+// existing scene), then applies the material entries. False when there is no scene afterwards.
+bool ResetSession(const CaelixUnityFramePacket& packet, const uint8_t* base)
 {
     State& state = GetState();
-    for (const auto& entry : g_rt.entities)
+    if (state.scene == nullptr)
     {
-        const CaelixResult result = caelix_scene_remove_entity(state.scene, entry.second);
-        if (result != CAELIX_OK) SceneError(result, "caelix_scene_remove_entity failed (reset)");
-    }
-    const size_t removed = g_rt.entities.size();
-    ForgetSceneContents();
-    const CaelixResult result = caelix_scene_set_materials(state.scene, nullptr, 0);
-    if (result != CAELIX_OK) SceneError(result, "caelix_scene_set_materials(default) failed (reset)");
-    Log(LogLevel::Info, "scene reset: %zu entities removed, pending uploads dropped, built-in "
-                        "materials restored",
-        removed);
-}
-
-void ApplyMaterials(const CaelixUnityPacket& packet, const uint8_t* base)
-{
-    State& state = GetState();
-    if (packet.material_mode == CAELIX_UNITY_MATERIALS_NONE) return;
-    if (packet.material_count > kMaterialEntries)
-    {
-        SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "material_count is above 65536");
-        return;
-    }
-    if (packet.material_mode == CAELIX_UNITY_MATERIALS_FULL)
-    {
-        if (!InPacket(packet, packet.materials_offset, packet.material_count, sizeof(CaelixMaterial), 4))
-        {
-            SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "material table outside the packet");
-            return;
-        }
-        const auto* entries = packet.material_count != 0
-                                  ? reinterpret_cast<const CaelixMaterial*>(base + packet.materials_offset)
-                                  : nullptr;
-        const CaelixResult result = caelix_scene_set_materials(state.scene, entries, packet.material_count);
-        if (result != CAELIX_OK)
-            SceneError(result, "caelix_scene_set_materials failed");
-        else
-            Log(LogLevel::Info, "materials: full table, %u entries", packet.material_count);
-        return;
-    }
-    if (packet.material_mode != CAELIX_UNITY_MATERIALS_PARTIAL)
-    {
-        SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "unknown material_mode");
-        return;
-    }
-    if (!InPacket(packet, packet.materials_offset, packet.material_count,
-                  sizeof(CaelixUnityMaterialEntry), 4))
-    {
-        SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "material entries outside the packet");
-        return;
-    }
-    // The built-in table first (the CPU copy is updated at once), then the entries over it.
-    CaelixResult result = caelix_scene_set_materials(state.scene, nullptr, 0);
-    if (result != CAELIX_OK)
-    {
-        SceneError(result, "caelix_scene_set_materials(default) failed");
-        return;
-    }
-    std::vector<CaelixMaterial> table(kMaterialEntries);
-    for (uint32_t code = 0; code < kMaterialEntries; ++code)
-    {
-        result = caelix_scene_get_material(state.scene, code, &table[code]);
+        CaelixSceneDesc desc{};
+        desc.encoding = packet.encoding;
+        desc.staging_bytes = static_cast<uint64_t>(packet.staging_mib) << 20;  // 0 = the library default
+        const CaelixResult result = caelix_scene_create(state.device, &desc, &state.scene);
         if (result != CAELIX_OK)
         {
-            SceneError(result, "caelix_scene_get_material failed");
-            return;
+            state.scene = nullptr;
+            Fail(result, "caelix_scene_create failed");
+            return false;
         }
+        g_rt.scene_encoding = packet.encoding;
+        state.scene_encoding.store(packet.encoding);
+        state.scene_resets.fetch_add(1);
+        // The ring is empty now: a quarter of it is the most one frame packet should carry, because
+        // the frames in flight keep their staging space until they complete.
+        CaelixSceneStats stats{};
+        caelix_scene_get_stats(state.scene, &stats);
+        state.upload_bricks_free.store(stats.upload_bricks_free);
+        state.upload_bricks_cap.store(stats.upload_bricks_free / 4);
+        state.staging_bytes.store(stats.staging_bytes);
     }
-    const auto* entries = reinterpret_cast<const CaelixUnityMaterialEntry*>(base + packet.materials_offset);
-    for (uint32_t i = 0; i < packet.material_count; ++i)
-    {
-        CaelixUnityMaterialEntry entry;
-        std::memcpy(&entry, entries + i, sizeof(entry));
-        if (entry.code >= kMaterialEntries)
-        {
-            SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "material entry code above 0xFFFF");
-            return;
-        }
-        table[entry.code] = entry.material;
-    }
-    result = caelix_scene_set_materials(state.scene, table.data(), kMaterialEntries);
-    if (result != CAELIX_OK)
-        SceneError(result, "caelix_scene_set_materials failed");
     else
-        Log(LogLevel::Info, "materials: %u entries over the built-in table", packet.material_count);
+    {
+        if (ShouldLogError())
+        {
+            Log(LogLevel::Error, "session reset while the plugin still has a scene (no release event with "
+                                 "CAELIX_UNITY_RELEASE_SCENE before it): %zu entities removed, built-in "
+                                 "materials restored; the scene keeps encoding %u (packet: %u) and its "
+                                 "staging ring",
+                g_rt.entities.size(), g_rt.scene_encoding, packet.encoding);
+        }
+        for (const auto& entry : g_rt.entities)
+        {
+            const CaelixResult result = caelix_scene_remove_entity(state.scene, entry.second);
+            if (result != CAELIX_OK) SceneError(result, "caelix_scene_remove_entity failed (reset)");
+        }
+        g_rt.entities.clear();
+        const CaelixResult result = caelix_scene_set_materials(state.scene, nullptr, 0);
+        if (result != CAELIX_OK) SceneError(result, "caelix_scene_set_materials(default) failed (reset)");
+    }
+
+    if (!InPacket(packet, packet.materials_offset, packet.material_count, sizeof(CaelixMaterialEntry), 4))
+    {
+        SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "material entries outside the packet: built-in table kept");
+    }
+    else if (packet.material_count != 0)
+    {
+        const auto* entries = reinterpret_cast<const CaelixMaterialEntry*>(base + packet.materials_offset);
+        const CaelixResult result = caelix_scene_set_material_entries(state.scene, entries, packet.material_count);
+        if (result != CAELIX_OK) SceneError(result, "caelix_scene_set_material_entries failed");
+    }
+    Log(LogLevel::Info, "session reset: encoding %u, staging %u MiB (0 = library default), %u material "
+                        "entries, upload cap %llu bricks per frame packet",
+        g_rt.scene_encoding, packet.staging_mib, packet.material_count,
+        static_cast<unsigned long long>(state.upload_bricks_cap.load()));
+    return true;
 }
 
-// Applies the packet's scene records. `base` is the packet memory (read in place).
-void ApplyScene(const CaelixUnityPacket& packet, const uint8_t* base)
+// Uploads one batch. Bricks the staging ring (or an error) refuses are dropped and counted.
+void Upload(uint32_t entity_index, CaelixEntityId entity, uint32_t count, const CaelixBrickKey* keys,
+            const uint16_t* blocks)
 {
     State& state = GetState();
-    const bool has_records = (packet.scene_flags & CAELIX_UNITY_SCENE_RESET) != 0 ||
-                             packet.entity_count != 0 || packet.remove_count != 0 ||
-                             packet.upload_count != 0 ||
-                             packet.material_mode != CAELIX_UNITY_MATERIALS_NONE;
-    if (has_records) state.scene_packets.fetch_add(1);
+    uint32_t consumed = 0;
+    const CaelixResult result = caelix_scene_upload_bricks(state.scene, entity, count, keys, blocks, &consumed);
+    if (result != CAELIX_OK) SceneError(result, "caelix_scene_upload_bricks failed");
+    if (consumed > count) consumed = count;
+    state.uploaded_total.fetch_add(consumed);
+    if (consumed < count)
+    {
+        const uint64_t dropped = state.bricks_dropped.fetch_add(count - consumed) + (count - consumed);
+        if (ShouldLogError())
+        {
+            Log(LogLevel::Error, "scene feed: the staging ring took %u of %u bricks of entity record %u "
+                                 "(CaelixResult %d); %u dropped, %llu dropped so far (C# sends more than "
+                                 "upload_bricks_free)",
+                consumed, count, entity_index, static_cast<int>(result), count - consumed,
+                static_cast<unsigned long long>(dropped));
+        }
+    }
+}
 
-    if ((packet.scene_flags & CAELIX_UNITY_SCENE_RESET) != 0) ResetScene();
+// Applies the frame packet's records: the entities in list order, then the brick removes in runs
+// of one entity, then the uploads. `base` is the packet memory (read in place). Returns true when
+// the packet had records.
+bool ApplyRecords(const CaelixUnityFramePacket& packet, const uint8_t* base)
+{
+    State& state = GetState();
+    const bool has_records = packet.entity_count != 0 || packet.remove_count != 0 || packet.upload_count != 0;
+    if (!has_records) return false;
 
     if (!InPacket(packet, packet.entities_offset, packet.entity_count, sizeof(CaelixUnityEntity), 4) ||
         !InPacket(packet, packet.removes_offset, packet.remove_count, sizeof(CaelixUnityBrickRemove), 4) ||
         !InPacket(packet, packet.uploads_offset, packet.upload_count, sizeof(CaelixUnityUpload), 4))
     {
-        SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "scene records outside the packet: packet ignored");
-        RetryPending();
-        return;
+        SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "scene records outside the packet: records ignored");
+        return false;
     }
 
     // Entities, in list order.
@@ -600,9 +541,6 @@ void ApplyScene(const CaelixUnityPacket& packet, const uint8_t* base)
         }
     }
 
-    // Bricks of earlier packets first.
-    RetryPending();
-
     // Brick removes, in runs of one entity.
     const auto* removes = reinterpret_cast<const CaelixUnityBrickRemove*>(base + packet.removes_offset);
     for (uint32_t i = 0; i < packet.remove_count;)
@@ -612,7 +550,7 @@ void ApplyScene(const CaelixUnityPacket& packet, const uint8_t* base)
         std::vector<CaelixBrickKey>& keys = g_rt.remove_scratch;
         keys.clear();
         uint32_t j = i;
-        // Merge until entity changes
+        // The run ends where the entity record changes.
         for (; j < packet.remove_count; ++j)
         {
             CaelixUnityBrickRemove record;
@@ -626,9 +564,7 @@ void ApplyScene(const CaelixUnityPacket& packet, const uint8_t* base)
             SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "brick removes name an unknown entity record");
             continue;
         }
-        const CaelixEntityId entity = ids[first.entity_index];
-        if (!g_rt.pending.empty()) FilterPending(entity, keys);
-        const CaelixResult result = caelix_scene_remove_bricks(state.scene, entity,
+        const CaelixResult result = caelix_scene_remove_bricks(state.scene, ids[first.entity_index],
                                                                static_cast<uint32_t>(keys.size()), keys.data());
         if (result != CAELIX_OK)
             SceneError(result, "caelix_scene_remove_bricks failed");
@@ -654,22 +590,15 @@ void ApplyScene(const CaelixUnityPacket& packet, const uint8_t* base)
             SceneError(CAELIX_ERROR_INVALID_ARGUMENT, "upload data outside the packet");
             continue;
         }
-        UploadOrQueue(ids[upload.entity_index], upload.brick_count,
-                      reinterpret_cast<const CaelixBrickKey*>(base + upload.keys_offset),
-                      reinterpret_cast<const uint16_t*>(base + upload.blocks_offset));
+        Upload(upload.entity_index, ids[upload.entity_index], upload.brick_count,
+               reinterpret_cast<const CaelixBrickKey*>(base + upload.keys_offset),
+               reinterpret_cast<const uint16_t*>(base + upload.blocks_offset));
     }
-    UpdatePendingCount();
-
-    ApplyMaterials(packet, base);
-    if (has_records && !g_rt.scene_busy)
-    {
-        g_rt.scene_busy = true;
-        g_rt.scene_busy_since = g_rt.plugin_frame;
-    }
+    return true;
 }
 
-// Publishes the scene statistics and the GPU timings for C#. Logs once when the scene becomes
-// idle (no pending bricks, no pending builds) after it had work.
+// Publishes the scene statistics for C# after a flush. Logs once when the scene becomes idle (no
+// staged bricks, no pending builds) after a burst of work that lasted a while.
 void PublishSceneStats()
 {
     State& state = GetState();
@@ -681,54 +610,129 @@ void PublishSceneStats()
     state.as_builds_pending.store(stats.as_builds_pending);
     state.record_bytes.store(stats.record_bytes);
     state.blas_bytes.store(stats.blas_bytes);
-    // The timings are those of view 0 (the Game view in C#).
-    if (state.renderers[0] != nullptr)
-    {
-        CaelixGpuTimings timings{};
-        caelix_renderer_get_gpu_timings(state.renderers[0], &timings);
-        state.flush_ms.store(timings.flush_ms);
-        state.trace_ms.store(timings.trace_ms);
-        state.composite_ms.store(timings.composite_ms);
-        state.denoise_ms.store(timings.denoise_ms);
-        state.timings_frame.store(timings.frame_number);
-    }
-    const bool busy = g_rt.pending_bricks != 0 || stats.as_builds_pending != 0 || stats.pending_bricks != 0;
+    state.staging_bytes.store(stats.staging_bytes);
+    state.upload_bricks_free.store(stats.upload_bricks_free);
+    UpdateLiveViews();
+    const bool busy = stats.as_builds_pending != 0 || stats.pending_bricks != 0;
     if (g_rt.scene_busy && !busy)
     {
         g_rt.scene_busy = false;
         // Only a burst that lasted a while is worth a line: a world that changes every frame goes
         // busy and idle once per frame and would write one line per frame to the Editor log.
         constexpr uint64_t kIdleLogMinFrames = 30;
-        if (g_rt.plugin_frame - g_rt.scene_busy_since < kIdleLogMinFrames) return;
-        Log(LogLevel::Info, "scene idle after plugin frame %llu: %u entities, %u groups, %llu bricks "
-                            "resident, %llu uploaded so far, records %.1f MiB, BLAS %.1f MiB",
-            static_cast<unsigned long long>(g_rt.plugin_frame), stats.entities, stats.groups,
+        if (g_rt.last_flushed_frame - g_rt.scene_busy_since < kIdleLogMinFrames) return;
+        Log(LogLevel::Info, "scene idle after Unity frame %llu: %u entities, %u groups, %llu bricks "
+                            "resident, %llu uploaded so far, %llu dropped, records %.1f MiB, BLAS %.1f MiB",
+            static_cast<unsigned long long>(g_rt.last_flushed_frame), stats.entities, stats.groups,
             static_cast<unsigned long long>(stats.bricks_resident),
             static_cast<unsigned long long>(state.uploaded_total.load()),
+            static_cast<unsigned long long>(state.bricks_dropped.load()),
             static_cast<double>(stats.record_bytes) / (1 << 20),
             static_cast<double>(stats.blas_bytes) / (1 << 20));
     }
 }
 
-// Reads the fixed part of a packet. False (logged) when the size or the version differs.
-bool ReadPacketHeader(const void* data, CaelixUnityPacket& packet)
+// ---------------------------------------------------------------------------------------------
+// Events
+
+void FrameEvent(void* data)
 {
-    uint32_t size_and_version[2];
-    std::memcpy(size_and_version, data, sizeof(size_and_version));
-    if (size_and_version[0] != sizeof(CaelixUnityPacket) ||
-        size_and_version[1] != CAELIX_UNITY_PACKET_VERSION)
+    State& state = GetState();
+    if (data == nullptr)
     {
+        Fail(CAELIX_ERROR_INVALID_ARGUMENT, "no packet");
+        return;
+    }
+    CaelixUnityFramePacket packet;
+    if (!ReadPacket(data, CAELIX_UNITY_PACKET_FRAME, packet))
+    {
+        Fail(CAELIX_ERROR_INVALID_ARGUMENT, "packet size, version or kind mismatch");
+        return;
+    }
+    const auto* base = static_cast<const uint8_t*>(data);
+    const uint64_t sequence = packet.header.sequence;
+
+    if (state.device == nullptr)
+    {
+        PublishConsumed(state.last_consumed_frame_sequence, sequence);
+        Fail(CAELIX_OK, "no adopted device (see the caelix_device_adopt log)");
+        return;
+    }
+    const bool reset = (packet.flags & CAELIX_UNITY_FRAME_RESET) != 0;
+    if (reset)
+    {
+        if (!ResetSession(packet, base))
+        {
+            PublishConsumed(state.last_consumed_frame_sequence, sequence);
+            return;
+        }
+    }
+    else if (state.scene == nullptr)
+    {
+        PublishConsumed(state.last_consumed_frame_sequence, sequence);
+        Fail(CAELIX_OK, "frame packet without a scene (no session reset yet)");
+        return;
+    }
+
+    const bool has_records = ApplyRecords(packet, base);
+    if ((reset || has_records) && !g_rt.scene_busy)
+    {
+        g_rt.scene_busy = true;
+        g_rt.scene_busy_since = g_rt.last_flushed_frame;
+    }
+    // The records are in the library now (the bricks in its staging ring): C# may reuse the memory.
+    PublishConsumed(state.last_consumed_frame_sequence, sequence);
+
+    UnityVulkanRecordingState recording{};
+    if (!GetRecordingState(recording))
+    {
+        // The records were applied; the flush waits for the next frame event.
+        Fail(CAELIX_OK, "CommandRecordingState failed");
+        return;
+    }
+    const uint64_t frame = recording.currentFrameNumber;
+    const uint64_t safe = recording.safeFrameNumber;
+    state.last_unity_frame.store(frame);
+    state.last_safe_frame.store(safe);
+    if (frame <= safe)
+    {
+        char what[128];
+        std::snprintf(what, sizeof(what), "Unity frame %llu is not above the safe frame %llu: no flush",
+                      static_cast<unsigned long long>(frame), static_cast<unsigned long long>(safe));
+        Fail(CAELIX_OK, what);
+        return;
+    }
+    if (frame <= g_rt.last_flushed_frame)
+    {
+        // A second frame event in this Unity frame: its records reach the GPU with the next flush.
         if (ShouldLogError())
         {
-            Log(LogLevel::Error, "packet size %u version %u, the plugin expects size %u version %u "
-                                 "(C# and plugin differ)",
-                size_and_version[0], size_and_version[1],
-                static_cast<unsigned>(sizeof(CaelixUnityPacket)), CAELIX_UNITY_PACKET_VERSION);
+            Log(LogLevel::Warning, "frame event: Unity frame %llu was already flushed (a second frame "
+                                   "event in one Unity frame); the records wait for the next flush",
+                static_cast<unsigned long long>(frame));
         }
-        return false;
+        return;
     }
-    std::memcpy(&packet, data, sizeof(packet));
-    return true;
+
+    CaelixResult result = caelix_scene_recycle(state.scene, safe);
+    if (result != CAELIX_OK) SceneError(result, "caelix_scene_recycle failed");
+
+    CaelixFrameDesc frame_desc{};
+    frame_desc.command_buffer = reinterpret_cast<uint64_t>(recording.commandBuffer);
+    frame_desc.frame_number = frame;
+    frame_desc.safe_frame_number = safe;
+    result = caelix_scene_flush(state.scene, &frame_desc);
+    if (result != CAELIX_OK)
+    {
+        // OUT_OF_MEMORY leaves acceleration structure builds pending but records everything else,
+        // and the library counts the frame as flushed.
+        Fail(result, "caelix_scene_flush failed");
+        if (result != CAELIX_ERROR_OUT_OF_MEMORY) return;
+    }
+    g_rt.last_flushed_frame = frame;
+    state.last_flushed_frame.store(frame);
+    state.frames.fetch_add(1);
+    PublishSceneStats();
 }
 
 void RenderEvent(void* data)
@@ -739,18 +743,40 @@ void RenderEvent(void* data)
         Fail(CAELIX_ERROR_INVALID_ARGUMENT, "no packet");
         return;
     }
-    CaelixUnityPacket packet;
-    if (!ReadPacketHeader(data, packet))
+    CaelixUnityViewPacket packet;
+    if (!ReadPacket(data, CAELIX_UNITY_PACKET_VIEW, packet))
     {
-        Fail(CAELIX_ERROR_INVALID_ARGUMENT, "packet size or version mismatch");
-        return;  // the sequence cannot be trusted; C# reuses the slot after its stale timeout
+        Fail(CAELIX_ERROR_INVALID_ARGUMENT, "packet size, version or kind mismatch");
+        return;
     }
-    const auto* base = static_cast<const uint8_t*>(data);
+    const uint64_t sequence = packet.header.sequence;
 
     if (state.device == nullptr)
     {
-        PublishConsumed(packet.sequence);
+        PublishConsumed(state.last_consumed_view_sequence, sequence);
         Fail(CAELIX_OK, "no adopted device (see the caelix_device_adopt log)");
+        return;
+    }
+    if (state.scene == nullptr)
+    {
+        // A camera can render before the first frame packet of a session (or after its end).
+        PublishConsumed(state.last_consumed_view_sequence, sequence);
+        ++g_rt.renders_without_scene;
+        if (!g_rt.warned_render_without_scene)
+        {
+            g_rt.warned_render_without_scene = true;
+            Log(LogLevel::Warning, "render event without a scene (no session reset yet): the view is not "
+                                   "rendered (logged once)");
+        }
+        return;
+    }
+    if (packet.view >= CAELIX_UNITY_MAX_VIEWS)
+    {
+        PublishConsumed(state.last_consumed_view_sequence, sequence);
+        char what[96];
+        std::snprintf(what, sizeof(what), "packet view %u out of range (max %u)", packet.view,
+                      CAELIX_UNITY_MAX_VIEWS - 1);
+        Fail(CAELIX_ERROR_INVALID_ARGUMENT, what);
         return;
     }
     if (packet.target_generation != g_rt.last_generation)
@@ -766,86 +792,46 @@ void RenderEvent(void* data)
     }
     g_rt.released_since_generation = false;
 
-    if (!EnsureScene(packet.encoding))
-    {
-        PublishConsumed(packet.sequence);
-        return;
-    }
-
     // Access calls may record commands and invalidate the recording state: all of them first.
     UnityVulkanImage color{};
-    bool color_ok = AccessTarget(packet.color, color);
-    if (!color_ok)
+    if (!AccessTarget(packet.color, color))
     {
+        PublishConsumed(state.last_consumed_view_sequence, sequence);
         Fail(CAELIX_ERROR_INVALID_ARGUMENT, "AccessTexture failed for the colour target");
+        return;
     }
-    else if ((color.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0)
+    if ((color.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0)
     {
-        color_ok = false;
+        PublishConsumed(state.last_consumed_view_sequence, sequence);
         Fail(CAELIX_ERROR_INVALID_ARGUMENT,
              "the colour target has no STORAGE usage (RenderTexture.enableRandomWrite is off)");
+        return;
     }
     CaelixRenderTargets targets{};
-    if (color_ok)
-    {
-        AccessOptionalTarget(packet.depth, "depth", color.extent.width, color.extent.height, targets.depth);
-        AccessOptionalTarget(packet.motion, "motion", color.extent.width, color.extent.height, targets.motion);
-        AccessOptionalTarget(packet.albedo, "albedo", color.extent.width, color.extent.height, targets.albedo);
-    }
+    AccessOptionalTarget(packet.depth, "depth", color.extent.width, color.extent.height, targets.depth);
+    AccessOptionalTarget(packet.motion, "motion", color.extent.width, color.extent.height, targets.motion);
+    AccessOptionalTarget(packet.albedo, "albedo", color.extent.width, color.extent.height, targets.albedo);
+    CaelixRenderOptions options = packet.options;
+    AccessSky(packet.sky, options.sky);
+
     UnityVulkanRecordingState recording{};
-    const bool recording_ok =
-        state.vulkan->CommandRecordingState(&recording, kUnityVulkanGraphicsQueueAccess_DontCare);
-    if (!recording_ok)
+    if (!GetRecordingState(recording))
     {
-        // The scene records are still applied (they must not be lost); flush and render wait.
-        ApplyScene(packet, base);
-        PublishConsumed(packet.sequence);
+        PublishConsumed(state.last_consumed_view_sequence, sequence);
         Fail(CAELIX_OK, "CommandRecordingState failed");
         return;
     }
-    if (!g_rt.logged_level)
+    const uint64_t frame = recording.currentFrameNumber;
+    const uint64_t safe = recording.safeFrameNumber;
+    state.last_unity_frame.store(frame);
+    state.last_safe_frame.store(safe);
+    if (frame <= safe)
     {
-        g_rt.logged_level = true;
-        Log(LogLevel::Info, "render event: command buffer %p level %s, render pass %p, framebuffer %p, "
-                            "subpass %d, Unity frame %llu, safe %llu",
-            static_cast<void*>(recording.commandBuffer),
-            recording.commandBufferLevel == VK_COMMAND_BUFFER_LEVEL_PRIMARY ? "primary" : "secondary",
-            static_cast<void*>(recording.renderPass), static_cast<void*>(recording.framebuffer),
-            recording.subPassIndex, recording.currentFrameNumber, recording.safeFrameNumber);
-    }
-
-    const uint64_t frame = ++g_rt.plugin_frame;
-    g_rt.frames.emplace_back(frame, recording.currentFrameNumber);
-    uint64_t safe = SafePluginFrame(recording.safeFrameNumber);
-    if (safe >= frame) safe = frame - 1;
-    state.last_unity_frame.store(recording.currentFrameNumber);
-    state.last_safe_frame.store(recording.safeFrameNumber);
-    state.last_plugin_frame.store(frame);
-
-    CaelixFrameDesc frame_desc{};
-    frame_desc.command_buffer = reinterpret_cast<uint64_t>(recording.commandBuffer);
-    frame_desc.frame_number = frame;
-    frame_desc.safe_frame_number = safe;
-
-    // Recycle first: the uploads below need the staging space of the completed frames.
-    CaelixResult result = caelix_scene_recycle(state.scene, safe);
-    if (result != CAELIX_OK)
-    {
-        SceneError(result, "caelix_scene_recycle failed");
-    }
-    ApplyScene(packet, base);
-    PublishConsumed(packet.sequence);
-
-    result = caelix_scene_flush(state.scene, &frame_desc);
-    if (result != CAELIX_OK)
-    {
-        // OUT_OF_MEMORY leaves acceleration structure builds pending but records everything else.
-        Fail(result, "caelix_scene_flush failed");
-        if (result != CAELIX_ERROR_OUT_OF_MEMORY) return;
-    }
-    if (!color_ok)
-    {
-        PublishSceneStats();
+        PublishConsumed(state.last_consumed_view_sequence, sequence);
+        char what[128];
+        std::snprintf(what, sizeof(what), "Unity frame %llu is not above the safe frame %llu: no render",
+                      static_cast<unsigned long long>(frame), static_cast<unsigned long long>(safe));
+        Fail(CAELIX_OK, what);
         return;
     }
 
@@ -862,101 +848,124 @@ void RenderEvent(void* data)
                 color.extent.width, color.extent.height, packet.color.width, packet.color.height);
         }
     }
-    // The scene records are applied and flushed above whatever the view is; only the render needs
-    // the view's renderer.
-    if (packet.view >= CAELIX_UNITY_MAX_VIEWS)
-    {
-        char what[96];
-        std::snprintf(what, sizeof(what), "packet view %u out of range (max %u)", packet.view,
-                      CAELIX_UNITY_MAX_VIEWS - 1);
-        Fail(CAELIX_ERROR_INVALID_ARGUMENT, what);
-        PublishSceneStats();
-        return;
-    }
     if (!EnsureRenderer(packet.view))
     {
-        PublishSceneStats();
+        PublishConsumed(state.last_consumed_view_sequence, sequence);
         return;
     }
-    result = caelix_renderer_render(state.renderers[packet.view], &frame_desc, &targets,
-                                    &packet.camera, &packet.options);
-    PublishSceneStats();
+
+    CaelixFrameDesc frame_desc{};
+    frame_desc.command_buffer = reinterpret_cast<uint64_t>(recording.commandBuffer);
+    frame_desc.frame_number = frame;
+    frame_desc.safe_frame_number = safe;
+    const CaelixResult result = caelix_renderer_render(state.renderers[packet.view], &frame_desc, &targets,
+                                                       &packet.camera, &options);
+    PublishConsumed(state.last_consumed_view_sequence, sequence);
     if (result != CAELIX_OK)
     {
+        // The library has logged the reason (for example a second render of this view in one Unity
+        // frame).
         Fail(result, "caelix_renderer_render failed");
         return;
     }
     state.renders.fetch_add(1);
+    if ((packet.flags & CAELIX_UNITY_VIEW_REPORT_TIMINGS) != 0)
+    {
+        CaelixGpuTimings timings{};
+        caelix_renderer_get_gpu_timings(state.renderers[packet.view], &timings);
+        state.flush_ms.store(timings.flush_ms);
+        state.trace_ms.store(timings.trace_ms);
+        state.composite_ms.store(timings.composite_ms);
+        state.denoise_ms.store(timings.denoise_ms);
+        state.timings_frame.store(timings.frame_number);
+        state.timings_view.store(packet.view);
+    }
     if (g_rt.access_logs < 4)
     {
         ++g_rt.access_logs;
-        Log(LogLevel::Info, "render %llu: AccessTexture reported layout %d (VkImage %p)", frame,
-            static_cast<int>(color.layout), static_cast<void*>(color.image));
+        Log(LogLevel::Info, "render, Unity frame %llu, view %u: AccessTexture reported layout %d (VkImage %p)",
+            static_cast<unsigned long long>(frame), packet.view, static_cast<int>(color.layout),
+            static_cast<void*>(color.image));
     }
     if (!g_rt.logged_first_render)
     {
         g_rt.logged_first_render = true;
-        Log(LogLevel::Info, "first render: %ux%u, VkFormat %d, layout at access %d, plugin frame "
-                            "%llu, Unity frame %llu (safe %llu), mode %u",
-            color.extent.width, color.extent.height,
-            static_cast<int>(color.format), static_cast<int>(color.layout), frame,
-            recording.currentFrameNumber, recording.safeFrameNumber, packet.options.mode);
+        Log(LogLevel::Info, "first render: view %u, %ux%u, VkFormat %d, layout at access %d, Unity frame "
+                            "%llu (safe %llu), mode %u, sky cubemap %s",
+            packet.view, color.extent.width, color.extent.height, static_cast<int>(color.format),
+            static_cast<int>(color.layout), static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(safe), options.mode, options.sky.image != 0 ? "yes" : "no");
     }
 }
 
-// Runs with graphics queue access (ConfigureEvent below): Unity has submitted its command buffers
+// Runs with graphics queue access (ConfigureEvents below): Unity has submitted its command buffers
 // and keeps its worker threads off the queue, so waiting for the queue to be idle is legal here.
-// `data` is NULL or the packet of the following render event.
 void ReleaseEvent(void* data)
 {
     State& state = GetState();
-    bool recreate = false;
-    uint32_t encoding = g_rt.scene_encoding;
-    if (data != nullptr && state.scene != nullptr)
+    if (data == nullptr)
     {
-        CaelixUnityPacket packet;
-        if (ReadPacketHeader(data, packet) && packet.encoding != g_rt.scene_encoding)
-        {
-            recreate = true;
-            encoding = packet.encoding;
-        }
-    }
-    if (!HasRenderer() && !recreate)
-    {
-        g_rt.released_since_generation = true;
+        Fail(CAELIX_ERROR_INVALID_ARGUMENT, "no packet");
         return;
     }
-    if (state.queue_wait_idle != nullptr)
+    CaelixUnityReleasePacket packet;
+    if (!ReadPacket(data, CAELIX_UNITY_PACKET_RELEASE, packet))
+    {
+        Fail(CAELIX_ERROR_INVALID_ARGUMENT, "packet size, version or kind mismatch");
+        return;
+    }
+    const bool release_scene = (packet.flags & CAELIX_UNITY_RELEASE_SCENE) != 0;
+    const bool release_view = (packet.flags & CAELIX_UNITY_RELEASE_VIEW) != 0;
+    const bool release_target_views = (packet.flags & CAELIX_UNITY_RELEASE_TARGET_VIEWS) != 0;
+    if (release_view && packet.view >= CAELIX_UNITY_MAX_VIEWS)
+    {
+        char what[96];
+        std::snprintf(what, sizeof(what), "release of view %u out of range (max %u)", packet.view,
+                      CAELIX_UNITY_MAX_VIEWS - 1);
+        Fail(CAELIX_ERROR_INVALID_ARGUMENT, what);
+    }
+    const bool view_in_range = packet.view < CAELIX_UNITY_MAX_VIEWS;
+
+    const bool work = (release_scene && (state.scene != nullptr || HasRenderer())) ||
+                      (release_view && view_in_range && state.renderers[packet.view] != nullptr) ||
+                      (release_target_views && HasRenderer());
+    if (work && state.queue_wait_idle != nullptr)
     {
         state.queue_wait_idle(state.vk_queue);
     }
-    if (recreate)
+    if (release_scene)
     {
-        // The device is idle for this queue: renderers and scene can go now. The render events that
-        // follow create them again with the packet's encoding.
-        Log(LogLevel::Info, "encoding change %u -> %u: destroying renderers and scene (%zu entities)",
-            g_rt.scene_encoding, encoding, g_rt.entities.size());
-        for (CaelixRenderer*& renderer : state.renderers)
+        // Every renderer goes with the scene, so there are no target views left to release.
+        if (state.scene != nullptr || HasRenderer())
         {
-            caelix_renderer_destroy(renderer);
-            renderer = nullptr;
+            const size_t entities = g_rt.entities.size();
+            DestroySceneObjects();
+            Log(LogLevel::Info, "session end: renderers and scene destroyed (%zu entities)", entities);
         }
-        caelix_scene_destroy(state.scene);
-        state.scene = nullptr;
-        g_rt.scene_encoding = kNoScene;
-        state.scene_encoding.store(kNoScene);
-        ForgetSceneContents();
-        state.scene_recreations.fetch_add(1);
     }
     else
     {
-        for (CaelixRenderer* renderer : state.renderers)
+        if (release_view && view_in_range && state.renderers[packet.view] != nullptr)
         {
-            if (renderer != nullptr) caelix_renderer_release_target_views(renderer);
+            caelix_renderer_destroy(state.renderers[packet.view]);
+            state.renderers[packet.view] = nullptr;
+            UpdateLiveViews();
+            Log(LogLevel::Info, "renderer destroyed for view %u", packet.view);
+        }
+        if (release_target_views)
+        {
+            for (CaelixRenderer* renderer : state.renderers)
+            {
+                if (renderer != nullptr) caelix_renderer_release_target_views(renderer);
+            }
         }
     }
-    g_rt.released_since_generation = true;
-    state.view_releases.fetch_add(1);
+    if (release_scene || release_target_views)
+    {
+        g_rt.released_since_generation = true;
+    }
+    state.releases.fetch_add(1);
+    PublishConsumed(state.last_consumed_release_sequence, packet.header.sequence);
 }
 
 }  // namespace
@@ -964,12 +973,19 @@ void ReleaseEvent(void* data)
 void UNITY_INTERFACE_API OnPluginEvent(int event_id, void* data)
 {
     const State& state = GetState();
-    if (event_id == state.render_event_id)
+    if (event_id == state.frame_event_id)
     {
+        g_rt.event_name = "frame";
+        FrameEvent(data);
+    }
+    else if (event_id == state.render_event_id)
+    {
+        g_rt.event_name = "render";
         RenderEvent(data);
     }
     else if (event_id == state.release_event_id)
     {
+        g_rt.event_name = "release";
         ReleaseEvent(data);
     }
 }
@@ -977,12 +993,14 @@ void UNITY_INTERFACE_API OnPluginEvent(int event_id, void* data)
 void ConfigureEvents()
 {
     State& state = GetState();
+    // Frame and render events: we bind compute pipelines and descriptor sets, so Unity must not
+    // assume its bindings survive.
     UnityVulkanPluginEventConfig render{};
     render.renderPassPrecondition = kUnityVulkanRenderPass_EnsureOutside;
     render.graphicsQueueAccess = kUnityVulkanGraphicsQueueAccess_DontCare;
-    // We bind compute pipelines and descriptor sets: Unity must not assume its bindings survive.
     render.flags = kUnityVulkanEventConfigFlag_EnsurePreviousFrameSubmission |
                    kUnityVulkanEventConfigFlag_ModifiesCommandBuffersState;
+    state.vulkan->ConfigureEvent(state.frame_event_id, &render);
     state.vulkan->ConfigureEvent(state.render_event_id, &render);
 
     UnityVulkanPluginEventConfig release{};
@@ -992,24 +1010,15 @@ void ConfigureEvents()
                     kUnityVulkanEventConfigFlag_FlushCommandBuffers |
                     kUnityVulkanEventConfigFlag_SyncWorkerThreads;
     state.vulkan->ConfigureEvent(state.release_event_id, &release);
-    Log(LogLevel::Info, "plugin events configured: render %d (outside render pass, no queue access), "
-                        "release %d (queue access, flush)",
-        state.render_event_id, state.release_event_id);
+    Log(LogLevel::Info, "plugin events configured: frame %d and render %d (outside render pass, no queue "
+                        "access), release %d (queue access, flush)",
+        state.frame_event_id, state.render_event_id, state.release_event_id);
 }
 
 void DestroyRenderObjects()
 {
-    State& state = GetState();
-    for (CaelixRenderer*& renderer : state.renderers)
-    {
-        caelix_renderer_destroy(renderer);
-        renderer = nullptr;
-    }
-    caelix_scene_destroy(state.scene);
-    state.scene = nullptr;
-    state.scene_encoding.store(kNoScene);
+    DestroySceneObjects();
     g_rt = RenderThreadState{};
-    state.bricks_pending_plugin.store(0);
 }
 
 }  // namespace caelix_unity
@@ -1028,8 +1037,10 @@ extern "C" CAELIX_UNITY_API void caelix_unity_status(CaelixUnityStatus* out)
     const caelix_unity::State& state = caelix_unity::GetState();
     CaelixUnityStatus status{};
     status.size = sizeof(CaelixUnityStatus);
-    status.packet_size = sizeof(CaelixUnityPacket);
     status.packet_version = CAELIX_UNITY_PACKET_VERSION;
+    status.frame_packet_size = sizeof(CaelixUnityFramePacket);
+    status.view_packet_size = sizeof(CaelixUnityViewPacket);
+    status.release_packet_size = sizeof(CaelixUnityReleasePacket);
     status.unity_renderer = state.unity_renderer.load();
     status.intercept_registered = state.intercept_registered.load();
     status.intercept_called = state.intercept_called.load();
@@ -1037,31 +1048,39 @@ extern "C" CAELIX_UNITY_API void caelix_unity_status(CaelixUnityStatus* out)
     status.device_patched = state.device_patched.load();
     status.device_adopted = state.device_adopted.load();
     status.last_error = state.last_error.load();
+    status.frame_event_id = state.frame_event_id;
     status.render_event_id = state.render_event_id;
     status.release_event_id = state.release_event_id;
-    status.last_consumed_sequence = state.last_consumed_sequence.load();
+    status.last_consumed_frame_sequence = state.last_consumed_frame_sequence.load();
+    status.last_consumed_view_sequence = state.last_consumed_view_sequence.load();
+    status.last_consumed_release_sequence = state.last_consumed_release_sequence.load();
     status.last_unity_frame = state.last_unity_frame.load();
     status.last_safe_frame = state.last_safe_frame.load();
-    status.last_plugin_frame = state.last_plugin_frame.load();
+    status.last_flushed_frame = state.last_flushed_frame.load();
+    status.frames = state.frames.load();
     status.renders = state.renders.load();
+    status.releases = state.releases.load();
     status.failed_events = state.failed_events.load();
-    status.view_releases = state.view_releases.load();
     status.scene_encoding = state.scene_encoding.load();
     status.entities = state.scene_entities.load();
     status.groups = state.scene_groups.load();
-    status.scene_recreations = state.scene_recreations.load();
+    status.scene_resets = state.scene_resets.load();
+    status.live_views = state.live_views.load();
     status.bricks_resident = state.bricks_resident.load();
-    status.bricks_pending_plugin = state.bricks_pending_plugin.load();
     status.as_builds_pending = state.as_builds_pending.load();
     status.uploaded_total = state.uploaded_total.load();
     status.removed_total = state.removed_total.load();
-    status.scene_packets = state.scene_packets.load();
+    status.bricks_dropped = state.bricks_dropped.load();
+    status.upload_bricks_free = state.upload_bricks_free.load();
+    status.upload_bricks_cap = state.upload_bricks_cap.load();
     status.record_bytes = state.record_bytes.load();
     status.blas_bytes = state.blas_bytes.load();
+    status.staging_bytes = state.staging_bytes.load();
     status.flush_ms = state.flush_ms.load();
     status.trace_ms = state.trace_ms.load();
     status.composite_ms = state.composite_ms.load();
     status.denoise_ms = state.denoise_ms.load();
     status.timings_frame = state.timings_frame.load();
+    status.timings_view = state.timings_view.load();
     *out = status;
 }

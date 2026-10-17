@@ -225,9 +225,10 @@ extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API UnityPluginLoad(
         return;
     }
     // Event ids are global across plugins (ConfigureEvent applies to an id), so reserve our own.
-    state.render_event_id = state.graphics->ReserveEventIDRange(2);
-    state.release_event_id = state.render_event_id + 1;
-    Log(LogLevel::Info, "plugin event ids: render %d, release target views %d",
+    state.frame_event_id = state.graphics->ReserveEventIDRange(3);
+    state.render_event_id = state.frame_event_id + 1;
+    state.release_event_id = state.frame_event_id + 2;
+    Log(LogLevel::Info, "plugin event ids: frame %d, render %d, release %d", state.frame_event_id,
         state.render_event_id, state.release_event_id);
 
     // At preload time Unity has not created a graphics device yet and reports the null renderer
