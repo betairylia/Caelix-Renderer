@@ -205,6 +205,7 @@ void Scene::ListEntity(CaelixEntityId id)
 CaelixResult Scene::AddEntity(const CaelixEntityDesc& desc, CaelixEntityId& out_id)
 {
     uint32_t id;
+
     // Reuse free entity IDs if possible
     if (!free_entities_.empty())
     {
@@ -222,13 +223,19 @@ CaelixResult Scene::AddEntity(const CaelixEntityDesc& desc, CaelixEntityId& out_
         entities_.emplace_back();
         id = static_cast<uint32_t>(entities_.size() - 1);
     }
+
+    // Copy data
     Entity& entity = entities_[id];
     std::memcpy(entity.guid, desc.guid, sizeof(entity.guid));
     std::memcpy(entity.position, desc.position, sizeof(entity.position));
     std::memcpy(entity.rotation, desc.rotation, sizeof(entity.rotation));
     TransformRows(entity.position, entity.rotation, entity.cur_rows);
+
+    // Initialize previous transforms as copy from current ones for entity creation
     std::memcpy(entity.prev_rows, entity.cur_rows, sizeof(entity.prev_rows));
     entity.transform_changed = false;
+
+    // Initialize voxel data
     entity.groups.clear();
     entity.alive = true;
     std::fill(std::begin(entity.grid_min), std::end(entity.grid_min), 0);
@@ -240,7 +247,8 @@ CaelixResult Scene::AddEntity(const CaelixEntityDesc& desc, CaelixEntityId& out_
     entity.grid_dirty_cells.clear();
     entity.info_dirty = true;
     // in_dirty_list keeps its value: the id may still be listed from its previous life.
-    ListEntity(id);
+
+    ListEntity(id); // Mark dirty
     ++entities_alive_;
     out_id = id;
     return CAELIX_OK;

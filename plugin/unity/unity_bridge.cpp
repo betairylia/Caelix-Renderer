@@ -342,7 +342,8 @@ uint32_t Upload(CaelixEntityId entity, uint32_t count, const CaelixBrickKey* key
     const CaelixResult result =
         caelix_scene_upload_bricks(state.scene, entity, count, keys, blocks, &consumed);
     ok = result == CAELIX_OK;
-    if (!ok) SceneError(result, "caelix_scene_upload_bricks failed");
+    // TODO: VibeReview: can we log the error code also instead of a bool?
+    if (!ok) SceneError(result, "caelix_scene_upload_bricks failed"); 
     if (consumed > count) consumed = count;
     state.uploaded_total.fetch_add(consumed);
     return consumed;
@@ -394,6 +395,7 @@ void UploadOrQueue(CaelixEntityId entity, uint32_t count, const CaelixBrickKey* 
 
 void DropPendingOf(CaelixEntityId entity)
 {
+    // TODO: VibeReview: Is the pending queue required? This loop also seems inefficient
     for (auto it = g_rt.pending.begin(); it != g_rt.pending.end();)
     {
         it = it->entity == entity ? g_rt.pending.erase(it) : it + 1;
@@ -610,6 +612,7 @@ void ApplyScene(const CaelixUnityPacket& packet, const uint8_t* base)
         std::vector<CaelixBrickKey>& keys = g_rt.remove_scratch;
         keys.clear();
         uint32_t j = i;
+        // Merge until entity changes
         for (; j < packet.remove_count; ++j)
         {
             CaelixUnityBrickRemove record;
