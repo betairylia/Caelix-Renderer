@@ -148,7 +148,7 @@ uint4 SharedRow(uint y, uint z)
 uint BlockOf(uint4 row, uint x)
 {
     const uint word = row[x >> 1];
-    return (x & 1) != 0 ? (word & 0xFFFFu) : (word >> 16);
+    return (x & 1) != 0 ? (word >> 16) : (word & 0xFFFFu);
 }
 
 [numthreads(64, 1, 1)]
@@ -220,9 +220,9 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     const uint64_t xp = gs_nbr[0];
     const uint64_t xn = gs_nbr[1];
     const uint block_xp =
-        xp != 0 ? (CAELIX_LOAD_U32(xp + uint64_t(RecordPayloadWord(0, y, z)) * 4) >> 16) : 0u;
+        xp != 0 ? (CAELIX_LOAD_U32(xp + uint64_t(RecordPayloadWord(0, y, z)) * 4) & 0xFFFFu) : 0u;
     const uint block_xn =
-        xn != 0 ? (CAELIX_LOAD_U32(xn + uint64_t(RecordPayloadWord(7, y, z)) * 4) & 0xFFFFu) : 0u;
+        xn != 0 ? (CAELIX_LOAD_U32(xn + uint64_t(RecordPayloadWord(7, y, z)) * 4) >> 16) : 0u;
 
     // 4. Per voxel.
     uint out_words[4] = {0u, 0u, 0u, 0u};
@@ -257,7 +257,7 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         {
             occupied |= 1u << x;
         }
-        out_words[x >> 1] |= (x & 1) != 0 ? result : (result << 16);
+        out_words[x >> 1] |= (x & 1) != 0 ? (result << 16) : result;
     }
 
     // Write back the payload words that changed.

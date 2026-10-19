@@ -166,8 +166,8 @@ void VerifyRecords(Gpu& gpu, const CaelixScene* scene, const Model& model,
                 for (uint32_t x = 0; x < 8; x += 2)
                 {
                     const uint32_t i = x + 8 * y + 64 * z;
-                    const uint32_t expected = (static_cast<uint32_t>(BlockValue(key, i, version)) << 16) |
-                                              BlockValue(key, i + 1, version);
+                    const uint32_t expected = static_cast<uint32_t>(BlockValue(key, i, version)) |
+                                              (static_cast<uint32_t>(BlockValue(key, i + 1, version)) << 16);
                     const uint32_t word = 18 + (x >> 1) + 4 * y + 32 * z;
                     if (record[word] != expected)
                     {

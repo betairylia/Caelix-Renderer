@@ -17,7 +17,7 @@
 //                micro = (x&3) | (y&3)<<2 | (z&3)<<4 is bit (micro & 31) of word
 //                2 + 2c + (micro >> 5)
 //   words 18..   payload, two blocks per word: the block at (x, y, z) is in word
-//                18 + (x>>1) + 4*y + 32*z, EVEN x in the HIGH 16 bits.
+//                18 + (x>>1) + 4*y + 32*z, EVEN x in the LOW 16 bits.
 static const uint kRecordInfoWords = 2;
 static const uint kRecordOccupancyWords = 16;
 static const uint kRecordPayloadWord = 18;

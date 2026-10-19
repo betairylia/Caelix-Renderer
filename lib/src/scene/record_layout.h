@@ -4,8 +4,8 @@
 namespace caelix {
 
 // The GPU record of one brick (8x8x8 blocks). One layout per scene, computed
-// from the block size. It mirrors the brick record of Unity's
-// CaelixBrickTrace.hlsl, so the trace kernels can be ported unchanged.
+// from the block size. It follows the brick record of Unity's
+// CaelixBrickTrace.hlsl, except for the pair order (even x is low here).
 //
 // Words (uint32), for block_bytes = 2:
 //   word 0        bits 0..15  group-local brick position
@@ -17,7 +17,8 @@ namespace caelix {
 //                 kernel fills it.
 //   words 18..273 raw blocks, two per word. The block at voxel (x, y, z) sits in
 //                 word 18 + (x >> 1) + 4*y + 32*z; the block at EVEN x is in the
-//                 HIGH 16 bits, the block at odd x in the LOW 16 bits.
+//                 LOW 16 bits, the block at odd x in the HIGH 16 bits (the
+//                 little-endian image of a uint16_t[512] array indexed x + 8y + 64z).
 //
 // Lossless rule: the payload always holds the raw block values that the host
 // uploaded. Later kernels add bits in the header words, never in the payload.

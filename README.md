@@ -94,11 +94,13 @@ Scene model:
 - The host owns the raw voxel data. The library stores only GPU records plus a
   CPU index from brick keys to records. A brick is 8x8x8 blocks; its key is the
   entity-local block coordinate shifted right by 3.
-- Record layout (1096 bytes for 16-bit blocks, mirrors Unity's
-  `CaelixBrickTrace.hlsl`): 2 info words, 16 micro-occupancy words, then the
-  blocks two per word (even x in the high 16 bits). The upload writes the raw
-  blocks and the group-local position; the finalize kernel fills the rest of
-  the header and adds face bits to transparent blocks (see "Finalize kernel").
+- Record layout (1096 bytes for 16-bit blocks, follows Unity's
+  `CaelixBrickTrace.hlsl` except for the pair order): 2 info words, 16
+  micro-occupancy words, then the blocks two per word, even x in the low 16
+  bits (the little-endian image of the `uint16` block array, so the upload is
+  one memcpy). The upload writes the raw blocks and the group-local position;
+  the finalize kernel fills the rest of the header and adds face bits to
+  transparent blocks (see "Finalize kernel").
 - Record pool: device-local pages of `records_per_page` records. Pages are only
   added, and a record never moves while its brick lives.
 - Render groups of `(1 << group_shift)^3` bricks (default 16^3). Each group has

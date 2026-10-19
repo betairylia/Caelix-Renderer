@@ -106,7 +106,7 @@ Expected Reference(const World& world, const Key& key, uint32_t group_shift, uin
                 const bool alive = opaque_neighbours < 6;
                 const uint32_t value = opaque(v) ? v : ((v & enc.id_mask) | (faces << enc.face_shift));
                 const uint32_t word = 18 + (x >> 1) + 4 * y + 32 * z;
-                out.record[word] |= (x & 1) != 0 ? value : (value << 16);
+                out.record[word] |= (x & 1) != 0 ? (value << 16) : value;
                 if (alive && value != 0)
                 {
                     const uint32_t coarse = (x >> 2) | ((y >> 2) << 1) | ((z >> 2) << 2);
@@ -273,7 +273,7 @@ World GlassWorld(uint16_t glass, uint16_t floor)
 uint32_t PayloadValue(const Actual& actual, uint32_t x, uint32_t y, uint32_t z)
 {
     const uint32_t word = actual.record[18 + (x >> 1) + 4 * y + 32 * z];
-    return (x & 1) != 0 ? (word & 0xFFFFu) : (word >> 16);
+    return (x & 1) != 0 ? (word >> 16) : (word & 0xFFFFu);
 }
 
 bool OccupiedBit(const Actual& actual, uint32_t x, uint32_t y, uint32_t z)

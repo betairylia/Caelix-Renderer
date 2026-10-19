@@ -250,22 +250,16 @@ void Scene::WriteRecord(uint8_t* dst, uint32_t pos, const uint8_t* blocks) const
     // may be write-combined.
     uint32_t record[2 + 16 + 256];
     static_assert(sizeof(record) == 1096);
-    uint16_t values[RecordLayout::kBlocksPerBrick];
-    std::memcpy(values, blocks, sizeof(values));  // the host pointer may be unaligned
-    record[0] = pos & 0xFFFFu;                    // the finalize kernel fills bits 16..23 and words 1..17
+    record[0] = pos & 0xFFFFu;  // the finalize kernel fills bits 16..23 and words 1..17
     for (uint32_t w = 1; w < layout_.payload_first_word(); ++w)
     {
         record[w] = 0;
     }
-    uint32_t* payload = record + layout_.payload_first_word();
-    // Voxel index i = x + 8y + 64z. For even x, i/2 = (x >> 1) + 4y + 32z, and the
-    // pair (i, i + 1) shares one word: even x high, odd x low.
-    // TODO: VibeReview: Can we just memcpy here? or it is the same speed as per elem copy?
-    for (uint32_t i = 0; i < RecordLayout::kBlocksPerBrick; i += 2)
-    {
-        payload[i / 2] = (static_cast<uint32_t>(values[i]) << 16) | values[i + 1];
-    }
-    // TODO: VibeReview: Also can we directly copy to dst?
+    // The payload is the little-endian image of the uint16_t[512] block array
+    // (index x + 8y + 64z): even x in the low 16 bits of word (x >> 1) + 4y + 32z.
+    // The host pointer may be unaligned, so copy bytes.
+    std::memcpy(record + layout_.payload_first_word(), blocks,
+                static_cast<size_t>(RecordLayout::kBlocksPerBrick) * layout_.block_bytes);
     std::memcpy(dst, record, layout_.record_bytes);
 }
 

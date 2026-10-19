@@ -223,8 +223,8 @@ inline uint CaelixBrickRayNormalFlags(uint index, int3 cell, float3 tStart, half
 
 inline int CaelixReadBrick(uint brickBase, int3 localBlockPos)
 {
-    uint shift = uint((1 - (localBlockPos.x & 1)) << 4);
-    // return int((g_bricks[brickBase + ((localBlockPos.x >> 1) + (localBlockPos.y << 2) + (localBlockPos.z << 5))] >> shift) & 0xFFFFu);
+    // Even x in the low 16 bits (see caelix_record.hlsl).
+    uint shift = uint((localBlockPos.x & 1) << 4);
     return int((CAELIX_BRICKS_LOAD((brickBase + ((localBlockPos.x >> 1) + (localBlockPos.y << 2) + (localBlockPos.z << 5))) << 2) >> shift) & 0xFFFFu);
 }
 
