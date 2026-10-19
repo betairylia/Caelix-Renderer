@@ -63,6 +63,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         albedo.rgb *= 2.0f;  // the trace stored half of a checkerboard pixel's albedo
     }
     const bool path_trace = fc.mode == kModePathTrace;
+
     CAELIX_BRANCH
     if (path_trace && fc.debug_view == kViewMotion)
     {
@@ -120,7 +121,9 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             color = SkyRadiance(fc, CaelixPrimaryDirection(fc, pixel));
         }
     }
+
     color *= fc.exposure;
+
     CAELIX_BRANCH
     if (fc.cross_resolve != 0u)
     {

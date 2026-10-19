@@ -153,7 +153,7 @@ float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout
 // BOUNCEIDX_IS_SPECULAR rule, the usual PSR practice). Compile-time switch for the
 // 6d measurement; the build uses 0.
 #ifndef CAELIX_PSR_LOBE
-#define CAELIX_PSR_LOBE 0
+#define CAELIX_PSR_LOBE 2
 #endif
 
 // The delta chain of the primary ray (Unity's primary loop + AdvanceDeltaRay):
@@ -194,6 +194,7 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
     c.interfaces = 0u;
     c.first_reflected = false;
     c.split = false;
+
     CAELIX_LOOP
     for (;;)
     {
@@ -556,6 +557,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         float4 diffuse = float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 specular = float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 normal_roughness = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
         CAELIX_BRANCH
         if (surface)
         {
@@ -582,7 +584,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
                 specular_target = true;
                 nrd_roughness = 0.0f;
             }
-#else
+#elif CAELIX_PSR_LOBE == 1
             if (chain.first_reflected)
             {
                 specular_target = true;
