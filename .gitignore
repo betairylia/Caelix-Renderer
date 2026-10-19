@@ -3,3 +3,5 @@ out/
 .vs/
 host-rs/target/
 *.user
+.idea/
+.vscode/
