@@ -315,7 +315,11 @@ private:
 
     std::vector<Entity> entities_;
     std::vector<uint32_t> free_entities_;
+
+    // All render groups in the scene, across all entities.
+    // Indices rather than pointers for better mem contiguity.
     std::vector<Group> groups_;
+
     std::vector<uint32_t> free_groups_;
     std::vector<uint32_t> dirty_groups_;
     std::vector<CaelixEntityId> dirty_entities_;
