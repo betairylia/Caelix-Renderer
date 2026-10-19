@@ -306,6 +306,11 @@ flush builds the TLAS that the render binds.
   air and the sky (procedural or the host's cubemap). Materials come from the
   scene's material table
   (`shaders/common/caelix_material.hlsl`, see "Materials and glass (step 6d)").
+- Scene traversal `shaders/render/caelix_scene_trace.hlsl`: the TLAS binding, the
+  ray-query loops `TraceScene` / `TraceShadow` (brick DDA on every procedural
+  candidate), the slot-row / page-table record lookup and the entity transform
+  helpers (`EntityCurWorld`, `EntityPrevWorld`). Everything the integrator knows
+  about the scene's tables goes through this file.
 - Brick DDA `shaders/render/caelix_brick_trace.hlsl`: a copy of Unity's
   `CaelixBrickTrace.hlsl` (2-level occupancy DDA on the 8^3 brick, tight
   bounds from record word 1, transparency by face bits). Every change is

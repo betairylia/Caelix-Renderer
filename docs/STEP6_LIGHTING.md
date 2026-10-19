@@ -79,6 +79,7 @@ image.
 Passes per frame, all inside `caelix_renderer_render`:
 
 1. `caelix_path_trace.hlsl`: primary ray, G-buffer writes, shading, bounce loop, NRD packing.
+   It includes `caelix_scene_trace.hlsl` (ray query loops, record lookup, entity transforms).
 2. NRD dispatches from `GetComputeDispatches` (skipped in reference mode and when the denoiser
    is off).
 3. `caelix_composite.hlsl`: `color = deterministic + albedo * (unpack(diff_out) +

@@ -44,27 +44,24 @@
 //                   (SkyDiffuseMiss, SkySpecularMiss).
 //
 // Inputs: the push constant is the device address of the frame constants; the
-// scene's tables (page table, slot rows, group infos, entity infos) are read
-// through the addresses in them. The descriptors are the TLAS (binding 0), the
-// six host targets (bindings 1..6, no format qualifier: format Unknown in SPIR-V,
-// needs shaderStorageImageWriteWithoutFormat, so every write is a float4 and the
-// image keeps the components its format has) and the internal targets of the
-// lighting modes (bindings 7..13, fixed formats), the sky cubemap (binding 14,
-// sampled image) and its sampler (binding 15). Every binding is PARTIALLY_BOUND:
+// scene's tables (page table, slot rows, group infos, entity infos) are read by
+// caelix_scene_trace.hlsl. The descriptors are the TLAS (binding 0, declared by
+// caelix_scene_trace.hlsl), the six host targets (bindings 1..6, no format
+// qualifier: format Unknown in SPIR-V, needs shaderStorageImageWriteWithoutFormat,
+// so every write is a float4 and the image keeps the components its format has)
+// and the internal targets of the lighting modes (bindings 7..13, fixed formats),
+// the sky cubemap (binding 14, sampled image) and its sampler (binding 15). Every
+// binding is PARTIALLY_BOUND:
 // the library writes only the TLAS (when the scene has one), the present targets
 // and, in the lighting modes, the internal targets, and the kernel touches a
 // binding only then (has_tlas, target_mask, mode). Bindings 14 and 15 are written
 // every frame (the host's cubemap, or a 1 x 1 fallback cube that is never sampled
 // because sky_cubemap is 0).
-//
-// Instances: instanceCustomIndex (CandidateInstanceID()) is the scene-wide group
-// index, the primitive index is the dense brick id inside the group, and the
-// object space is the entity-local block space.
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_record.hlsl"
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
-#include "render/caelix_brick_trace.hlsl"
+#include "render/caelix_scene_trace.hlsl"
 #include "common/caelix_material.hlsl"
 // The sky cubemap and its sampler (caelix_shading.hlsl declares them).
 #define CAELIX_SKY_BINDING_IMAGE 14
@@ -75,7 +72,6 @@
 #include "NRD.hlsli"
 
 CAELIX_PUSH_CONSTANTS(CaelixTracePush, g_push);
-CAELIX_BINDING(0, 0) RaytracingAccelerationStructure g_tlas;
 CAELIX_BINDING(1, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_color;
 CAELIX_BINDING(2, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_albedo;
 CAELIX_BINDING(3, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_normal;
@@ -95,14 +91,6 @@ static const float kRayTMax = 1e30f;
 static const uint kStepsHeatMax = 64;
 // Internal view_z of a miss (beyond any denoising range).
 static const float kInternalMissViewZ = 1e30f;
-
-uint64_t RecordAddress(CaelixFrameConstants fc, uint record_index)
-{
-    const uint page = record_index >> fc.records_per_page_shift;
-    const uint slot = record_index & ((1u << fc.records_per_page_shift) - 1u);
-    const uint64_t page_address = CAELIX_LOAD_U64(fc.page_table + uint64_t(page) * 8);
-    return page_address + uint64_t(slot) * fc.record_bytes;
-}
 
 // Blue -> cyan -> green -> yellow -> red for t in [0, 1].
 float3 HeatMap(float t)
@@ -130,135 +118,6 @@ bool PreviousPixel(CaelixFrameConstants fc, float3 p, out float2 pixel, out floa
                               dot(rel, fc.prev_up.xyz) / (z * fc.prev_tan_half_fov_y));
     pixel = float2((ndc.x + 1.0f) * 0.5f * float(fc.size.x), (1.0f - ndc.y) * 0.5f * float(fc.size.y));
     return all(abs(pixel) < 1e30f);
-}
-
-// The committed hit of one ray through the scene.
-struct TraceResult
-{
-    bool hit;
-    float T;            // world distance (the ray direction is unit length)
-    uint attrib;        // AttributeData::matID_faceNormal: block << 16 | face flags
-    uint group;         // scene-wide group index
-    uint id;            // dense brick id in the group
-    uint candidates;    // procedural candidates visited
-    float3 normal;      // world-space face normal
-    float3 object_hit;  // entity-local block coordinates of the hit
-};
-
-// The brick DDA on one procedural candidate (group, dense id) of a ray query:
-// returns the DDA's t (object space = world distance, scale 1) and its attribute;
-// attrib.matID_faceNormal == 0 means no hit (or the brick is not resident).
-float TraceCandidate(CaelixFrameConstants fc, uint group, uint id, float3 object_origin,
-                     float3 object_direction, float t_current, out AttributeData attrib)
-{
-    attrib.matID_faceNormal = 0u;
-    // GroupInfo: coord (words 0..2), entity, slot_row_base (word 4), ...
-    const uint64_t info = fc.group_infos + uint64_t(group) * 32;
-    const uint4 w0 = CAELIX_LOAD_U32x4(info);
-    const uint slot_row_base = CAELIX_LOAD_U32(info + 16);
-    const uint4 row = CAELIX_LOAD_U32x4(fc.slot_tables + (uint64_t(slot_row_base) + id) * kSlotRowBytes);
-    if (SlotRowState(row.x) != kSlotStateResident || row.z == kInvalidRecord)
-    {
-        return t_current;
-    }
-    g_recordBase = RecordAddress(fc, row.z);
-    // Entity-local block coordinate of the brick's corner (same formula as the
-    // finalize kernel's AABB origin).
-    const uint shift = fc.group_shift;
-    const int mask = int((1u << shift) - 1u);
-    const uint pos = SlotRowPos(row.x);
-    const int3 brick = int3(int(pos) & mask, int(pos >> shift) & mask, int(pos >> (2 * shift)) & mask);
-    const float3 brick_origin = float3((int3(w0.xyz) * int(1u << shift) + brick) * 8);
-    return CaelixTraceBrickPrimitiveCore(0, object_origin, object_direction, t_current, brick_origin,
-                                         attrib);
-}
-
-// Traces `ray` through the TLAS: every procedural candidate runs the brick DDA on
-// its record, and a DDA hit inside [TMin, CommittedRayT()) is committed. Before
-// the scene's first TLAS build binding 0 holds no valid descriptor
-// (PARTIALLY_BOUND): the ray query does not start and the ray misses.
-TraceResult TraceScene(CaelixFrameConstants fc, RayDesc ray)
-{
-    TraceResult r;
-    r.hit = false;
-    r.T = 0.0f;
-    r.attrib = 0;
-    r.group = 0;
-    r.id = 0;
-    r.candidates = 0;
-    r.normal = float3(0.0f, 0.0f, 0.0f);
-    r.object_hit = float3(0.0f, 0.0f, 0.0f);
-    CAELIX_BRANCH
-    if (fc.has_tlas != 0u)
-    {
-        RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
-        q.TraceRayInline(g_tlas, RAY_FLAG_NONE, 0xFF, ray);
-
-        while (q.Proceed())
-        {
-            if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE)
-            {
-                continue;
-            }
-            ++r.candidates;
-            const uint group = q.CandidateInstanceID();
-            const uint id = q.CandidatePrimitiveIndex();
-            AttributeData attrib;
-            const float t = TraceCandidate(fc, group, id, q.CandidateObjectRayOrigin(),
-                                           q.CandidateObjectRayDirection(), q.CommittedRayT(), attrib);
-            // Nothing rejects a t outside [TMin, TCurrent] for us, so the test is done here.
-            if (attrib.matID_faceNormal != 0u && t >= ray.TMin && t < q.CommittedRayT())
-            {
-                q.CommitProceduralPrimitiveHit(t);
-                r.attrib = attrib.matID_faceNormal;
-                r.group = group;
-                r.id = id;
-            }
-        }
-        if (q.CommittedStatus() == COMMITTED_PROCEDURAL_PRIMITIVE_HIT)
-        {
-            r.hit = true;
-            r.T = q.CommittedRayT();
-            const float3x4 object_to_world = q.CommittedObjectToWorld3x4();
-            r.normal = normalize(mul((float3x3)object_to_world, UnpackObjectNormal(r.attrib)));
-            // The object ray direction is the world direction in object space (not
-            // normalized), so the same T applies.
-            r.object_hit = q.CommittedObjectRayOrigin() + q.CommittedObjectRayDirection() * r.T;
-        }
-    }
-    return r;
-}
-
-// Shadow ray: true when a voxel lies on `ray` inside [TMin, TMax). The first
-// candidate whose DDA reports a hit in range is committed and ends the search
-// (RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH); no closest-hit data is needed.
-bool TraceShadow(CaelixFrameConstants fc, RayDesc ray)
-{
-    bool occluded = false;
-    CAELIX_BRANCH
-    if (fc.has_tlas != 0u)
-    {
-        RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
-        q.TraceRayInline(g_tlas, RAY_FLAG_NONE, 0xFF, ray);
-        while (q.Proceed())
-        {
-            if (q.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE)
-            {
-                continue;
-            }
-            AttributeData attrib;
-            const float t = TraceCandidate(fc, q.CandidateInstanceID(), q.CandidatePrimitiveIndex(),
-                                           q.CandidateObjectRayOrigin(), q.CandidateObjectRayDirection(),
-                                           q.CommittedRayT(), attrib);
-            if (attrib.matID_faceNormal != 0u && t >= ray.TMin && t < q.CommittedRayT())
-            {
-                q.CommitProceduralPrimitiveHit(t);
-                occluded = true;
-                break;
-            }
-        }
-    }
-    return occluded;
 }
 
 // Sun next-event estimation at a diffuse path vertex with world normal `normal`
@@ -646,25 +505,14 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     CAELIX_BRANCH
     if (((targets & kTargetMotion) != 0u || lighting) && hit && fc.has_prev_camera != 0u)
     {
-        // The hit point under the entity's previous transform: EntityInfo prev rows,
-        // bytes 80..127 of the entity's 128-byte row (GroupInfo word 3 = entity).
-        const uint entity = CAELIX_LOAD_U32(fc.group_infos + uint64_t(geometry.group) * 32 + 12);
-        const uint64_t entity_info = fc.entity_infos + uint64_t(entity) * 128;
-        const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + 80));
-        const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + 96));
-        const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + 112));
-        const float4 h = float4(geometry.object_hit, 1.0f);
-        float3 prev_world = float3(dot(r0, h), dot(r1, h), dot(r2, h));
+        // The hit point under the entity's previous transform.
+        float3 prev_world = EntityPrevWorld(fc, geometry.group, geometry.object_hit);
         CAELIX_BRANCH
         if (chain.interfaces > 0u)
         {
             // PSR (Unity): the virtual point on the camera ray, moved by the replaced
-            // surface's own motion (its previous minus its current world position; the
-            // current rows are bytes 32..79).
-            const float4 c0 = asfloat(CAELIX_LOAD_U32x4(entity_info + 32));
-            const float4 c1 = asfloat(CAELIX_LOAD_U32x4(entity_info + 48));
-            const float4 c2 = asfloat(CAELIX_LOAD_U32x4(entity_info + 64));
-            const float3 cur_world = float3(dot(c0, h), dot(c1, h), dot(c2, h));
+            // surface's own motion (its previous minus its current world position).
+            const float3 cur_world = EntityCurWorld(fc, geometry.group, geometry.object_hit);
             prev_world = fc.position.xyz + rel + (prev_world - cur_world);
         }
         float2 prev_pixel;
