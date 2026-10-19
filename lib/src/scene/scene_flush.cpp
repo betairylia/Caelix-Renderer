@@ -527,6 +527,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
     // 1. Release what the GPU has finished with.
     Recycle(desc.safe_frame_number);
     ++flush_serial_;
+    // TODO: VibeReview: Curious Q. Why is this here?
     // Entities staged with prev != cur at the last flush: prev = cur from now on.
     for (const CaelixEntityId id : motion_entities_)
     {

@@ -190,6 +190,7 @@ void Scene::QueueFinalize(uint32_t group_index, uint16_t id)
     slot.finalize_epoch = finalize_epoch_;
     dirty_.push_back(DirtyBrick{group_index, id});
     // The finalize kernel rewrites the brick's AABB row.
+    // TODO: VibeReview: Can we save blas dirty if this in turns does not modify the AABB?
     MarkBlasDirty(group_index);
 }
 
@@ -259,10 +260,12 @@ void Scene::WriteRecord(uint8_t* dst, uint32_t pos, const uint8_t* blocks) const
     uint32_t* payload = record + layout_.payload_first_word();
     // Voxel index i = x + 8y + 64z. For even x, i/2 = (x >> 1) + 4y + 32z, and the
     // pair (i, i + 1) shares one word: even x high, odd x low.
+    // TODO: VibeReview: Can we just memcpy here? or it is the same speed as per elem copy?
     for (uint32_t i = 0; i < RecordLayout::kBlocksPerBrick; i += 2)
     {
         payload[i / 2] = (static_cast<uint32_t>(values[i]) << 16) | values[i + 1];
     }
+    // TODO: VibeReview: Also can we directly copy to dst?
     std::memcpy(dst, record, layout_.record_bytes);
 }
 
