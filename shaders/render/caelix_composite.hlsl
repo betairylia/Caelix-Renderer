@@ -30,6 +30,10 @@
 //   (after exposure, before the sRGB encode and the validation overlay; the motion view
 //   as it is) goes to the resolve image, and caelix_cross_resolve.hlsl writes the host
 //   target.
+//   fc.upscale (an upscaler runs): the output goes, linear and unflipped, to the upscale
+//   input (binding 9) instead of the host target (without the sRGB encode and the
+//   validation overlay; the motion view as it is); with the cross resolve the cross
+//   resolve does that. The upscaler and caelix_upscale_encode.hlsl write the host target.
 //
 // Descriptors: render/caelix_composite_set.hlsl.
 #include "common/caelix_platform.hlsl"
@@ -37,7 +41,7 @@
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
 #include "common/caelix_material.hlsl"
-// Before the shading helpers: the set defines the sky bindings (9, 10) they declare.
+// Before the shading helpers: the set defines the sky bindings (10, 11) they declare.
 #include "render/caelix_composite_set.hlsl"
 #include "render/caelix_shading.hlsl"
 #include "NRD.hlsli"
@@ -75,6 +79,10 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         if (fc.cross_resolve != 0u)
         {
             g_int_resolve[pixel] = value;  // passed through by the cross resolve
+        }
+        else if (fc.upscale != 0u)
+        {
+            g_int_upscale_in[pixel] = value;
         }
         else
         {
@@ -129,6 +137,12 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     {
         // Linear: the cross resolve blends, then encodes.
         g_int_resolve[pixel] = float4(color, hit ? 1.0f : 0.0f);
+        return;
+    }
+    CAELIX_BRANCH
+    if (fc.upscale != 0u)
+    {
+        g_int_upscale_in[pixel] = CaelixUpscaleInput(color, hit ? 1.0f : 0.0f);
         return;
     }
     g_color[CaelixOutputPixel(fc, pixel)] = float4(CaelixOutputColor(fc, pixel, color), hit ? 1.0f : 0.0f);

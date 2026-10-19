@@ -342,6 +342,35 @@ CaelixShadeResult ShadeVoxelHit(uint block, float3 hit_position, float3 ray_dire
     return shade;
 }
 
+// The specular albedo guide of DLSS Ray Reconstruction (RR integration guide, appendix "Specular
+// Albedo Calculation", from Ray Tracing Gems chapter 32): the average specular reflectance of a
+// GGX lobe with reflectance `specular_color` (F0), alpha = roughness^2 and the view cosine `NoV`.
+float3 EnvBRDFApprox2(float3 specular_color, float alpha, float NoV)
+{
+    NoV = abs(NoV);
+    float4 X;
+    X.x = 1.0f;
+    X.y = NoV;
+    X.z = NoV * NoV;
+    X.w = NoV * X.z;
+    float4 Y;
+    Y.x = 1.0f;
+    Y.y = alpha;
+    Y.z = alpha * alpha;
+    Y.w = alpha * Y.z;
+    const float2x2 M1 = float2x2(0.99044f, -1.28514f, 1.29678f, -0.755907f);
+    const float3x3 M2 = float3x3(1.0f, 2.92338f, 59.4188f, 20.3225f, -27.0302f, 222.592f, 121.563f, 626.13f,
+                                 316.627f);
+    const float2x2 M3 = float2x2(0.0365463f, 3.32707f, 9.0632f, -9.04756f);
+    const float3x3 M4 = float3x3(1.0f, 3.59685f, -1.36772f, 9.04401f, -16.3174f, 9.22949f, 5.56589f, 19.7886f,
+                                 -20.2123f);
+    float bias = dot(mul(M1, X.xy), Y.xy) * rcp(dot(mul(M2, X.xyw), Y.xyw));
+    const float scale = dot(mul(M3, X.xy), Y.xy) * rcp(dot(mul(M4, X.xzw), Y.xyw));
+    // The guide's correction for a specular reflectance of 0.
+    bias *= saturate(specular_color.g * 50.0f);
+    return mad(specular_color, max(0.0f, scale), max(0.0f, bias));
+}
+
 // Unity CaelixSanitizeRadiance (any NaN or Inf channel drops the whole colour), then
 // a clamp to the FP16 range of the radiance targets.
 float3 SanitizeRadiance(float3 radiance)

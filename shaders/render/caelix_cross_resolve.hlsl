@@ -17,6 +17,8 @@
 // encode, NRD validation overlay); the motion debug view passes through untouched.
 // kRenderFlagFlipY: the host colour target is written at the mirrored row; the taps read the
 // internal images at unflipped pixels (they are symmetric, so the flip does not change them).
+// fc.upscale (an upscaler runs): the result goes, linear and unflipped, to the upscale input
+// (binding 9) instead of the host target (no sRGB encode, no validation overlay).
 //
 // Inputs: the composite set (render/caelix_composite_set.hlsl): binding 8 the
 // composite's linear output, binding 7 the motion (w = flag), binding 0 the host colour.
@@ -42,7 +44,14 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     CAELIX_BRANCH
     if (fc.mode == kModePathTrace && fc.debug_view == kViewMotion)
     {
-        g_color[CaelixOutputPixel(fc, pixel)] = centre;
+        if (fc.upscale != 0u)
+        {
+            g_int_upscale_in[pixel] = centre;
+        }
+        else
+        {
+            g_color[CaelixOutputPixel(fc, pixel)] = centre;
+        }
         return;
     }
 
@@ -66,6 +75,12 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             weight += 0.125f;
         }
         color = sum / weight;
+    }
+    CAELIX_BRANCH
+    if (fc.upscale != 0u)
+    {
+        g_int_upscale_in[pixel] = CaelixUpscaleInput(color, centre.a);
+        return;
     }
     g_color[CaelixOutputPixel(fc, pixel)] = float4(CaelixOutputColor(fc, pixel, color), centre.a);
 }

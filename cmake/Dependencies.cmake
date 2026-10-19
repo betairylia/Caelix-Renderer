@@ -60,6 +60,38 @@ FetchContent_MakeAvailable(volk VulkanMemoryAllocator unordered_dense nrd)
 # The directory of NRD.hlsli and the generated NRDConfig.hlsli (DXC include path).
 set(CAELIX_NRD_SHADER_INCLUDE_DIR ${nrd_SOURCE_DIR}/Shaders)
 
+# NVIDIA NGX SDK (DLSS Super Resolution and Ray Reconstruction), only with CAELIX_DLSS. The
+# repository has no CMakeLists.txt: MakeAvailable only populates it. Target ngx::ngx is the
+# static import library (dynamic CRT; the _dbg variant for Debug) with the SDK headers; the
+# library links it PRIVATE (lib/src/render/dlss_upscaler.*). The feature DLLs nvngx_dlss.dll
+# (SR) and nvngx_dlssd.dll (RR) are copied next to caelix_renderer.dll from CAELIX_NGX_DLL_DIR
+# (rel, or dev with CAELIX_DLSS_DEV_DLL). License: third_party/NOTICES.md.
+if(CAELIX_DLSS)
+  # GIT_SUBMODULES "": the repository's NVIDIAImageScaling submodule is not used.
+  FetchContent_Declare(ngx
+    GIT_REPOSITORY https://github.com/NVIDIA/DLSS.git
+    GIT_TAG        v310.9.16
+    GIT_SHALLOW    TRUE
+    GIT_SUBMODULES "")
+  FetchContent_MakeAvailable(ngx)
+  set(CAELIX_NGX_LIB_DIR ${ngx_SOURCE_DIR}/lib/Windows_x86_64/x64)
+  if(NOT EXISTS ${CAELIX_NGX_LIB_DIR}/nvsdk_ngx_d.lib)
+    message(FATAL_ERROR "NGX SDK: ${CAELIX_NGX_LIB_DIR}/nvsdk_ngx_d.lib not found")
+  endif()
+  add_library(ngx::ngx STATIC IMPORTED GLOBAL)
+  set_target_properties(ngx::ngx PROPERTIES
+    IMPORTED_LOCATION ${CAELIX_NGX_LIB_DIR}/nvsdk_ngx_d.lib
+    IMPORTED_LOCATION_DEBUG ${CAELIX_NGX_LIB_DIR}/nvsdk_ngx_d_dbg.lib)
+  # SYSTEM: /W4 on our targets does not report warnings from the SDK headers.
+  target_include_directories(ngx::ngx SYSTEM INTERFACE ${ngx_SOURCE_DIR}/include)
+  if(CAELIX_DLSS_DEV_DLL)
+    set(CAELIX_NGX_DLL_DIR ${ngx_SOURCE_DIR}/lib/Windows_x86_64/dev)
+  else()
+    set(CAELIX_NGX_DLL_DIR ${ngx_SOURCE_DIR}/lib/Windows_x86_64/rel)
+  endif()
+  set(CAELIX_NGX_DLLS ${CAELIX_NGX_DLL_DIR}/nvngx_dlss.dll ${CAELIX_NGX_DLL_DIR}/nvngx_dlssd.dll)
+endif()
+
 # Test-only dependencies. The library never links them.
 if(CAELIX_BUILD_TESTS)
   # Catch2 v3: targets Catch2::Catch2 and Catch2::Catch2WithMain.

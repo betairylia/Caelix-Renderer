@@ -4,6 +4,7 @@
 
 #include "core/log.h"
 #include "core/vk_common.h"
+#include "render/dlss_upscaler.h"
 #include "render/render_kernels.h"
 #include "render/renderer.h"
 #include "rhi/device.h"
@@ -12,6 +13,7 @@
 
 #include <cstddef>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <new>
 
@@ -24,15 +26,29 @@ static_assert(offsetof(CaelixRenderOptions, fog_density) == 132);
 static_assert(offsetof(CaelixRenderOptions, fog_color) == 136);
 static_assert(offsetof(CaelixRenderOptions, pad3) == 148);
 static_assert(offsetof(CaelixRenderOptions, sky) == 152);
-static_assert(sizeof(CaelixRenderOptions) == 176);
+static_assert(offsetof(CaelixRenderOptions, upscaler) == 176);
+static_assert(offsetof(CaelixRenderOptions, upscale_quality) == 180);
+static_assert(offsetof(CaelixRenderOptions, upscale_preset) == 184);
+static_assert(offsetof(CaelixRenderOptions, upscale_flags) == 188);
+static_assert(sizeof(CaelixRenderOptions) == 192);
 static_assert(sizeof(CaelixMaterialEntry) == 52);
+static_assert(offsetof(CaelixGpuTimings, upscale_ms) == 24);
+static_assert(sizeof(CaelixGpuTimings) == 32);
+static_assert(sizeof(CaelixUpscalerQueryDesc) == 16);
+static_assert(sizeof(CaelixUpscalerQueryResult) == 40);
+static_assert(sizeof(CaelixUpscalerInfo) == 36);
 
-// The opaque handle behind CaelixDevice*. Members are destroyed in reverse order: the
-// kernels go before the device.
+// The opaque handle behind CaelixDevice*. Members are destroyed in reverse order: the NGX
+// runtime goes first (every renderer, and so every DLSS feature, is already destroyed), then
+// the kernels, then the device.
 struct CaelixDevice
 {
     std::unique_ptr<caelix::Device> impl;
     std::unique_ptr<caelix::RenderKernels> kernels;  // created by the first caelix_renderer_create
+#if CAELIX_DLSS
+    std::unique_ptr<caelix::NgxRuntime> ngx;  // created by the first upscaler query or upscaled render
+    bool ngx_failed = false;                  // NGX did not start (logged once): never tried again
+#endif
 };
 
 // The opaque handle behind CaelixScene*.
@@ -101,6 +117,40 @@ bool CheckEntity(const caelix::Scene& scene, CaelixEntityId entity, const char* 
         return false;
     }
     return true;
+}
+
+#if CAELIX_DLSS
+// The device's NGX runtime, created on the first call; null when NGX does not start (logged once
+// by NgxRuntime, not tried again).
+caelix::NgxRuntime* NgxFor(CaelixDevice& device)
+{
+    if (device.ngx == nullptr && !device.ngx_failed)
+    {
+        try
+        {
+            device.ngx = std::make_unique<caelix::NgxRuntime>(*device.impl);
+        }
+        catch (const caelix::NgxError&)
+        {
+            device.ngx_failed = true;
+        }
+    }
+    return device.ngx.get();
+}
+#endif
+
+// The radical inverse of `index` in `base` (Halton sequence).
+float RadicalInverse(uint32_t index, uint32_t base)
+{
+    double result = 0.0;
+    double fraction = 1.0 / static_cast<double>(base);
+    while (index > 0)
+    {
+        result += static_cast<double>(index % base) * fraction;
+        index /= base;
+        fraction /= static_cast<double>(base);
+    }
+    return static_cast<float>(result);
 }
 
 }  // namespace
@@ -555,9 +605,14 @@ CAELIX_API CaelixResult caelix_renderer_create(CaelixDevice* device, CaelixScene
         {
             device->kernels = std::make_unique<caelix::RenderKernels>(*device->impl);
         }
+        // The renderer reaches the device's NGX runtime through this accessor (lazy creation).
+        std::function<caelix::NgxRuntime*()> ngx;
+#if CAELIX_DLSS
+        ngx = [device]() { return NgxFor(*device); };
+#endif
         std::unique_ptr<caelix::Renderer> impl;
         const CaelixResult result =
-            caelix::Renderer::Create(*device->impl, *device->kernels, *scene->impl, impl);
+            caelix::Renderer::Create(*device->impl, *device->kernels, *scene->impl, std::move(ngx), impl);
         if (result != CAELIX_OK)
         {
             return result;
@@ -637,6 +692,161 @@ CAELIX_API CaelixResult caelix_renderer_get_nrd_info(const CaelixRenderer* rende
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     renderer->impl->GetNrdInfo(*out);
+    return CAELIX_OK;
+}
+
+CAELIX_API CaelixResult caelix_upscaler_query(CaelixDevice* device, const CaelixUpscalerQueryDesc* desc,
+                                              CaelixUpscalerQueryResult* out)
+{
+    constexpr const char* kFunction = "caelix_upscaler_query";
+    if (out != nullptr)
+    {
+        *out = CaelixUpscalerQueryResult{};
+    }
+    if (device == nullptr || device->impl == nullptr || desc == nullptr || out == nullptr)
+    {
+        CAELIX_LOGE("%s: null argument", kFunction);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (desc->upscaler > CAELIX_UPSCALER_DLSS_RR || desc->quality > CAELIX_UPSCALE_ULTRA_PERFORMANCE)
+    {
+        CAELIX_LOGE("%s: unknown upscaler %u or quality %u", kFunction, desc->upscaler, desc->quality);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (desc->upscaler == CAELIX_UPSCALER_NONE)
+    {
+        out->supported = 1;
+        out->render_width = out->render_min_width = out->render_max_width = desc->output_width;
+        out->render_height = out->render_min_height = out->render_max_height = desc->output_height;
+        return CAELIX_OK;
+    }
+#if CAELIX_DLSS
+    if (desc->output_width < 64 || desc->output_height < 32)
+    {
+        out->reason = CAELIX_UPSCALER_BAD_ARGUMENT;
+        return CAELIX_OK;
+    }
+    try
+    {
+        caelix::NgxRuntime* ngx = NgxFor(*device);
+        if (ngx == nullptr)
+        {
+            out->reason = CAELIX_UPSCALER_NO_NGX;
+            return CAELIX_OK;
+        }
+        ngx->Query(static_cast<caelix::UpscalerKind>(desc->upscaler), desc->quality, desc->output_width,
+                   desc->output_height, *out);
+        return CAELIX_OK;
+    }
+    catch (...)
+    {
+        return TranslateException(kFunction);
+    }
+#else
+    out->reason = CAELIX_UPSCALER_NOT_BUILT;
+    return CAELIX_OK;
+#endif
+}
+
+CAELIX_API void caelix_upscaler_instance_extensions(uint32_t* out_count, const char* const** out_names)
+{
+    uint32_t count = 0;
+    const char* const* names = nullptr;
+#if CAELIX_DLSS
+    try
+    {
+        caelix::UpscalerInstanceExtensions(count, names);
+    }
+    catch (...)
+    {
+        CAELIX_LOGE("caelix_upscaler_instance_extensions: unexpected exception");
+        count = 0;
+        names = nullptr;
+    }
+#endif
+    if (out_count != nullptr)
+    {
+        *out_count = count;
+    }
+    if (out_names != nullptr)
+    {
+        *out_names = names;
+    }
+}
+
+CAELIX_API CaelixResult caelix_upscaler_device_extensions(uint64_t instance, uint64_t physical_device,
+                                                          uint32_t* out_count, const char* const** out_names)
+{
+    constexpr const char* kFunction = "caelix_upscaler_device_extensions";
+    if (out_count != nullptr)
+    {
+        *out_count = 0;
+    }
+    if (out_names != nullptr)
+    {
+        *out_names = nullptr;
+    }
+    if (out_count == nullptr || out_names == nullptr || instance == 0 || physical_device == 0)
+    {
+        CAELIX_LOGE("%s: null argument or zero handle", kFunction);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+#if CAELIX_DLSS
+    try
+    {
+        return caelix::UpscalerDeviceExtensions(caelix::HandleFromU64<VkInstance>(instance),
+                                                caelix::HandleFromU64<VkPhysicalDevice>(physical_device),
+                                                *out_count, *out_names);
+    }
+    catch (...)
+    {
+        *out_count = 0;
+        *out_names = nullptr;
+        return TranslateException(kFunction);
+    }
+#else
+    return CAELIX_OK;
+#endif
+}
+
+CAELIX_API uint32_t caelix_upscaler_jitter_phases(uint32_t upscaler, uint32_t render_width, uint32_t output_width)
+{
+    // 8 * ceil((output / render)^2), in integers: ceil(o^2 / r^2) = (o^2 + r^2 - 1) / r^2.
+    uint64_t phases = 8;
+    if (render_width != 0 && output_width != 0)
+    {
+        const uint64_t o2 = static_cast<uint64_t>(output_width) * output_width;
+        const uint64_t r2 = static_cast<uint64_t>(render_width) * render_width;
+        phases = 8 * ((o2 + r2 - 1) / r2);
+    }
+    if (upscaler == CAELIX_UPSCALER_DLSS_RR && phases < 32)
+    {
+        phases = 32;
+    }
+    return phases > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(phases);
+}
+
+CAELIX_API void caelix_jitter_halton(uint32_t index, uint32_t phases, float out_jitter[2])
+{
+    if (out_jitter == nullptr)
+    {
+        return;
+    }
+    const uint32_t wrapped = phases != 0 ? index % phases : index;
+    // Point number wrapped + 1: Halton point 0 is (0, 0), a corner of the pixel, not a jitter.
+    const uint32_t point = wrapped == UINT32_MAX ? wrapped : wrapped + 1;
+    out_jitter[0] = RadicalInverse(point, 2) - 0.5f;
+    out_jitter[1] = RadicalInverse(point, 3) - 0.5f;
+}
+
+CAELIX_API CaelixResult caelix_renderer_get_upscaler_info(const CaelixRenderer* renderer, CaelixUpscalerInfo* out)
+{
+    if (renderer == nullptr || renderer->impl == nullptr || out == nullptr)
+    {
+        CAELIX_LOGE("caelix_renderer_get_upscaler_info: null argument");
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    renderer->impl->GetUpscalerInfo(*out);
     return CAELIX_OK;
 }
 

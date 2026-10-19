@@ -81,6 +81,22 @@ void CreateGpu(Gpu& gpu, const char* app_name)
         .set_debug_messenger_severity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
                                       VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
         .set_debug_callback(DebugCallback);
+    // The upscalers' instance extensions (DLSS through NGX; none without CAELIX_DLSS), when the
+    // instance supports them.
+    uint32_t upscaler_instance_count = 0;
+    const char* const* upscaler_instance_names = nullptr;
+    caelix_upscaler_instance_extensions(&upscaler_instance_count, &upscaler_instance_names);
+    for (uint32_t i = 0; i < upscaler_instance_count; ++i)
+    {
+        if (system.is_extension_available(upscaler_instance_names[i]))
+        {
+            instance_builder.enable_extension(upscaler_instance_names[i]);
+        }
+        else
+        {
+            std::printf("upscaler instance extension %s is not available (skipped)\n", upscaler_instance_names[i]);
+        }
+    }
     auto instance = instance_builder.build();
     if (!instance)
     {
@@ -150,9 +166,23 @@ void CreateGpu(Gpu& gpu, const char* app_name)
     {
         FAIL("vkb physical device: " << physical.error().message());
     }
-    std::printf("physical device: %s\n", physical.value().name.c_str());
+    vkb::PhysicalDevice physical_device = physical.value();
+    std::printf("physical device: %s\n", physical_device.name.c_str());
+    // The upscalers' device extensions (DLSS through NGX), when the physical device has them.
+    uint32_t upscaler_device_count = 0;
+    const char* const* upscaler_device_names = nullptr;
+    REQUIRE(caelix_upscaler_device_extensions(reinterpret_cast<uint64_t>(gpu.instance.instance),
+                                              reinterpret_cast<uint64_t>(physical_device.physical_device),
+                                              &upscaler_device_count, &upscaler_device_names) == CAELIX_OK);
+    for (uint32_t i = 0; i < upscaler_device_count; ++i)
+    {
+        if (!physical_device.enable_extension_if_present(upscaler_device_names[i]))
+        {
+            std::printf("upscaler device extension %s is not available (skipped)\n", upscaler_device_names[i]);
+        }
+    }
 
-    auto device = vkb::DeviceBuilder(physical.value()).build();
+    auto device = vkb::DeviceBuilder(physical_device).build();
     if (!device)
     {
         FAIL("vkb device: " << device.error().message());

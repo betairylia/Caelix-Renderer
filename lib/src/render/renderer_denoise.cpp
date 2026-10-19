@@ -21,27 +21,6 @@ namespace {
 // hit in range, and the miss view z (1e30) far out of it.
 constexpr float kDenoisingRange = 1e6f;
 
-// NRD's world-to-view matrix of `camera`: column-major, column vectors
-// (view = M * world), rows right, up, forward (the camera's view space, +z forward,
-// left-handed like the projection), translation -dot(axis, position).
-void WorldToView(const CaelixCamera& camera, float m[16])
-{
-    const float* axes[3] = {camera.right, camera.up, camera.forward};
-    for (uint32_t row = 0; row < 3; ++row)
-    {
-        const float* axis = axes[row];
-        m[0 * 4 + row] = axis[0];
-        m[1 * 4 + row] = axis[1];
-        m[2 * 4 + row] = axis[2];
-        m[3 * 4 + row] = -(axis[0] * camera.position[0] + axis[1] * camera.position[1] +
-                           axis[2] * camera.position[2]);
-    }
-    m[3] = 0.0f;
-    m[7] = 0.0f;
-    m[11] = 0.0f;
-    m[15] = 1.0f;
-}
-
 }  // namespace
 
 NrdExecutor* Renderer::EnsureDenoiser(uint32_t width, uint32_t height, bool& error)

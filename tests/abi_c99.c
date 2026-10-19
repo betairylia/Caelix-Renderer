@@ -11,10 +11,11 @@ size_t caelix_abi_c99_touch(void);
 
 /* CaelixMaterial is the GPU table layout: 48 bytes (C99 has no static_assert). */
 typedef char caelix_material_is_48_bytes[(sizeof(CaelixMaterial) == 48) ? 1 : -1];
-/* CaelixRenderOptions is embedded by value in host packets (the Unity plugin): 176 bytes, the sky
-   cubemap at offset 152. */
-typedef char caelix_render_options_is_176_bytes[(sizeof(CaelixRenderOptions) == 176) ? 1 : -1];
+/* CaelixRenderOptions is embedded by value in host packets (the Unity plugin): 192 bytes, the sky
+   cubemap at offset 152, the upscaler fields from offset 176. */
+typedef char caelix_render_options_is_192_bytes[(sizeof(CaelixRenderOptions) == 192) ? 1 : -1];
 typedef char caelix_sky_cubemap_at_152[(offsetof(CaelixRenderOptions, sky) == 152) ? 1 : -1];
+typedef char caelix_upscaler_at_176[(offsetof(CaelixRenderOptions, upscaler) == 176) ? 1 : -1];
 
 size_t caelix_abi_c99_touch(void)
 {
@@ -51,7 +52,14 @@ size_t caelix_abi_c99_touch(void)
                                    CAELIX_MAX_BOUNCES_TRANSPARENT};
     CaelixMaterial material = {{1.0f, 1.0f, 1.0f}, 1.0f, {0.0f, 0.0f, 0.0f}, 0.0f, 1.55f, 0.0f, {0.0f, 0.0f}};
     CaelixRenderTargets targets = {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}};
-    CaelixGpuTimings timings = {0.0f, 0.0f, 0, 0.0f, 0.0f};
+    CaelixGpuTimings timings = {0.0f, 0.0f, 0, 0.0f, 0.0f, 0.0f};
+    CaelixUpscalerQueryDesc upscaler_query = {CAELIX_UPSCALER_DLSS_SR, CAELIX_UPSCALE_QUALITY, 1920, 1080};
+    CaelixUpscalerQueryResult upscaler_result = {0, CAELIX_UPSCALER_NOT_BUILT, 0, 0, 0, 0, 0, 0, 0, 0};
+    CaelixUpscalerInfo upscaler_info = {CAELIX_UPSCALER_DLSS_RR, CAELIX_UPSCALE_DLAA, 0, 0, 0, 0, 0, 0, 0};
+    CaelixUpscaler upscaler = CAELIX_UPSCALER_NONE;
+    CaelixUpscaleQuality quality = CAELIX_UPSCALE_ULTRA_PERFORMANCE;
+    CaelixUpscalerUnsupportedReason reason = CAELIX_UPSCALER_BAD_ARGUMENT;
+    uint32_t upscale_flags = CAELIX_UPSCALE_FLAG_RESET_HISTORY | CAELIX_UPSCALE_FLAG_AUTO_EXPOSURE;
     CaelixNrdInfo nrd_info = {4, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     CaelixDeviceFeatureBits read_bit = CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT;
     CaelixRenderMode mode = CAELIX_MODE_REFERENCE;
@@ -68,11 +76,13 @@ size_t caelix_abi_c99_touch(void)
                  sizeof(level) + sizeof(result) + sizeof(camera) + sizeof(options) +
                  sizeof(targets) + sizeof(timings) + sizeof(view) + sizeof(renderer) +
                  sizeof(mode) + sizeof(nrd_info) + sizeof(read_bit) + sizeof(material) +
-                 sizeof(caelix_material_is_48_bytes) + sizeof(caelix_render_options_is_176_bytes) +
-                 sizeof(caelix_sky_cubemap_at_152);
+                 sizeof(caelix_material_is_48_bytes) + sizeof(caelix_render_options_is_192_bytes) +
+                 sizeof(caelix_sky_cubemap_at_152) + sizeof(caelix_upscaler_at_176) + sizeof(upscaler_query) +
+                 sizeof(upscaler_result) + sizeof(upscaler_info) + sizeof(upscaler) + sizeof(quality) +
+                 sizeof(reason) + upscale_flags;
     /* Take the address of every function so a declaration typo fails to compile. Casts between
        function pointer types are valid C; the pointers are never called. */
-    AnyFn functions[27];
+    AnyFn functions[34];
     functions[0] = (AnyFn)caelix_get_version;
     functions[1] = (AnyFn)caelix_version_string;
     functions[2] = (AnyFn)caelix_set_log_callback;
@@ -100,6 +110,13 @@ size_t caelix_abi_c99_touch(void)
     functions[24] = (AnyFn)caelix_scene_set_materials;
     functions[25] = (AnyFn)caelix_scene_set_glass_palette;
     functions[26] = (AnyFn)caelix_scene_get_material;
+    functions[27] = (AnyFn)caelix_scene_set_material_entries;
+    functions[28] = (AnyFn)caelix_upscaler_query;
+    functions[29] = (AnyFn)caelix_upscaler_instance_extensions;
+    functions[30] = (AnyFn)caelix_upscaler_device_extensions;
+    functions[31] = (AnyFn)caelix_upscaler_jitter_phases;
+    functions[32] = (AnyFn)caelix_jitter_halton;
+    functions[33] = (AnyFn)caelix_renderer_get_upscaler_info;
     sum += sizeof(functions) + (create != NULL ? 1u : 0u) + (functions[22] != NULL ? 1u : 0u);
     sum += (size_t)key.x + (size_t)frame.frame_number + (size_t)info.resident;
     return sum;

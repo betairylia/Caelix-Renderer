@@ -51,11 +51,52 @@ constexpr InternalSpec kInternalSpecs[] = {
     {"deterministic", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"diff_in", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"spec_in", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"depth", VK_FORMAT_R32_SFLOAT},
+    {"rr_diffuse_albedo", VK_FORMAT_R8G8B8A8_UNORM},
+    {"rr_specular_albedo", VK_FORMAT_R8G8B8A8_UNORM},
+    {"rr_normal_roughness", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"rr_hit_dist", VK_FORMAT_R16_SFLOAT},
     {"accum", VK_FORMAT_R32G32B32A32_SFLOAT},
     {"diff_out", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"spec_out", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"validation", VK_FORMAT_R8G8B8A8_UNORM},
     {"resolve", VK_FORMAT_R16G16B16A16_SFLOAT},
+    {"upscale_in", VK_FORMAT_R16G16B16A16_SFLOAT},
 };
+
+// NRD's (and DLSS RR's) world-to-view matrix of `camera`: column-major, column vectors
+// (view = M * world), rows right, up, forward (the camera's view space, +z forward,
+// left-handed like the projection), translation -dot(axis, position). NGX's "row major, left
+// multiplication" matrices have the same memory layout.
+inline void WorldToView(const CaelixCamera& camera, float m[16])
+{
+    const float* axes[3] = {camera.right, camera.up, camera.forward};
+    for (uint32_t row = 0; row < 3; ++row)
+    {
+        const float* axis = axes[row];
+        m[0 * 4 + row] = axis[0];
+        m[1 * 4 + row] = axis[1];
+        m[2 * 4 + row] = axis[2];
+        m[3 * 4 + row] = -(axis[0] * camera.position[0] + axis[1] * camera.position[1] +
+                           axis[2] * camera.position[2]);
+    }
+    m[3] = 0.0f;
+    m[7] = 0.0f;
+    m[11] = 0.0f;
+    m[15] = 1.0f;
+}
+
+// True when CaelixCamera::projection is reverse Z: the device depth (clip.z / clip.w) of a point
+// at view z = 2 near is below the depth at z = near (near = camera.near_z, at least 1e-3).
+inline bool ProjectionDepthInverted(const CaelixCamera& camera)
+{
+    const float* m = camera.projection;  // column-major: row r, column c = m[c * 4 + r]
+    const auto depth = [m](float z) {
+        const float w = m[11] * z + m[15];
+        return w != 0.0f ? (m[10] * z + m[14]) / w : 0.0f;
+    };
+    const float z = camera.near_z > 1e-3f ? camera.near_z : 1e-3f;
+    return depth(2.0f * z) < depth(z);
+}
 
 }  // namespace caelix

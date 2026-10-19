@@ -41,7 +41,8 @@ constexpr uint32_t kNoScene = 0xFFFFFFFFu;
 // The sizes caelix_unity.h states, which C# mirrors.
 static_assert(sizeof(CaelixUnityPacketHeader) == 24, "CaelixUnityPacketHeader is 24 bytes");
 static_assert(sizeof(CaelixUnityFramePacket) == 80, "CaelixUnityFramePacket is 80 bytes");
-static_assert(sizeof(CaelixUnityViewPacket) == 488, "CaelixUnityViewPacket is 488 bytes");
+// 504 since the DLSS step (CaelixRenderOptions grew 176 -> 192 bytes); the C# mirror must follow.
+static_assert(sizeof(CaelixUnityViewPacket) == 504, "CaelixUnityViewPacket is 504 bytes");
 static_assert(sizeof(CaelixUnityReleasePacket) == 32, "CaelixUnityReleasePacket is 32 bytes");
 static_assert(sizeof(CaelixUnityStatus) == 280, "CaelixUnityStatus is 280 bytes");
 static_assert(sizeof(CaelixUnityEntity) == 48 && sizeof(CaelixUnityBrickRemove) == 16 &&

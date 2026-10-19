@@ -42,6 +42,18 @@
 //                   bounce that misses receives the irradiance SH / pi that
 //                   caelix_sky_sh.hlsl projected before this dispatch
 //                   (SkyDiffuseMiss, SkySpecularMiss).
+//                   The internal device depth (binding 14, the host depth target's
+//                   expression; the upscaler's depth) is written in every lighting
+//                   frame; with fc.upscaler = kUpscalerDlssRr the four DLSS RR guides
+//                   (bindings 15..18): diffuse albedo albedo * (1 - metallic) (sky 0.5),
+//                   specular albedo EnvBRDFApprox2(lerp(0.04, albedo, metallic),
+//                   roughness^2, N.V) (sky 0), world normal + linear roughness (sky 0) and
+//                   the hit distance of the first bounce segment (sky and no segment 65504),
+//                   all of the surface where the delta chain stopped, the albedos times the
+//                   chain's transmission. A transparent surface (rough glass) gets diffuse 0
+//                   and specular = the transmission. APPROXIMATION: the hit distance is the
+//                   one of the lobe the path sampled (diffuse or specular), not always a
+//                   specular segment.
 //
 // Inputs: the push constant is the device address of the frame constants; the
 // scene's tables (page table, slot rows, group infos, entity infos) are read by
@@ -49,12 +61,12 @@
 // caelix_scene_trace.hlsl), the six host targets (bindings 1..6, no format
 // qualifier: format Unknown in SPIR-V, needs shaderStorageImageWriteWithoutFormat,
 // so every write is a float4 and the image keeps the components its format has)
-// and the internal targets of the lighting modes (bindings 7..13, fixed formats),
-// the sky cubemap (binding 14, sampled image) and its sampler (binding 15). Every
+// and the internal targets of the lighting modes (bindings 7..18, fixed formats),
+// the sky cubemap (binding 19, sampled image) and its sampler (binding 20). Every
 // binding is PARTIALLY_BOUND:
 // the library writes only the TLAS (when the scene has one), the present targets
 // and, in the lighting modes, the internal targets, and the kernel touches a
-// binding only then (has_tlas, target_mask, mode). Bindings 14 and 15 are written
+// binding only then (has_tlas, target_mask, mode). Bindings 19 and 20 are written
 // every frame (the host's cubemap, or a 1 x 1 fallback cube that is never sampled
 // because sky_cubemap is 0).
 #include "common/caelix_platform.hlsl"
@@ -64,8 +76,8 @@
 #include "render/caelix_scene_trace.hlsl"
 #include "common/caelix_material.hlsl"
 // The sky cubemap and its sampler (caelix_shading.hlsl declares them).
-#define CAELIX_SKY_BINDING_IMAGE 14
-#define CAELIX_SKY_BINDING_SAMPLER 15
+#define CAELIX_SKY_BINDING_IMAGE 19
+#define CAELIX_SKY_BINDING_SAMPLER 20
 #include "render/caelix_shading.hlsl"
 // NRD's front-end packing (normal + roughness, radiance + normalized hit distance);
 // NRDConfig.hlsli next to it fixes the encodings NRD was built with.
@@ -86,6 +98,11 @@ CAELIX_BINDING(10, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_albedo;
 CAELIX_BINDING(11, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_deterministic;
 CAELIX_BINDING(12, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_diff;
 CAELIX_BINDING(13, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_spec;
+CAELIX_BINDING(14, 0) CAELIX_FORMAT("r32f") RWTexture2D<float4> g_int_depth;
+CAELIX_BINDING(15, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_diffuse_albedo;
+CAELIX_BINDING(16, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_specular_albedo;
+CAELIX_BINDING(17, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_rr_normal_roughness;
+CAELIX_BINDING(18, 0) CAELIX_FORMAT("r16f") RWTexture2D<float4> g_int_rr_hit_dist;
 
 static const float kRayTMax = 1e30f;
 static const uint kStepsHeatMax = 64;
@@ -483,16 +500,17 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     // View space of the current camera: the (virtual) hit is position + direction * T.
     const float3 rel = ray.Direction * T;
     const float view_z = dot(rel, fc.forward.xyz);
+    // Device depth of the host projection: the depth target and the internal depth (upscaler).
+    float device_depth = fc.miss_depth;
+    if (hit)
+    {
+        const float4 view = float4(dot(rel, fc.right.xyz), dot(rel, fc.up.xyz), view_z, 1.0f);
+        device_depth = dot(fc.projection[2], view) / dot(fc.projection[3], view);
+    }
     CAELIX_BRANCH
     if ((targets & kTargetDepth) != 0u)
     {
-        float depth = fc.miss_depth;
-        if (hit)
-        {
-            const float4 view = float4(dot(rel, fc.right.xyz), dot(rel, fc.up.xyz), view_z, 1.0f);
-            depth = dot(fc.projection[2], view) / dot(fc.projection[3], view);
-        }
-        g_depth[out_pixel] = float4(depth, 0.0f, 0.0f, 0.0f);
+        g_depth[out_pixel] = float4(device_depth, 0.0f, 0.0f, 0.0f);
     }
     CAELIX_BRANCH
     if ((targets & kTargetViewZ) != 0u)
@@ -557,6 +575,12 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         float4 diffuse = float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 specular = float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 normal_roughness = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        // DLSS RR guides (fc.upscaler = kUpscalerDlssRr), with the sky values of the RR guide.
+        const bool rr_guides = fc.upscaler == kUpscalerDlssRr;
+        float3 rr_diffuse_albedo = float3(0.5f, 0.5f, 0.5f);
+        float3 rr_specular_albedo = float3(0.0f, 0.0f, 0.0f);
+        float4 rr_normal_roughness = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float rr_hit_distance = kHalfMax;
 
         CAELIX_BRANCH
         if (surface)
@@ -604,6 +628,34 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             {
                 diffuse = packed;
             }
+
+            CAELIX_BRANCH
+            if (rr_guides)
+            {
+                const uint surface_block = (chain.surface.attrib >> 16) & 0xFFFFu;
+                const CaelixMaterial material = GET_MATERIAL(surface_block);
+                // The RGBA8 guides hold [0, 1]; the chain's transmission is at most 1 without the
+                // checkerboard (RR forces it off).
+                const float3 transmission = saturate(chain.throughput);
+                const float3 surface_normal = chain.surface.normal;
+                if (IsOpaque(int(surface_block)))
+                {
+                    const float roughness = 1.0f - material.smoothness;
+                    const float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), material.albedo, material.metallic);
+                    const float NoV = dot(surface_normal, -chain.ray.Direction);
+                    rr_diffuse_albedo = transmission * material.albedo * (1.0f - material.metallic);
+                    rr_specular_albedo = transmission * EnvBRDFApprox2(f0, roughness * roughness, NoV);
+                    rr_normal_roughness = float4(surface_normal, roughness);
+                }
+                else
+                {
+                    // Rough glass (shaded stochastically): all of its light is specular.
+                    rr_diffuse_albedo = float3(0.0f, 0.0f, 0.0f);
+                    rr_specular_albedo = transmission;
+                    rr_normal_roughness = float4(surface_normal, 1.0f - material.smoothness);
+                }
+                rr_hit_distance = (stochastic.a > 0.0f && stochastic.a < fc.t_max) ? stochastic.a : kHalfMax;
+            }
         }
         else if (hit)
         {
@@ -617,5 +669,14 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         g_int_deterministic[pixel] = float4(SanitizeRadiance(deterministic), coverage);
         g_int_diff[pixel] = diffuse;
         g_int_spec[pixel] = specular;
+        g_int_depth[pixel] = float4(device_depth, 0.0f, 0.0f, 0.0f);
+        CAELIX_BRANCH
+        if (rr_guides)
+        {
+            g_int_rr_diffuse_albedo[pixel] = float4(saturate(rr_diffuse_albedo), 1.0f);
+            g_int_rr_specular_albedo[pixel] = float4(saturate(rr_specular_albedo), 1.0f);
+            g_int_rr_normal_roughness[pixel] = rr_normal_roughness;
+            g_int_rr_hit_dist[pixel] = float4(rr_hit_distance, 0.0f, 0.0f, 0.0f);
+        }
     }
 }

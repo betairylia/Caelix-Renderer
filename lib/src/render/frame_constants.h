@@ -6,7 +6,7 @@ namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
 // together. One per render call, in a host-visible buffer; its device address is
-// the only push constant of the trace and composite kernels. 528 bytes. Every field sits at an offset
+// the only push constant of the trace and composite kernels. 544 bytes. Every field sits at an offset
 // that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
 // std430 and scalar layout rules give the same offsets.
 struct FrameConstants
@@ -15,7 +15,7 @@ struct FrameConstants
     float right[4];                     //  16  camera basis, w unused
     float up[4];                        //  32
     float forward[4];                   //  48
-    uint32_t size[2];                   //  64  target width, height in pixels
+    uint32_t size[2];                   //  64  render width, height in pixels (the targets; with an upscaler the render size)
     float tan_half_fov_y;               //  72
     float aspect;                       //  76
     float near_z;                       //  80
@@ -70,10 +70,12 @@ struct FrameConstants
     uint32_t sky_cubemap;               // 508  1 = the kernels sample the host cubemap, 0 = the procedural sky
     float sky_max_lod;                  // 512  mip_levels - 1 of the cubemap
     float sky_sh_lod;                   // 516  the mip the SH kernel samples (face about 32 px)
-    uint32_t pad_520;                   // 520
-    uint32_t pad_524;                   // 524
+    uint32_t output_size[2];            // 520  the colour target's size (= size without an upscaler)
+    uint32_t upscale_src_size[2];       // 528  size of the encode kernel's source (upscaler output, or size on the fallback)
+    uint32_t upscaler;                  // 536  0 none, 1 DLSS SR, 2 DLSS RR (the trace writes the RR guides)
+    uint32_t upscale;                   // 540  1 = the composite / cross resolve write upscale_in instead of the colour target
 };
-static_assert(sizeof(FrameConstants) == 528);
+static_assert(sizeof(FrameConstants) == 544);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -104,6 +106,10 @@ static_assert(offsetof(FrameConstants, emission_scale) == 504);
 static_assert(offsetof(FrameConstants, sky_cubemap) == 508);
 static_assert(offsetof(FrameConstants, sky_max_lod) == 512);
 static_assert(offsetof(FrameConstants, sky_sh_lod) == 516);
+static_assert(offsetof(FrameConstants, output_size) == 520);
+static_assert(offsetof(FrameConstants, upscale_src_size) == 528);
+static_assert(offsetof(FrameConstants, upscaler) == 536);
+static_assert(offsetof(FrameConstants, upscale) == 540);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

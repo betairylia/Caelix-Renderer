@@ -194,9 +194,10 @@ typedef struct CaelixUnityFramePacket
 /* CaelixUnityViewPacket::flags */
 #define CAELIX_UNITY_VIEW_REPORT_TIMINGS 1u /* this view's GPU timings go to CaelixUnityStatus */
 
-/* One render event. 488 bytes. The plugin accesses every present target (AccessTexture); a
-   target that AccessTexture refuses, without STORAGE usage, or of another size than the colour
-   target is dropped (logged a few times) and the frame renders without it. */
+/* One render event. 504 bytes (488 before the DLSS step grew CaelixRenderOptions). The plugin
+   accesses every present target (AccessTexture); a target that AccessTexture refuses, without
+   STORAGE usage, or of another size than the colour target is dropped (logged a few times) and the
+   frame renders without it. */
 typedef struct CaelixUnityViewPacket
 {
     CaelixUnityPacketHeader header; /* kind CAELIX_UNITY_PACKET_VIEW */

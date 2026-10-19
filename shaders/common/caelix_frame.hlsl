@@ -1,6 +1,6 @@
 // Per-frame constants of the trace and composite kernels. Mirrors
 // lib/src/render/frame_constants.h; change both together. The kernel's only push constant is the device address of
-// one CaelixFrameConstants (528 bytes). Every field sits at an offset that is a multiple of its
+// one CaelixFrameConstants (544 bytes). Every field sits at an offset that is a multiple of its
 // size, so std430 and scalar layout rules give the same offsets.
 #ifndef CAELIX_FRAME_HLSL
 #define CAELIX_FRAME_HLSL
@@ -13,7 +13,7 @@ struct CaelixFrameConstants
     float4 right;                   //  16  camera basis (+X right, +Y up, +Z forward), w unused
     float4 up;                      //  32
     float4 forward;                 //  48
-    uint2 size;                     //  64  target width, height in pixels
+    uint2 size;                     //  64  render width, height in pixels (with an upscaler the render size)
     float tan_half_fov_y;           //  72
     float aspect;                   //  76
     float near_z;                   //  80
@@ -68,8 +68,10 @@ struct CaelixFrameConstants
     uint sky_cubemap;               // 508  1 = sample the host cubemap (g_sky), 0 = procedural sky
     float sky_max_lod;              // 512  mip_levels - 1 of the cubemap
     float sky_sh_lod;               // 516  the mip the SH kernel samples (face about 32 px)
-    uint pad_520;                   // 520
-    uint pad_524;                   // 524  -> 528
+    uint2 output_size;              // 520  the colour target's size (= size without an upscaler)
+    uint2 upscale_src_size;         // 528  size of the encode kernel's source image
+    uint upscaler;                  // 536  kUpscaler*: 2 = the trace writes the RR guide images
+    uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear) -> 544
 };
 
 struct CaelixTracePush
@@ -89,6 +91,11 @@ static const uint kViewNrdDiff = 7;        // path trace mode: denoised diffuse 
 static const uint kViewMotion = 8;         // path trace mode: the motion vector of the primary hit
 static const uint kViewMaterial = 9;       // primary mode: the material table's albedo, tinted by kind
 static const uint kViewNrdSpec = 10;       // path trace mode: denoised specular radiance
+
+// CaelixUpscaler
+static const uint kUpscalerNone = 0;
+static const uint kUpscalerDlssSr = 1;
+static const uint kUpscalerDlssRr = 2;
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

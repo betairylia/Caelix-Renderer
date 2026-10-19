@@ -63,8 +63,15 @@ extern "C" {
    CaelixMaterialEntry and caelix_scene_set_material_entries, appended
    CaelixSceneStats::upload_bricks_free and made a second caelix_renderer_render of one renderer with a
    frame_number not above its previous one an error (CAELIX_ERROR_INVALID_ARGUMENT), also without a
-   bump. A host built against an older version-2 header must be rebuilt (the library reads and writes
-   the larger structs). */
+   bump. The DLSS step appended upscaler, upscale_quality, upscale_preset and upscale_flags to
+   CaelixRenderOptions (176 -> 192 bytes) and CaelixGpuTimings::upscale_ms (24 -> 32 bytes), and
+   added CaelixUpscaler, CaelixUpscaleQuality, CAELIX_UPSCALE_FLAG_*, the upscaler query
+   (CaelixUpscalerQueryDesc, CaelixUpscalerQueryResult, CaelixUpscalerUnsupportedReason,
+   caelix_upscaler_query), the extension lists (caelix_upscaler_instance_extensions,
+   caelix_upscaler_device_extensions), the jitter helpers (caelix_upscaler_jitter_phases,
+   caelix_jitter_halton) and CaelixUpscalerInfo with caelix_renderer_get_upscaler_info, also without
+   a bump. A host built against an older version-2 header must be rebuilt (the library reads and
+   writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
 typedef struct CaelixVersion
@@ -529,11 +536,37 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
  * sky_horizon, sky_ground) is used. CaelixRenderOptions::fog_density / fog_color make the air a
  * homogeneous absorbing and emitting medium for every segment that ends on a surface;
  * emission_scale multiplies every material's emission in every mode.
- * In the two lighting modes the renderer owns internal targets (about 90 bytes per pixel) sized to
- * the host's targets; they are created at the first lighting render and recreated when the target
- * size changes. The NRD instance (its own pools, see caelix_renderer_get_nrd_info) is created at the
- * first denoised render and recreated (history lost) when the target size changes: NRD has no
- * resize. Its 14 compute pipelines are created again too, a one-time CPU cost per size change.
+ * In the two lighting modes the renderer owns internal targets (about 120 bytes per pixel) sized to
+ * the host's targets (the render size with an upscaler); they are created at the first lighting
+ * render and recreated when the target size changes. The NRD instance (its own pools, see
+ * caelix_renderer_get_nrd_info) is created at the first denoised render and recreated (history
+ * lost) when the target size changes: NRD has no resize.
+ *
+ * Upscalers (CaelixRenderOptions::upscaler, CAELIX_MODE_PATH_TRACE with a colour target only;
+ * docs/DLSS.md): NVIDIA DLSS Super Resolution (CAELIX_UPSCALER_DLSS_SR, keeps NRD as the denoiser)
+ * or DLSS Ray Reconstruction (CAELIX_UPSCALER_DLSS_RR, replaces NRD). The renderer then traces at
+ * the RENDER size and the upscaler writes the OUTPUT size:
+ *   - the colour target has the output size; every other present target (albedo, normal, depth,
+ *     motion, view_z) has the render size that caelix_upscaler_query reports for that upscaler,
+ *     quality and output size. A mismatch returns CAELIX_ERROR_INVALID_ARGUMENT with a log line
+ *     naming the expected size. The internal targets have the render size. The output must be at
+ *     least 64 x 32.
+ *   - CAELIX_MODE_PRIMARY, CAELIX_MODE_REFERENCE and a render without a colour target ignore the
+ *     upscaler (every present target then has one size, as without an upscaler).
+ *   - DLSS RR ignores CaelixRenderOptions::denoise and forces CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD
+ *     off (the RR guide forbids checkerboard rendering). DLSS SR keeps both.
+ *   - The debug views of the path trace mode are upscaled like the colour (NRD's validation overlay
+ *     is not drawn; the motion view is not sRGB-encoded).
+ *   - CAELIX_ERROR_UNSUPPORTED when the upscaler is not available (the build has no DLSS, NGX does
+ *     not start, the GPU or driver lacks the feature, or the quality is unavailable): query first.
+ *   - When NGX reports an error (feature creation or evaluation), the frame is recorded with the
+ *     fallback (nearest upscale of the render-size colour), the call returns CAELIX_ERROR_VULKAN
+ *     once, and later calls return CAELIX_OK with CaelixUpscalerInfo::failed = 1 until the upscaler
+ *     options (upscaler, quality, preset, sizes, auto exposure, depth direction) change.
+ *   - The upscaler keeps a history: CAELIX_UPSCALE_FLAG_RESET_HISTORY, reset_accumulation, the
+ *     first frame of a new upscaler and the first render call of the renderer drop it.
+ *   - Jitter: vary CaelixCamera::jitter every frame (caelix_jitter_halton with
+ *     caelix_upscaler_jitter_phases phases); the upscaler receives it as its jitter offset.
  *
  * G-buffer mode: a host with its own deferred pipeline passes only the geometry targets (no colour
  * target). The library then writes no lighting at all: per pixel, the material albedo, the world
@@ -737,6 +770,29 @@ typedef struct CaelixSkyCubemap
     uint32_t mip_levels; /* mip levels of the image (>= 1); the library samples up to the last */
 } CaelixSkyCubemap;
 
+/* CaelixRenderOptions::upscaler (see "Upscalers" above). */
+typedef enum CaelixUpscaler
+{
+    CAELIX_UPSCALER_NONE = 0,
+    CAELIX_UPSCALER_DLSS_SR = 1, /* NVIDIA DLSS Super Resolution; NRD stays the denoiser */
+    CAELIX_UPSCALER_DLSS_RR = 2  /* NVIDIA DLSS Ray Reconstruction; replaces NRD */
+} CaelixUpscaler;
+
+/* CaelixRenderOptions::upscale_quality: the render size per output size (DLSS execution modes). */
+typedef enum CaelixUpscaleQuality
+{
+    CAELIX_UPSCALE_DLAA = 0,             /* render size = output size (anti-aliasing only) */
+    CAELIX_UPSCALE_QUALITY = 1,          /* about 0.67 per axis */
+    CAELIX_UPSCALE_BALANCED = 2,         /* about 0.58 per axis */
+    CAELIX_UPSCALE_PERFORMANCE = 3,      /* 0.5 per axis */
+    CAELIX_UPSCALE_ULTRA_PERFORMANCE = 4 /* about 0.33 per axis */
+} CaelixUpscaleQuality;
+
+/* CaelixRenderOptions::upscale_flags */
+#define CAELIX_UPSCALE_FLAG_RESET_HISTORY (1u << 0) /* this frame: drop the upscaler's history (a cut) */
+#define CAELIX_UPSCALE_FLAG_AUTO_EXPOSURE (1u << 1) /* DLSS SR: NGX auto exposure instead of a fixed
+                                                       exposure of 1 (the colour is already exposed) */
+
 /* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
 typedef struct CaelixRenderOptions
 {
@@ -805,6 +861,14 @@ typedef struct CaelixRenderOptions
     float fog_color[3];                /* radiance of the fog, linear RGB (exposure applies) */
     float pad3;
     CaelixSkyCubemap sky; /* lighting modes: the sky cubemap; image 0 = the procedural sky */
+    uint32_t upscaler;        /* CaelixUpscaler; CAELIX_MODE_PATH_TRACE with a colour target only, else
+                                 ignored (an unknown value is an error in every mode) */
+    uint32_t upscale_quality; /* CaelixUpscaleQuality (checked when upscaler != NONE) */
+    uint32_t upscale_preset;  /* 0 = the NGX default; else the raw NGX preset enum value (SR:
+                                 NVSDK_NGX_DLSS_Hint_Render_Preset_*, RR:
+                                 NVSDK_NGX_RayReconstruction_Hint_Render_Preset_*), set as the hint
+                                 of the chosen quality mode */
+    uint32_t upscale_flags;   /* CAELIX_UPSCALE_FLAG_* */
 } CaelixRenderOptions;
 
 /* The images of one render call. A target is PRESENT when its `image` is nonzero; an absent target
@@ -867,10 +931,19 @@ typedef struct CaelixRenderTargets
    not above safe_frame_number, a frame number not above this renderer's previous successful call's
    (one render per renderer per frame), a ninth frame in flight,
    a sky image (CaelixRenderOptions::sky) with format VK_FORMAT_UNDEFINED, size 0, mip_levels 0 or
-   layout VK_IMAGE_LAYOUT_UNDEFINED, or a negative or non-finite fog_density or emission_scale;
+   layout VK_IMAGE_LAYOUT_UNDEFINED, a negative or non-finite fog_density or emission_scale, an
+   unknown upscaler, and with an active upscaler an unknown upscale_quality, an output below 64 x 32
+   or a target that does not have its expected size (see "Upscalers");
    CAELIX_ERROR_OUT_OF_MEMORY when the internal targets of the lighting modes or the NRD instance
    cannot be allocated (nothing is recorded); CAELIX_ERROR_UNSUPPORTED when a target format
-   cannot be written as a storage image without a format qualifier.
+   cannot be written as a storage image without a format qualifier, or when the requested upscaler
+   is not available.
+   Upscaler (see "Upscalers"): after the composite (which then writes an internal render-size
+   image instead of the colour target) the call records the upscaler's evaluate (DLSS records its
+   own dispatches and barriers; the library rebinds its own state after it) and one compute dispatch
+   (8 x 8 per workgroup, at the output size) that writes the colour target from the upscaler's
+   output, both between two timestamps (upscale_ms). The first frame of a new upscaler also records
+   the NGX feature creation.
    Sky cubemap (lighting modes with CaelixRenderOptions::sky.image != 0): before the trace the call
    records one small compute dispatch that projects the cubemap onto the irradiance SH and a
    barrier; both lie inside the trace timestamps (trace_ms).
@@ -904,6 +977,9 @@ typedef struct CaelixGpuTimings
     uint64_t frame_number; /* the frame the values belong to; 0 = none yet */
     float composite_ms;    /* the composite dispatch of that frame; 0 when it had none (primary mode) */
     float denoise_ms;      /* NRD's dispatches of that frame; 0 when it was not denoised */
+    float upscale_ms;      /* the upscaler of that frame: its evaluate (DLSS) and the dispatch that
+                              encodes its output into the colour target (on the fallback after an
+                              NGX error, that dispatch only); 0 when the frame had no upscaler */
 } CaelixGpuTimings;
 
 /* Fills *out. A NULL argument is ignored. All zero when the queue has no timestamp support. */
@@ -931,6 +1007,91 @@ typedef struct CaelixNrdInfo
 /* Fills *out. Returns CAELIX_ERROR_INVALID_ARGUMENT (logged) for a NULL argument. */
 CAELIX_API CaelixResult caelix_renderer_get_nrd_info(const CaelixRenderer* renderer,
                                                      CaelixNrdInfo* out);
+
+/* ---------------------------------------------------------------------------
+ * Upscalers: availability, Vulkan extensions, jitter, state (see "Upscalers" in the renderer
+ * section and docs/DLSS.md)
+ * ------------------------------------------------------------------------- */
+
+typedef struct CaelixUpscalerQueryDesc
+{
+    uint32_t upscaler;                  /* CaelixUpscaler */
+    uint32_t quality;                   /* CaelixUpscaleQuality */
+    uint32_t output_width, output_height; /* the colour target size */
+} CaelixUpscalerQueryDesc;
+
+typedef enum CaelixUpscalerUnsupportedReason
+{
+    CAELIX_UPSCALER_OK = 0,
+    CAELIX_UPSCALER_NOT_BUILT = 1,           /* the library was built without the upscaler (CAELIX_DLSS=OFF) */
+    CAELIX_UPSCALER_NO_NGX = 2,              /* NGX did not start: no NVIDIA driver, a DLL or a device
+                                                extension is missing (see the log) */
+    CAELIX_UPSCALER_FEATURE_UNAVAILABLE = 3, /* the GPU or the NGX runtime lacks the feature */
+    CAELIX_UPSCALER_DRIVER_TOO_OLD = 4,      /* see min_driver_major / min_driver_minor */
+    CAELIX_UPSCALER_QUALITY_UNAVAILABLE = 5, /* the feature has no render size for this quality */
+    CAELIX_UPSCALER_BAD_ARGUMENT = 6         /* output below 64 x 32 */
+} CaelixUpscalerUnsupportedReason;
+
+typedef struct CaelixUpscalerQueryResult
+{
+    uint32_t supported; /* 1 = the device, driver and build support this upscaler at this quality */
+    uint32_t reason;    /* CaelixUpscalerUnsupportedReason when supported = 0, else CAELIX_UPSCALER_OK */
+    uint32_t render_width, render_height; /* optimal render size, the size the renderer requires
+                                             (0 when unsupported) */
+    uint32_t render_min_width, render_min_height, render_max_width, render_max_height; /* the
+                                             feature's dynamic range (informative; the renderer uses
+                                             the optimal size) */
+    uint32_t min_driver_major, min_driver_minor; /* when the driver is too old, else 0 */
+} CaelixUpscalerQueryResult;
+
+/* Fills *out for `desc`. Returns CAELIX_OK also when the upscaler is unsupported (read
+   `supported`); CAELIX_ERROR_INVALID_ARGUMENT for a null argument or an unknown upscaler or quality.
+   CAELIX_UPSCALER_NONE is always supported with render size = output size. Creates the device's
+   NGX runtime on first use (also done by the first upscaled render). */
+CAELIX_API CaelixResult caelix_upscaler_query(CaelixDevice* device, const CaelixUpscalerQueryDesc* desc,
+                                              CaelixUpscalerQueryResult* out);
+
+/* Vulkan extensions the upscalers need, as NGX reports them (the union over DLSS SR and RR). The
+   strings and the array are owned by the library; count 0 (and a null array) when the build has no
+   upscaler. The instance list needs nothing: call it before vkCreateInstance and enable the names
+   the instance supports. A null argument is ignored. */
+CAELIX_API void caelix_upscaler_instance_extensions(uint32_t* out_count, const char* const** out_names);
+/* The device list needs the VkInstance and the VkPhysicalDevice (NGX's own loader queries them):
+   call it before vkCreateDevice and enable the names the physical device supports (without them
+   NGX does not start: CAELIX_UPSCALER_NO_NGX). The array stays valid until the next call of this
+   function. CAELIX_ERROR_INVALID_ARGUMENT for a null argument or a zero handle; CAELIX_ERROR_VULKAN
+   when NGX's query fails (logged; count 0). */
+CAELIX_API CaelixResult caelix_upscaler_device_extensions(uint64_t instance, uint64_t physical_device,
+                                                          uint32_t* out_count,
+                                                          const char* const** out_names);
+
+/* Jitter helpers (pure functions, any thread, also without an upscaler in the build).
+   caelix_upscaler_jitter_phases: the jitter sequence length the DLSS guide recommends,
+   8 * ceil((output_width / render_width)^2), at least 32 for CAELIX_UPSCALER_DLSS_RR (the RR
+   guide asks for at least 32). A zero width counts as a ratio of 1.
+   caelix_jitter_halton: the Halton(2, 3) point number (index % phases) + 1 minus 0.5, so both
+   values lie in [-0.5, 0.5): out_jitter[0] = Halton base 2, out_jitter[1] = Halton base 3 (pass
+   them as CaelixCamera::jitter). phases 0 does not wrap. */
+CAELIX_API uint32_t caelix_upscaler_jitter_phases(uint32_t upscaler, uint32_t render_width,
+                                                  uint32_t output_width);
+CAELIX_API void caelix_jitter_halton(uint32_t index, uint32_t phases, float out_jitter[2]);
+
+/* The renderer's current upscaler: the options of its newest upscaled render call. All zero until
+   the first one. */
+typedef struct CaelixUpscalerInfo
+{
+    uint32_t upscaler; /* CaelixUpscaler */
+    uint32_t quality;  /* CaelixUpscaleQuality */
+    uint32_t preset;   /* the preset hint (0 = NGX default) */
+    uint32_t render_width, render_height, output_width, output_height;
+    uint32_t failed;         /* 1 after an NGX error: the renderer falls back to the nearest upscale
+                                until the upscaler options change */
+    uint32_t depth_inverted; /* 1 when the host projection is reverse Z (detected per call) */
+} CaelixUpscalerInfo;
+
+/* Fills *out. Returns CAELIX_ERROR_INVALID_ARGUMENT (logged) for a NULL argument. */
+CAELIX_API CaelixResult caelix_renderer_get_upscaler_info(const CaelixRenderer* renderer,
+                                                          CaelixUpscalerInfo* out);
 
 /* Reserved for later (not declared yet):
  *   caelix_scene_upload_brick_summaries - per-brick summaries for bricks that are known but not

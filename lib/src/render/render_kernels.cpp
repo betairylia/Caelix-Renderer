@@ -18,8 +18,8 @@ namespace {
 VkDescriptorSetLayout CreateSetLayout(VkDevice device, uint32_t count,
                                       const VkDescriptorType* types)
 {
-    VkDescriptorSetLayoutBinding bindings[16];
-    VkDescriptorBindingFlags binding_flags[16];
+    VkDescriptorSetLayoutBinding bindings[kMaxSetBindings];
+    VkDescriptorBindingFlags binding_flags[kMaxSetBindings];
     for (uint32_t i = 0; i < count; ++i)
     {
         bindings[i] = {i, types[i], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -57,13 +57,14 @@ void Check(VkResult result, const char* call)
 RenderKernels::RenderKernels(Device& device)
     : device_(device)
 {
-    static_assert(kTraceBindingCount <= 16 && kCompositeBindingCount <= 16,
-                  "CreateSetLayout handles at most 16 bindings");
+    static_assert(kTraceBindingCount <= kMaxSetBindings && kCompositeBindingCount <= kMaxSetBindings &&
+                      kEncodeBindingCount <= kMaxSetBindings,
+                  "CreateSetLayout handles at most kMaxSetBindings bindings");
     const VkDevice vk_device = device.device();
     try
     {
-        // Trace set: binding 0 the TLAS, bindings 1..6 the host targets, 7..13 the
-        // internal targets, 14 the sky cubemap, 15 its sampler. Every binding is
+        // Trace set: binding 0 the TLAS, bindings 1..6 the host targets, 7..18 the
+        // internal targets, 19 the sky cubemap, 20 its sampler. Every binding is
         // PARTIALLY_BOUND (descriptorBindingPartiallyBound, a device requirement): a render
         // call writes only the TLAS when there is one, the targets that are present, the
         // internal targets in the lighting modes and the sky bindings, and the kernel
@@ -74,8 +75,9 @@ RenderKernels::RenderKernels(Device& device)
         trace_types[kTraceSkyBinding] = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         trace_types[kTraceSkyBinding + 1] = VK_DESCRIPTOR_TYPE_SAMPLER;
         trace_layout_ = CreateSetLayout(vk_device, kTraceBindingCount, trace_types);
-        // Composite set: binding 0 the host colour target, 1..8 internal targets, 9 the sky
-        // cubemap, 10 its sampler. The cross resolve kernel uses the same layout and set.
+        // Composite set: binding 0 the host colour target, 1..8 internal targets, 9 the upscale
+        // input, 10 the sky cubemap, 11 its sampler. The cross resolve kernel uses the same layout
+        // and set.
         VkDescriptorType composite_types[kCompositeBindingCount];
         std::fill(composite_types, composite_types + kCompositeBindingCount,
                   VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
@@ -86,6 +88,10 @@ RenderKernels::RenderKernels(Device& device)
         const VkDescriptorType sky_types[2] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                                VK_DESCRIPTOR_TYPE_SAMPLER};
         sky_layout_ = CreateSetLayout(vk_device, 2, sky_types);
+        // Encode set: three storage images (host colour, source, internal albedo).
+        const VkDescriptorType encode_types[kEncodeBindingCount] = {
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+        encode_layout_ = CreateSetLayout(vk_device, kEncodeBindingCount, encode_types);
 
         const std::vector<uint32_t> trace_spirv = LoadShader("caelix_path_trace");
         trace_ = ComputePipeline(vk_device, trace_spirv, sizeof(TracePush), "caelix_path_trace",
@@ -99,6 +105,9 @@ RenderKernels::RenderKernels(Device& device)
         const std::vector<uint32_t> sky_sh_spirv = LoadShader("caelix_sky_sh");
         sky_sh_ = ComputePipeline(vk_device, sky_sh_spirv, sizeof(TracePush), "caelix_sky_sh",
                                   sky_layout_);
+        const std::vector<uint32_t> encode_spirv = LoadShader("caelix_upscale_encode");
+        upscale_encode_ = ComputePipeline(vk_device, encode_spirv, sizeof(TracePush), "caelix_upscale_encode",
+                                          encode_layout_);
 
         // The sky sampler: trilinear, clamp to edge (a cube view samples across faces anyway),
         // every mip (the kernels clamp the lod to sky_max_lod).
@@ -133,11 +142,13 @@ RenderKernels::RenderKernels(Device& device)
         composite_ = ComputePipeline();
         cross_resolve_ = ComputePipeline();
         sky_sh_ = ComputePipeline();
+        upscale_encode_ = ComputePipeline();
         if (sky_sampler_ != VK_NULL_HANDLE)
         {
             vkDestroySampler(vk_device, sky_sampler_, nullptr);
         }
-        for (const VkDescriptorSetLayout layout : {trace_layout_, composite_layout_, sky_layout_})
+        for (const VkDescriptorSetLayout layout :
+             {trace_layout_, composite_layout_, sky_layout_, encode_layout_})
         {
             if (layout != VK_NULL_HANDLE)
             {
@@ -147,7 +158,7 @@ RenderKernels::RenderKernels(Device& device)
         throw;
     }
     CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_composite, caelix_cross_resolve, "
-                "caelix_sky_sh");
+                "caelix_sky_sh, caelix_upscale_encode");
 }
 
 RenderKernels::~RenderKernels()
@@ -162,6 +173,7 @@ RenderKernels::~RenderKernels()
     composite_ = ComputePipeline();
     cross_resolve_ = ComputePipeline();
     sky_sh_ = ComputePipeline();
+    upscale_encode_ = ComputePipeline();
     if (trace_layout_ != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorSetLayout(device, trace_layout_, nullptr);
@@ -173,6 +185,10 @@ RenderKernels::~RenderKernels()
     if (sky_layout_ != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorSetLayout(device, sky_layout_, nullptr);
+    }
+    if (encode_layout_ != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(device, encode_layout_, nullptr);
     }
     if (sky_sampler_ != VK_NULL_HANDLE)
     {

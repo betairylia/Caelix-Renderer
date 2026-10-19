@@ -1,5 +1,5 @@
 // Renderer::Render: validation, descriptors, frame constants, barriers and the
-// pass sequence (sky SH, trace, NRD, composite).
+// pass sequence (sky SH, trace, NRD, composite, upscaler, encode).
 #include "render/renderer.h"
 
 #include "core/log.h"
@@ -8,6 +8,7 @@
 #include "scene/scene.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iterator>
@@ -16,8 +17,11 @@
 namespace caelix {
 namespace {
 
-// [numthreads(8, 8, 1)] in caelix_path_trace.hlsl and caelix_composite.hlsl.
+// [numthreads(8, 8, 1)] in caelix_path_trace.hlsl, caelix_composite.hlsl and caelix_upscale_encode.hlsl.
 constexpr uint32_t kWorkgroupSize = 8;
+// The smallest output of an upscaler (DLSS: 64 x 32).
+constexpr uint32_t kMinUpscaleOutputWidth = 64;
+constexpr uint32_t kMinUpscaleOutputHeight = 32;
 constexpr uint32_t kDebugViewCount = 11;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_NRD_SPEC
 constexpr uint32_t kModeCount = 3;
 constexpr float kDefaultSunAngularRadius = 0.00873f;  // 0.5 degrees
@@ -107,8 +111,8 @@ public:
     }
 
 private:
-    // The targets, the internal targets and the fallback sky cube.
-    VkImageMemoryBarrier2 images_[std::size(kTargetSpecs) + std::size(kInternalSpecs) + 1] = {};
+    // The targets, the internal targets, the fallback sky cube and the upscaler's output.
+    VkImageMemoryBarrier2 images_[std::size(kTargetSpecs) + std::size(kInternalSpecs) + 2] = {};
     uint32_t image_count_ = 0;
     VkMemoryBarrier2 memory_{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     bool has_memory_ = false;
@@ -120,6 +124,11 @@ void Copy3(const float in[3], float out[4])
     out[1] = in[1];
     out[2] = in[2];
     out[3] = 0.0f;
+}
+
+UpscalerImage ImageOf(const GpuImage& image)
+{
+    return UpscalerImage{image.image(), image.view(), image.format(), image.width(), image.height()};
 }
 
 }  // namespace
@@ -194,9 +203,44 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                     options.sky.layout);
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    if (options.upscaler > CAELIX_UPSCALER_DLSS_RR)
+    {
+        CAELIX_LOGE("%s: unknown upscaler %u", kFunction, options.upscaler);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
     const bool lighting = options.mode != CAELIX_MODE_PRIMARY;
     // The host's sky cubemap (lighting modes only; the primary mode never samples the sky).
     const bool sky = lighting && options.sky.image != 0;
+    // The upscaler (path trace mode with a colour target): the colour target has the output size,
+    // every other present target and the internal targets the render size of the query.
+    const bool upscaling = options.mode == CAELIX_MODE_PATH_TRACE && targets.color.image != 0 &&
+                           options.upscaler != CAELIX_UPSCALER_NONE;
+    uint32_t render_width = 0;
+    uint32_t render_height = 0;
+    if (upscaling)
+    {
+        if (options.upscale_quality > CAELIX_UPSCALE_ULTRA_PERFORMANCE)
+        {
+            CAELIX_LOGE("%s: unknown upscale_quality %u", kFunction, options.upscale_quality);
+            return CAELIX_ERROR_INVALID_ARGUMENT;
+        }
+        if (targets.color.width < kMinUpscaleOutputWidth || targets.color.height < kMinUpscaleOutputHeight)
+        {
+            CAELIX_LOGE("%s: the colour target is %ux%u; an upscaler needs at least %ux%u", kFunction,
+                        targets.color.width, targets.color.height, kMinUpscaleOutputWidth, kMinUpscaleOutputHeight);
+            return CAELIX_ERROR_INVALID_ARGUMENT;
+        }
+        const CaelixResult query = QueryUpscaler(options.upscaler, options.upscale_quality, targets.color.width,
+                                                 targets.color.height, render_width, render_height);
+        if (query != CAELIX_OK)
+        {
+            return query;
+        }
+    }
+    // DLSS RR replaces NRD and must not see checkerboard rendering (RR guide 3.5).
+    const bool ray_reconstruction = upscaling && options.upscaler == CAELIX_UPSCALER_DLSS_RR;
+    const uint32_t flags =
+        ray_reconstruction ? (options.flags & ~CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) : options.flags;
 
     // The present targets (image != 0), in binding order.
     const CaelixTargetImage* const all[kTargetCount] = {&targets.color, &targets.albedo,
@@ -218,7 +262,21 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
             CAELIX_LOGE("%s: the %s target needs a format and a nonzero size", kFunction, spec.name);
             return CAELIX_ERROR_INVALID_ARGUMENT;
         }
-        if (present_count > 0)
+        if (upscaling)
+        {
+            const uint32_t expected_width = i == 0 ? targets.color.width : render_width;
+            const uint32_t expected_height = i == 0 ? targets.color.height : render_height;
+            if (target.width != expected_width || target.height != expected_height)
+            {
+                CAELIX_LOGE("%s: the %s target is %ux%u; with upscaler %u at quality %u it must be %ux%u (the "
+                            "render size of caelix_upscaler_query for the %ux%u colour target)",
+                            kFunction, spec.name, target.width, target.height, options.upscaler,
+                            options.upscale_quality, expected_width, expected_height, targets.color.width,
+                            targets.color.height);
+                return CAELIX_ERROR_INVALID_ARGUMENT;
+            }
+        }
+        else if (present_count > 0)
         {
             const CaelixTargetImage& first = *all[present[0]];
             if (target.width != first.width || target.height != first.height)
@@ -265,19 +323,23 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     {
         mask |= kTargetNormalUnorm;
     }
-    const uint32_t width = all[present[0]]->width;
-    const uint32_t height = all[present[0]]->height;
+    // The render size (the size of the trace, the internal targets and every geometry target).
+    const uint32_t width = upscaling ? render_width : all[present[0]]->width;
+    const uint32_t height = upscaling ? render_height : all[present[0]]->height;
     const bool has_color = targets.color.image != 0;
+    const uint32_t output_width = has_color ? targets.color.width : width;
+    const uint32_t output_height = has_color ? targets.color.height : height;
     const bool composite = lighting && has_color;
     // The delta checkerboard (path trace mode only) needs the cross resolve after the composite.
     const bool cross_resolve = composite && options.mode == CAELIX_MODE_PATH_TRACE &&
-                               (options.flags & CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) != 0;
+                               (flags & CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) != 0;
 
     const VkCommandBuffer cmd = HandleFromU64<VkCommandBuffer>(frame.command_buffer);
     const uint64_t safe = frame.safe_frame_number;
     timer_.Resolve(safe);
     composite_timer_.Resolve(safe);
     denoise_timer_.Resolve(safe);
+    upscale_timer_.Resolve(safe);
     FreeRetired(safe);
 
     // Internal targets of the lighting modes and the NRD executor (before anything is
@@ -289,7 +351,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     }
     bool nrd_error = false;
     NrdExecutor* denoiser = nullptr;
-    if (options.mode == CAELIX_MODE_PATH_TRACE && options.denoise != 0 && composite && !nrd_failed_)
+    if (options.mode == CAELIX_MODE_PATH_TRACE && options.denoise != 0 && composite && !nrd_failed_ &&
+        !ray_reconstruction)
     {
         denoiser = EnsureDenoiser(width, height, nrd_error);
     }
@@ -301,6 +364,26 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                     kMaxSlots, static_cast<unsigned long long>(safe),
                     static_cast<unsigned long long>(frame.frame_number));
         return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+
+    // The upscaler of these options (created at its first frame: the NGX feature creation is
+    // recorded into this command buffer; an NGX error here: the fallback for this desc).
+    bool upscale_error = false;
+    Upscaler* upscaler = nullptr;
+    if (upscaling)
+    {
+        UpscalerDesc desc;
+        desc.kind = static_cast<UpscalerKind>(options.upscaler);
+        desc.quality = options.upscale_quality;
+        desc.preset = options.upscale_preset;
+        desc.render_width = width;
+        desc.render_height = height;
+        desc.output_width = output_width;
+        desc.output_height = output_height;
+        desc.depth_inverted = ProjectionDepthInverted(camera);
+        desc.auto_exposure =
+            !ray_reconstruction && (options.upscale_flags & CAELIX_UPSCALE_FLAG_AUTO_EXPOSURE) != 0;
+        upscaler = EnsureUpscaler(desc, cmd, frame.frame_number, upscale_error);
     }
 
     // NRD settings of this frame (an NRD error here: no denoising, raw output).
@@ -410,6 +493,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     Copy3(camera.forward, constants.forward);
     constants.size[0] = width;
     constants.size[1] = height;
+    constants.output_size[0] = output_width;
+    constants.output_size[1] = output_height;
+    constants.upscale_src_size[0] = width;  // the fallback's source; the upscaler's output below
+    constants.upscale_src_size[1] = height;
+    constants.upscaler = upscaling ? options.upscaler : 0u;
+    constants.upscale = upscaling ? 1u : 0u;
     constants.jitter[0] = camera.jitter[0];
     constants.jitter[1] = camera.jitter[1];
     constants.tan_half_fov_y = camera.tan_half_fov_y;
@@ -426,7 +515,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.group_shift = scene_.group_shift();
     constants.encoding = scene_.encoding();
     constants.debug_view = options.debug_view;
-    constants.flags = options.flags;
+    constants.flags = flags;
     float sun[3] = {options.sun_dir[0], options.sun_dir[1], options.sun_dir[2]};
     const float length = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
     if (length > 0.0f && std::isfinite(length))
@@ -547,6 +636,13 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                          VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                          VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, fallback_sky.layers());
         }
+        // The upscaler's new output image: written by the upscaler (any stage), read by the encode.
+        if (upscaling && upscale_out_needs_init_)
+        {
+            before.Image(upscale_out_.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_NONE,
+                         VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
         before.Record(cmd);
     }
     const TracePush push{slot->constants.address()};
@@ -608,12 +704,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     }
     nrd_history_valid_ = denoised;
     constants.denoised = denoised ? 1u : 0u;
-    std::memcpy(slot->constants.mapped(), &constants, sizeof(constants));
-    slot->constants.FlushHostWrites(0, sizeof(constants));
 
     // Composite (lighting modes with a colour target). Bindings 3 and 4 hold NRD's
     // outputs when this frame was denoised, else the raw radiance.
-    // Binding 7 is the motion of the primary hit (CAELIX_VIEW_MOTION); 9 and 10 the sky.
+    // Binding 7 is the motion of the primary hit (CAELIX_VIEW_MOTION); 9 the upscale input
+    // (written instead of the colour target when an upscaler runs); 10 and 11 the sky.
     if (composite)
     {
         write_count = 0;
@@ -621,7 +716,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         const uint32_t composite_internals[] = {
             kInternalAlbedo, kInternalDeterministic, denoised ? kInternalDiffOut : kInternalDiff,
             denoised ? kInternalSpecOut : kInternalSpec, kInternalAccum, kInternalValidation,
-            kInternalMotion, kInternalResolve};
+            kInternalMotion, kInternalResolve, kInternalUpscaleIn};
         static_assert(std::size(composite_internals) + 1 == kCompositeStorageCount);
         for (uint32_t i = 0; i < std::size(composite_internals); ++i)
         {
@@ -663,6 +758,90 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         composite_timer_.End(cmd);
     }
 
+    // Upscaler (renderer_upscale.cpp): the evaluate (its own barriers before and after: the
+    // composite's writes -> its reads, its writes -> the encode's reads), then the encode kernel
+    // writes the colour target from its output; without a working upscaler the encode kernel reads
+    // the upscale input (nearest upscale). Both between the upscale timestamps.
+    if (upscaling)
+    {
+        const bool timed = upscale_timer_.Begin(cmd, frame.frame_number, safe);
+        bool evaluated = false;
+        if (upscaler != nullptr)
+        {
+            UpscalerInputs in;
+            in.color = ImageOf(internal_[kInternalUpscaleIn]);
+            in.depth = ImageOf(internal_[kInternalDepth]);
+            in.motion = ImageOf(internal_[kInternalMotion]);
+            in.output = ImageOf(upscale_out_);
+            if (ray_reconstruction)
+            {
+                in.diffuse_albedo = ImageOf(internal_[kInternalRrDiffuseAlbedo]);
+                in.specular_albedo = ImageOf(internal_[kInternalRrSpecularAlbedo]);
+                in.normal_roughness = ImageOf(internal_[kInternalRrNormalRoughness]);
+                in.specular_hit_distance = ImageOf(internal_[kInternalRrHitDistance]);
+                WorldToView(camera, in.world_to_view);
+                std::memcpy(in.view_to_clip, camera.projection, sizeof(in.view_to_clip));
+            }
+            const auto clamp_jitter = [](float value) {
+                return std::isfinite(value) ? std::clamp(value, -0.5f, 0.5f) : 0.0f;
+            };
+            in.jitter[0] = clamp_jitter(camera.jitter[0]);
+            in.jitter[1] = clamp_jitter(camera.jitter[1]);
+            in.reset = upscaler_new_ || (options.upscale_flags & CAELIX_UPSCALE_FLAG_RESET_HISTORY) != 0 ||
+                       options.reset_accumulation != 0 || !has_prev_camera_;
+            const auto now = std::chrono::steady_clock::now();
+            if (upscale_last_time_ != std::chrono::steady_clock::time_point{})
+            {
+                in.frame_time_ms = std::chrono::duration<float, std::milli>(now - upscale_last_time_).count();
+            }
+            upscale_last_time_ = now;
+            evaluated = upscaler->Evaluate(cmd, in);
+            upscaler_new_ = false;
+            if (!evaluated)
+            {
+                upscaler_failed_ = true;
+                upscale_error = true;
+            }
+        }
+        else
+        {
+            // The fallback: the composite's writes of the upscale input -> the encode's reads.
+            Barriers fallback;
+            fallback.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+            fallback.Record(cmd);
+        }
+        if (evaluated)
+        {
+            constants.upscale_src_size[0] = output_width;
+            constants.upscale_src_size[1] = output_height;
+        }
+        write_count = 0;
+        write_image(slot->encode_set, 0, color_view);
+        write_image(slot->encode_set, 1,
+                    evaluated ? upscale_out_.view() : internal_[kInternalUpscaleIn].view());
+        write_image(slot->encode_set, 2, internal_[kInternalAlbedo].view());
+        vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
+        const ComputePipeline& encode = kernels_.upscale_encode();
+        // NGX changed the command buffer state: everything is bound again.
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, encode.pipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, encode.layout(), 0, 1, &slot->encode_set, 0,
+                                nullptr);
+        vkCmdPushConstants(cmd, encode.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (output_width + kWorkgroupSize - 1) / kWorkgroupSize,
+                      (output_height + kWorkgroupSize - 1) / kWorkgroupSize, 1);
+        if (timed)
+        {
+            upscale_timer_.End(cmd);
+        }
+        upscaler_last_frame_ = frame.frame_number;
+        upscale_out_needs_init_ = false;
+    }
+
+    // The constants are complete (the GPU reads them when the command buffer executes).
+    std::memcpy(slot->constants.mapped(), &constants, sizeof(constants));
+    slot->constants.FlushHostWrites(0, sizeof(constants));
+
     // The kernels' writes -> all later commands (the host's use of its targets).
     {
         Barriers after;
@@ -687,9 +866,9 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         accum_count_ =
             (options.mode == CAELIX_MODE_REFERENCE && composite) ? accum_count + 1 : accum_count;
     }
-    // An NRD error is reported once, by the call in which it happened; the frame is
-    // recorded (raw output) all the same.
-    return nrd_error ? CAELIX_ERROR_VULKAN : CAELIX_OK;
+    // An NRD or NGX error is reported once, by the call in which it happened; the frame is
+    // recorded (raw output, nearest upscale) all the same.
+    return nrd_error || upscale_error ? CAELIX_ERROR_VULKAN : CAELIX_OK;
 }
 
 }  // namespace caelix

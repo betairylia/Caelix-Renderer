@@ -8,19 +8,25 @@
 
 #include <algorithm>
 #include <iterator>
+#include <utility>
 
 namespace caelix {
 
-Renderer::Renderer(Device& device, RenderKernels& kernels, Scene& scene)
+Renderer::Renderer(Device& device, RenderKernels& kernels, Scene& scene, std::function<NgxRuntime*()> ngx)
     : device_(device), kernels_(kernels), scene_(scene)
 {
+#if CAELIX_DLSS
+    ngx_ = std::move(ngx);
+#else
+    static_cast<void>(ngx);
+#endif
 }
 
 CaelixResult Renderer::Create(Device& device, RenderKernels& kernels, Scene& scene,
-                              std::unique_ptr<Renderer>& out)
+                              std::function<NgxRuntime*()> ngx, std::unique_ptr<Renderer>& out)
 {
     out.reset();
-    std::unique_ptr<Renderer> renderer(new Renderer(device, kernels, scene));
+    std::unique_ptr<Renderer> renderer(new Renderer(device, kernels, scene, std::move(ngx)));
     const VkDevice vk_device = device.device();
     static_assert(std::size(kTargetSpecs) == kTargetCount);
     static_assert(std::size(kInternalSpecs) == kInternalCount);
@@ -38,6 +44,7 @@ CaelixResult Renderer::Create(Device& device, RenderKernels& kernels, Scene& sce
     renderer->timer_ = GpuTimer(device);
     renderer->composite_timer_ = GpuTimer(device);
     renderer->denoise_timer_ = GpuTimer(device);
+    renderer->upscale_timer_ = GpuTimer(device);
     CAELIX_LOGI("renderer created (shared kernels), %u frame slots", kInitialSlots);
     out = std::move(renderer);
     return CAELIX_OK;
@@ -56,8 +63,9 @@ Renderer::~Renderer()
     }
     slots_.clear();
     // The device is idle (caelix_renderer_destroy contract): internal_, retired_, the NRD
-    // executors and sky_sh_buffer_ are destroyed with the members. The layouts, pipelines,
-    // sky sampler and fallback sky belong to the RenderKernels.
+    // executors, the upscalers and sky_sh_buffer_ are destroyed with the members (before the
+    // device's NGX runtime, which outlives every renderer). The layouts, pipelines, sky sampler
+    // and fallback sky belong to the RenderKernels.
 }
 
 void Renderer::AddSlot()
@@ -65,16 +73,17 @@ void Renderer::AddSlot()
     const VkDevice device = device_.device();
     auto slot = std::make_unique<FrameSlot>();
     slot->index = static_cast<uint32_t>(slots_.size());
-    // Three sets: trace, composite, sky SH; each has one sampled image and one sampler.
+    // Four sets: trace, composite, sky SH (each has one sampled image and one sampler) and the
+    // upscale encode set (storage images only).
     const VkDescriptorPoolSize sizes[4] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-         kTargetCount + kTraceInternalCount + kCompositeStorageCount},
+         kTargetCount + kTraceInternalCount + kCompositeStorageCount + kEncodeBindingCount},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 3},
     };
     VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pool_info.maxSets = 3;
+    pool_info.maxSets = 4;
     pool_info.poolSizeCount = 4;
     pool_info.pPoolSizes = sizes;
     VkResult result = vkCreateDescriptorPool(device, &pool_info, nullptr, &slot->pool);
@@ -87,12 +96,12 @@ void Renderer::AddSlot()
     // Pushed now so that the destructor destroys the pool if a later call throws.
     slots_.push_back(std::move(slot));
     FrameSlot& added = *slots_.back();
-    const VkDescriptorSetLayout layouts[3] = {kernels_.trace_layout(), kernels_.composite_layout(),
-                                              kernels_.sky_layout()};
-    VkDescriptorSet sets[3] = {};
+    const VkDescriptorSetLayout layouts[4] = {kernels_.trace_layout(), kernels_.composite_layout(),
+                                              kernels_.sky_layout(), kernels_.encode_layout()};
+    VkDescriptorSet sets[4] = {};
     VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     set_info.descriptorPool = added.pool;
-    set_info.descriptorSetCount = 3;
+    set_info.descriptorSetCount = 4;
     set_info.pSetLayouts = layouts;
     result = vkAllocateDescriptorSets(device, &set_info, sets);
     if (result != VK_SUCCESS)
@@ -103,6 +112,7 @@ void Renderer::AddSlot()
     added.set = sets[0];
     added.composite_set = sets[1];
     added.sky_set = sets[2];
+    added.encode_set = sets[3];
     VmaAllocationCreateInfo allocation_info{};
     allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
     allocation_info.flags =
@@ -282,6 +292,9 @@ void Renderer::FreeRetired(uint64_t safe_frame)
     std::erase_if(retired_nrd_, [safe_frame](const RetiredDenoiser& retired) {
         return retired.frame <= safe_frame;
     });
+    std::erase_if(retired_upscalers_, [safe_frame](const RetiredUpscaler& retired) {
+        return retired.frame <= safe_frame;
+    });
 }
 
 void Renderer::GetTimings(CaelixGpuTimings& out) const
@@ -307,6 +320,11 @@ void Renderer::GetTimings(CaelixGpuTimings& out) const
     if (denoise_timer_.MsForFrame(out.frame_number, denoise_ms))
     {
         out.denoise_ms = denoise_ms;
+    }
+    float upscale_ms = 0.0f;
+    if (upscale_timer_.MsForFrame(out.frame_number, upscale_ms))
+    {
+        out.upscale_ms = upscale_ms;
     }
 }
 

@@ -44,7 +44,9 @@ add_library(caelix_renderer SHARED
   src/scene/glass_palette_default.inc
   src/scene/scene_internal.h
   src/scene/slot_table_pool.h
-  # The renderer: per-device kernels, render targets, the pass sequence, NRD.
+  # The renderer: per-device kernels, render targets, the pass sequence, NRD, the upscalers.
+  src/render/dlss_upscaler.cpp
+  src/render/dlss_upscaler.h
   src/render/frame_constants.h
   src/render/nrd_executor.cpp
   src/render/nrd_executor.h
@@ -54,7 +56,9 @@ add_library(caelix_renderer SHARED
   src/render/renderer_denoise.cpp
   src/render/renderer_internal.h
   src/render/renderer_render.cpp
-  src/render/renderer_targets.cpp)
+  src/render/renderer_targets.cpp
+  src/render/renderer_upscale.cpp
+  src/render/upscaler.h)
 set_target_properties(caelix_renderer PROPERTIES OUTPUT_NAME caelix_renderer)
 target_include_directories(caelix_renderer
   PUBLIC ${PROJECT_SOURCE_DIR}/include
@@ -70,7 +74,9 @@ target_compile_definitions(caelix_renderer PRIVATE
   CAELIX_VERSION_MINOR=${PROJECT_VERSION_MINOR}
   CAELIX_VERSION_PATCH=${PROJECT_VERSION_PATCH}
   CAELIX_VERSION_STRING="${PROJECT_VERSION}"
-  CAELIX_NRD_QUAD_INTRINSICS=$<BOOL:${CAELIX_NRD_QUAD_INTRINSICS}>)
+  CAELIX_NRD_QUAD_INTRINSICS=$<BOOL:${CAELIX_NRD_QUAD_INTRINSICS}>
+  # 1: the DLSS upscalers (NGX) are built; 0: every NGX code path is compiled out.
+  CAELIX_DLSS=$<BOOL:${CAELIX_DLSS}>)
 # Strict warnings for our own code only; fetched dependencies keep their defaults.
 if(MSVC)
   target_compile_options(caelix_renderer PRIVATE /W4)
@@ -82,6 +88,15 @@ target_link_libraries(caelix_renderer PRIVATE
   GPUOpen::VulkanMemoryAllocator
   unordered_dense::unordered_dense
   NRD)
+if(CAELIX_DLSS)
+  target_link_libraries(caelix_renderer PRIVATE ngx::ngx)
+  # NGX loads the feature DLLs from the directory of caelix_renderer.dll
+  # (NVSDK_NGX_FeatureCommonInfo::PathListInfo, see dlss_upscaler.cpp); the tests run from there.
+  add_custom_command(TARGET caelix_renderer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CAELIX_NGX_DLLS} $<TARGET_FILE_DIR:caelix_renderer>
+    COMMENT "Copying the NGX feature DLLs (nvngx_dlss.dll, nvngx_dlssd.dll) next to caelix_renderer.dll"
+    VERBATIM)
+endif()
 
 # Kernels (HLSL -> SPIR-V, embedded). See cmake/Shaders.cmake.
 caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
@@ -96,7 +111,9 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_scene_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_output.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite_set.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_cross_resolve.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_sky_sh.hlsl)
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_sky_sh.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_upscale_encode.hlsl)

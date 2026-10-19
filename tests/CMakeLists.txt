@@ -58,3 +58,9 @@ caelix_add_gpu_test(caelix_nrd_test nrd_test.cpp)
 caelix_add_gpu_test(caelix_material_test material_test.cpp)
 target_compile_definitions(caelix_material_test PRIVATE
   CAELIX_GLASS_PALETTE_JSON="${PROJECT_SOURCE_DIR}/data/glass-palette.json")
+
+# The DLSS upscalers (SR, RR) through the C ABI: the availability query, the jitter helpers, SR and
+# RR smoke tests against an accumulated reference, argument checks, quality changes and the upscale
+# cost at 1920x1080. The GPU cases skip themselves when the build (CAELIX_DLSS=OFF) or the machine
+# has no DLSS.
+caelix_add_gpu_test(caelix_dlss_test dlss_test.cpp)

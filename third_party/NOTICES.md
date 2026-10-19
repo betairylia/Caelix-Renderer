@@ -56,6 +56,66 @@ compiled SPIR-V of those shaders ships, not the header.
 8. **Downstream terms** (section 2(c)): whoever distributes the library must do so
    under terms at least as protective of NVIDIA's rights as the NRD license.
 
+## NVIDIA DLSS (NGX SDK)
+
+- Version: v310.9.16 (DLSS 310.9.16 SDK), fetched by CMake (`cmake/Dependencies.cmake`)
+  from `https://github.com/NVIDIA/DLSS` only when `CAELIX_DLSS=ON` (the default on
+  Windows). `CAELIX_DLSS=OFF` removes all of it: no NGX code, no NGX library, no
+  DLLs.
+- License: "NVIDIA RTX SDKs LICENSE" with the "NVIDIA RTX Supplement" (version of
+  March 14, 2024; the same license family as NRD, with stricter terms for the DLSS and
+  NGX SDKs). The full text is `LICENSE.txt` in the fetched source:
+  `build/_deps/ngx-src/LICENSE.txt` after the first CMake configure. Read it before you
+  ship a build. Not yet accepted by the owner for distribution (integration work only).
+
+### What the library contains and ships
+
+- `caelix_renderer.dll` statically links the NGX import library `nvsdk_ngx_d.lib`
+  (dynamic CRT; `nvsdk_ngx_d_dbg.lib` in Debug builds) from
+  `lib/Windows_x86_64/x64`, in object code. The SDK headers are used at build time
+  only; no SDK source is modified or distributed.
+- The feature DLLs `nvngx_dlss.dll` (Super Resolution) and `nvngx_dlssd.dll` (Ray
+  Reconstruction) from `lib/Windows_x86_64/rel` are copied next to
+  `caelix_renderer.dll` (and into the Unity plugin directory when
+  `CAELIX_UNITY_PLUGIN_DIR` is set). These are the files that ship.
+- The development DLLs of `lib/Windows_x86_64/dev` (on-screen watermark and debug
+  overlay) are copied instead only with `CAELIX_DLSS_DEV_DLL=ON`. **They must never
+  ship.**
+
+### Obligations
+
+1. **Distribution in object code only, inside an application with material
+   additional functionality** (license sections 1(c), 2(a)); never as a stand-alone
+   redistribution of the SDK or its DLLs.
+2. **NVIDIA marks in the application** (supplement section 7.1(b), stronger than
+   NRD's credit-screen rule): an application that incorporates the DLSS or NGX SDK
+   must attribute the use of the SDK and include the NVIDIA Marks on its splash
+   screens, in its about box (when it has one) and in the credits of a game. The marks
+   and logos need NVIDIA's prior written approval of a sample (supplement section
+   7.2(c): submit at least two weeks before use; no answer within ten business days
+   means not approved). The game side (Titania, any host that ships this library) owns
+   this obligation.
+3. **Notify NVIDIA before a commercial release** (supplement section 4) of an
+   application, or of a plug-in to a commercial application, that incorporates the
+   DLSS or NGX SDK: `https://developer.nvidia.com/sw-notification`, with company,
+   publisher and developer name, the SDK used, application name, platform, scheduled
+   ship date and a link to the product or a video.
+4. **NVIDIA GPUs only** (supplement section 1): the DLSS and NGX SDKs are licensed for
+   applications that use them on systems with NVIDIA GPUs, and the application must
+   stay fully interoperable with compatible NVIDIA GPUs. (The library itself runs on
+   other GPUs without DLSS: `caelix_upscaler_query` reports the feature as
+   unavailable.)
+5. **Cloud use is limited** (supplement section 3): only cloud services on NVIDIA vGPU
+   software are in scope.
+6. **Integration quality** (supplement section 6.2): a public DLSS integration with
+   material stability, performance or image quality issues must be fixed quickly;
+   NVIDIA may disable it as a last resort. NVIDIA may also update the SDK over the air
+   (section 6.1).
+7. **No endorsement claim** (section 4(c)), **no open-source relicensing** (section
+   4(e)), **downstream terms at least as protective** (section 2(c)), as for NRD above.
+8. **Source notice** (section 2(b)): only for distributed modifications of SDK source;
+   this project distributes none.
+
 ## Other dependencies
 
 volk, VulkanMemoryAllocator and unordered_dense (MIT licenses) are compiled into

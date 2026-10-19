@@ -15,19 +15,27 @@ namespace caelix {
 // Descriptor bindings of the kernel sets, shared by the set layouts (RenderKernels)
 // and the descriptor writes (Renderer).
 //
-// Trace set: binding 0 the TLAS, bindings 1..6 the host targets, bindings 7..13 the
+// Trace set: binding 0 the TLAS, bindings 1..6 the host targets, bindings 7..18 the
 // internal targets of the lighting modes (Renderer::Internal order up to
-// kInternalAccum), binding 14 the sky cubemap (sampled image), 15 its sampler.
-constexpr uint32_t kTargetCount = 6;         // descriptor bindings 1..6
-constexpr uint32_t kTraceInternalCount = 7;  // descriptor bindings 7..13
+// kInternalAccum: the NRD G-buffer and radiance, the device depth and the four DLSS RR
+// guides), binding 19 the sky cubemap (sampled image), 20 its sampler.
+constexpr uint32_t kTargetCount = 6;          // descriptor bindings 1..6
+constexpr uint32_t kTraceInternalCount = 12;  // descriptor bindings 7..18
 constexpr uint32_t kTraceSkyBinding = 1 + kTargetCount + kTraceInternalCount;
 constexpr uint32_t kTraceBindingCount = kTraceSkyBinding + 2;
 // Composite set (also bound by the cross resolve kernel): binding 0 the host colour
-// target, bindings 1..8 internal targets (8 = the resolve image), binding 9 the sky
-// cubemap (sampled image), 10 its sampler.
-constexpr uint32_t kCompositeStorageCount = 9;  // bindings 0..8
+// target, bindings 1..8 internal targets (8 = the resolve image), binding 9 the upscale
+// input (the composite's linear output when an upscaler runs), binding 10 the sky
+// cubemap (sampled image), 11 its sampler.
+constexpr uint32_t kCompositeStorageCount = 10;  // bindings 0..9
 constexpr uint32_t kCompositeSkyBinding = kCompositeStorageCount;
 constexpr uint32_t kCompositeBindingCount = kCompositeSkyBinding + 2;
+// Encode set (caelix_upscale_encode, upscaled frames only): binding 0 the host colour target,
+// binding 1 the source (the upscaler's output, or the upscale input on the fallback), binding 2
+// the internal albedo (coverage in alpha).
+constexpr uint32_t kEncodeBindingCount = 3;
+// The most bindings of one set (the arrays of CreateSetLayout).
+constexpr uint32_t kMaxSetBindings = 32;
 
 // The NRD objects that every NrdExecutor of a device shares: the samplers, the two
 // set layouts, the pipeline layout and the pipelines, and the parts of the
@@ -65,10 +73,10 @@ struct NrdKernels
 // The immutable GPU objects of the render kernels, created once per adopted device
 // and borrowed by every Renderer and NrdExecutor of that device:
 // - the descriptor set layouts of the trace set, the composite set (also used by the
-//   cross resolve kernel) and the sky SH set (binding 0 the cubemap, 1 the sampler),
-//   every binding PARTIALLY_BOUND;
-// - the compute pipelines caelix_path_trace, caelix_composite, caelix_cross_resolve and
-//   caelix_sky_sh (push constant TracePush);
+//   cross resolve kernel), the sky SH set (binding 0 the cubemap, 1 the sampler) and the
+//   encode set, every binding PARTIALLY_BOUND;
+// - the compute pipelines caelix_path_trace, caelix_composite, caelix_cross_resolve,
+//   caelix_sky_sh and caelix_upscale_encode (push constant TracePush);
 // - the sky sampler (linear, mipmapped, clamp to edge) and the fallback sky cube (1 x 1
 //   RGBA8), bound in every sky binding when the host gives no cubemap. The first render
 //   call on the device moves the cube from UNDEFINED to GENERAL (TakeFallbackSkyInit);
@@ -96,6 +104,10 @@ public:
     {
         return sky_layout_;
     }
+    VkDescriptorSetLayout encode_layout() const
+    {
+        return encode_layout_;
+    }
     const ComputePipeline& trace() const
     {
         return trace_;
@@ -111,6 +123,10 @@ public:
     const ComputePipeline& sky_sh() const
     {
         return sky_sh_;
+    }
+    const ComputePipeline& upscale_encode() const
+    {
+        return upscale_encode_;
     }
     VkSampler sky_sampler() const
     {
@@ -144,10 +160,12 @@ private:
     VkDescriptorSetLayout trace_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout composite_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout sky_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout encode_layout_ = VK_NULL_HANDLE;
     ComputePipeline trace_;                   // shaders/render/caelix_path_trace.hlsl, trace set
     ComputePipeline composite_;               // shaders/render/caelix_composite.hlsl, composite set
     ComputePipeline cross_resolve_;           // shaders/render/caelix_cross_resolve.hlsl, composite set
     ComputePipeline sky_sh_;                  // shaders/render/caelix_sky_sh.hlsl, sky set
+    ComputePipeline upscale_encode_;          // shaders/render/caelix_upscale_encode.hlsl, encode set
     VkSampler sky_sampler_ = VK_NULL_HANDLE;  // linear, mipmapped, clamp to edge
     GpuImage fallback_sky_;                   // 1 x 1 RGBA8 cube bound without a host cubemap
     bool fallback_sky_needs_init_ = true;     // fallback_sky_ still in VK_IMAGE_LAYOUT_UNDEFINED

@@ -276,8 +276,9 @@ Three plugin events (`ReserveEventIDRange(3)`: frame, render = frame + 1, releas
   entity records in list order, brick removes in runs per entity, uploads, publish the sequence,
   then the flush. Same configuration as the render event (outside a render pass, no queue access,
   `EnsurePreviousFrameSubmission | ModifiesCommandBuffersState`).
-- **Render event**, `CaelixUnityViewPacket` (488 B), once per view per Unity frame from the view's
-  camera pass. Accesses the targets, renders the view's renderer (created lazily), publishes the
+- **Render event**, `CaelixUnityViewPacket` (488 B; 504 B since the DLSS step grew
+  `CaelixRenderOptions` to 192 B, the C# mirror must follow), once per view per Unity frame from
+  the view's camera pass. Accesses the targets, renders the view's renderer (created lazily), publishes the
   sequence. A render event before the session's first frame packet publishes its sequence and
   renders nothing (one warning).
 - **Release event**, `CaelixUnityReleasePacket` (32 B), with graphics queue access (flush, sync

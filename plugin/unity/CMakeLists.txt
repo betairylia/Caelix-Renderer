@@ -36,10 +36,18 @@ endif()
 target_link_libraries(caelix_unity PRIVATE caelix_renderer Vulkan::Headers)
 
 if(CAELIX_UNITY_PLUGIN_DIR)
+  set(CAELIX_UNITY_PLUGIN_FILES
+    "$<TARGET_FILE:caelix_unity>;$<TARGET_FILE:caelix_renderer>;$<TARGET_PDB_FILE:caelix_unity>;$<TARGET_PDB_FILE:caelix_renderer>")
+  # The NGX feature DLLs (DLSS SR and RR) are loaded from the directory of caelix_renderer.dll.
+  if(CAELIX_DLSS)
+    foreach(dll IN LISTS CAELIX_NGX_DLLS)
+      string(APPEND CAELIX_UNITY_PLUGIN_FILES ";${dll}")
+    endforeach()
+  endif()
   add_custom_command(TARGET caelix_unity POST_BUILD
     COMMAND ${CMAKE_COMMAND}
       -DDEST=${CAELIX_UNITY_PLUGIN_DIR}
-      "-DFILES=$<TARGET_FILE:caelix_unity>;$<TARGET_FILE:caelix_renderer>;$<TARGET_PDB_FILE:caelix_unity>;$<TARGET_PDB_FILE:caelix_renderer>"
+      "-DFILES=${CAELIX_UNITY_PLUGIN_FILES}"
       -P ${CMAKE_CURRENT_SOURCE_DIR}/CopyPlugin.cmake
     COMMENT "Copying the Unity plugin DLLs to ${CAELIX_UNITY_PLUGIN_DIR}"
     VERBATIM)
