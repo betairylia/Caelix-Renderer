@@ -15,11 +15,32 @@ pub(crate) fn create_instance(
     entry: &ash::Entry,
     display_handle: RawDisplayHandle,
     api_version: u32,
+    extra_extensions: &[CString],
     enable_validation: bool,
 ) -> Result<(ash::Instance, Option<DebugMessenger>), Error> {
     let mut extensions: Vec<*const c_char> = ash_window::enumerate_required_extensions(display_handle)
         .map_err(vk_error("ash_window::enumerate_required_extensions"))?
         .to_vec();
+
+    // The caller's extensions: enabled when the loader (or an implicit layer) offers them.
+    if !extra_extensions.is_empty() {
+        // SAFETY: plain enumeration through the loader.
+        let available = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .map_err(vk_error("vkEnumerateInstanceExtensionProperties"))?;
+        for name in extra_extensions {
+            // SAFETY: every pointer in `extensions` is a NUL-terminated string that outlives this
+            // function (ash_window's static names, or names of `extra_extensions`).
+            let already = extensions.iter().any(|&p| unsafe { CStr::from_ptr(p) } == name.as_c_str());
+            if already {
+                continue;
+            }
+            if available.iter().any(|e| e.extension_name_as_c_str().ok() == Some(name.as_c_str())) {
+                extensions.push(name.as_ptr());
+            } else {
+                log::warn!("instance extension {} is not available: skipped", name.to_string_lossy());
+            }
+        }
+    }
 
     let mut layers: Vec<*const c_char> = Vec::new();
     let mut validation = false;
@@ -164,7 +185,7 @@ fn check_device(
             .iter()
             .any(|e| e.extension_name_as_c_str().ok() == Some(name))
     };
-    for name in device_extensions(requirements) {
+    for name in device_extensions(requirements, &[]) {
         if !has_extension(&name) {
             return Err(format!("missing extension {}", name.to_string_lossy()));
         }
@@ -252,23 +273,59 @@ fn check_device(
     Err("no queue family with graphics + compute + present".into())
 }
 
-/// The library's extensions plus VK_KHR_swapchain, without duplicates.
-fn device_extensions(requirements: &DeviceRequirements) -> Vec<CString> {
-    let mut names: Vec<CString> = requirements.device_extensions.clone();
+/// The library's extensions plus VK_KHR_swapchain, then `optional` (already filtered to the
+/// supported ones), without duplicates.
+fn device_extensions(requirements: &DeviceRequirements, optional: &[CString]) -> Vec<CString> {
+    let mut names: Vec<CString> = Vec::new();
     let swapchain = CString::from(ash::khr::swapchain::NAME);
-    if !names.contains(&swapchain) {
-        names.push(swapchain);
+    for name in requirements
+        .device_extensions
+        .iter()
+        .chain(std::iter::once(&swapchain))
+        .chain(optional)
+    {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
     }
     names
+}
+
+/// The names of `wanted` that the physical device offers. A missing one is logged at warn
+/// level and skipped.
+pub(crate) fn supported_optional_extensions(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    wanted: Vec<CString>,
+) -> Result<Vec<CString>, Error> {
+    if wanted.is_empty() {
+        return Ok(wanted);
+    }
+    // SAFETY: plain enumeration on a physical device of this instance.
+    let available = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .map_err(vk_error("vkEnumerateDeviceExtensionProperties"))?;
+    Ok(wanted
+        .into_iter()
+        .filter(|name| {
+            let found = available
+                .iter()
+                .any(|e| e.extension_name_as_c_str().ok() == Some(name.as_c_str()));
+            if !found {
+                log::warn!("optional device extension {} is not available: skipped", name.to_string_lossy());
+            }
+            found
+        })
+        .collect())
 }
 
 pub(crate) fn create_device(
     instance: &ash::Instance,
     selected: &SelectedDevice,
     requirements: &DeviceRequirements,
+    optional_extensions: &[CString],
 ) -> Result<(ash::Device, vk::Queue), Error> {
     let features = host_features(&requirements.features);
-    let extension_names = device_extensions(requirements);
+    let extension_names = device_extensions(requirements, optional_extensions);
     let extension_ptrs: Vec<*const c_char> = extension_names.iter().map(|n| n.as_ptr()).collect();
 
     let priorities = [1.0f32];

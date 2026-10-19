@@ -55,13 +55,20 @@ fn main() {
     // Cargo does not manage runtime DLLs. The usual workaround: copy the DLL
     // next to the executables of the current profile, so `cargo run` and
     // `cargo test` find it. OUT_DIR is <target>/<profile>/build/<pkg>-<hash>/out,
-    // so three levels up is <target>/<profile>.
+    // so three levels up is <target>/<profile>. The NGX feature DLLs (DLSS SR
+    // and RR) go along when the library was built with them: NGX loads them
+    // from the directory of caelix_renderer.dll.
     let profile_dir = out_dir
         .ancestors()
         .nth(3)
         .expect("unexpected OUT_DIR layout")
         .to_path_buf();
-    for name in ["caelix_renderer.dll", "caelix_renderer.pdb"] {
+    for name in [
+        "caelix_renderer.dll",
+        "caelix_renderer.pdb",
+        "nvngx_dlss.dll",
+        "nvngx_dlssd.dll",
+    ] {
         let src = lib_dir.join(name);
         if src.exists() {
             println!("cargo:rerun-if-changed={}", src.display());

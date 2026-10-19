@@ -18,6 +18,12 @@
 //!
 //! `--test-entity` and `--test-edits` add a synthetic moving box and timed brick edits
 //! (`testscene.rs`, Test window) to judge the motion vectors and NRD.
+//!
+//! `--upscaler dlss-sr|dlss-rr` (pt mode, also in the Render window) lets the library trace at
+//! the render size of `caelix_upscaler_query` and NVIDIA DLSS write the window size
+//! (docs/DLSS.md). The host enables the Vulkan extensions that NGX asks for (`--no-dlss` does
+//! not), queries the support per quality and window size, and jitters the camera with the
+//! library's Halton sequence while an upscaler is active.
 
 mod camera;
 mod materials;
@@ -28,7 +34,7 @@ mod ui;
 mod world;
 
 use std::collections::HashSet;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -46,7 +52,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use camera::Camera;
-use settings::{same_options, Encoding, Mode, RenderSettings, View};
+use settings::{same_options, Encoding, Mode, RenderSettings, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
 use testscene::{EditPattern, TestScene};
 
 /// Free camera: default speed in world units (blocks) per second.
@@ -311,6 +317,96 @@ struct Args {
     /// (the emissive corners are replaced).
     #[arg(long, value_enum, default_value_t = EditPattern::Wave)]
     test_edit_pattern: EditPattern,
+    /// Pt mode: the upscaler. dlss-sr keeps NRD as the denoiser; dlss-rr replaces it. The
+    /// renderer then traces at the render size of the quality mode and DLSS writes the window.
+    #[arg(long, value_enum, default_value_t = Upscaler::None)]
+    upscaler: Upscaler,
+    /// Render size per window size of the upscaler (DLSS execution mode).
+    #[arg(long, value_enum, default_value_t = UpscaleQuality::Quality)]
+    upscale_quality: UpscaleQuality,
+    /// Upscaler preset: 0 = the NGX default; else the raw NGX preset value, set as the hint of
+    /// the chosen quality mode. DLSS SR: J=10, K=11, L=12, M=13. DLSS RR: D=4, E=5, F=6.
+    #[arg(long, value_name = "N", default_value_t = 0,
+          value_parser = clap::value_parser!(u32).range(0..=MAX_UPSCALE_PRESET as i64))]
+    upscale_preset: u32,
+    /// DLSS SR: NGX auto exposure instead of the fixed exposure 1.0 (DLSS RR ignores it).
+    #[arg(long)]
+    upscale_auto_exposure: bool,
+    /// Length of the jitter sequence with an upscaler (Halton 2, 3). 0 = the library's count
+    /// (caelix_upscaler_jitter_phases: 8 * ceil((window / render width)^2), at least 32 for RR).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    jitter_phases: u32,
+    /// Do not enable the Vulkan extensions that NGX needs: DLSS is then unsupported (the Render
+    /// window shows the query reason).
+    #[arg(long)]
+    no_dlss: bool,
+}
+
+/// The upscaler query results for one (quality, window size): SR and RR.
+#[derive(Clone, Copy)]
+struct UpscalerSupport {
+    quality: UpscaleQuality,
+    width: u32,
+    height: u32,
+    sr: CaelixUpscalerQueryResult,
+    rr: CaelixUpscalerQueryResult,
+}
+
+impl UpscalerSupport {
+    /// Queries both upscalers. A failed query counts as unsupported (reason BAD_ARGUMENT).
+    fn query(device: *mut CaelixDevice, quality: UpscaleQuality, width: u32, height: u32) -> Self {
+        let one = |upscaler: Upscaler| {
+            let desc = CaelixUpscalerQueryDesc {
+                upscaler: upscaler.raw(),
+                quality: quality.raw(),
+                output_width: width,
+                output_height: height,
+            };
+            // SAFETY: CaelixUpscalerQueryResult holds only integers, so all-zero is a valid value.
+            let mut result: CaelixUpscalerQueryResult = unsafe { std::mem::zeroed() };
+            // SAFETY: the device is adopted and live; desc and result are valid for the call.
+            let status = unsafe { caelix_upscaler_query(device, &desc, &mut result) };
+            if status != CaelixResult_CAELIX_OK {
+                log::warn!("caelix_upscaler_query({upscaler:?}) failed: CaelixResult {status}");
+                result.supported = 0;
+                result.reason = CaelixUpscalerUnsupportedReason_CAELIX_UPSCALER_BAD_ARGUMENT as u32;
+            }
+            result
+        };
+        Self { quality, width, height, sr: one(Upscaler::DlssSr), rr: one(Upscaler::DlssRr) }
+    }
+
+    fn matches(&self, quality: UpscaleQuality, width: u32, height: u32) -> bool {
+        self.quality == quality && self.width == width && self.height == height
+    }
+
+    /// The result of `upscaler`; `None` for `Upscaler::None`.
+    fn result(&self, upscaler: Upscaler) -> Option<&CaelixUpscalerQueryResult> {
+        match upscaler {
+            Upscaler::None => None,
+            Upscaler::DlssSr => Some(&self.sr),
+            Upscaler::DlssRr => Some(&self.rr),
+        }
+    }
+
+    /// "DLSS SR Quality at 1920x1080: render 1280x720" or "...: unsupported (reason)".
+    fn describe(&self, upscaler: Upscaler) -> String {
+        let r = self.result(upscaler).expect("an upscaler");
+        let head = format!("{} {} at {}x{}", upscaler.label(), self.quality.label(), self.width, self.height);
+        if r.supported != 0 {
+            format!(
+                "{head}: render {}x{} (range {}x{} .. {}x{})",
+                r.render_width,
+                r.render_height,
+                r.render_min_width,
+                r.render_min_height,
+                r.render_max_width,
+                r.render_max_height
+            )
+        } else {
+            format!("{head}: unsupported ({})", ui::unsupported_reason(r))
+        }
+    }
 }
 
 /// Everything that lives while the window exists. Drop order matters: Drop
@@ -435,6 +531,10 @@ struct App {
     /// Frames rendered since the renderer reported an NRD instance (the info line is logged at the
     /// second one, whose dispatch count no longer includes the first frame's pool clears).
     nrd_frames: u32,
+    /// The upscaler query results for the current quality and swapchain size.
+    upscaler_support: Option<UpscalerSupport>,
+    /// The newest upscaler state that was logged (a change is logged once).
+    last_upscaler_info: Option<CaelixUpscalerInfo>,
     error: Option<anyhow::Error>,
 }
 
@@ -449,7 +549,7 @@ impl App {
             .context("cannot create the window")?;
         let size = window.inner_size();
 
-        let requirements = device_requirements();
+        let requirements = device_requirements(self.args.no_dlss);
         let mut context = caelix_vk::Context::new(
             &window,
             size.width,
@@ -483,6 +583,12 @@ impl App {
             bail!("caelix_device_adopt failed: CaelixResult {result}");
         }
         log::debug!("{} frames in flight", context.frames_in_flight());
+        // The upscalers' support at the window size (logged once; the draw loop queries again when
+        // the swapchain size or the quality changes).
+        let support = UpscalerSupport::query(caelix_device, self.settings.upscale_quality, size.width, size.height);
+        log::info!("{}", support.describe(Upscaler::DlssSr));
+        log::info!("{}", support.describe(Upscaler::DlssRr));
+        self.upscaler_support = Some(support);
         // From here on, an error drops `state`, which releases what exists so far.
         let views_generation = context.swapchain_generation();
         let mut state = State {
@@ -622,6 +728,9 @@ impl App {
                     },
                     accumulated: self.accumulation.frames,
                     screenshot_note: self.screenshot_note.clone(),
+                    upscaler_sr: self.upscaler_support.map(|s| s.sr),
+                    upscaler_rr: self.upscaler_support.map(|s| s.rr),
+                    upscaler_info: upscaler_info(state.renderer),
                 };
                 let mut panel = ui::Panel {
                     stats: &stats,
@@ -639,6 +748,19 @@ impl App {
                     self.ui_screenshot_requested = true;
                 }
             }
+            // The upscaler support follows the swapchain size and the quality (the UI may have
+            // changed it above); the jitter below needs this frame's render size.
+            if self
+                .upscaler_support
+                .is_none_or(|s| !s.matches(self.settings.upscale_quality, frame.width, frame.height))
+            {
+                let support =
+                    UpscalerSupport::query(state.caelix_device, self.settings.upscale_quality, frame.width, frame.height);
+                log::debug!("{}", support.describe(Upscaler::DlssSr));
+                log::debug!("{}", support.describe(Upscaler::DlssRr));
+                self.upscaler_support = Some(support);
+            }
+
             // Test entity: added or removed, animated (its row becomes dirty when the pose changed)
             // and edited, before the transforms are sent.
             let test_edited = self.test.update(state.scene, dt, &self.camera, &mut self.entities)?;
@@ -712,9 +834,42 @@ impl App {
                 view_z: NO_TARGET,
             };
             let aspect = frame.width as f32 / frame.height.max(1) as f32;
-            let camera = self.camera.to_caelix(aspect, DEPTH_NEAR, DEPTH_FAR);
+            // Jitter: the library's Halton sequence while a supported upscaler is active, else none.
+            let upscaler = self.settings.effective_upscaler();
+            let jitter = match self
+                .upscaler_support
+                .as_ref()
+                .and_then(|s| s.result(upscaler))
+                .filter(|r| r.supported != 0)
+            {
+                Some(result) => {
+                    let phases = if self.args.jitter_phases != 0 {
+                        self.args.jitter_phases
+                    } else {
+                        // SAFETY: a pure function of its arguments.
+                        unsafe { caelix_upscaler_jitter_phases(upscaler.raw(), result.render_width, frame.width) }
+                    };
+                    let mut jitter = [0.0f32; 2];
+                    // SAFETY: a pure function; `jitter` holds the two floats it writes.
+                    unsafe { caelix_jitter_halton(frame.frame_number as u32, phases, jitter.as_mut_ptr()) };
+                    jitter
+                }
+                None => [0.0; 2],
+            };
+            let camera = self.camera.to_caelix(aspect, DEPTH_NEAR, DEPTH_FAR, jitter);
             // A new random stream every frame.
             let mut options = self.settings.options(false, frame.frame_number as u32);
+            // A window below 64 x 32 cannot be upscaled (the render call would return
+            // INVALID_ARGUMENT): render it without the upscaler and keep the setting.
+            let too_small = self.upscaler_support.as_ref().and_then(|s| s.result(upscaler)).is_some_and(|r| {
+                r.reason == CaelixUpscalerUnsupportedReason_CAELIX_UPSCALER_BAD_ARGUMENT as u32
+            });
+            if too_small {
+                options.upscaler = Upscaler::None.raw();
+                options.upscale_quality = 0;
+                options.upscale_preset = 0;
+                options.upscale_flags = 0;
+            }
             // Reference mode: restart while the camera moves, the options or an entity change, or
             // the scene still loads. Pt mode: NRD follows the camera and the entities through the
             // motion vectors; its history restarts only while the world is still loading. The
@@ -731,9 +886,35 @@ impl App {
             options.reset_accumulation = u32::from(reset_accumulation);
             // SAFETY: the command buffer is recording after this frame's flush; the image is
             // the acquired one; every struct is valid for the call.
-            let result = unsafe { caelix_renderer_render(state.renderer, &frame_desc, &targets, &camera, &options) };
+            let mut result =
+                unsafe { caelix_renderer_render(state.renderer, &frame_desc, &targets, &camera, &options) };
+            if result == CaelixResult_CAELIX_ERROR_UNSUPPORTED && options.upscaler != Upscaler::None.raw() {
+                // The library refused the upscaler before recording anything (the frame does not
+                // count as rendered): switch it off and render this frame again without it, so the
+                // swapchain image is written.
+                log::warn!(
+                    "{} is not available (see the log above): upscaler switched off",
+                    self.settings.upscaler.label()
+                );
+                self.settings.upscaler = Upscaler::None;
+                let mut retry = self.settings.options(false, frame.frame_number as u32);
+                retry.reset_accumulation = options.reset_accumulation;
+                self.last_options = Some(retry);
+                let camera = self.camera.to_caelix(aspect, DEPTH_NEAR, DEPTH_FAR, [0.0; 2]);
+                self.accumulation.last_camera = Some(camera);
+                // SAFETY: as above; the refused call recorded nothing.
+                result = unsafe { caelix_renderer_render(state.renderer, &frame_desc, &targets, &camera, &retry) };
+            }
             if result != CaelixResult_CAELIX_OK {
                 bail!("caelix_renderer_render(frame {}) failed: CaelixResult {result}", frame.frame_number);
+            }
+            // The upscaler state: logged once per change (render size, preset, an NGX failure).
+            if self.settings.effective_upscaler() != Upscaler::None {
+                let info = upscaler_info(state.renderer);
+                if self.last_upscaler_info.is_none_or(|last| !same_upscaler_info(&last, &info)) {
+                    log::info!("upscaler: {}", upscaler_info_line(&info));
+                    self.last_upscaler_info = Some(info);
+                }
             }
 
             // Screenshot: wait for the world (or frame 10), then 3 more frames; with
@@ -1113,8 +1294,8 @@ fn every_due(args: &Args, every_base: &mut Option<u64>, frames_presented: u64, w
 }
 
 fn gpu_timings(renderer: *const CaelixRenderer) -> CaelixGpuTimings {
-    let mut timings =
-        CaelixGpuTimings { trace_ms: 0.0, flush_ms: 0.0, frame_number: 0, composite_ms: 0.0, denoise_ms: 0.0 };
+    // SAFETY: CaelixGpuTimings holds only numbers, so all-zero is a valid value.
+    let mut timings: CaelixGpuTimings = unsafe { std::mem::zeroed() };
     // SAFETY: the renderer is live and timings is writable.
     unsafe { caelix_renderer_get_gpu_timings(renderer, &mut timings) };
     timings
@@ -1140,12 +1321,54 @@ fn nrd_info(renderer: *const CaelixRenderer) -> CaelixNrdInfo {
     info
 }
 
-/// "Caelix Renderer | trace 1.23 ms | denoise 0.40 ms | composite 0.05 ms | flush 0.45 ms | 144 fps"
+/// The renderer's current upscaler; all zero when the call fails.
+fn upscaler_info(renderer: *const CaelixRenderer) -> CaelixUpscalerInfo {
+    // SAFETY: CaelixUpscalerInfo holds only integers, so all-zero is a valid value.
+    let mut info: CaelixUpscalerInfo = unsafe { std::mem::zeroed() };
+    // SAFETY: the renderer is live and info is writable.
+    if unsafe { caelix_renderer_get_upscaler_info(renderer, &mut info) } != CaelixResult_CAELIX_OK {
+        // SAFETY: as above.
+        info = unsafe { std::mem::zeroed() };
+    }
+    info
+}
+
+fn same_upscaler_info(a: &CaelixUpscalerInfo, b: &CaelixUpscalerInfo) -> bool {
+    a.upscaler == b.upscaler
+        && a.quality == b.quality
+        && a.preset == b.preset
+        && a.render_width == b.render_width
+        && a.render_height == b.render_height
+        && a.output_width == b.output_width
+        && a.output_height == b.output_height
+        && a.failed == b.failed
+        && a.depth_inverted == b.depth_inverted
+}
+
+/// "upscaler 1, quality 1, preset 0, render 1280x720 -> output 1920x1080, depth inverted 1"
+fn upscaler_info_line(info: &CaelixUpscalerInfo) -> String {
+    format!(
+        "upscaler {}, quality {}, preset {}, render {}x{} -> output {}x{}, depth inverted {}{}",
+        info.upscaler,
+        info.quality,
+        info.preset,
+        info.render_width,
+        info.render_height,
+        info.output_width,
+        info.output_height,
+        info.depth_inverted,
+        if info.failed != 0 { ", FAILED (nearest upscale)" } else { "" }
+    )
+}
+
+/// "Caelix Renderer | trace 1.23 ms | denoise 0.40 ms | upscale 0.49 ms | composite 0.05 ms |
+/// flush 0.45 ms | 144 fps"
 fn timing_line(renderer: *const CaelixRenderer, fps: f64) -> String {
     let timings = gpu_timings(renderer);
     format!(
-        "Caelix Renderer | trace {:.2} ms | denoise {:.2} ms | composite {:.2} ms | flush {:.2} ms | {:.0} fps",
-        timings.trace_ms, timings.denoise_ms, timings.composite_ms, timings.flush_ms, fps
+        "Caelix Renderer | trace {:.2} ms | denoise {:.2} ms | upscale {:.2} ms | composite {:.2} ms | \
+         flush {:.2} ms | {:.0} fps",
+        timings.trace_ms, timings.denoise_ms, timings.upscale_ms, timings.composite_ms, timings.flush_ms, fps
     )
 }
 
@@ -1199,9 +1422,32 @@ unsafe extern "C" fn caelix_log(level: CaelixLogLevel, message: *const c_char, _
     log::log!(target: "caelix", level, "{message}");
 }
 
+/// Copies a library-owned array of C strings.
+///
+/// # Safety
+/// `names` points to `count` valid NUL-terminated strings (or `count` is 0).
+unsafe fn c_string_list(count: u32, names: *const *const c_char) -> Vec<CString> {
+    if names.is_null() {
+        return Vec::new();
+    }
+    (0..count as usize)
+        // SAFETY: guaranteed by the caller.
+        .map(|i| unsafe { CStr::from_ptr(*names.add(i)) }.to_owned())
+        .collect()
+}
+
+fn join_names(names: &[CString]) -> String {
+    if names.is_empty() {
+        return "none".into();
+    }
+    names.iter().map(|n| n.to_string_lossy()).collect::<Vec<_>>().join(", ")
+}
+
 /// Converts the library's requirements to `caelix_vk` types. This lives in the
-/// app so that `caelix-vk` stays independent of `caelix-sys`.
-fn device_requirements() -> caelix_vk::DeviceRequirements {
+/// app so that `caelix-vk` stays independent of `caelix-sys`. Unless `no_dlss`, the
+/// Vulkan extensions of the upscalers (NGX) are added: the instance ones up front, the
+/// device ones through a query on the selected physical device.
+fn device_requirements(no_dlss: bool) -> caelix_vk::DeviceRequirements {
     let mut raw = CaelixDeviceRequirements {
         api_version: 0,
         device_extension_count: 0,
@@ -1214,9 +1460,42 @@ fn device_requirements() -> caelix_vk::DeviceRequirements {
         .map(|i| unsafe { CStr::from_ptr(*raw.device_extensions.add(i)) }.to_owned())
         .collect();
     let has = |bit: CaelixDeviceFeatureBits| raw.feature_flags & bit as u32 != 0;
+
+    let (instance_extensions, optional_device_extensions) = if no_dlss {
+        log::info!("--no-dlss: the upscalers' Vulkan extensions are not enabled");
+        (Vec::new(), None)
+    } else {
+        let mut count = 0u32;
+        let mut names: *const *const c_char = ptr::null();
+        // SAFETY: both out pointers are writable; the strings are owned by the library.
+        unsafe { caelix_upscaler_instance_extensions(&mut count, &mut names) };
+        // SAFETY: the library returned `count` strings in `names`.
+        let instance = unsafe { c_string_list(count, names) };
+        log::info!("upscaler instance extensions: {}", join_names(&instance));
+        let query: Box<caelix_vk::DeviceExtensionQuery> = Box::new(|instance, physical_device| {
+            let mut count = 0u32;
+            let mut names: *const *const c_char = ptr::null();
+            // SAFETY: the handles are live (caelix-vk calls this after the device selection);
+            // both out pointers are writable.
+            let result =
+                unsafe { caelix_upscaler_device_extensions(instance, physical_device, &mut count, &mut names) };
+            if result != CaelixResult_CAELIX_OK {
+                log::warn!("caelix_upscaler_device_extensions failed: CaelixResult {result}");
+                return Vec::new();
+            }
+            // SAFETY: the library returned `count` strings, valid until its next call.
+            let device = unsafe { c_string_list(count, names) };
+            log::info!("upscaler device extensions: {}", join_names(&device));
+            device
+        });
+        (instance, Some(query))
+    };
+
     caelix_vk::DeviceRequirements {
         api_version: raw.api_version,
         device_extensions,
+        instance_extensions,
+        optional_device_extensions,
         features: caelix_vk::Features {
             buffer_device_address: has(CaelixDeviceFeatureBits_CAELIX_FEATURE_BUFFER_DEVICE_ADDRESS),
             descriptor_indexing: has(CaelixDeviceFeatureBits_CAELIX_FEATURE_DESCRIPTOR_INDEXING),
@@ -1291,6 +1570,7 @@ fn main() -> anyhow::Result<()> {
     log::info!(
         "mode {mode:?}, bounces {}, transparent bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, \
          sun NEE {}, denoise {}, sky {}, fog density {} colour {:?}, emission scale {}, \
+         upscaler {:?}, upscale quality {:?}, upscale preset {}, upscale auto exposure {}, jitter phases {}, \
          window {}x{}",
         args.bounces,
         args.bounces_transparent,
@@ -1303,6 +1583,11 @@ fn main() -> anyhow::Result<()> {
         args.fog_density,
         args.fog_color,
         args.emission_scale,
+        if mode == Mode::Pt { args.upscaler } else { Upscaler::None },
+        args.upscale_quality,
+        args.upscale_preset,
+        args.upscale_auto_exposure,
+        if args.jitter_phases == 0 { "auto".to_string() } else { args.jitter_phases.to_string() },
         args.size.0,
         args.size.1
     );
@@ -1350,6 +1635,10 @@ fn main() -> anyhow::Result<()> {
         fog_density: args.fog_density,
         fog_color: args.fog_color,
         emission_scale: args.emission_scale,
+        upscaler: args.upscaler,
+        upscale_quality: args.upscale_quality,
+        upscale_preset: args.upscale_preset,
+        upscale_auto_exposure: args.upscale_auto_exposure,
     };
 
     if !(1..=120).contains(&args.test_edit_interval) {
@@ -1392,6 +1681,8 @@ fn main() -> anyhow::Result<()> {
         timing: Timing { window_start: Instant::now(), window_frames: 0, fps: 0.0 },
         load_mismatch: false,
         nrd_frames: 0,
+        upscaler_support: None,
+        last_upscaler_info: None,
         error: None,
     };
     let run_result = event_loop.run_app(&mut app);

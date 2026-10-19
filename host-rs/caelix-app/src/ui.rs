@@ -11,7 +11,7 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::camera::{self, Camera};
-use crate::settings::{Mode, RenderSettings, View};
+use crate::settings::{Mode, RenderSettings, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
 use crate::testscene::{EditPattern, TestScene};
 use crate::world::EntityEntry;
 
@@ -33,6 +33,33 @@ pub struct Stats {
     pub accumulated: u64,
     /// The newest screenshot of the "Screenshot" button, or a waiting note.
     pub screenshot_note: String,
+    /// The upscaler queries at the current quality and target size (`None` before the first).
+    pub upscaler_sr: Option<CaelixUpscalerQueryResult>,
+    pub upscaler_rr: Option<CaelixUpscalerQueryResult>,
+    /// The renderer's current upscaler (`caelix_renderer_get_upscaler_info`).
+    pub upscaler_info: CaelixUpscalerInfo,
+}
+
+/// Why an upscaler query reported "unsupported", in words (`CaelixUpscalerUnsupportedReason`).
+pub fn unsupported_reason(result: &CaelixUpscalerQueryResult) -> String {
+    let reason = result.reason;
+    if reason == CaelixUpscalerUnsupportedReason_CAELIX_UPSCALER_OK as u32 {
+        "supported".into()
+    } else if reason == CaelixUpscalerUnsupportedReason_CAELIX_UPSCALER_NOT_BUILT as u32 {
+        "the library was built without DLSS (CAELIX_DLSS=OFF)".into()
+    } else if reason == CaelixUpscalerUnsupportedReason_CAELIX_UPSCALER_NO_NGX as u32 {
+        "NGX did not start: no NVIDIA driver, a DLL or a device extension is missing (--no-dlss?)".into()
+    } else if reason == CaelixUpscalerUnsupportedReason_CAELIX_UPSCALER_FEATURE_UNAVAILABLE as u32 {
+        "the GPU or the NGX runtime lacks the feature".into()
+    } else if reason == CaelixUpscalerUnsupportedReason_CAELIX_UPSCALER_DRIVER_TOO_OLD as u32 {
+        format!("the driver is too old (needs {}.{})", result.min_driver_major, result.min_driver_minor)
+    } else if reason == CaelixUpscalerUnsupportedReason_CAELIX_UPSCALER_QUALITY_UNAVAILABLE as u32 {
+        "the feature has no render size for this quality".into()
+    } else if reason == CaelixUpscalerUnsupportedReason_CAELIX_UPSCALER_BAD_ARGUMENT as u32 {
+        "the window is below 64 x 32".into()
+    } else {
+        format!("unknown reason {reason}")
+    }
 }
 
 /// One scene entity in the Entities window: its file transform and the edited transform.
@@ -262,6 +289,7 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
                 ("of frame", t.frame_number.to_string()),
                 ("trace", format!("{:.2} ms", t.trace_ms)),
                 ("denoise", format!("{:.2} ms", t.denoise_ms)),
+                ("upscale", format!("{:.2} ms", t.upscale_ms)),
                 ("composite", format!("{:.2} ms", t.composite_ms)),
                 ("flush", format!("{:.2} ms", t.flush_ms)),
             ],
@@ -302,6 +330,72 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
     });
 }
 
+/// The upscaler rows of the Mode grid: upscaler, quality, preset and the current render size.
+/// Pt mode only; an unsupported upscaler is shown disabled with the reason as hover text.
+fn upscaler_rows(ui: &mut egui::Ui, stats: &Stats, settings: &mut RenderSettings) {
+    let pt = settings.mode == Mode::Pt;
+    let upscaling = pt && settings.upscaler != Upscaler::None;
+
+    ui.label("upscaler");
+    ui.add_enabled_ui(pt, |ui| {
+        ComboBox::from_id_salt("upscaler").selected_text(settings.upscaler.label()).show_ui(ui, |ui| {
+            for upscaler in Upscaler::ALL {
+                let result = match upscaler {
+                    Upscaler::None => None,
+                    Upscaler::DlssSr => stats.upscaler_sr,
+                    Upscaler::DlssRr => stats.upscaler_rr,
+                };
+                let unsupported = result.filter(|r| r.supported == 0);
+                let response = ui
+                    .add_enabled_ui(unsupported.is_none(), |ui| {
+                        ui.selectable_value(&mut settings.upscaler, upscaler, upscaler.label())
+                    })
+                    .inner;
+                if let Some(r) = unsupported {
+                    response.on_disabled_hover_text(unsupported_reason(&r));
+                }
+            }
+        });
+    });
+    ui.end_row();
+
+    ui.label("quality");
+    ui.add_enabled_ui(upscaling, |ui| {
+        ComboBox::from_id_salt("upscale_quality")
+            .selected_text(settings.upscale_quality.label())
+            .show_ui(ui, |ui| {
+                for quality in UpscaleQuality::ALL {
+                    ui.selectable_value(&mut settings.upscale_quality, quality, quality.label());
+                }
+            });
+    });
+    ui.end_row();
+
+    ui.label("preset");
+    ui.add_enabled(upscaling, DragValue::new(&mut settings.upscale_preset).range(0..=MAX_UPSCALE_PRESET))
+        .on_hover_text(PRESET_HINT);
+    ui.end_row();
+
+    ui.label("upscale");
+    let info = &stats.upscaler_info;
+    let text = if !upscaling {
+        "off".to_string()
+    } else if info.upscaler == 0 {
+        "no upscaled frame yet".to_string()
+    } else {
+        format!(
+            "render {}x{} -> output {}x{}{}",
+            info.render_width,
+            info.render_height,
+            info.output_width,
+            info.output_height,
+            if info.failed != 0 { " FAILED" } else { "" }
+        )
+    };
+    ui.label(text);
+    ui.end_row();
+}
+
 /// Pitch (elevation above the horizon, positive = up) and yaw (0 = +Z, 90 = +X) of a direction,
 /// in degrees.
 fn direction_angles(dir: [f32; 3]) -> (f32, f32) {
@@ -320,7 +414,12 @@ fn direction_from_angles(pitch: f32, yaw: f32) -> [f32; 3] {
     [cp * sy, sp, cp * cy]
 }
 
+/// Hover text of the preset value.
+const PRESET_HINT: &str = "0 = the NGX default; else the raw NGX preset value of the chosen quality mode.\n\
+    DLSS SR: J = 10, K = 11, L = 12, M = 13.\nDLSS RR: D = 4, E = 5, F = 6.";
+
 fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
+    let stats = panel.stats;
     let settings = &mut *panel.settings;
     let lighting = settings.lighting();
     CollapsingHeader::new("Mode").default_open(true).show(ui, |ui| {
@@ -355,12 +454,18 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             ui.label("exposure");
             ui.add_enabled(lighting, Slider::new(&mut settings.exposure, 0.05..=8.0).logarithmic(true));
             ui.end_row();
+
+            upscaler_rows(ui, stats, settings);
         });
         ui.add_enabled(settings.mode == Mode::Pt, egui::Checkbox::new(&mut settings.denoise, "denoise (NRD, pt mode)"));
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.sun_nee, "sun NEE"));
         ui.add_enabled(
             settings.mode == Mode::Pt,
             egui::Checkbox::new(&mut settings.checkerboard, "glass checkerboard (pt mode)"),
+        );
+        ui.add_enabled(
+            settings.mode == Mode::Pt && settings.upscaler == Upscaler::DlssSr,
+            egui::Checkbox::new(&mut settings.upscale_auto_exposure, "auto exposure (SR)"),
         );
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.sky_on_miss, "sky on miss"));
         ui.add_enabled(!lighting, egui::Checkbox::new(&mut settings.shading, "Lambert (primary mode)"));

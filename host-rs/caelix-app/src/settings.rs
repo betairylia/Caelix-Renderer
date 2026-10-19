@@ -135,6 +135,85 @@ impl Mode {
     }
 }
 
+/// Upscaler of the path trace mode (`CaelixUpscaler`, docs/DLSS.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Upscaler {
+    /// No upscaler: the renderer traces at the window size.
+    None,
+    /// NVIDIA DLSS Super Resolution: NRD stays the denoiser, DLSS upscales the composited colour.
+    DlssSr,
+    /// NVIDIA DLSS Ray Reconstruction: replaces NRD, denoises and upscales the raw colour.
+    DlssRr,
+}
+
+impl Upscaler {
+    pub const ALL: [Upscaler; 3] = [Upscaler::None, Upscaler::DlssSr, Upscaler::DlssRr];
+
+    pub fn raw(self) -> u32 {
+        match self {
+            Upscaler::None => CaelixUpscaler_CAELIX_UPSCALER_NONE as u32,
+            Upscaler::DlssSr => CaelixUpscaler_CAELIX_UPSCALER_DLSS_SR as u32,
+            Upscaler::DlssRr => CaelixUpscaler_CAELIX_UPSCALER_DLSS_RR as u32,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Upscaler::None => "Off",
+            Upscaler::DlssSr => "DLSS SR",
+            Upscaler::DlssRr => "DLSS RR",
+        }
+    }
+}
+
+/// Render size per output size of the upscaler (`CaelixUpscaleQuality`, DLSS execution modes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum UpscaleQuality {
+    /// Render size = output size (anti-aliasing only).
+    Dlaa,
+    /// About 0.67 per axis.
+    Quality,
+    /// About 0.58 per axis.
+    Balanced,
+    /// 0.5 per axis.
+    Performance,
+    /// About 0.33 per axis.
+    UltraPerformance,
+}
+
+impl UpscaleQuality {
+    pub const ALL: [UpscaleQuality; 5] = [
+        UpscaleQuality::Dlaa,
+        UpscaleQuality::Quality,
+        UpscaleQuality::Balanced,
+        UpscaleQuality::Performance,
+        UpscaleQuality::UltraPerformance,
+    ];
+
+    pub fn raw(self) -> u32 {
+        match self {
+            UpscaleQuality::Dlaa => CaelixUpscaleQuality_CAELIX_UPSCALE_DLAA as u32,
+            UpscaleQuality::Quality => CaelixUpscaleQuality_CAELIX_UPSCALE_QUALITY as u32,
+            UpscaleQuality::Balanced => CaelixUpscaleQuality_CAELIX_UPSCALE_BALANCED as u32,
+            UpscaleQuality::Performance => CaelixUpscaleQuality_CAELIX_UPSCALE_PERFORMANCE as u32,
+            UpscaleQuality::UltraPerformance => CaelixUpscaleQuality_CAELIX_UPSCALE_ULTRA_PERFORMANCE as u32,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UpscaleQuality::Dlaa => "DLAA",
+            UpscaleQuality::Quality => "Quality",
+            UpscaleQuality::Balanced => "Balanced",
+            UpscaleQuality::Performance => "Performance",
+            UpscaleQuality::UltraPerformance => "Ultra Performance",
+        }
+    }
+}
+
+/// Largest `--upscale-preset` / preset value of the debug UI.
+pub const MAX_UPSCALE_PRESET: u32 = 15;
+
 /// Everything that `CaelixRenderOptions` holds, except the per-frame values (seed, reset).
 #[derive(Clone, Debug)]
 pub struct RenderSettings {
@@ -176,6 +255,13 @@ pub struct RenderSettings {
     pub fog_color: [f32; 3],
     /// Every mode: multiplies the emission of every material.
     pub emission_scale: f32,
+    /// Pt mode: the upscaler (the other modes always render without one).
+    pub upscaler: Upscaler,
+    pub upscale_quality: UpscaleQuality,
+    /// Raw NGX preset value of the chosen quality mode; 0 = the NGX default.
+    pub upscale_preset: u32,
+    /// DLSS SR: NGX auto exposure instead of the fixed exposure 1.0.
+    pub upscale_auto_exposure: bool,
 }
 
 impl RenderSettings {
@@ -191,6 +277,15 @@ impl RenderSettings {
 
     pub fn lighting(&self) -> bool {
         self.mode != Mode::Primary
+    }
+
+    /// The upscaler that the library receives: `None` outside the pt mode.
+    pub fn effective_upscaler(&self) -> Upscaler {
+        if self.mode == Mode::Pt {
+            self.upscaler
+        } else {
+            Upscaler::None
+        }
     }
 
     /// The direction toward the sun that the library receives.
@@ -213,6 +308,16 @@ impl RenderSettings {
         if self.mode == Mode::Pt && self.checkerboard {
             flags |= CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD;
         }
+        // Without an upscaler the other upscaler fields are zero, so they do not restart the
+        // reference accumulation (`same_options`). RESET_HISTORY is never needed from the host:
+        // the library drops the upscaler history with reset_accumulation.
+        let upscaler = self.effective_upscaler();
+        let upscaling = upscaler != Upscaler::None;
+        let upscale_flags = if upscaling && upscaler == Upscaler::DlssSr && self.upscale_auto_exposure {
+            CAELIX_UPSCALE_FLAG_AUTO_EXPOSURE
+        } else {
+            0
+        };
         CaelixRenderOptions {
             debug_view: self.view.raw(),
             flags,
@@ -240,6 +345,10 @@ impl RenderSettings {
             fog_color: self.fog_color,
             pad3: 0.0,
             sky: self.sky(),
+            upscaler: upscaler.raw(),
+            upscale_quality: if upscaling { self.upscale_quality.raw() } else { 0 },
+            upscale_preset: if upscaling { self.upscale_preset } else { 0 },
+            upscale_flags,
         }
     }
 
@@ -279,4 +388,8 @@ pub fn same_options(a: &CaelixRenderOptions, b: &CaelixRenderOptions) -> bool {
         && a.fog_density == b.fog_density
         && a.fog_color == b.fog_color
         && a.sky.image == b.sky.image
+        && a.upscaler == b.upscaler
+        && a.upscale_quality == b.upscale_quality
+        && a.upscale_preset == b.upscale_preset
+        && a.upscale_flags == b.upscale_flags
 }

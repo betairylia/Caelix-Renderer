@@ -48,11 +48,24 @@ const FRAMES_IN_FLIGHT: usize = 2;
 pub struct DeviceRequirements {
     /// Minimum Vulkan API version, encoded like `VK_MAKE_API_VERSION`.
     pub api_version: u32,
-    /// Device extensions to enable, in addition to `VK_KHR_swapchain`.
+    /// Device extensions to enable, in addition to `VK_KHR_swapchain`. A physical device without
+    /// one of them is not selected.
     pub device_extensions: Vec<CString>,
     /// Device features to enable.
     pub features: Features,
+    /// Instance extensions to enable, in addition to the window system's. A name that the loader
+    /// does not offer is skipped with a warning (never an error).
+    pub instance_extensions: Vec<CString>,
+    /// Optional device extensions: called once after the physical device is selected, with the
+    /// raw `VkInstance` and `VkPhysicalDevice`. The returned names are enabled when the physical
+    /// device offers them; a missing one is skipped with a warning. They do not take part in the
+    /// device selection.
+    pub optional_device_extensions: Option<Box<DeviceExtensionQuery>>,
 }
+
+/// Returns device extension names for a raw `VkInstance` and `VkPhysicalDevice`
+/// ([`DeviceRequirements::optional_device_extensions`]).
+pub type DeviceExtensionQuery = dyn Fn(u64, u64) -> Vec<CString>;
 
 /// Device features to enable. Every `true` field must be supported by the
 /// selected physical device.
@@ -203,8 +216,13 @@ impl Context {
         // Links vulkan-1.lib from the Vulkan SDK (ash feature "linked").
         let entry = ash::Entry::linked();
         let api_version = requirements.api_version.max(vk::API_VERSION_1_3);
-        let (instance, debug_messenger) =
-            device::create_instance(&entry, display_handle, api_version, enable_validation)?;
+        let (instance, debug_messenger) = device::create_instance(
+            &entry,
+            display_handle,
+            api_version,
+            &requirements.instance_extensions,
+            enable_validation,
+        )?;
 
         let surface_fn = ash::khr::surface::Instance::new(&entry, &instance);
         // SAFETY: the handles come from a live window; the caller keeps the window
@@ -216,7 +234,16 @@ impl Context {
 
         let selected =
             device::select_physical_device(&instance, &surface_fn, surface, requirements, api_version)?;
-        let (device, queue) = device::create_device(&instance, &selected, requirements)?;
+        let optional_extensions = match &requirements.optional_device_extensions {
+            Some(query) => device::supported_optional_extensions(
+                &instance,
+                selected.physical_device,
+                query(instance.handle().as_raw(), selected.physical_device.as_raw()),
+            )?,
+            None => Vec::new(),
+        };
+        let (device, queue) =
+            device::create_device(&instance, &selected, requirements, &optional_extensions)?;
 
         let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
         let swapchain = Swapchain::new(

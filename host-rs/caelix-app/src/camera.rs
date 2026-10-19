@@ -82,7 +82,9 @@ impl Camera {
         )
     }
 
-    pub fn to_caelix(self, aspect: f32, near_z: f32, far_z: f32) -> CaelixCamera {
+    /// The library's camera. `jitter` is the sub-pixel offset of the sample position in render
+    /// pixels (`CaelixCamera::jitter`, in [-0.5, 0.5]); zero without an upscaler.
+    pub fn to_caelix(self, aspect: f32, near_z: f32, far_z: f32, jitter: [f32; 2]) -> CaelixCamera {
         let (right, up, forward) = self.basis();
         CaelixCamera {
             position: self.position,
@@ -98,7 +100,7 @@ impl Camera {
             near_z,
             far_z,
             projection: perspective_reverse_z(self.fov_y, aspect, near_z),
-            jitter: [0.0; 2],
+            jitter,
         }
     }
 }

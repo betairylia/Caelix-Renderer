@@ -1,8 +1,7 @@
 # DLSS upscalers (NGX) in the library
 
-Status: library phase as built (2026-10-20). The Rust host and the Unity plugin do not use the
-upscalers yet (later phases); the plugin only copies the feature DLLs and accepts the larger
-`CaelixRenderOptions` (see "Unity plugin" below).
+Status: library phase as built (2026-10-20); the Unity plugin and the C# side use the upscalers
+since packet version 6 (see "Unity plugin" below).
 
 The renderer can hand its path-traced frame to NVIDIA DLSS:
 
@@ -156,8 +155,11 @@ binding 9 (sky 10, sampler 11); the encode set is a fourth set per frame slot. F
   physical_device, ...)`: what NGX needs. Measured on the RTX 5080 / 610.88: instance
   `VK_KHR_get_physical_device_properties2`; device `VK_NVX_binary_import`,
   `VK_NVX_image_view_handle`, `VK_KHR_buffer_device_address`, `VK_KHR_push_descriptor`. Without
-  the device extensions NGX does not start (`NO_NGX`). The test device (`tests/test_device.cpp`)
-  enables them when present.
+  the device extensions NGX still initializes, but the feature query fails
+  (`FEATURE_UNAVAILABLE`; NGX logs the missing `VK_NVX_binary_import` through our callback at
+  error level; measured with the host's `--no-dlss`). `NO_NGX` is the init failure itself (no
+  NVIDIA driver, no `nvngx.dll`). The test device (`tests/test_device.cpp`) enables them when
+  present.
 - `caelix_upscaler_jitter_phases(upscaler, render_width, output_width)` = 8 * ceil((output /
   render)^2), at least 32 for RR; `caelix_jitter_halton(index, phases, out)` = Halton(2, 3)
   point (index % phases) + 1 minus 0.5.
@@ -226,15 +228,53 @@ the SDK enables the driver-side log as well.
 - The fallback after an NGX error is a nearest upscale (no filtering).
 - The render size is always the query's optimal size (no dynamic resolution).
 
+## Rust host (`host-rs/caelix-app`)
+
+Flags: `--upscaler none|dlss-sr|dlss-rr`, `--upscale-quality dlaa|quality|balanced|performance|ultra-performance`,
+`--upscale-preset N` (0 = NGX default; SR J=10 K=11 L=12 M=13, RR D=4 E=5 F=6),
+`--upscale-auto-exposure` (SR), `--jitter-phases N` (0 = `caelix_upscaler_jitter_phases`),
+`--no-dlss` (no NGX extensions on the device). The F1 Render window has the same rows plus
+"render WxH -> output WxH" from `caelix_renderer_get_upscaler_info`; Stats and the title show
+`upscale` ms. `caelix-vk` gets the NGX instance extensions and an optional device-extension
+query closure from the app (it stays free of caelix-sys); missing extensions are skipped with
+a warning. The host queries SR and RR support after the adopt and after a resize or quality
+change; a render call that returns `UNSUPPORTED` is repeated without the upscaler (the refused
+call records nothing). The jitter is `caelix_jitter_halton(frame_number, phases)` only while an
+upscaler is active (pt mode); otherwise 0 as before.
+
+Host validation (2026-10-20, `Artifacts/dlss-host-20261020/`, Bistro exterior 4096 at
+1920x1080, sun 2e4, pose from `native-renderer-bistro-20261014`, frame 240 of a 360-frame run):
+
+| Run | Render size | trace | denoise | upscale | composite |
+| --- | --- | --- | --- | --- | --- |
+| NRD, no upscaler | 1920x1080 | 7.25 | 1.13 | 0 | 0.05 |
+| SR Quality | 1280x720 | 3.52 | 0.71 | 0.50 | 0.02 |
+| SR Performance | 960x540 | 2.01 | 0.32 | 0.68 | 0.01 |
+| RR Quality | 1280x720 | 3.52 | 0 | 1.75 | 0.01 |
+| RR Quality, preset F | 1280x720 | 3.52 | 0 | 1.75 | 0.01 |
+
+SR Performance costs more upscale time than SR Quality (NGX picks preset M there, K for
+Quality). A constant jitter (`--jitter-phases 1`) gives stair-stepped edges, which shows the
+Halton sequence reaches DLSS. Image notes: SR Quality is a little softer than native with clean
+edges; SR Performance shows NRD's colour blotches enlarged. **RR is clean and sharp but visibly
+brighter and hazier than NRD and the reference** (mean luminance of the 8-bit screenshots: NRD
+0.89 of the 1024-frame reference, RR 1.15, 1.25 on the shaded right wall; the raw 1 spp frame
+reads 0.70 because the swapchain clips fireflies, so these ratios are only indicative). Open
+tuning item for RR, candidates: the hit distance of diffuse-sampled bounces in the specular
+slot, the specular albedo of dielectrics, the sky diffuse albedo 0.5, HW depth vs linear depth,
+sun NEE spikes. The fallback with `--no-dlss` is pixel-identical to the NRD image.
+
 ## Unity plugin
 
-`CaelixUnityViewPacket` embeds `CaelixRenderOptions`, so it grew from 488 to 504 bytes; the
-plugin's `static_assert` and `caelix_unity.h` say so. The C# mirror (Caelix repository,
-`CaelixNativeBridge.cs`) must grow by the four new fields before the plugin works in Unity
-again: its `Check()` size comparison fails until then. The plugin passes the fields through
-unchanged (zero = no upscaler). The plugin does not enable the NGX extensions in its
-`vkCreateDevice` interception yet, and it drops targets of another size than the colour target;
-both are plugin-phase work.
+Packet version 6 (`docs/UNITY_PLUGIN.md`, "Packet v6 as built"): the `CaelixNativeRenderer`
+component selects the upscaler, quality, preset and auto exposure (path trace mode only, live in
+Play Mode). The plugin queries the upscaler per view and key and publishes the result in
+`CaelixUnityStatus::upscalers[view]`; C# allocates the depth, motion and albedo targets at the
+reported render size from the next frame on (the first frame of a key renders without the
+upscaler) and uses the Halton jitter of `caelix_jitter_halton` instead of URP's TAA jitter. The
+plugin's `vkCreateInstance` / `vkCreateDevice` interception enables the NGX extensions the loader
+and the device offer (`CaelixUnityStatus::upscaler_extensions`), and the status carries
+`upscale_ms`. `CaelixUnityViewPacket` is 504 bytes, `CaelixUnityStatus` 536 bytes.
 
 ## Validation (2026-10-20, RTX 5080, driver 610.88, Vulkan validation layer on)
 
