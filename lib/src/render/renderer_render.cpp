@@ -356,6 +356,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     {
         denoiser = EnsureDenoiser(width, height, nrd_error);
     }
+    else if (ray_reconstruction && nrd_ != nullptr)
+    {
+        // RR replaces NRD: the instance (about 160 MiB at 2048x1152) is released once its last
+        // frame is safe; a later SR frame creates a new one (its history is stale anyway).
+        RetireDenoiser();
+    }
 
     FrameSlot* slot = AcquireSlot(frame.frame_number, safe);
     if (slot == nullptr)

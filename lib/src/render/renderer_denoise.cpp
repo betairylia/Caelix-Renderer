@@ -29,10 +29,7 @@ NrdExecutor* Renderer::EnsureDenoiser(uint32_t width, uint32_t height, bool& err
     {
         return nrd_.get();
     }
-    if (nrd_ != nullptr)
-    {
-        retired_nrd_.push_back(RetiredDenoiser{nrd_last_frame_, std::move(nrd_)});
-    }
+    RetireDenoiser();
     const nrd::DenoiserDesc denoiser{kReblurIdentifier, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR};
     try
     {
@@ -52,6 +49,16 @@ NrdExecutor* Renderer::EnsureDenoiser(uint32_t width, uint32_t height, bool& err
     nrd_frame_index_ = 0;
     nrd_last_time_ = {};
     return nrd_.get();
+}
+
+void Renderer::RetireDenoiser()
+{
+    if (nrd_ == nullptr)
+    {
+        return;
+    }
+    retired_nrd_.push_back(RetiredDenoiser{nrd_last_frame_, std::move(nrd_)});
+    nrd_history_valid_ = false;
 }
 
 bool Renderer::ConfigureDenoiser(NrdExecutor& executor, const CaelixCamera& camera,

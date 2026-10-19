@@ -337,8 +337,93 @@ statistics after the newest flush (plus `staging_bytes`, `upload_bricks_free`), 
 `upload_bricks_cap` and `live_views`. Removed: `bricks_pending_plugin`, `scene_packets`,
 `last_plugin_frame`.
 
+## Packet v6 as built (2026-10-20): DLSS upscalers
+
+Packet version 6 makes the library's upscalers (DLSS Super Resolution and Ray Reconstruction,
+`docs/DLSS.md`) usable from Unity. The packets keep their layout apart from the view packet's
+embedded `CaelixRenderOptions` (176 -> 192 bytes: `upscaler`, `upscale_quality`, `upscale_preset`,
+`upscale_flags`), so the view packet is 504 bytes.
+
+Status (280 -> 536 bytes). `pad1` (offset 164) became `upscaler_extensions`, `pad2` (offset 276)
+became `upscale_ms` (the `CaelixGpuTimings::upscale_ms` of the `REPORT_TIMINGS` view), and
+`CaelixUnityUpscalerStatus upscalers[8]` (32 bytes each) starts at offset 280:
+
+| Offset in the entry | Field | Meaning |
+| --- | --- | --- |
+| 0 | `upscaler` | the key of the view's newest query: `CaelixUpscaler` (0 = no query yet) |
+| 4 | `quality` | `CaelixUpscaleQuality` of the query |
+| 8, 12 | `output_width`, `output_height` | the colour target size of the query |
+| 16 | `supported` | `CaelixUpscalerQueryResult::supported` |
+| 20 | `reason` | `CaelixUpscalerUnsupportedReason` (`BAD_ARGUMENT` also when the query call failed) |
+| 24, 28 | `render_width`, `render_height` | the size of the geometry targets while upscaling |
+
+The render thread writes an entry whole under a mutex, and `caelix_unity_status` copies the array
+under the same mutex, so a reader never pairs the key of one query with the result of another.
+
+One-frame handshake. A view packet in `CAELIX_MODE_PATH_TRACE` with `options.upscaler != NONE`:
+
+1. The plugin builds the key (upscaler, quality, colour image width and height) and, when it
+   differs from the view's cached key, calls `caelix_upscaler_query` (the first query of the device
+   creates the NGX runtime) and publishes the entry.
+2. Unsupported: `options.upscaler` is cleared for this frame, the frame renders at the colour size
+   (warning once per view and key).
+3. Supported: when every present geometry target (depth, motion, albedo) of the packet declares
+   the render size, the frame is upscaled and those targets must have the render size; otherwise
+   `options.upscaler` is cleared for this frame and the geometry targets are accepted at the
+   colour size (an info line once per view and key: the normal first frame of a key). The first
+   upscaled frame of a key logs "view v: DLSS SR quality q preset p upscales WxH -> WxH".
+4. `AccessOptionalTarget` takes the expected size (render size when upscaling, colour size
+   otherwise); a target of another size is dropped with "it is WxH, the frame expects WxH".
+
+The other modes ignore the upscaler (the plugin clears the field). The log lines of the upscaler
+decision have their own rate limit (the first 10, then one in 600).
+
+Vulkan extensions. `vkCreateInstance` adds the names of `caelix_upscaler_instance_extensions` that
+the loader offers (`vkEnumerateInstanceExtensionProperties` through the loader's
+`vkGetInstanceProcAddr`); a missing one is logged and skipped, and a failed `vkCreateInstance` with
+the additions retries with Unity's create info (as before for the api version). `vkCreateDevice`
+asks `caelix_upscaler_device_extensions(instance, physical_device)` after the requirement check and
+adds the names the device offers. They are optional: missing ones are logged and skipped (NGX then
+does not start and the query reports `NO_NGX`). `upscaler_extensions` is 1 only when every name was
+enabled and the device was created with the plugin's create info (the retry path and the "lacks a
+Caelix requirement" path leave it 0). On the RTX 5080 / 610.88 the lists are instance
+`VK_KHR_get_physical_device_properties2`, device `VK_NVX_binary_import`,
+`VK_NVX_image_view_handle`, `VK_KHR_buffer_device_address`, `VK_KHR_push_descriptor`.
+
+C# (`CaelixNativeRenderer`, section "Upscaler" of the Inspector, live in Play Mode): `upscaler`
+(None, DlssSuperResolution, DlssRayReconstruction), `upscaleQuality` (Dlaa, Quality, Balanced,
+Performance, UltraPerformance; default Quality), `upscalePreset` (0..15, 0 = NGX default; SR J 10,
+K 11, L 12, M 13; RR D 4, E 5, F 6), `upscaleAutoExposure` (SR only). Properties `UpscalerKind`,
+`UpscaleQualityLevel`, `UpscalePreset`, `UpscaleAutoExposure`. Per view frame
+(`ResolveUpscaler` in `CaelixNativeRenderer.Views.cs`):
+
+- The request is none unless the view is in the path trace mode (a Scene view in `Primary` mode
+  gets none) and `upscaler` is set.
+- The status entry of the view with the request's key and `supported = 1` gives the render size:
+  depth, motion and albedo are allocated at `render_width x render_height`, the colour at the
+  camera size (`CaelixNativeViewTargets.Ensure(colour w, h, geometry w, h, view)` recreates only the
+  targets whose size changed; each packet target carries its own texture size). Before that entry
+  arrives the geometry targets have the camera size and the plugin renders that frame without the
+  upscaler. An entry with the key and `supported = 0` makes the request none (one warning per view
+  and key with the reason); C# then sends no upscaler, so the plugin keeps the entry.
+- Jitter: while the request is not none, URP's jittered projection is ignored and the jitter is
+  `caelix_jitter_halton(Time.frameCount, caelix_upscaler_jitter_phases(upscaler, render_width,
+  camera width))` (render width 0 while unknown = ratio 1: 8 phases for SR, 32 for RR), through the
+  P/Invoke class `CaelixNativeLibrary` (`caelix_renderer.dll`). `LastJitter` follows it.
+- A camera with `UniversalAdditionalCameraData.antialiasing == TemporalAntiAliasing` while a
+  request is active logs once "DLSS replaces TAA; set the anti-aliasing of camera ... to None";
+  the frame still renders.
+- `ResetAccumulation()` stays the reset path (`reset_accumulation` also drops the upscaler's
+  history). `CAELIX_UPSCALE_FLAG_RESET_HISTORY` is not used by C#.
+- The feature and the present shader are unchanged: the shader point-samples every target by UV,
+  so render-size depth, motion and albedo scale by themselves, and the motion pass divides by the
+  motion texture's own dimensions (`GetDimensions`).
+- The status log (`statusLogInterval`) adds `upscale` to the GPU timings, `upscaler extensions`
+  and, per live view with a query, "view v: upscaler u quality q WxH -> WxH (reason r)".
+
 ## Open questions for the owner
 
 1. (answered) Loading time: "Load on startup" on the plugin importer; P1 verifies it.
-2. Should the plugin's targets be camera-sized or allow a render scale now (for the later
-   upscalers)? Proposal: camera-sized in P1-P3; a scale factor is one line later.
+2. (answered by packet v6) Should the plugin's targets be camera-sized or allow a render scale now
+   (for the later upscalers)? The colour target stays camera-sized; the geometry targets take the
+   upscaler's render size (see "Packet v6 as built").

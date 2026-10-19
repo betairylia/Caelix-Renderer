@@ -4,9 +4,15 @@
 // the function we return for every Vulkan entry point. We return HookGetInstanceProcAddr, which
 // hands out two wrappers and passes everything else through:
 //   vkCreateInstance: raises VkApplicationInfo::apiVersion to the library's api version (1.3) when
-//     Unity asks for less, so the core 1.2 / 1.3 entry points that the library loads exist.
+//     Unity asks for less, so the core 1.2 / 1.3 entry points that the library loads exist, and
+//     appends the upscalers' instance extensions (caelix_upscaler_instance_extensions) that the
+//     loader offers. A missing one is logged and skipped.
 //   vkCreateDevice: appends the library's device extensions and enables its feature bits
-//     (caelix_get_device_requirements), keeping everything Unity asked for.
+//     (caelix_get_device_requirements), keeping everything Unity asked for, and appends the
+//     upscalers' device extensions (caelix_upscaler_device_extensions) that the device offers.
+//     Those are optional: a missing one is logged and skipped (NGX then does not start, the
+//     upscaler query reports CAELIX_UPSCALER_NO_NGX); CaelixUnityStatus::upscaler_extensions is 1
+//     only when every one was enabled.
 //
 // Features, without breaking Vulkan's valid-usage rules on Unity's own chain:
 //   - A feature struct that Unity already chained is edited IN PLACE (the bits are OR-ed in) and
@@ -23,7 +29,8 @@
 //     pEnabledFeatures becomes NULL (the two must not be used together).
 // When the physical device lacks a requirement, the wrapper logs it and creates Unity's device
 // unchanged (caelix_device_adopt then reports CAELIX_ERROR_UNSUPPORTED). When vkCreateDevice fails
-// with our additions, it logs the error and retries with Unity's create info.
+// with our additions, it logs the error and retries with Unity's create info. vkCreateInstance
+// does the same when its additions fail.
 #include "plugin_state.h"
 
 #include <cstring>
@@ -48,6 +55,45 @@ std::string JoinNames(const char* const* names, uint32_t count)
         joined += names[i];
     }
     return joined.empty() ? std::string("(none)") : joined;
+}
+
+bool ContainsName(const std::vector<const char*>& names, const char* name)
+{
+    for (const char* existing : names)
+    {
+        if (std::strcmp(existing, name) == 0) return true;
+    }
+    return false;
+}
+
+bool Offers(const std::vector<VkExtensionProperties>& offered, const char* name)
+{
+    for (const VkExtensionProperties& extension : offered)
+    {
+        if (std::strcmp(extension.extensionName, name) == 0) return true;
+    }
+    return false;
+}
+
+void AppendName(std::string& list, const char* name)
+{
+    if (!list.empty()) list += ", ";
+    list += name;
+}
+
+// The device extensions the physical device offers (empty when the query cannot be loaded).
+std::vector<VkExtensionProperties> DeviceExtensions(VkPhysicalDevice physical_device)
+{
+    auto enumerate_extensions = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        g_next_gipa(g_instance, "vkEnumerateDeviceExtensionProperties"));
+    std::vector<VkExtensionProperties> available;
+    if (enumerate_extensions == nullptr) return available;
+    uint32_t count = 0;
+    enumerate_extensions(physical_device, nullptr, &count, nullptr);
+    available.resize(count);
+    enumerate_extensions(physical_device, nullptr, &count, available.data());
+    available.resize(count);
+    return available;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -105,20 +151,64 @@ VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstance(const VkInstanceCreateInfo* cr
     VkInstanceCreateInfo info = *create_info;
     info.pApplicationInfo = &app;
 
+    // The upscalers' instance extensions that the loader offers and Unity did not enable.
+    std::vector<const char*> extensions(create_info->ppEnabledExtensionNames,
+                                        create_info->ppEnabledExtensionNames + create_info->enabledExtensionCount);
+    std::string upscaler_added;
+    std::string upscaler_missing;
+    {
+        uint32_t upscaler_count = 0;
+        const char* const* upscaler_names = nullptr;
+        caelix_upscaler_instance_extensions(&upscaler_count, &upscaler_names);
+        std::vector<VkExtensionProperties> offered;
+        auto enumerate_extensions = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+            g_next_gipa(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties"));
+        if (upscaler_count > 0 && enumerate_extensions != nullptr)
+        {
+            uint32_t count = 0;
+            enumerate_extensions(nullptr, &count, nullptr);
+            offered.resize(count);
+            enumerate_extensions(nullptr, &count, offered.data());
+            offered.resize(count);
+        }
+        for (uint32_t i = 0; i < upscaler_count; ++i)
+        {
+            const char* name = upscaler_names[i];
+            if (ContainsName(extensions, name)) continue;
+            if (Offers(offered, name))
+            {
+                extensions.push_back(name);
+                AppendName(upscaler_added, name);
+            }
+            else
+            {
+                AppendName(upscaler_missing, name);
+            }
+        }
+    }
+    if (!upscaler_missing.empty())
+    {
+        Log(LogLevel::Warning, "vkCreateInstance: the loader lacks upscaler instance extensions (skipped): %s",
+            upscaler_missing.c_str());
+    }
+    info.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
+    info.ppEnabledExtensionNames = extensions.data();
+
     char unity_text[32], our_text[32], loader_text[32];
     Log(LogLevel::Info, "vkCreateInstance: Unity requested Vulkan %s%s, the plugin requests %s "
-                        "(loader %s); instance extensions: %s",
+                        "(loader %s); instance extensions: %s; added for the upscalers: %s",
         FormatVersion(unity_version, unity_text, sizeof(unity_text)),
         create_info->pApplicationInfo == nullptr ? " (no VkApplicationInfo)" : "",
         FormatVersion(our_version, our_text, sizeof(our_text)),
         FormatVersion(loader_version, loader_text, sizeof(loader_text)),
-        JoinNames(create_info->ppEnabledExtensionNames, create_info->enabledExtensionCount).c_str());
+        JoinNames(create_info->ppEnabledExtensionNames, create_info->enabledExtensionCount).c_str(),
+        upscaler_added.empty() ? "none" : upscaler_added.c_str());
 
     VkResult result = next(&info, allocator, out_instance);
-    if (result != VK_SUCCESS && our_version != unity_version)
+    if (result != VK_SUCCESS && (our_version != unity_version || !upscaler_added.empty()))
     {
-        Log(LogLevel::Error, "vkCreateInstance with Vulkan %s failed (VkResult %d); retrying with "
-                             "Unity's create info",
+        Log(LogLevel::Error, "vkCreateInstance with Vulkan %s and the added extensions failed (VkResult %d); "
+                             "retrying with Unity's create info",
             our_text, static_cast<int>(result));
         result = next(create_info, allocator, out_instance);
         our_version = unity_version;
@@ -206,22 +296,10 @@ bool CheckSupport(VkPhysicalDevice physical_device, const CaelixDeviceRequiremen
             FormatVersion(properties.apiVersion, text, sizeof(text)));
         ok = false;
     }
-    uint32_t count = 0;
-    enumerate_extensions(physical_device, nullptr, &count, nullptr);
-    std::vector<VkExtensionProperties> available(count);
-    enumerate_extensions(physical_device, nullptr, &count, available.data());
+    const std::vector<VkExtensionProperties> available = DeviceExtensions(physical_device);
     for (uint32_t i = 0; i < requirements.device_extension_count; ++i)
     {
-        bool found = false;
-        for (const VkExtensionProperties& extension : available)
-        {
-            if (std::strcmp(extension.extensionName, requirements.device_extensions[i]) == 0)
-            {
-                found = true;
-                break;
-            }
-        }
-        if (!found)
+        if (!Offers(available, requirements.device_extensions[i]))
         {
             Log(LogLevel::Error, "vkCreateDevice: %s lacks extension %s", properties.deviceName,
                 requirements.device_extensions[i]);
@@ -370,31 +448,27 @@ const VkBaseInStructure* FindInChain(const void* chain, VkStructureType type)
     return nullptr;
 }
 
+// `optional_extensions`: the upscalers' device extensions that the device offers.
 void BuildPatch(const VkDeviceCreateInfo& unity, const CaelixDeviceRequirements& requirements,
-                const Wanted& w, DevicePatch& patch)
+                const Wanted& w, const std::vector<const char*>& optional_extensions, DevicePatch& patch)
 {
     patch.info = unity;
 
-    // Extensions: Unity's, then ours that are missing.
+    // Extensions: Unity's, then ours that are missing, then the optional ones that are missing.
     patch.extensions.assign(unity.ppEnabledExtensionNames,
                             unity.ppEnabledExtensionNames + unity.enabledExtensionCount);
+    auto add = [&patch](const char* name) {
+        if (ContainsName(patch.extensions, name)) return;
+        patch.extensions.push_back(name);
+        patch.added_extensions.emplace_back(name);
+    };
     for (uint32_t i = 0; i < requirements.device_extension_count; ++i)
     {
-        const char* name = requirements.device_extensions[i];
-        bool present = false;
-        for (const char* existing : patch.extensions)
-        {
-            if (std::strcmp(existing, name) == 0)
-            {
-                present = true;
-                break;
-            }
-        }
-        if (!present)
-        {
-            patch.extensions.push_back(name);
-            patch.added_extensions.emplace_back(name);
-        }
+        add(requirements.device_extensions[i]);
+    }
+    for (const char* name : optional_extensions)
+    {
+        add(name);
     }
     patch.info.enabledExtensionCount = static_cast<uint32_t>(patch.extensions.size());
     patch.info.ppEnabledExtensionNames = patch.extensions.data();
@@ -620,6 +694,7 @@ VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice physical_device
         create_info->enabledExtensionCount,
         JoinNames(create_info->ppEnabledExtensionNames, create_info->enabledExtensionCount).c_str());
 
+    GetState().upscaler_extensions.store(0);
     if (!CheckSupport(physical_device, requirements, wanted))
     {
         Log(LogLevel::Error, "vkCreateDevice: the physical device lacks a Caelix requirement; Unity's "
@@ -627,10 +702,60 @@ VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice physical_device
         return next(physical_device, create_info, allocator, out_device);
     }
 
+    // The upscalers' device extensions (optional): the ones the device offers are added.
+    std::vector<const char*> upscaler_extensions;
+    bool upscaler_complete = false;
+    {
+        uint32_t upscaler_count = 0;
+        const char* const* upscaler_names = nullptr;
+        const CaelixResult query = caelix_upscaler_device_extensions(
+            reinterpret_cast<uint64_t>(g_instance), reinterpret_cast<uint64_t>(physical_device), &upscaler_count,
+            &upscaler_names);
+        if (query != CAELIX_OK)
+        {
+            Log(LogLevel::Warning, "vkCreateDevice: caelix_upscaler_device_extensions failed (CaelixResult %d); "
+                                   "no upscaler extensions are added",
+                static_cast<int>(query));
+        }
+        const std::vector<VkExtensionProperties> available = DeviceExtensions(physical_device);
+        std::string missing;
+        for (uint32_t i = 0; i < upscaler_count; ++i)
+        {
+            // Unity enables VK_EXT_buffer_device_address; the KHR extension must not be enabled with
+            // it (VUID-VkDeviceCreateInfo-ppEnabledExtensionNames-03328). The device is Vulkan 1.2+
+            // with the core bufferDeviceAddress feature (a Caelix requirement), which NGX accepts
+            // (measured: the DLSS test passes without the KHR extension), so it counts as satisfied.
+            if (std::strcmp(upscaler_names[i], VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) == 0 &&
+                ContainsName(std::vector<const char*>(create_info->ppEnabledExtensionNames,
+                                                      create_info->ppEnabledExtensionNames +
+                                                          create_info->enabledExtensionCount),
+                             VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME))
+            {
+                Log(LogLevel::Info, "vkCreateDevice: %s is not added: Unity enables %s, and the core "
+                                    "bufferDeviceAddress feature satisfies NGX",
+                    VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+                continue;
+            }
+            if (Offers(available, upscaler_names[i]))
+                upscaler_extensions.push_back(upscaler_names[i]);
+            else
+                AppendName(missing, upscaler_names[i]);
+        }
+        upscaler_complete = query == CAELIX_OK && upscaler_count > 0 && missing.empty();
+        if (!missing.empty())
+        {
+            Log(LogLevel::Warning, "vkCreateDevice: the device lacks upscaler extensions (skipped; the "
+                                   "upscalers will not start): %s",
+                missing.c_str());
+        }
+        Log(LogLevel::Info, "vkCreateDevice: upscaler device extensions: %s",
+            JoinNames(upscaler_extensions.data(), static_cast<uint32_t>(upscaler_extensions.size())).c_str());
+    }
+
     VkResult result;
     {
         DevicePatch patch;
-        BuildPatch(*create_info, requirements, wanted, patch);
+        BuildPatch(*create_info, requirements, wanted, upscaler_extensions, patch);
         std::string added;
         for (const std::string& name : patch.added_extensions)
         {
@@ -651,8 +776,10 @@ VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice physical_device
     if (result == VK_SUCCESS)
     {
         GetState().device_patched.store(1);
-        Log(LogLevel::Info, "vkCreateDevice OK: VkDevice %p with the Caelix extensions and features",
-            static_cast<void*>(*out_device));
+        GetState().upscaler_extensions.store(upscaler_complete ? 1u : 0u);
+        Log(LogLevel::Info, "vkCreateDevice OK: VkDevice %p with the Caelix extensions and features (upscaler "
+                            "extensions %s)",
+            static_cast<void*>(*out_device), upscaler_complete ? "complete" : "incomplete");
         return result;
     }
     Log(LogLevel::Error, "vkCreateDevice with the Caelix additions failed (VkResult %d); retrying "

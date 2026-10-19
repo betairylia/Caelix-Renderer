@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 namespace caelix_unity {
 
@@ -52,6 +53,8 @@ struct State
     std::atomic<uint32_t> intercept_called{0};
     std::atomic<uint32_t> instance_patched{0};
     std::atomic<uint32_t> device_patched{0};
+    // 1 when vkCreateDevice enabled every device extension of the upscalers.
+    std::atomic<uint32_t> upscaler_extensions{0};
     std::atomic<uint32_t> device_adopted{0};
     std::atomic<int32_t> last_error{0};
     // The packets the render thread is done with, one sequence per packet kind.
@@ -87,8 +90,14 @@ struct State
     std::atomic<float> trace_ms{0.0f};
     std::atomic<float> composite_ms{0.0f};
     std::atomic<float> denoise_ms{0.0f};
+    std::atomic<float> upscale_ms{0.0f};
     std::atomic<uint64_t> timings_frame{0};
     std::atomic<uint32_t> timings_view{0};
+    // The newest upscaler query of each view (CaelixUnityStatus::upscalers). Written on the render
+    // thread when a view's query key changes, read by caelix_unity_status; the mutex keeps the key
+    // and the result of one entry together.
+    std::mutex upscalers_mutex;
+    CaelixUnityUpscalerStatus upscalers[CAELIX_UNITY_MAX_VIEWS] = {};
 
     // Render thread only (device events and plugin events).
     CaelixDevice* device = nullptr;

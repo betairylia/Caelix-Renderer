@@ -1,6 +1,6 @@
 // The plugin's C API for C# and the render-thread work of the plugin events.
 //
-// Packet version 5: three plugin events, each with its own packet kind (caelix_unity.h).
+// Packet version 6: three plugin events, each with its own packet kind (caelix_unity.h).
 //
 // Frame event (once per Unity frame, before any camera renders): applies the frame packet's scene
 // records (entities, brick removes, brick uploads) and flushes the scene. A packet with
@@ -19,7 +19,10 @@
 //
 // Render event (once per view per Unity frame): renders the view's renderer (created on the
 // view's first render event) over the shared scene into the packet's targets, with the sky
-// cubemap target when the packet has one.
+// cubemap target when the packet has one. A path trace packet with an upscaler is upscaled when
+// the upscaler query (cached per view and key, published in CaelixUnityStatus::upscalers) says
+// supported and the geometry targets have the query's render size; otherwise the frame renders at
+// the colour size without the upscaler.
 //
 // Release event (graphics queue access, queue idle): releases cached target views, one view's
 // renderer, or every renderer and the scene.
@@ -27,8 +30,10 @@
 
 #include <caelix_unity.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -44,7 +49,11 @@ static_assert(sizeof(CaelixUnityFramePacket) == 80, "CaelixUnityFramePacket is 8
 // 504 since the DLSS step (CaelixRenderOptions grew 176 -> 192 bytes); the C# mirror must follow.
 static_assert(sizeof(CaelixUnityViewPacket) == 504, "CaelixUnityViewPacket is 504 bytes");
 static_assert(sizeof(CaelixUnityReleasePacket) == 32, "CaelixUnityReleasePacket is 32 bytes");
-static_assert(sizeof(CaelixUnityStatus) == 280, "CaelixUnityStatus is 280 bytes");
+static_assert(sizeof(CaelixUnityStatus) == 536, "CaelixUnityStatus is 536 bytes");
+static_assert(sizeof(CaelixUnityUpscalerStatus) == 32, "CaelixUnityUpscalerStatus is 32 bytes");
+static_assert(offsetof(CaelixUnityStatus, upscaler_extensions) == 164 &&
+                  offsetof(CaelixUnityStatus, upscale_ms) == 276 && offsetof(CaelixUnityStatus, upscalers) == 280,
+              "CaelixUnityStatus offsets of the upscaler fields (C# mirrors them)");
 static_assert(sizeof(CaelixUnityEntity) == 48 && sizeof(CaelixUnityBrickRemove) == 16 &&
                   sizeof(CaelixUnityUpload) == 16 && sizeof(CaelixMaterialEntry) == 52,
               "record sizes of caelix_unity.h");
@@ -67,6 +76,16 @@ struct GuidHash
     }
 };
 
+// The upscaler query of one view, cached by its key (see "Upscalers" in caelix_unity.h).
+struct UpscalerCache
+{
+    bool valid = false;
+    CaelixUpscalerQueryDesc key{};
+    CaelixUpscalerQueryResult result{};
+    bool logged_fallback = false;  // the frame of this key rendered without the upscaler (logged)
+    bool logged_active = false;    // the first upscaled frame of this key (logged)
+};
+
 // Render thread only.
 struct RenderThreadState
 {
@@ -86,6 +105,8 @@ struct RenderThreadState
     uint64_t renders_without_scene = 0;
     uint64_t error_logs = 0;
     uint32_t access_logs = 0;
+    uint64_t upscaler_logs = 0;
+    UpscalerCache upscalers[CAELIX_UNITY_MAX_VIEWS];
 
     std::unordered_map<Guid, CaelixEntityId, GuidHash> entities;
     std::vector<CaelixEntityId> packet_ids;      // scratch: entity id per packet entity record
@@ -113,6 +134,13 @@ void Fail(CaelixResult result, const char* what)
         Log(LogLevel::Error, "%s event: %s (CaelixResult %d)", g_rt.event_name, what,
             static_cast<int>(result));
     }
+}
+
+// The upscaler lines (once per view and key): the first 10, then one in 600, like the errors.
+bool ShouldLogUpscaler()
+{
+    ++g_rt.upscaler_logs;
+    return g_rt.upscaler_logs <= 10 || g_rt.upscaler_logs % 600 == 0;
 }
 
 // A scene call failed but the event goes on.
@@ -279,27 +307,29 @@ bool AccessTarget(const CaelixUnityTarget& target, UnityVulkanImage& image)
 }
 
 // An optional geometry target of the packet: accessed and checked like the colour target, but a
-// failure only drops the target (logged a few times), the frame still renders.
+// failure only drops the target (logged a few times), the frame still renders. `width` x `height`
+// is the expected size: the colour target's, or the upscaler's render size.
 bool AccessOptionalTarget(const CaelixUnityTarget& target, const char* name, uint32_t width,
                           uint32_t height, CaelixTargetImage& out)
 {
     out = CaelixTargetImage{};
     if (target.native_texture == nullptr && target.native_render_buffer == nullptr) return false;
     UnityVulkanImage image{};
-    const char* problem = nullptr;
+    char problem[128] = {};
     if (!AccessTarget(target, image))
     {
-        problem = "AccessTexture failed";
+        std::snprintf(problem, sizeof(problem), "AccessTexture failed");
     }
     else if ((image.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0)
     {
-        problem = "no STORAGE usage (RenderTexture.enableRandomWrite is off)";
+        std::snprintf(problem, sizeof(problem), "no STORAGE usage (RenderTexture.enableRandomWrite is off)");
     }
     else if (image.extent.width != width || image.extent.height != height)
     {
-        problem = "its size differs from the colour target";
+        std::snprintf(problem, sizeof(problem), "it is %ux%u, the frame expects %ux%u", image.extent.width,
+                      image.extent.height, width, height);
     }
-    if (problem != nullptr)
+    if (problem[0] != '\0')
     {
         if (g_rt.dropped_target_logs < 8)
         {
@@ -314,6 +344,148 @@ bool AccessOptionalTarget(const CaelixUnityTarget& target, const char* name, uin
     out.height = image.extent.height;
     out.layout = static_cast<uint32_t>(image.layout);
     return true;
+}
+
+const char* UpscalerName(uint32_t upscaler)
+{
+    switch (upscaler)
+    {
+        case CAELIX_UPSCALER_NONE: return "none";
+        case CAELIX_UPSCALER_DLSS_SR: return "DLSS SR";
+        case CAELIX_UPSCALER_DLSS_RR: return "DLSS RR";
+        default: return "unknown upscaler";
+    }
+}
+
+const char* UpscalerReasonName(uint32_t reason)
+{
+    switch (reason)
+    {
+        case CAELIX_UPSCALER_OK: return "ok";
+        case CAELIX_UPSCALER_NOT_BUILT: return "the library was built without the upscaler";
+        case CAELIX_UPSCALER_NO_NGX: return "NGX did not start (driver, DLL or device extension missing)";
+        case CAELIX_UPSCALER_FEATURE_UNAVAILABLE: return "the GPU or the NGX runtime lacks the feature";
+        case CAELIX_UPSCALER_DRIVER_TOO_OLD: return "the driver is too old";
+        case CAELIX_UPSCALER_QUALITY_UNAVAILABLE: return "no render size for this quality";
+        case CAELIX_UPSCALER_BAD_ARGUMENT: return "bad argument (output below 64 x 32, or an unknown value)";
+        default: return "unknown reason";
+    }
+}
+
+// Publishes the query of `view` for caelix_unity_status (key and result together).
+void PublishUpscalerStatus(uint32_t view, const UpscalerCache& cache)
+{
+    CaelixUnityUpscalerStatus entry{};
+    entry.upscaler = cache.key.upscaler;
+    entry.quality = cache.key.quality;
+    entry.output_width = cache.key.output_width;
+    entry.output_height = cache.key.output_height;
+    entry.supported = cache.result.supported;
+    entry.reason = cache.result.reason;
+    entry.render_width = cache.result.render_width;
+    entry.render_height = cache.result.render_height;
+    State& state = GetState();
+    std::lock_guard<std::mutex> lock(state.upscalers_mutex);
+    state.upscalers[view] = entry;
+}
+
+// True when the packet target is absent or declares `width` x `height`.
+bool DeclaresSize(const CaelixUnityTarget& target, uint32_t width, uint32_t height)
+{
+    const bool present = target.native_texture != nullptr || target.native_render_buffer != nullptr;
+    return !present || (target.width == width && target.height == height);
+}
+
+// Decides whether this frame of `view` is upscaled (see "Upscalers" in caelix_unity.h). With
+// options.upscaler set in the path trace mode it queries the upscaler for the key (upscaler,
+// quality, colour size), cached per view, and publishes the result. The frame is upscaled when the
+// query says supported and every present geometry target of the packet declares the query's render
+// size; otherwise options.upscaler is cleared for this frame (logged once per key). Writes the size
+// the geometry targets must have (render size or colour size) to geometry_width / geometry_height.
+void DecideUpscaler(uint32_t view, const CaelixUnityViewPacket& packet, uint32_t color_width,
+                    uint32_t color_height, CaelixRenderOptions& options, uint32_t& geometry_width,
+                    uint32_t& geometry_height)
+{
+    geometry_width = color_width;
+    geometry_height = color_height;
+    if (options.upscaler == CAELIX_UPSCALER_NONE) return;
+    if (options.mode != CAELIX_MODE_PATH_TRACE)
+    {
+        // The library ignores the upscaler in the other modes; C# sends none there.
+        options.upscaler = CAELIX_UPSCALER_NONE;
+        return;
+    }
+
+    State& state = GetState();
+    UpscalerCache& cache = g_rt.upscalers[view];
+    const CaelixUpscalerQueryDesc key{options.upscaler, options.upscale_quality, color_width, color_height};
+    if (!cache.valid || std::memcmp(&cache.key, &key, sizeof(key)) != 0)
+    {
+        cache = UpscalerCache{};
+        cache.valid = true;
+        cache.key = key;
+        // The first query of the device creates the NGX runtime (it costs once).
+        const CaelixResult result = caelix_upscaler_query(state.device, &key, &cache.result);
+        if (result != CAELIX_OK)
+        {
+            cache.result = CaelixUpscalerQueryResult{};
+            cache.result.reason = CAELIX_UPSCALER_BAD_ARGUMENT;
+            state.last_error.store(static_cast<int32_t>(result));
+        }
+        PublishUpscalerStatus(view, cache);
+    }
+
+    if (cache.result.supported == 0)
+    {
+        options.upscaler = CAELIX_UPSCALER_NONE;
+        if (!cache.logged_fallback)
+        {
+            cache.logged_fallback = true;
+            if (ShouldLogUpscaler())
+            {
+                Log(LogLevel::Warning, "view %u: %s quality %u at %ux%u is not available (reason %u: %s); the view "
+                                       "renders without the upscaler",
+                    view, UpscalerName(key.upscaler), key.quality, key.output_width, key.output_height,
+                    cache.result.reason, UpscalerReasonName(cache.result.reason));
+            }
+        }
+        return;
+    }
+
+    const uint32_t render_width = cache.result.render_width;
+    const uint32_t render_height = cache.result.render_height;
+    if (!DeclaresSize(packet.depth, render_width, render_height) ||
+        !DeclaresSize(packet.motion, render_width, render_height) ||
+        !DeclaresSize(packet.albedo, render_width, render_height))
+    {
+        // The normal first frame of a key: C# reads the render size from the status and allocates
+        // its geometry targets at that size for the next frame.
+        options.upscaler = CAELIX_UPSCALER_NONE;
+        if (!cache.logged_fallback)
+        {
+            cache.logged_fallback = true;
+            if (ShouldLogUpscaler())
+            {
+                Log(LogLevel::Info, "view %u: %s quality %u needs geometry targets of %ux%u for the output %ux%u; "
+                                    "this frame renders without the upscaler",
+                    view, UpscalerName(key.upscaler), key.quality, render_width, render_height,
+                    key.output_width, key.output_height);
+            }
+        }
+        return;
+    }
+    geometry_width = render_width;
+    geometry_height = render_height;
+    if (!cache.logged_active)
+    {
+        cache.logged_active = true;
+        if (ShouldLogUpscaler())
+        {
+            Log(LogLevel::Info, "view %u: %s quality %u preset %u upscales %ux%u -> %ux%u", view,
+                UpscalerName(key.upscaler), key.quality, options.upscale_preset, render_width, render_height,
+                key.output_width, key.output_height);
+        }
+    }
 }
 
 // The sky cubemap target of a view packet: observed (ObserveOnly records nothing and ignores the
@@ -815,11 +987,16 @@ void RenderEvent(void* data)
              "the colour target has no STORAGE usage (RenderTexture.enableRandomWrite is off)");
         return;
     }
-    CaelixRenderTargets targets{};
-    AccessOptionalTarget(packet.depth, "depth", color.extent.width, color.extent.height, targets.depth);
-    AccessOptionalTarget(packet.motion, "motion", color.extent.width, color.extent.height, targets.motion);
-    AccessOptionalTarget(packet.albedo, "albedo", color.extent.width, color.extent.height, targets.albedo);
+    // The upscaler decision sets the size the geometry targets must have (no command recorded).
     CaelixRenderOptions options = packet.options;
+    uint32_t geometry_width = 0;
+    uint32_t geometry_height = 0;
+    DecideUpscaler(packet.view, packet, color.extent.width, color.extent.height, options, geometry_width,
+                   geometry_height);
+    CaelixRenderTargets targets{};
+    AccessOptionalTarget(packet.depth, "depth", geometry_width, geometry_height, targets.depth);
+    AccessOptionalTarget(packet.motion, "motion", geometry_width, geometry_height, targets.motion);
+    AccessOptionalTarget(packet.albedo, "albedo", geometry_width, geometry_height, targets.albedo);
     AccessSky(packet.sky, options.sky);
 
     UnityVulkanRecordingState recording{};
@@ -885,6 +1062,7 @@ void RenderEvent(void* data)
         state.trace_ms.store(timings.trace_ms);
         state.composite_ms.store(timings.composite_ms);
         state.denoise_ms.store(timings.denoise_ms);
+        state.upscale_ms.store(timings.upscale_ms);
         state.timings_frame.store(timings.frame_number);
         state.timings_view.store(packet.view);
     }
@@ -899,10 +1077,11 @@ void RenderEvent(void* data)
     {
         g_rt.logged_first_render = true;
         Log(LogLevel::Info, "first render: view %u, %ux%u, VkFormat %d, layout at access %d, Unity frame "
-                            "%llu (safe %llu), mode %u, sky cubemap %s",
+                            "%llu (safe %llu), mode %u, sky cubemap %s, upscaler %s",
             packet.view, color.extent.width, color.extent.height, static_cast<int>(color.format),
             static_cast<int>(color.layout), static_cast<unsigned long long>(frame),
-            static_cast<unsigned long long>(safe), options.mode, options.sky.image != 0 ? "yes" : "no");
+            static_cast<unsigned long long>(safe), options.mode, options.sky.image != 0 ? "yes" : "no",
+            UpscalerName(options.upscaler));
     }
 }
 
@@ -1027,6 +1206,13 @@ void DestroyRenderObjects()
 {
     DestroySceneObjects();
     g_rt = RenderThreadState{};
+    // The upscaler queries belonged to the device that goes away.
+    State& state = GetState();
+    std::lock_guard<std::mutex> lock(state.upscalers_mutex);
+    for (CaelixUnityUpscalerStatus& entry : state.upscalers)
+    {
+        entry = CaelixUnityUpscalerStatus{};
+    }
 }
 
 }  // namespace caelix_unity
@@ -1042,7 +1228,7 @@ extern "C" CAELIX_UNITY_API void caelix_unity_status(CaelixUnityStatus* out)
     {
         return;
     }
-    const caelix_unity::State& state = caelix_unity::GetState();
+    caelix_unity::State& state = caelix_unity::GetState();
     CaelixUnityStatus status{};
     status.size = sizeof(CaelixUnityStatus);
     status.packet_version = CAELIX_UNITY_PACKET_VERSION;
@@ -1074,6 +1260,7 @@ extern "C" CAELIX_UNITY_API void caelix_unity_status(CaelixUnityStatus* out)
     status.groups = state.scene_groups.load();
     status.scene_resets = state.scene_resets.load();
     status.live_views = state.live_views.load();
+    status.upscaler_extensions = state.upscaler_extensions.load();
     status.bricks_resident = state.bricks_resident.load();
     status.as_builds_pending = state.as_builds_pending.load();
     status.uploaded_total = state.uploaded_total.load();
@@ -1090,5 +1277,10 @@ extern "C" CAELIX_UNITY_API void caelix_unity_status(CaelixUnityStatus* out)
     status.denoise_ms = state.denoise_ms.load();
     status.timings_frame = state.timings_frame.load();
     status.timings_view = state.timings_view.load();
+    status.upscale_ms = state.upscale_ms.load();
+    {
+        std::lock_guard<std::mutex> lock(state.upscalers_mutex);
+        std::memcpy(status.upscalers, state.upscalers, sizeof(status.upscalers));
+    }
     *out = status;
 }

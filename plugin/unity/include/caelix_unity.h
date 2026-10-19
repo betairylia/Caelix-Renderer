@@ -5,8 +5,10 @@
  *
  * The plugin is preloaded by Unity ("Load on startup" on the plugin importer). At load it
  * intercepts Unity's Vulkan initialization (vkCreateInstance, vkCreateDevice) and adds the
- * renderer's requirements (caelix_get_device_requirements); at the graphics device
- * initialization it adopts Unity's device (caelix_device_adopt).
+ * renderer's requirements (caelix_get_device_requirements) and, where the loader and the device
+ * offer them, the Vulkan extensions of the upscalers (caelix_upscaler_instance_extensions,
+ * caelix_upscaler_device_extensions; optional, see CaelixUnityStatus::upscaler_extensions); at the
+ * graphics device initialization it adopts Unity's device (caelix_device_adopt).
  *
  * Thread rule: every caelix_* call of the renderer library happens on Unity's render thread,
  * inside a plugin event or a graphics device event. The functions below never call the library:
@@ -59,6 +61,17 @@
  * sustained rate: frames in flight keep their staging space until they complete). Bricks the
  * library still refuses are dropped and counted in CaelixUnityStatus::bricks_dropped (logged); C#
  * treats a growing count as an error and sends the world again.
+ *
+ * Upscalers (DLSS SR / RR, caelix.h "Upscalers"): a view packet in CAELIX_MODE_PATH_TRACE with
+ * options.upscaler != CAELIX_UPSCALER_NONE makes the plugin query the upscaler for the packet's
+ * key (upscaler, upscale_quality, colour target width and height) with caelix_upscaler_query. The
+ * result is cached per view by that key (the first query of a device creates the NGX runtime) and
+ * published in CaelixUnityStatus::upscalers[view]. The frame is upscaled when the query says
+ * supported AND every present geometry target (depth, motion, albedo) has the query's render size;
+ * otherwise the plugin clears options.upscaler for this frame (logged once per key), renders at the
+ * colour size and accepts the geometry targets at the colour size. So C# learns the render size
+ * from the status one frame after it first asks, allocates its geometry targets at that size, and
+ * renders that first frame without the upscaler. The other modes ignore the upscaler.
  */
 #include <stdint.h>
 #include <caelix/caelix.h>
@@ -78,8 +91,11 @@ extern "C" {
 
 /* Bumped on every change of the packets, their records or CaelixUnityStatus.
    Version 5: three packet kinds with a common header (frame, view, release), sessions with a
-   reset config, sky cubemap target, no material mode, no per-packet encoding, 8 views. */
-#define CAELIX_UNITY_PACKET_VERSION 5u
+   reset config, sky cubemap target, no material mode, no per-packet encoding, 8 views.
+   Version 6: CaelixRenderOptions carries the upscaler fields (view packet 488 -> 504 bytes), the
+   geometry targets have the render size while a view upscales, and CaelixUnityStatus grew
+   upscale_ms, upscaler_extensions and upscalers[] (280 -> 536 bytes). */
+#define CAELIX_UNITY_PACKET_VERSION 6u
 
 /* Number of views (CaelixUnityViewPacket::view). Each view has its own renderer over the shared
    scene. C# gives every camera that renders through the plugin its own view. */
@@ -196,8 +212,9 @@ typedef struct CaelixUnityFramePacket
 
 /* One render event. 504 bytes (488 before the DLSS step grew CaelixRenderOptions). The plugin
    accesses every present target (AccessTexture); a target that AccessTexture refuses, without
-   STORAGE usage, or of another size than the colour target is dropped (logged a few times) and the
-   frame renders without it. */
+   STORAGE usage, or of another size than expected is dropped (logged a few times) and the frame
+   renders without it. The expected size of depth, motion and albedo is the colour target's size,
+   or the upscaler's render size when the frame is upscaled (see "Upscalers" at the top). */
 typedef struct CaelixUnityViewPacket
 {
     CaelixUnityPacketHeader header; /* kind CAELIX_UNITY_PACKET_VIEW */
@@ -208,9 +225,10 @@ typedef struct CaelixUnityViewPacket
                                        without a release */
     uint32_t pad;
     CaelixUnityTarget color;  /* RGBA16F with random write (STORAGE usage); required */
-    CaelixUnityTarget depth;  /* R32F: device depth of camera.projection; optional */
-    CaelixUnityTarget motion; /* RGBA16F: previous - current pixel, w = delta checkerboard flag; optional */
-    CaelixUnityTarget albedo; /* RGBA8 UNORM: albedo, a = coverage; optional */
+    CaelixUnityTarget depth;  /* R32F: device depth of camera.projection; optional; render size */
+    CaelixUnityTarget motion; /* RGBA16F: previous - current pixel, w = delta checkerboard flag; optional;
+                                 render size */
+    CaelixUnityTarget albedo; /* RGBA8 UNORM: albedo, a = coverage; optional; render size */
     /* The sky cubemap of the lighting modes (CaelixSkyCubemap, caelix.h): a Cubemap or a cube
        RenderTexture with mips, SAMPLED usage, no sun disk. NULL = the procedural sky. The plugin
        observes the image (AccessTexture, ObserveOnly) and fills options.sky from it (format, face
@@ -244,7 +262,23 @@ typedef struct CaelixUnityReleasePacket
  * Status
  * ------------------------------------------------------------------------------------------- */
 
-/* Plugin state for C#. 280 bytes. Counters are monotonic. */
+/* The upscaler query of one view (CaelixUnityStatus::upscalers). 32 bytes. The first four fields are
+   the key of the view's newest query (all 0 = none yet); the rest is its CaelixUpscalerQueryResult.
+   The plugin writes the whole entry at once, so a reader never sees the key of one query with the
+   result of another. */
+typedef struct CaelixUnityUpscalerStatus
+{
+    uint32_t upscaler;                    /* CaelixUpscaler of the query (0 = no query yet) */
+    uint32_t quality;                     /* CaelixUpscaleQuality */
+    uint32_t output_width, output_height; /* the colour target size of the query */
+    uint32_t supported;                   /* CaelixUpscalerQueryResult::supported */
+    uint32_t reason;                      /* CaelixUpscalerUnsupportedReason (CAELIX_UPSCALER_BAD_ARGUMENT
+                                             also when the query returned an error) */
+    uint32_t render_width, render_height; /* the size of the geometry targets while upscaling (0 when
+                                             unsupported) */
+} CaelixUnityUpscalerStatus;
+
+/* Plugin state for C#. 536 bytes. Counters are monotonic. */
 typedef struct CaelixUnityStatus
 {
     uint32_t size;                 /* sizeof(CaelixUnityStatus) */
@@ -285,7 +319,10 @@ typedef struct CaelixUnityStatus
     uint32_t groups;            /* CaelixSceneStats::groups */
     uint32_t scene_resets;      /* scenes created by CAELIX_UNITY_FRAME_RESET so far */
     uint32_t live_views;        /* bit v = view v has a renderer */
-    uint32_t pad1;
+    uint32_t upscaler_extensions; /* 1: vkCreateDevice enabled every Vulkan device extension of the
+                                     upscalers (caelix_upscaler_device_extensions); 0: some were
+                                     missing (logged; NGX then does not start), the build has no
+                                     upscaler, or the device was created with Unity's create info */
     uint64_t bricks_resident;   /* CaelixSceneStats::bricks_resident */
     uint64_t as_builds_pending; /* CaelixSceneStats::as_builds_pending */
     uint64_t uploaded_total;    /* bricks accepted by caelix_scene_upload_bricks so far */
@@ -306,7 +343,10 @@ typedef struct CaelixUnityStatus
     float denoise_ms;
     uint64_t timings_frame; /* CaelixGpuTimings::frame_number */
     uint32_t timings_view;  /* the view the timings belong to */
-    uint32_t pad2;
+    float upscale_ms;       /* CaelixGpuTimings::upscale_ms of that view (0 when it did not upscale) */
+
+    /* The newest upscaler query of each view (see "Upscalers" at the top). */
+    CaelixUnityUpscalerStatus upscalers[CAELIX_UNITY_MAX_VIEWS];
 } CaelixUnityStatus;
 
 /* The UnityRenderingEventAndData callback for CommandBuffer.IssuePluginEventAndData. Never NULL. */

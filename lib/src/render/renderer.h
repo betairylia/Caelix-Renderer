@@ -210,6 +210,8 @@ private:
     // when missing or of another size. Null after an NRD error (nrd_failed_, logged,
     // `error` set); throws VulkanError when its GPU objects cannot be created.
     NrdExecutor* EnsureDenoiser(uint32_t width, uint32_t height, bool& error);
+    // Retires nrd_ (destroyed once its last frame is safe) and forgets its history.
+    void RetireDenoiser();
     // nrd::CommonSettings and nrd::ReblurSettings of one frame.
     bool ConfigureDenoiser(NrdExecutor& executor, const CaelixCamera& camera,
                            const CaelixRenderOptions& options, uint32_t width, uint32_t height,
