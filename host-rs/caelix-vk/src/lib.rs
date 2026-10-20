@@ -24,7 +24,7 @@
 //!    and presents.
 //!
 //! [`Context::create_sky_cubemap`] uploads a sky cubemap once (outside the frame
-//! loop); the image lives until the context is dropped.
+//! loop); the image lives until [`Context::destroy_sky_cubemap`] or until the context is dropped.
 
 mod cubemap;
 mod debug;

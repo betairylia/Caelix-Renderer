@@ -16,6 +16,10 @@
 //! the library samples it instead of the procedural sky. `--load-on-key` opens the world on the L
 //! key instead of at start.
 //!
+//! The Load buttons of the Entities window (world) and the Render window's Sky section open a file
+//! dialog (`rfd`) after the frame and replace the world (its entities are removed from the scene)
+//! or the sky cubemap at run time; the Sequencer's Load and Save buttons use the same dialogs.
+//!
 //! `--test-entity` and `--test-edits` add a synthetic moving box and timed brick edits
 //! (`testscene.rs`, Test window) to judge the motion vectors and NRD.
 //!
@@ -166,7 +170,7 @@ struct Args {
     /// Vertical field of view in degrees.
     #[arg(long, value_name = "DEGREES", default_value_t = 60.0)]
     fov: f32,
-    /// Rendering mode. Default: `pt` with --world, else `primary`.
+    /// Rendering mode. Default: `pt`.
     #[arg(long, value_enum)]
     mode: Option<Mode>,
     /// Primary mode: the debug view (albedo .. steps, material); pt mode: nrd-validation, nrd-diff,
@@ -579,6 +583,13 @@ struct App {
     sequencer: Sequencer,
     /// --sky: taken by `create_state` for the upload.
     sky: Option<SkySource>,
+    /// The sky image of the current cubemap (--sky or the Sky section's Load button).
+    sky_path: Option<PathBuf>,
+    /// The error of the last world / sky load of a Load button, else empty.
+    world_note: String,
+    sky_note: String,
+    /// A file dialog that a debug UI button asked for; run after the frame.
+    file_request: Option<ui::FileRequest>,
     /// --screenshot-every: the presented-frame count of the first capture.
     every_base: Option<u64>,
     /// The debug UI's Screenshot button was pressed; the copy is recorded when no readback is pending.
@@ -634,9 +645,11 @@ impl App {
             None
         } else {
             context.init_overlay().context("cannot create the egui overlay")?;
+            // Without a world at start the Entities window is open: its Load button opens one.
+            let entities_open = self.args.world.is_none() || self.args.load_on_key;
             let test_open = self.args.test_entity || self.args.test_edits;
             let sequencer_open = self.args.sequence.is_some();
-            Some(ui::Ui::new(&window, !self.args.no_ui, self.args.ui_demo, test_open, sequencer_open))
+            Some(ui::Ui::new(&window, !self.args.no_ui, self.args.ui_demo, entities_open, test_open, sequencer_open))
         };
 
         let handles = context.adopt_handles();
@@ -722,6 +735,7 @@ impl App {
                 start.elapsed().as_secs_f64() * 1e3
             );
             self.settings.sky_cubemap = Some(cubemap);
+            self.sky_path = Some(source.path);
         }
 
         if let Some(path) = self.args.world.as_deref() {
@@ -809,6 +823,10 @@ impl App {
                     upscaler_rr: self.upscaler_support.map(|s| s.rr),
                     upscaler_info: upscaler_info(state.renderer),
                     gi: gi_stats(state.renderer),
+                    world_name: state.loader.as_ref().and(self.args.world.as_deref()).map(file_name),
+                    world_note: self.world_note.clone(),
+                    sky_name: self.sky_path.as_deref().map(file_name),
+                    sky_note: self.sky_note.clone(),
                 };
                 let mut panel = ui::Panel {
                     stats: &stats,
@@ -821,8 +839,10 @@ impl App {
                     reset_accumulation: false,
                     reset_gi_history: false,
                     screenshot: false,
+                    file_request: None,
                 };
                 ui_frame = Some(ui.run(&state.window, &mut panel));
+                self.file_request = panel.file_request;
                 ui_reset = panel.reset_accumulation;
                 ui_gi_reset = panel.reset_gi_history;
                 if panel.screenshot {
@@ -1152,6 +1172,11 @@ impl App {
                 }
             }
         }
+        // A Load / Save button: the dialog blocks the thread, so it runs after the frame.
+        if let Some(request) = self.file_request.take() {
+            self.run_file_request(request);
+        }
+
         // A failed export (a PNG write error) ends a --sequence-export run with an error; in the
         // window the Sequencer note shows it.
         if let Some(error) = self.sequencer.export_failed() {
@@ -1160,6 +1185,9 @@ impl App {
             }
         }
 
+        let Some(state) = self.state.as_mut() else {
+            return Ok(());
+        };
         // NRD: one info line at the second frame of the renderer's NRD instance (or at an NRD error).
         if self.nrd_frames < 2 {
             // SAFETY: CaelixNrdInfo is a plain C struct of integers; all zero is a valid value.
@@ -1246,24 +1274,48 @@ impl App {
         self.camera.translate(forward * step, right * step, up * step);
     }
 
-    /// --load-on-key: opens the --world file (once), adds its entity rows before the test entity's,
-    /// and takes the file's player pose when no --pose was given.
+    /// --load-on-key: opens the --world file (once) and takes the file's player pose when no
+    /// --pose was given.
     fn load_world_on_key(&mut self) -> anyhow::Result<()> {
-        let (true, Some(path)) = (self.args.load_on_key, self.args.world.as_deref()) else {
+        let (true, Some(path)) = (self.args.load_on_key, self.args.world.clone()) else {
             return Ok(());
         };
-        let Some(state) = self.state.as_mut() else {
-            return Ok(());
-        };
-        if state.loader.is_some() {
+        if self.state.as_ref().is_none_or(|state| state.loader.is_some()) {
             return Ok(());
         }
         log::info!("world load requested by key: {}", path.display());
+        self.open_world(&path, self.args.pose.is_none())
+    }
+
+    /// Removes the loaded world's entities from the scene (after the decoder stopped and the device
+    /// is idle), then opens `path`: its entity rows go before the test entity's, and with
+    /// `take_pose` the camera moves to the file's player pose. An empty sequence that still has the
+    /// old world's default file gets the new world's.
+    fn open_world(&mut self, path: &Path, take_pose: bool) -> anyhow::Result<()> {
+        let Some(state) = self.state.as_mut() else {
+            return Ok(());
+        };
+        if let Some(mut old) = state.loader.take() {
+            old.stop();
+            // Frames in flight still read the old entities' records.
+            state.context.wait_idle();
+            let count = old.entities().len();
+            for row in self.entities.drain(..count) {
+                // SAFETY: the scene is live and the entity is one of its own.
+                let result = unsafe { caelix_scene_remove_entity(state.scene, row.scene_id) };
+                if result != CaelixResult_CAELIX_OK {
+                    bail!("caelix_scene_remove_entity({}) failed: CaelixResult {result}", row.scene_id);
+                }
+            }
+            log::info!("world unloaded: {count} entities removed");
+        }
+        let old_default = sequence::default_file(self.args.world.as_deref());
+        self.args.world = Some(path.to_path_buf());
         let loader = world::WorldLoader::open(state.scene, path)?;
         // The draw loop pairs the first rows with the loader's entities, in file order.
         let rows: Vec<ui::EntityRow> = loader.entities().iter().map(ui::EntityRow::new).collect();
         self.entities.splice(0..0, rows);
-        if let (None, Some(player)) = (self.args.pose, loader.player_pose()) {
+        if let (true, Some(player)) = (take_pose, loader.player_pose()) {
             self.camera = Camera::from_quaternion(player.position, player.rotation, self.args.fov);
             log::info!(
                 "camera from the world's player pose: position {:?}, pitch {:.4}, yaw {:.4}",
@@ -1273,7 +1325,113 @@ impl App {
             );
         }
         state.loader = Some(loader);
+        if self.sequencer.sequence.keyframes.is_empty() && self.sequencer.file == old_default {
+            self.sequencer.new_sequence(sequence::default_file(Some(path)));
+        }
         Ok(())
+    }
+
+    /// Converts a lat-long sky image and replaces the sky cubemap with it (the old one is destroyed
+    /// after the device is idle and the renderer released its view). The cubemap is switched on.
+    fn load_sky(&mut self, path: &Path) -> anyhow::Result<()> {
+        let Some(state) = self.state.as_mut() else {
+            return Ok(());
+        };
+        let start = Instant::now();
+        let latlong = sky::load_latlong(path)?;
+        let source = sky::to_cubemap(&latlong, self.args.sky_size, self.args.sky_rotation);
+        let convert_ms = start.elapsed().as_secs_f64() * 1e3;
+        state.context.wait_idle();
+        // SAFETY: the device is idle, so no frame uses the cached views.
+        unsafe { caelix_renderer_release_target_views(state.renderer) };
+        if let Some(old) = self.settings.sky_cubemap.take() {
+            state.context.destroy_sky_cubemap(&old);
+        }
+        self.sky_path = None;
+        let start = Instant::now();
+        let cubemap =
+            state.context.create_sky_cubemap(source.size, &source.mips).context("cannot upload the sky cubemap")?;
+        log::info!(
+            "sky cubemap loaded: {} ({}x{} lat-long), face {}, {} mips, decode + convert {convert_ms:.1} ms, \
+             upload {:.1} ms",
+            path.display(),
+            latlong.width,
+            latlong.height,
+            cubemap.size,
+            cubemap.mip_levels,
+            start.elapsed().as_secs_f64() * 1e3
+        );
+        self.settings.sky_cubemap = Some(cubemap);
+        self.settings.use_sky_cubemap = true;
+        self.sky_path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Runs the file dialog of a debug UI button and acts on the chosen file. A failed load is
+    /// reported in the window's note, not fatal.
+    fn run_file_request(&mut self, request: ui::FileRequest) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        // The dialog starts in the directory of the current file.
+        let dialog = |title: &str, current: Option<&Path>| {
+            let mut dialog = rfd::FileDialog::new().set_title(title).set_parent(&state.window);
+            let current = current.and_then(|p| std::path::absolute(p).ok());
+            if let Some(dir) = current.as_deref().and_then(Path::parent) {
+                dialog = dialog.set_directory(dir);
+            }
+            if let Some(name) = current.as_deref().and_then(Path::file_name) {
+                dialog = dialog.set_file_name(name.to_string_lossy());
+            }
+            dialog
+        };
+        let sequence_file = PathBuf::from(&self.sequencer.file);
+        match request {
+            ui::FileRequest::LoadWorld => {
+                let picked = dialog("Load world", self.args.world.as_deref())
+                    .add_filter("Caelix world", &["cxw"])
+                    .pick_file();
+                if let Some(path) = picked {
+                    self.world_note.clear();
+                    if let Err(e) = self.open_world(&path, true) {
+                        log::error!("world load failed: {e:#}");
+                        self.world_note = format!("load failed: {e:#}");
+                    }
+                }
+            }
+            ui::FileRequest::LoadSky => {
+                let picked = dialog("Load sky image", self.sky_path.as_deref())
+                    .add_filter("Lat-long HDR image", &["exr", "hdr"])
+                    .pick_file();
+                if let Some(path) = picked {
+                    self.sky_note.clear();
+                    if let Err(e) = self.load_sky(&path) {
+                        log::error!("sky load failed: {e:#}");
+                        self.sky_note = format!("load failed: {e:#}");
+                    }
+                }
+            }
+            ui::FileRequest::LoadSequence => {
+                let picked =
+                    dialog("Load sequence", Some(&sequence_file)).add_filter("Sequence", &["json"]).pick_file();
+                if let Some(path) = picked {
+                    self.sequencer.file = path.display().to_string();
+                    // The result is in the Sequencer note.
+                    let _ = self.sequencer.load();
+                }
+            }
+            ui::FileRequest::SaveSequence => {
+                let picked =
+                    dialog("Save sequence", Some(&sequence_file)).add_filter("Sequence", &["json"]).save_file();
+                if let Some(path) = picked {
+                    self.sequencer.file = path.display().to_string();
+                    let _ = self.sequencer.save();
+                }
+            }
+            ui::FileRequest::NewSequence => {
+                self.sequencer.new_sequence(sequence::default_file(self.args.world.as_deref()));
+            }
+        }
     }
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
@@ -1425,6 +1583,11 @@ impl ApplicationHandler for App {
         // the context (State::drop).
         self.state = None;
     }
+}
+
+/// The file name of a path, for the debug UI.
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// Directory of the debug UI's and --screenshot-every's PNGs: --screenshot-dir, else the
@@ -1724,7 +1887,7 @@ fn main() -> anyhow::Result<()> {
     if args.bounces > CAELIX_MAX_BOUNCES {
         bail!("--bounces {} is above the maximum {}", args.bounces, CAELIX_MAX_BOUNCES);
     }
-    let mode = args.mode.unwrap_or(if args.world.is_some() { Mode::Pt } else { Mode::Primary });
+    let mode = args.mode.unwrap_or(Mode::Pt);
     if args.accumulate.is_some() && mode != Mode::Ref {
         bail!("--accumulate needs --mode ref");
     }
@@ -1856,13 +2019,9 @@ fn main() -> anyhow::Result<()> {
     // The camera sequencer. File field: --sequence, else <world dir>/<world stem>.sequence.json,
     // else sequence.json; export directory: --sequence-export, else the file without ".json" plus
     // "-frames".
-    let sequence_file = match (args.sequence.as_deref(), args.world.as_deref()) {
-        (Some(path), _) => path.display().to_string(),
-        (None, Some(world)) => {
-            let stem = world.file_stem().map_or_else(|| "world".into(), |s| s.to_string_lossy());
-            world.with_file_name(format!("{stem}.sequence.json")).display().to_string()
-        }
-        (None, None) => "sequence.json".into(),
+    let sequence_file = match args.sequence.as_deref() {
+        Some(path) => path.display().to_string(),
+        None => sequence::default_file(args.world.as_deref()),
     };
     let export_dir = match args.sequence_export.as_deref() {
         Some(dir) => dir.display().to_string(),
@@ -1906,6 +2065,10 @@ fn main() -> anyhow::Result<()> {
         test,
         sequencer,
         sky,
+        sky_path: None,
+        world_note: String::new(),
+        sky_note: String::new(),
+        file_request: None,
         every_base: None,
         ui_screenshot_requested: false,
         readback_owner: None,

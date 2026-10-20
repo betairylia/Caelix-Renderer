@@ -66,7 +66,7 @@ compiled SPIR-V of those shaders ships, not the header.
   March 14, 2024; the same license family as NRD, with stricter terms for the DLSS and
   NGX SDKs). The full text is `LICENSE.txt` in the fetched source:
   `build/_deps/ngx-src/LICENSE.txt` after the first CMake configure. Read it before you
-  ship a build. Not yet accepted by the owner for distribution (integration work only).
+  ship a build. Accepted by the owner for distribution on 2026-10-20.
 
 ### What the library contains and ships
 

@@ -896,8 +896,7 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   degrees. Default: the world's player pose (format version 7), else
   (0, 64, -128) with pitch 15 and yaw 0.
 - `--fov <DEGREES>`: vertical field of view. Default 60.
-- `--mode <primary|pt|ref>`: the rendering mode. Default `pt` with `--world`,
-  else `primary`.
+- `--mode <primary|pt|ref>`: the rendering mode. Default `pt`.
 - `--view <albedo|normal|depth|group|brick|steps|material|nrd-validation|nrd-diff|nrd-spec|motion>`:
   the debug view; the first six and `material` (the material table's albedo,
   transparent codes tinted blue, emitters white) in the primary mode,
@@ -1149,7 +1148,12 @@ and `egui-ash-renderer` 0.13.0 (dynamic rendering, default allocator) in
 
 Six separate egui windows in egui's default style (two changes: no window
 and popup shadows, window titles at 15.5 points instead of 18). Each window
-can be dragged and collapsed, and each has collapsible sections:
+can be dragged and collapsed, and each has collapsible sections. Every window
+starts collapsed, except Entities when no world is open at start, Test with
+`--test-*` and Sequencer with `--sequence` (`--ui-demo` opens everything). In
+the Render window only the Mode and "Accumulation and screenshot" sections
+start open. The Load and Save buttons open a system file dialog (`rfd`); the
+host runs it after the frame, because the dialog blocks the thread.
 
 - **Stats**: fps (1 s window), frame number, target size; the GPU times of
   the newest timed frame (trace, denoise, composite, flush,
@@ -1164,8 +1168,10 @@ can be dragged and collapsed, and each has collapsible sections:
   0.05..8); the sun as pitch (elevation, positive up) and yaw (0 = +Z, 90 =
   +X) in degrees with the resulting direction, colour plus intensity
   (logarithmic, 0..1e5; radiance = colour x intensity) and angular radius
-  (0.1..10 degrees); the sky: "cubemap (--sky)" (disabled without `--sky`;
-  the face size and mip count) and the zenith, horizon and ground colours
+  (0.1..10 degrees); the sky: the image file name with Load (a lat-long
+  `.exr` / `.hdr`, converted at `--sky-size` and `--sky-rotation`; it replaces
+  the cubemap and switches it on), "cubemap" (disabled without an image; the
+  face size and mip count) and the zenith, horizon and ground colours
   (greyed out while the cubemap is in use); fog density (logarithmic, 0..1
   per unit) and colour; the materials' emission scale (logarithmic, 0..64);
   the GI section: method, ReSTIR GI M cap (1..64), spatial samples (1..8),
@@ -1180,7 +1186,11 @@ can be dragged and collapsed, and each has collapsible sections:
   rewritten only when their controls change).
 - **Camera**: position, pitch, yaw, vertical fov, speed; "Copy --pose" puts
   the `--pose ... --fov ...` line on the clipboard (the `P` key still logs it).
-- **Entities**: one collapsible row per world entity (index, GUID, decoded
+- **Entities**: the world row (file name, Load: opens a `.cxw` in place of the
+  loaded world; the old world's decoder stops, the device waits idle and its
+  entities are removed with `caelix_scene_remove_entity`; the camera takes the
+  new file's player pose; disabled during an export), the load state, then
+  one collapsible row per world entity (index, GUID, decoded
   brick count) with the position and the Unity Euler angles (pitch, yaw,
   roll, degrees, `Quaternion.Euler` order: roll, then pitch, then yaw). A
   change calls `caelix_scene_set_entity_transform` before the frame's flush;
@@ -1197,8 +1207,9 @@ can be dragged and collapsed, and each has collapsible sections:
   uploads), Stats (flush ms newest and 1 s mean / max, AS builds per second,
   AS builds pending, finalized bricks per second).
 - **Sequencer** (bottom centre, collapsed unless `--sequence`; see "Camera
-  sequencer"): File (file path, Load, Save, New, name, interpolation, loop,
-  export fps), Transport (`|<`, Play / Pause, Stop, time slider), Keyframes
+  sequencer"): File (file name, Load, Save = a save dialog at the current
+  file, New = an empty sequence at `<world stem>.sequence.json` that only Save
+  writes; name, interpolation, loop, export fps), Transport (`|<`, Play / Pause, Stop, time slider), Keyframes
   (per row: select, start time, hold, travel, pose, Go, Set, Dup, x; Add at
   camera, Up, Down), Export (directory, warmup, samples, size, frame count,
   Export / Cancel, progress, the ffmpeg line with Copy). File and keyframe

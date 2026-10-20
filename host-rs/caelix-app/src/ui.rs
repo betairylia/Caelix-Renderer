@@ -3,7 +3,11 @@
 //!
 //! egui-winit turns the window events into egui input; this module holds the egui context and
 //! builds the windows. They edit the host's state directly (render settings, camera, entity
-//! transforms) and report one-shot requests (reset accumulation, screenshot) in [`Panel`].
+//! transforms) and report one-shot requests (reset accumulation, screenshot, a file dialog) in
+//! [`Panel`]. Every window starts collapsed except Entities without a world (it holds the world's
+//! Load button), Test with `--test-*` and Sequencer with `--sequence`.
+
+use std::path::Path;
 
 use caelix_sys::*;
 use egui::{CollapsingHeader, ComboBox, DragValue, Grid, ScrollArea, Slider};
@@ -41,6 +45,29 @@ pub struct Stats {
     pub upscaler_info: CaelixUpscalerInfo,
     /// The GI passes' time and reservoir memory (`caelix_renderer_get_gi_stats`).
     pub gi: CaelixGiStats,
+    /// File name of the loaded world (`None` before the first load).
+    pub world_name: Option<String>,
+    /// The error of the last world load, else empty.
+    pub world_note: String,
+    /// File name of the sky image of the cubemap (`None` without one).
+    pub sky_name: Option<String>,
+    /// The error of the last sky load, else empty.
+    pub sky_note: String,
+}
+
+/// A file dialog that a button asked for. The host runs it after the frame (the dialog blocks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileRequest {
+    /// Open a `.cxw` world in place of the loaded one.
+    LoadWorld,
+    /// Open a lat-long `.exr` / `.hdr` sky image in place of the cubemap.
+    LoadSky,
+    /// Open a sequence JSON file.
+    LoadSequence,
+    /// Write the sequence to a JSON file (the dialog starts at the current file).
+    SaveSequence,
+    /// An empty sequence at the default file of the world (no dialog, nothing written).
+    NewSequence,
 }
 
 /// Why an upscaler query reported "unsupported", in words (`CaelixUpscalerUnsupportedReason`).
@@ -150,6 +177,8 @@ pub struct Panel<'a> {
     pub reset_gi_history: bool,
     /// Output: the "Screenshot" button was pressed.
     pub screenshot: bool,
+    /// Output: a Load / Save / New button was pressed.
+    pub file_request: Option<FileRequest>,
 }
 
 /// egui's output of one frame, for `caelix_vk::Context::draw_overlay`.
@@ -166,6 +195,8 @@ pub struct Ui {
     pub visible: bool,
     /// `--ui-demo`: every window and section starts open.
     demo: bool,
+    /// The Entities window starts open (no world at start).
+    entities_open: bool,
     /// The Test window starts open (`--test-entity`, `--test-edits`).
     test_open: bool,
     /// The Sequencer window starts open (`--sequence`).
@@ -173,7 +204,14 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(window: &Window, visible: bool, demo: bool, test_open: bool, sequencer_open: bool) -> Self {
+    pub fn new(
+        window: &Window,
+        visible: bool,
+        demo: bool,
+        entities_open: bool,
+        test_open: bool,
+        sequencer_open: bool,
+    ) -> Self {
         let ctx = egui::Context::default();
         // egui's default style with two changes (owner's choice): no window or popup shadows, and
         // smaller window titles (the title uses the Heading text style, 18 by default).
@@ -193,7 +231,7 @@ impl Ui {
             None,
             None,
         );
-        Self { ctx, winit, visible, demo, test_open, sequencer_open }
+        Self { ctx, winit, visible, demo, entities_open, test_open, sequencer_open }
     }
 
     /// Feeds a window event to egui (only while the UI is visible).
@@ -216,9 +254,13 @@ impl Ui {
     /// Runs one egui pass with the debug windows and tessellates it.
     pub fn run(&mut self, window: &Window, panel: &mut Panel<'_>) -> UiFrame {
         let raw_input = self.winit.take_egui_input(window);
-        let (demo, test_open, sequencer_open) = (self.demo, self.test_open, self.sequencer_open);
-        let output =
-            self.ctx.run_ui(raw_input, |root| debug_windows(root.ctx(), panel, demo, test_open, sequencer_open));
+        let open = StartOpen {
+            demo: self.demo,
+            entities: self.entities_open,
+            test: self.test_open,
+            sequencer: self.sequencer_open,
+        };
+        let output = self.ctx.run_ui(raw_input, |root| debug_windows(root.ctx(), panel, open));
         self.winit.handle_platform_output(window, output.platform_output);
         let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
         UiFrame { textures_delta: output.textures_delta, primitives, pixels_per_point: output.pixels_per_point }
@@ -229,16 +271,28 @@ fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 20) as f64
 }
 
+/// Which windows start open (egui reads it on the first frame only).
+#[derive(Clone, Copy)]
+struct StartOpen {
+    /// `--ui-demo`: every window.
+    demo: bool,
+    entities: bool,
+    test: bool,
+    sequencer: bool,
+}
+
 /// Six separate egui windows: Stats at the top left, Camera at the bottom left (with `--ui-demo`,
 /// where Stats is fully open, at the bottom centre, left of the Sequencer), Render at the top right,
-/// Entities at the top centre, Test at the bottom right (collapsed unless `test_open`), Sequencer at
-/// the bottom centre (collapsed unless `sequencer_open`). Each is draggable and collapsible (title
-/// bar); egui keeps the positions after the first frame.
-fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, demo: bool, test_open: bool, sequencer_open: bool) {
+/// Entities at the top centre, Test at the bottom right, Sequencer at the bottom centre. Each is
+/// draggable and collapsible (title bar) and starts collapsed unless `open` says otherwise; egui
+/// keeps the positions after the first frame.
+fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, open: StartOpen) {
+    let demo = open.demo;
     let screen = ctx.content_rect();
     let margin = 8.0;
     egui::Window::new("Stats")
         .default_pos([screen.min.x + margin, screen.min.y + margin])
+        .default_open(demo)
         .show(ctx, |ui| stats_window(ui, panel.stats, demo));
     let (camera_pivot, camera_x) = if demo {
         (egui::Align2::CENTER_BOTTOM, screen.center().x - 260.0)
@@ -248,27 +302,29 @@ fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, demo: bool, test_op
     egui::Window::new("Camera")
         .pivot(camera_pivot)
         .default_pos([camera_x, screen.max.y - margin])
+        .default_open(demo)
         .show(ctx, |ui| camera_window(ui, panel, demo));
     egui::Window::new("Render")
         .pivot(egui::Align2::RIGHT_TOP)
         .default_pos([screen.max.x - margin, screen.min.y + margin])
+        .default_open(demo)
         .show(ctx, |ui| render_window(ui, panel, demo));
     egui::Window::new(format!("Entities ({})", panel.entities.len()))
         .id(egui::Id::new("entities_window"))
         .pivot(egui::Align2::CENTER_TOP)
         .default_pos([screen.center().x, screen.min.y + margin])
-        .default_open(demo)
-        .show(ctx, |ui| entities_window(ui, panel.entities, demo));
+        .default_open(open.entities || demo)
+        .show(ctx, |ui| entities_window(ui, panel, demo));
     egui::Window::new("Test")
         .pivot(egui::Align2::RIGHT_BOTTOM)
         .default_pos([screen.max.x - margin, screen.max.y - margin])
-        .default_open(test_open || demo)
+        .default_open(open.test || demo)
         .show(ctx, |ui| test_window(ui, panel));
     let sequencer_x = if demo { screen.center().x + 220.0 } else { screen.center().x };
     egui::Window::new("Sequencer")
         .pivot(egui::Align2::CENTER_BOTTOM)
         .default_pos([sequencer_x, screen.max.y - margin])
-        .default_open(sequencer_open || demo)
+        .default_open(open.sequencer || demo)
         .show(ctx, |ui| sequencer_window(ui, panel));
 }
 
@@ -490,7 +546,7 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         ui.add_enabled(!lighting, egui::Checkbox::new(&mut settings.shading, "Lambert (primary mode)"));
     });
 
-    CollapsingHeader::new("GI").default_open(true).show(ui, |ui| {
+    CollapsingHeader::new("GI").default_open(demo).show(ui, |ui| {
         let gi = &mut settings.gi;
         let restir = lighting && gi.method == GiMethod::Restir;
         Grid::new("render_gi").num_columns(2).show(ui, |ui| {
@@ -542,7 +598,7 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         ui.label("Both methods force the Lambert lobe.");
     });
 
-    CollapsingHeader::new("Sun").default_open(true).show(ui, |ui| {
+    CollapsingHeader::new("Sun").default_open(demo).show(ui, |ui| {
         let (mut pitch, mut yaw) = direction_angles(settings.effective_sun_dir());
         Grid::new("render_sun").num_columns(2).show(ui, |ui| {
             ui.label("pitch");
@@ -585,16 +641,27 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
     CollapsingHeader::new("Sky").default_open(demo).show(ui, |ui| {
         let cubemap = settings.sky_cubemap;
         ui.horizontal(|ui| {
+            ui.label("image");
+            file_label(ui, stats.sky_name.as_deref(), "none (procedural sky)");
+            let load = ui.button("Load").on_hover_text("open a lat-long .exr or .hdr sky image without the sun disk");
+            if load.clicked() {
+                panel.file_request = Some(FileRequest::LoadSky);
+            }
+        });
+        if !stats.sky_note.is_empty() {
+            ui.label(&stats.sky_note);
+        }
+        ui.horizontal(|ui| {
             let checkbox = ui.add_enabled(
                 lighting && cubemap.is_some(),
-                egui::Checkbox::new(&mut settings.use_sky_cubemap, "cubemap (--sky)"),
+                egui::Checkbox::new(&mut settings.use_sky_cubemap, "cubemap"),
             );
             match cubemap {
                 Some(c) => {
                     ui.label(format!("face {}, {} mips", c.size, c.mip_levels));
                 }
                 None => {
-                    checkbox.on_disabled_hover_text("no --sky file");
+                    checkbox.on_disabled_hover_text("no sky image loaded");
                 }
             }
         });
@@ -705,12 +772,38 @@ fn camera_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
     });
 }
 
-fn entities_window(ui: &mut egui::Ui, entities: &mut [EntityRow], demo: bool) {
-    if entities.is_empty() {
-        ui.label("no world loaded");
+/// A file name in strong text, or the weak hint `none` when there is no file.
+fn file_label(ui: &mut egui::Ui, name: Option<&str>, none: &str) {
+    match name {
+        Some(name) => ui.strong(name),
+        None => ui.weak(none),
+    };
+}
+
+/// The world row (file name, Load), the load state and the entity list.
+fn entities_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
+    let stats = panel.stats;
+    ui.horizontal(|ui| {
+        ui.label("world");
+        file_label(ui, stats.world_name.as_deref(), "none");
+        // The export renders the loaded world; a new one would break it.
+        let load = ui.add_enabled(!panel.sequencer.is_exporting(), egui::Button::new("Load"));
+        if load.on_hover_text("open a .cxw world in place of the loaded one").clicked() {
+            panel.file_request = Some(FileRequest::LoadWorld);
+        }
+    });
+    if !stats.world_note.is_empty() {
+        ui.label(&stats.world_note);
+    } else if stats.world_name.is_some() {
+        ui.label(&stats.load_state);
+    } else {
+        ui.label("Load opens a .cxw world.");
+    }
+    if panel.entities.is_empty() {
         return;
     }
-    ScrollArea::vertical().max_height(300.0).show(ui, |ui| entities_list(ui, entities, demo));
+    ui.separator();
+    ScrollArea::vertical().max_height(300.0).show(ui, |ui| entities_list(ui, panel.entities, demo));
 }
 
 fn entities_list(ui: &mut egui::Ui, entities: &mut [EntityRow], demo: bool) {
@@ -861,17 +954,19 @@ fn sequencer_window(ui: &mut egui::Ui, panel: &mut Panel<'_>) {
     CollapsingHeader::new("File").default_open(true).show(ui, |ui| {
         ui.add_enabled_ui(!exporting, |ui| {
             ui.horizontal(|ui| {
-                ui.label("file");
-                ui.add(egui::TextEdit::singleline(&mut seq.file).desired_width(320.0));
-                // The result is in the note.
-                if ui.button("Load").clicked() {
-                    let _ = seq.load();
+                ui.label("file").on_hover_text(&seq.file);
+                let name = Path::new(&seq.file).file_name().map(|n| n.to_string_lossy());
+                file_label(ui, name.as_deref(), "none");
+                // The host runs the dialogs after the frame; the result is in the note.
+                if ui.button("Load").on_hover_text("open a sequence JSON file").clicked() {
+                    panel.file_request = Some(FileRequest::LoadSequence);
                 }
-                if ui.button("Save").clicked() {
-                    let _ = seq.save();
+                if ui.button("Save").on_hover_text("write the sequence to a JSON file").clicked() {
+                    panel.file_request = Some(FileRequest::SaveSequence);
                 }
-                if ui.button("New").clicked() {
-                    seq.new_sequence();
+                let new = ui.button("New").on_hover_text("an empty sequence at the world's default file");
+                if new.clicked() {
+                    panel.file_request = Some(FileRequest::NewSequence);
                 }
             });
             Grid::new("sequencer_file").num_columns(2).show(ui, |ui| {

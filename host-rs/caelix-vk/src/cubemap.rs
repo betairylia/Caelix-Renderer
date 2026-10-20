@@ -1,5 +1,6 @@
 //! Sky cubemap upload: an RGBA32F cube image with mips, filled once through a staging buffer and a
-//! one-time command buffer, then kept in `SHADER_READ_ONLY_OPTIMAL` until the context is dropped.
+//! one-time command buffer, then kept in `SHADER_READ_ONLY_OPTIMAL` until `destroy_sky_cubemap` or
+//! until the context is dropped.
 
 use ash::vk;
 use ash::vk::Handle;
@@ -135,6 +136,18 @@ impl Context {
                 Err(e)
             }
         }
+    }
+
+    /// Waits for the device and destroys a cubemap of `create_sky_cubemap` (a sky replaced at
+    /// run time). The caller first drops every view of it (`caelix_renderer_release_target_views`
+    /// after this wait, or before it with no frame pending). An unknown image is ignored.
+    pub fn destroy_sky_cubemap(&mut self, cubemap: &SkyCubemap) {
+        let Some(index) = self.owned_images.iter().position(|owned| owned.image.as_raw() == cubemap.image) else {
+            return;
+        };
+        self.wait_idle();
+        let owned = self.owned_images.swap_remove(index);
+        owned.destroy(&self.device);
     }
 
     /// Creates the objects of `upload` one by one (so the caller can destroy them on an error),

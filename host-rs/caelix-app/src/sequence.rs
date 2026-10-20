@@ -23,6 +23,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::camera::{wrap_degrees, Camera};
 
+/// The default sequence file: `<world dir>/<world file stem>.sequence.json`, else `sequence.json`.
+pub fn default_file(world: Option<&Path>) -> String {
+    match world {
+        Some(world) => {
+            let stem = world.file_stem().map_or_else(|| "world".into(), |s| s.to_string_lossy());
+            world.with_file_name(format!("{stem}.sequence.json")).display().to_string()
+        }
+        None => "sequence.json".into(),
+    }
+}
+
 /// Version of the JSON format that this host writes; a newer file is rejected.
 pub const FORMAT_VERSION: u32 = 1;
 /// Travel time of a new keyframe when there is none to copy from.
@@ -555,18 +566,19 @@ impl Sequencer {
         }
     }
 
-    /// Replaces the sequence with an empty one named after the file stem. Does nothing while
-    /// exporting.
-    pub fn new_sequence(&mut self) {
+    /// Replaces the sequence with an empty one at `file` (not written until Save), named after the
+    /// file stem. Does nothing while exporting.
+    pub fn new_sequence(&mut self, file: String) {
         if self.is_exporting() {
             return;
         }
+        self.file = file;
         let name = Path::new(&self.file).file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
         self.sequence = Sequence::new(name);
         self.playback = Playback::Stopped;
         self.selected = None;
         self.time = 0.0;
-        self.note = "new sequence".into();
+        self.note = "new sequence (Save writes it)".into();
     }
 
     // ---- Export ----
