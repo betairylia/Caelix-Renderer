@@ -18,14 +18,14 @@
     {
       "name": "bistro_dark",
       "world": "F:/RP_Games/Titania/saves/bistro-combined.8192.packed.cxw",
-      "pose": "1761.5,239.9,2456.0,-1.119,-127.260",
+      "pose": "3523.0,479.8,4912.0,-1.119,-127.260",
       "fov": 60,
       "extra": ["--sky-zenith", "0,0,0", "--sky-horizon", "0,0,0", "--sky-ground", "0,0,0"]
     },
     {
       "name": "bistro_sky",
       "world": "F:/RP_Games/Titania/saves/bistro-combined.8192.packed.cxw",
-      "pose": "1761.5,239.9,2456.0,-1.119,-127.260",
+      "pose": "3523.0,479.8,4912.0,-1.119,-127.260",
       "fov": 60,
       "extra": []
     }

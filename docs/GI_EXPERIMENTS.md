@@ -261,6 +261,63 @@ weights 1.0 % darker. On ashwick at 1024 reference frames: 1/M mean ratio 0.90 /
 channel, Z weights 0.996 / 1.000 / 1.001; GI cost 0.10 ms without reuse, 0.43 ms with 1/M,
 3.37 ms with Z weights at 1280x720.
 
+### Phase 1 results (2026-10-20, commit 622cb1e, RTX 5080, 1920x1080, 4 bounces)
+
+Full tables, comparison sheets and logs: `F:/RP_Games/Caelix-family/Artifacts/gi-experiments-20261020/`
+(`bench/` for cornell and ashwick, `bench-bistro-pose2x/` for both bistro scenes: the bench config
+had the 4096-world pose, fixed to `3523.0,479.8,4912.0,-1.119,-127.260` afterwards).
+
+Bias of the converged runs in linear light (mean of a 512-frame accumulation over the 2048-frame
+path tracer reference; the sRGB ratio in the bench tables is misleading because the references
+are still noisy and single frames clip at 255):
+
+| scene | 1/M (`restir`) | Z-count (`restir_unbiased`) |
+| --- | --- | --- |
+| cornell | 1.009 | 1.012 |
+| ashwick | 0.921 | 0.990 |
+| bistro black sky | 0.818 | 0.973 |
+| bistro with sky | 0.885 | 0.981 |
+
+Single frames after 64 warm-up frames, PSNR against the reference and the GI pass cost:
+
+| scene | pt 1 spp | restir 1/M | restir Z-count | gi ms 1/M | gi ms Z | gi ms visibility |
+| --- | --- | --- | --- | --- | --- | --- |
+| cornell | 5.5 dB (black) | 11.5 dB (reference noise bound) | 11.5 dB | 0.97 | 2.3 | 1.5 |
+| ashwick | 19.1 dB | 29.2 dB | 29.1 dB | 0.90 | 6.9 | 3.4 |
+| bistro black sky | 13.8 dB | 18.1 dB | 17.9 dB | 0.94 | 7.5 | 4.7 |
+| bistro with sky | 11.3 dB | 17.5 dB | 17.0 dB | 0.80 | 9.1 | 4.0 |
+
+Findings:
+- Emitter discovery without a light list works: the Cornell room is fully lit by the single voxel
+  at 64 frames (the path tracer at 1 spp is black); bistro shows the whole street.
+- The 1/M weights lose 8 to 18 % of the light in the complex scenes, concentrated in the light
+  pools near the emitters (lamp glows, the bounce from lamp heads). The Z-count weights remove the
+  bias but cost 7 to 9 ms at 1080p (one shadow ray per accepted neighbour for the selected sample).
+- `VISIBILITY` as built (occluded neighbours keep their M in the 1/M normalisation) darkens the
+  image to 0.5 to 0.7 linear. Wrong design, not a bug: the DI paper's visibility reuse tests the
+  SELECTED sample at the receiver instead. Change for the next iteration.
+- Temporal only and spatial only are both far below the combination (5 to 10 dB).
+- Warm-up: 4 frames after a history start the image has large coloured blotches (reservoirs hold
+  one bright sample each); 64 frames are clean. This is the disocclusion cost a moving camera pays,
+  and the main argument for a persistent world-space cache (phase 2).
+- Converged ReSTIR images keep sparkles along concave edges (cornell) and on near facades (bistro):
+  temporal correlation of bright reservoirs; a boiling filter or M cap tuning is untested.
+- No blocky patches and no depth-edge halos at 64 frames. Voxel face normals make the similarity
+  test exact.
+- Unrelated library bug seen in 4 of about 56 loads of ashwick and bistro: `entity group grid of
+  64 x 128 x 4096 cells exceeds the limit of 16777216 cells` -> `caelix_scene_upload_bricks: out
+  of memory`. `Scene::GrownGridShape` doubles the grid on an axis every time a group lands outside
+  it, so the final size depends on the sector arrival order (1 to 64 MiB for the same world).
+  Logs in `Artifacts/gi-experiments-20261020/failed-loads/`. Fix: grow to the actual span.
+- A path tracer artefact: a dotted dark line on the short block's top face along the brick seam
+  x = 32 in cornell (also in the reference, weaker): ray origin push-off at brick seams.
+
+Cheap next steps inside phase 1 (before phase 2): (a) Z-count WITHOUT visibility rays (count
+neighbours with a nonzero target function only; no rays, removes the geometric part of the 1/M
+bias) or pairwise MIS; (b) visibility reuse on the selected sample; (c) raise or remove the
+Jacobian clamp near emitters and measure the light pools again; (d) a converged run of the
+unbiased mode is now part of the protocol (`restir_unbiased_converged`).
+
 ## Phase 2 (planned): brick-keyed world-space reservoirs
 
 Sketch, to be designed after phase 1 numbers exist: hash cells keyed by (entity id, level,
