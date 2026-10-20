@@ -1,0 +1,34 @@
+Credits and third-party notices
+===============================
+
+This product uses NVIDIA Real-Time Denoisers (NRD).
+This product uses NVIDIA DLSS.
+
+NVIDIA, RTX and DLSS are trademarks and/or registered trademarks of NVIDIA
+Corporation in the U.S. and other countries.
+
+
+Components and licenses
+-----------------------
+
+caelix_renderer.dll contains:
+
+- NVIDIA Real-Time Denoisers (NRD) {nrd_version}, object code and compiled
+  shaders. License: NVIDIA RTX SDKs license,
+  licenses/NVIDIA-NRD-LICENSE.txt.
+- The NVIDIA NGX SDK {ngx_version} runtime library (DLSS). License: NVIDIA
+  RTX SDKs license, licenses/NVIDIA-DLSS-LICENSE.txt.
+- NVIDIA ShaderMake (ShaderMakeBlob), MIT, licenses/ShaderMake-LICENSE.txt.
+- NVIDIA MathLib, MIT, licenses/MathLib-LICENSE.txt.
+- volk, MIT, licenses/volk-LICENSE.md.
+- Vulkan Memory Allocator, MIT, licenses/VulkanMemoryAllocator-LICENSE.txt.
+- unordered_dense, MIT, licenses/unordered_dense-LICENSE.txt.
+
+nvngx_dlss.dll and nvngx_dlssd.dll: NVIDIA DLSS Super Resolution and Ray
+Reconstruction {ngx_version}. License: NVIDIA RTX SDKs license,
+licenses/NVIDIA-DLSS-LICENSE.txt.
+
+caelix-app.exe contains Rust crates under the MIT, Apache-2.0, BSD,
+Boost (BSL-1.0), ISC, zlib and Unicode licenses, and the egui default fonts
+(SIL Open Font License 1.1 and the Ubuntu Font Licence 1.0). The list of
+crates and the full license texts: licenses/rust-crates.txt.

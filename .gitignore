@@ -7,3 +7,4 @@ host-rs/target/
 .vscode/
 build-gi/
 __pycache__/
+dist/
