@@ -1,5 +1,5 @@
-//! Debug UI: five egui windows (Stats, Render, Camera, Entities, Test) in egui's default style, drawn by
-//! `caelix-vk` as an overlay on the swapchain image after the library has written it.
+//! Debug UI: six egui windows (Stats, Render, Camera, Entities, Test, Sequencer) in egui's default style,
+//! drawn by `caelix-vk` as an overlay on the swapchain image after the library has written it.
 //!
 //! egui-winit turns the window events into egui input; this module holds the egui context and
 //! builds the windows. They edit the host's state directly (render settings, camera, entity
@@ -11,6 +11,7 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::camera::{self, Camera};
+use crate::sequence::{Interpolation, Playback, Sequencer, MIN_DURATION};
 use crate::settings::{Mode, RenderSettings, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
 use crate::testscene::{EditPattern, TestScene};
 use crate::world::EntityEntry;
@@ -139,6 +140,8 @@ pub struct Panel<'a> {
     pub entities: &'a mut [EntityRow],
     /// The test entity and its edits (Test window).
     pub test: &'a mut TestScene,
+    /// The camera sequence, its playback and its export (Sequencer window).
+    pub sequencer: &'a mut Sequencer,
     /// Output: the "Reset accumulation" button was pressed.
     pub reset_accumulation: bool,
     /// Output: the "Screenshot" button was pressed.
@@ -161,10 +164,12 @@ pub struct Ui {
     demo: bool,
     /// The Test window starts open (`--test-entity`, `--test-edits`).
     test_open: bool,
+    /// The Sequencer window starts open (`--sequence`).
+    sequencer_open: bool,
 }
 
 impl Ui {
-    pub fn new(window: &Window, visible: bool, demo: bool, test_open: bool) -> Self {
+    pub fn new(window: &Window, visible: bool, demo: bool, test_open: bool, sequencer_open: bool) -> Self {
         let ctx = egui::Context::default();
         // egui's default style with two changes (owner's choice): no window or popup shadows, and
         // smaller window titles (the title uses the Heading text style, 18 by default).
@@ -184,7 +189,7 @@ impl Ui {
             None,
             None,
         );
-        Self { ctx, winit, visible, demo, test_open }
+        Self { ctx, winit, visible, demo, test_open, sequencer_open }
     }
 
     /// Feeds a window event to egui (only while the UI is visible).
@@ -207,8 +212,9 @@ impl Ui {
     /// Runs one egui pass with the debug windows and tessellates it.
     pub fn run(&mut self, window: &Window, panel: &mut Panel<'_>) -> UiFrame {
         let raw_input = self.winit.take_egui_input(window);
-        let (demo, test_open) = (self.demo, self.test_open);
-        let output = self.ctx.run_ui(raw_input, |root| debug_windows(root.ctx(), panel, demo, test_open));
+        let (demo, test_open, sequencer_open) = (self.demo, self.test_open, self.sequencer_open);
+        let output =
+            self.ctx.run_ui(raw_input, |root| debug_windows(root.ctx(), panel, demo, test_open, sequencer_open));
         self.winit.handle_platform_output(window, output.platform_output);
         let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
         UiFrame { textures_delta: output.textures_delta, primitives, pixels_per_point: output.pixels_per_point }
@@ -219,18 +225,19 @@ fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 20) as f64
 }
 
-/// Five separate egui windows: Stats at the top left, Camera at the bottom left (with `--ui-demo`,
-/// where Stats is fully open, at the bottom centre), Render at the top right, Entities at the top
-/// centre, Test at the bottom right (collapsed unless `test_open`). Each is draggable and
-/// collapsible (title bar); egui keeps the positions after the first frame.
-fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, demo: bool, test_open: bool) {
+/// Six separate egui windows: Stats at the top left, Camera at the bottom left (with `--ui-demo`,
+/// where Stats is fully open, at the bottom centre, left of the Sequencer), Render at the top right,
+/// Entities at the top centre, Test at the bottom right (collapsed unless `test_open`), Sequencer at
+/// the bottom centre (collapsed unless `sequencer_open`). Each is draggable and collapsible (title
+/// bar); egui keeps the positions after the first frame.
+fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, demo: bool, test_open: bool, sequencer_open: bool) {
     let screen = ctx.content_rect();
     let margin = 8.0;
     egui::Window::new("Stats")
         .default_pos([screen.min.x + margin, screen.min.y + margin])
         .show(ctx, |ui| stats_window(ui, panel.stats, demo));
     let (camera_pivot, camera_x) = if demo {
-        (egui::Align2::CENTER_BOTTOM, screen.center().x)
+        (egui::Align2::CENTER_BOTTOM, screen.center().x - 260.0)
     } else {
         (egui::Align2::LEFT_BOTTOM, screen.min.x + margin)
     };
@@ -253,6 +260,12 @@ fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, demo: bool, test_op
         .default_pos([screen.max.x - margin, screen.max.y - margin])
         .default_open(test_open || demo)
         .show(ctx, |ui| test_window(ui, panel));
+    let sequencer_x = if demo { screen.center().x + 220.0 } else { screen.center().x };
+    egui::Window::new("Sequencer")
+        .pivot(egui::Align2::CENTER_BOTTOM)
+        .default_pos([sequencer_x, screen.max.y - margin])
+        .default_open(sequencer_open || demo)
+        .show(ctx, |ui| sequencer_window(ui, panel));
 }
 
 /// Two-column grid of label / value rows.
@@ -766,6 +779,214 @@ fn test_window(ui: &mut egui::Ui, panel: &mut Panel<'_>) {
                 ("bricks finalized", format!("{:.1} /s", r.finalized_per_s)),
             ],
         );
+    });
+}
+
+/// A button of a keyframe row; applied after the grid, which borrows the list.
+enum RowAction {
+    Select(usize),
+    Go(usize),
+    Set(usize),
+    Duplicate(usize),
+    Remove(usize),
+}
+
+/// The camera sequencer: file, transport, keyframe list and export. File and keyframe edits are
+/// disabled during an export.
+fn sequencer_window(ui: &mut egui::Ui, panel: &mut Panel<'_>) {
+    let seq = &mut *panel.sequencer;
+    let camera = &mut *panel.camera;
+    let exporting = seq.is_exporting();
+    let total = seq.sequence.total();
+    let has_keyframes = !seq.sequence.keyframes.is_empty();
+
+    CollapsingHeader::new("File").default_open(true).show(ui, |ui| {
+        ui.add_enabled_ui(!exporting, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("file");
+                ui.add(egui::TextEdit::singleline(&mut seq.file).desired_width(320.0));
+                // The result is in the note.
+                if ui.button("Load").clicked() {
+                    let _ = seq.load();
+                }
+                if ui.button("Save").clicked() {
+                    let _ = seq.save();
+                }
+                if ui.button("New").clicked() {
+                    seq.new_sequence();
+                }
+            });
+            Grid::new("sequencer_file").num_columns(2).show(ui, |ui| {
+                ui.label("name");
+                ui.text_edit_singleline(&mut seq.sequence.name);
+                ui.end_row();
+                ui.label("interpolation");
+                ComboBox::from_id_salt("sequencer_interpolation")
+                    .selected_text(seq.sequence.interpolation.label())
+                    .show_ui(ui, |ui| {
+                        for interpolation in Interpolation::ALL {
+                            ui.selectable_value(&mut seq.sequence.interpolation, interpolation, interpolation.label());
+                        }
+                    });
+                ui.end_row();
+                ui.label("loop");
+                ui.checkbox(&mut seq.sequence.looped, "");
+                ui.end_row();
+                ui.label("fps");
+                ui.add(DragValue::new(&mut seq.sequence.fps).range(1..=240)).on_hover_text("the export frame rate");
+                ui.end_row();
+            });
+        });
+        // During an export the Export section shows the progress note.
+        if !exporting && !seq.note.is_empty() {
+            ui.label(&seq.note);
+        }
+    });
+
+    CollapsingHeader::new("Transport").default_open(true).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!exporting, egui::Button::new("|<")).clicked() {
+                seq.seek(0.0, camera);
+            }
+            let label = if seq.playback == Playback::Playing { "Pause" } else { "Play" };
+            if ui.add_enabled(has_keyframes && !exporting, egui::Button::new(label)).clicked() {
+                seq.toggle_play();
+            }
+            if ui.add_enabled(!exporting, egui::Button::new("Stop")).clicked() {
+                seq.stop();
+            }
+        });
+        ui.horizontal(|ui| {
+            let mut time = seq.time;
+            let slider = Slider::new(&mut time, 0.0..=total.max(MIN_DURATION)).suffix(" s");
+            if ui.add_enabled(!exporting && total > 0.0, slider).changed() {
+                seq.seek(time, camera);
+            }
+            ui.label(format!("{:.2} / {total:.2} s", seq.time));
+        });
+        ui.label("K adds a keyframe at the camera, Space plays / pauses, moving the camera stops the playback.");
+    });
+
+    CollapsingHeader::new(format!("Keyframes ({})", seq.sequence.keyframes.len()))
+        .id_salt("sequencer_keyframes")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.add_enabled_ui(!exporting, |ui| {
+                let mut action = None;
+                ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    Grid::new("sequencer_keyframe_grid").num_columns(6).striped(true).show(ui, |ui| {
+                        for header in ["#", "time", "hold", "travel", "pose", ""] {
+                            ui.label(header);
+                        }
+                        ui.end_row();
+                        let n = seq.sequence.keyframes.len();
+                        let looped = seq.sequence.looped;
+                        for i in 0..n {
+                            if ui.selectable_label(seq.selected == Some(i), format!("#{i}")).clicked() {
+                                action = Some(RowAction::Select(i));
+                            }
+                            ui.label(format!("{:.2}", seq.sequence.keyframe_time(i)));
+                            let k = &mut seq.sequence.keyframes[i];
+                            ui.add(DragValue::new(&mut k.hold).speed(0.1).range(0.0..=600.0).suffix(" s"));
+                            // The last keyframe of a sequence that does not loop travels nowhere.
+                            ui.add_enabled(
+                                looped || i + 1 < n,
+                                DragValue::new(&mut k.duration).speed(0.1).range(MIN_DURATION..=600.0).suffix(" s"),
+                            );
+                            let p = k.position;
+                            ui.label(format!(
+                                "{:.0}, {:.0}, {:.0}  {:.0}/{:.0}  fov {:.0}",
+                                p[0], p[1], p[2], k.pitch, k.yaw, k.fov
+                            ));
+                            ui.horizontal(|ui| {
+                                if ui.button("Go").clicked() {
+                                    action = Some(RowAction::Go(i));
+                                }
+                                let set = ui.button("Set").on_hover_text("overwrite the pose with the current camera");
+                                if set.clicked() {
+                                    action = Some(RowAction::Set(i));
+                                }
+                                if ui.button("Dup").clicked() {
+                                    action = Some(RowAction::Duplicate(i));
+                                }
+                                if ui.button("x").clicked() {
+                                    action = Some(RowAction::Remove(i));
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
+                match action {
+                    Some(RowAction::Select(i)) => seq.selected = Some(i),
+                    Some(RowAction::Go(i)) => seq.go_to(i, camera),
+                    Some(RowAction::Set(i)) => seq.set_keyframe(i, camera),
+                    Some(RowAction::Duplicate(i)) => seq.duplicate(i),
+                    Some(RowAction::Remove(i)) => seq.remove(i),
+                    None => {}
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Add at camera").clicked() {
+                        seq.add_keyframe(camera);
+                    }
+                    let selected = seq.selected;
+                    if ui.add_enabled(selected.is_some(), egui::Button::new("Up")).clicked() {
+                        if let Some(i) = selected {
+                            seq.move_up(i);
+                        }
+                    }
+                    if ui.add_enabled(selected.is_some(), egui::Button::new("Down")).clicked() {
+                        if let Some(i) = selected {
+                            seq.move_down(i);
+                        }
+                    }
+                });
+            });
+        });
+
+    CollapsingHeader::new("Export").default_open(true).show(ui, |ui| {
+        Grid::new("sequencer_export").num_columns(2).show(ui, |ui| {
+            ui.label("dir");
+            ui.add_enabled(!exporting, egui::TextEdit::singleline(&mut seq.export_dir).desired_width(320.0));
+            ui.end_row();
+            ui.label("warmup");
+            ui.add_enabled(!exporting, DragValue::new(&mut seq.warmup).range(0..=1000).suffix(" frames"));
+            ui.end_row();
+            ui.label("samples");
+            ui.add_enabled(!exporting, DragValue::new(&mut seq.samples).range(1..=4096).suffix(" per frame"))
+                .on_hover_text(
+                    "renders per exported frame; the last is captured. Reference mode: accumulated samples per frame.",
+                );
+            ui.end_row();
+            ui.label("size");
+            let (w, h) = panel.stats.target;
+            ui.label(format!("{w} x {h} (the window; --size sets it)"));
+            ui.end_row();
+            ui.label("frames");
+            ui.label(format!("{} ({total:.2} s)", seq.sequence.frame_count(seq.sequence.fps)));
+            ui.end_row();
+        });
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!exporting && has_keyframes, egui::Button::new("Export")).clicked() {
+                if let Err(e) = seq.start_export() {
+                    seq.note = format!("{e:#}");
+                }
+            }
+            if ui.add_enabled(exporting, egui::Button::new("Cancel")).clicked() {
+                seq.cancel_export();
+            }
+        });
+        if exporting && !seq.note.is_empty() {
+            ui.label(&seq.note);
+        }
+        if !seq.ffmpeg.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&seq.ffmpeg).monospace());
+                if ui.button("Copy").clicked() {
+                    ui.ctx().copy_text(seq.ffmpeg.clone());
+                }
+            });
+        }
     });
 }
 

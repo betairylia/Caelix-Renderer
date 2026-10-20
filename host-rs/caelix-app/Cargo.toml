@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false, features = ["hdr"] }
 log = "0.4.34"
 png = "0.18.1"
 raw-window-handle = "0.6.2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 winit = "0.30.13"
 egui = "0.36.2"

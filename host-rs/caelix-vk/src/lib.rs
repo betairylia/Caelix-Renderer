@@ -15,7 +15,9 @@
 //! 3. Optional, in this order: [`Context::readback_now`] records a copy of the
 //!    image into a host buffer at that point of the command buffer (the image
 //!    stays in `GENERAL`); [`Context::take_readback`] returns the pixels once the
-//!    frame has completed. [`Context::draw_overlay`] (after
+//!    frame has completed; [`Context::wait_readback`] waits for the device to go
+//!    idle and returns them at once (frame-by-frame exports).
+//!    [`Context::draw_overlay`] (after
 //!    [`Context::init_overlay`]) draws egui's output over the image and leaves it
 //!    in `GENERAL`. A readback recorded before the overlay excludes the overlay.
 //! 4. [`Context::end_frame`] transitions the image to `PRESENT_SRC_KHR`, submits
@@ -408,6 +410,18 @@ impl Context {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Waits for the device to go idle, so that the pending readback (and every submitted frame)
+    /// has completed, then returns it as [`Context::take_readback`] does. For frame-by-frame
+    /// exports that must capture every frame. `Ok(None)` when no readback is pending.
+    pub fn wait_readback(&mut self) -> Result<Option<(Vec<u8>, u32, u32)>, Error> {
+        if self.readback.is_none() {
+            return Ok(None);
+        }
+        self.wait_idle();
+        self.completed_frame = self.frames.iter().map(|f| f.submitted_frame).fold(self.completed_frame, u64::max);
+        self.take_readback()
     }
 
     /// Marks the swapchain for recreation on the next `begin_frame`.

@@ -24,9 +24,14 @@
 //! (docs/DLSS.md). The host enables the Vulkan extensions that NGX asks for (`--no-dlss` does
 //! not), queries the support per quality and window size, and jitters the camera with the
 //! library's Halton sequence while an upscaler is active.
+//!
+//! The camera sequencer (`sequence.rs`, Sequencer window) keeps keyframed camera tours: K adds a
+//! keyframe at the camera, Space plays the tour, `--sequence` loads and saves it as JSON, and
+//! `--sequence-export` (or the Export button) writes it frame by frame as PNGs.
 
 mod camera;
 mod materials;
+mod sequence;
 mod settings;
 mod sky;
 mod testscene;
@@ -52,6 +57,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use camera::Camera;
+use sequence::{Playback, Sequence, Sequencer};
 use settings::{same_options, Encoding, Mode, RenderSettings, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
 use testscene::{EditPattern, TestScene};
 
@@ -340,6 +346,26 @@ struct Args {
     /// window shows the query reason).
     #[arg(long)]
     no_dlss: bool,
+    /// A camera sequence JSON file to load at start; Save in the Sequencer window writes it. A
+    /// missing file is allowed: the sequencer starts empty with that path. Default path of the
+    /// Sequencer window: <world dir>/<world file stem>.sequence.json, else sequence.json.
+    #[arg(long, value_name = "PATH")]
+    sequence: Option<PathBuf>,
+    /// Start playing the --sequence at once.
+    #[arg(long, requires = "sequence")]
+    sequence_play: bool,
+    /// Export the --sequence as frame-NNNNNN.png into DIR (window size, without the debug UI) once
+    /// the world is complete, then exit. Works with --no-input.
+    #[arg(long, value_name = "DIR", requires = "sequence")]
+    sequence_export: Option<PathBuf>,
+    /// Export: frames rendered at the first frame's pose before the first capture, so the NRD and
+    /// upscaler history is warm.
+    #[arg(long, value_name = "N", default_value_t = 32)]
+    sequence_warmup: u32,
+    /// Export: renders per exported frame; the last one is captured. Reference mode accumulates
+    /// them (clean offline frames).
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    sequence_samples: u32,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -457,6 +483,8 @@ enum ReadbackOwner {
     Ui(PathBuf),
     /// --screenshot-every: the PNG path.
     Every(PathBuf),
+    /// A sequence export frame: the PNG path.
+    Export(PathBuf),
 }
 
 /// Screenshot progress.
@@ -508,6 +536,8 @@ struct App {
     entities: Vec<ui::EntityRow>,
     /// The test entity and its edits (--test-entity, --test-edits, Test window).
     test: TestScene,
+    /// The camera sequencer (--sequence*, Sequencer window).
+    sequencer: Sequencer,
     /// --sky: taken by `create_state` for the upload.
     sky: Option<SkySource>,
     /// --screenshot-every: the presented-frame count of the first capture.
@@ -564,7 +594,8 @@ impl App {
         } else {
             context.init_overlay().context("cannot create the egui overlay")?;
             let test_open = self.args.test_entity || self.args.test_edits;
-            Some(ui::Ui::new(&window, !self.args.no_ui, self.args.ui_demo, test_open))
+            let sequencer_open = self.args.sequence.is_some();
+            Some(ui::Ui::new(&window, !self.args.no_ui, self.args.ui_demo, test_open, sequencer_open))
         };
 
         let handles = context.adopt_handles();
@@ -681,7 +712,11 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.25);
         self.last_frame = now;
-        self.move_camera(dt);
+        // The keys move the camera only while the sequencer does not drive it (a movement key
+        // already stopped a playback in `window_event`).
+        if self.sequencer.playback == Playback::Stopped {
+            self.move_camera(dt);
+        }
 
         let Some(state) = self.state.as_mut() else {
             return Ok(());
@@ -739,6 +774,7 @@ impl App {
                     speed: &mut self.input.speed,
                     entities: &mut self.entities,
                     test: &mut self.test,
+                    sequencer: &mut self.sequencer,
                     reset_accumulation: false,
                     screenshot: false,
                 };
@@ -818,6 +854,9 @@ impl App {
             // The world is complete on the GPU after this frame's flush.
             let world_ready = state.loader.as_ref().is_none_or(|loader| loader.is_ready());
             self.test.after_flush(&scene_stats(state.scene), &gpu_timings(state.renderer), world_ready);
+            // The sequencer drives the camera while it plays or exports; an export names the frame
+            // to capture.
+            let export_capture = self.sequencer.advance(dt, world_ready, &mut self.camera);
 
             let targets = CaelixRenderTargets {
                 color: CaelixTargetImage {
@@ -939,7 +978,15 @@ impl App {
                     cli_due = self.frames_presented >= at;
                 }
             }
-            if cli_due && state.context.readback_now(&frame)? {
+            if let Some(path) = export_capture {
+                // An export frame is read back in this draw (`wait_readback`), so the slot is free
+                // unless another capture was recorded in an earlier frame.
+                if state.context.readback_now(&frame)? {
+                    self.readback_owner = Some(ReadbackOwner::Export(path));
+                } else {
+                    bail!("export: the readback slot was busy at frame {}", frame.frame_number);
+                }
+            } else if cli_due && state.context.readback_now(&frame)? {
                 self.readback_owner = Some(ReadbackOwner::Cli);
                 self.screenshot = Screenshot::Requested;
                 if self.args.accumulate.is_some() {
@@ -957,7 +1004,12 @@ impl App {
                 let path = screenshot_dir(&self.args).join(format!("frame-{}.png", frame.frame_number));
                 log::info!("screenshot (every) requested at frame {}", frame.frame_number);
                 self.readback_owner = Some(ReadbackOwner::Every(path));
-            } else if self.ui_screenshot_requested && state.context.readback_now(&frame)? {
+            } else if self.ui_screenshot_requested
+                && !self.sequencer.is_exporting()
+                && state.context.readback_now(&frame)?
+            {
+                // During an export the button waits: its pending copy would make the next export
+                // frame find the readback slot busy.
                 self.ui_screenshot_requested = false;
                 let path = screenshot_dir(&self.args).join(format!("screenshot-{}.png", frame.frame_number));
                 self.screenshot_note = format!("writing {}", path.display());
@@ -974,8 +1026,24 @@ impl App {
         }
 
         if self.readback_owner.is_some() {
-            if let Some((pixels, width, height)) = state.context.take_readback()? {
+            // An export frame waits for the device, so every frame of the tour is captured; the
+            // other captures arrive frames_in_flight frames later.
+            let readback = if matches!(self.readback_owner, Some(ReadbackOwner::Export(_))) {
+                state.context.wait_readback()?
+            } else {
+                state.context.take_readback()?
+            };
+            if let Some((pixels, width, height)) = readback {
                 match self.readback_owner.take().expect("checked above") {
+                    ReadbackOwner::Export(path) => {
+                        if self.sequencer.frame_captured(path, pixels, width, height)
+                            && self.sequencer.exit_after_export
+                        {
+                            log::info!("export done, exiting");
+                            event_loop.exit();
+                            return Ok(());
+                        }
+                    }
                     ReadbackOwner::Cli => {
                         let path = self.args.screenshot.clone().expect("screenshot path");
                         write_png(&path, &pixels, width, height)?;
@@ -1012,6 +1080,13 @@ impl App {
                         }
                     }
                 }
+            }
+        }
+        // A failed export (a PNG write error) ends a --sequence-export run with an error; in the
+        // window the Sequencer note shows it.
+        if let Some(error) = self.sequencer.export_failed() {
+            if self.sequencer.exit_after_export {
+                bail!("sequence export failed: {error}");
             }
         }
 
@@ -1198,12 +1273,33 @@ impl ApplicationHandler for App {
                                 self.fail(event_loop, e);
                             }
                         }
+                        // Sequencer: K adds a keyframe at the camera (not during an export), Space
+                        // plays and pauses, a movement key stops a playback.
+                        if !event.repeat {
+                            match code {
+                                KeyCode::KeyK if !self.sequencer.is_exporting() => {
+                                    self.sequencer.add_keyframe(&self.camera);
+                                }
+                                KeyCode::Space => self.sequencer.toggle_play(),
+                                KeyCode::KeyW
+                                | KeyCode::KeyA
+                                | KeyCode::KeyS
+                                | KeyCode::KeyD
+                                | KeyCode::KeyQ
+                                | KeyCode::KeyE => self.sequencer.stop_if_playing(),
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Right, .. } if !self.args.no_input => {
                 // A press over an egui window does not start the mouse look; a release always ends it.
                 self.input.looking = state == ElementState::Pressed && !ui_pointer;
+                // The mouse look takes the camera over from a playback.
+                if self.input.looking {
+                    self.sequencer.stop_if_playing();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } if !self.args.no_input && !ui_pointer => {
                 let notches = match delta {
@@ -1383,8 +1479,9 @@ fn same_camera(a: &CaelixCamera, b: &CaelixCamera) -> bool {
 }
 
 /// Writes an RGBA PNG with alpha forced to 255: in the lighting modes the swapchain alpha is the
-/// coverage (0 on the sky), which image viewers would show as transparent.
-fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> anyhow::Result<()> {
+/// coverage (0 on the sky), which image viewers would show as transparent. The sequencer's export
+/// thread calls it too.
+pub(crate) fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32) -> anyhow::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
@@ -1657,6 +1754,48 @@ fn main() -> anyhow::Result<()> {
     // The entity is added by the first frame's update, with the start camera.
     test.enabled = args.test_entity || args.test_edits;
 
+    // The camera sequencer. File field: --sequence, else <world dir>/<world stem>.sequence.json,
+    // else sequence.json; export directory: --sequence-export, else the file without ".json" plus
+    // "-frames".
+    let sequence_file = match (args.sequence.as_deref(), args.world.as_deref()) {
+        (Some(path), _) => path.display().to_string(),
+        (None, Some(world)) => {
+            let stem = world.file_stem().map_or_else(|| "world".into(), |s| s.to_string_lossy());
+            world.with_file_name(format!("{stem}.sequence.json")).display().to_string()
+        }
+        (None, None) => "sequence.json".into(),
+    };
+    let export_dir = match args.sequence_export.as_deref() {
+        Some(dir) => dir.display().to_string(),
+        None => format!("{}-frames", sequence_file.strip_suffix(".json").unwrap_or(&sequence_file)),
+    };
+    let sequence_name =
+        Path::new(&sequence_file).file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let mut sequencer = Sequencer::new(
+        Sequence::new(sequence_name),
+        sequence_file,
+        export_dir,
+        args.sequence_warmup,
+        args.sequence_samples,
+    );
+    if let Some(path) = args.sequence.as_deref() {
+        if path.exists() {
+            sequencer.load().context("cannot load the --sequence file")?;
+        } else {
+            log::warn!(
+                "--sequence {}: the file does not exist; the sequencer starts empty and Save writes it",
+                path.display()
+            );
+        }
+    }
+    if args.sequence_play {
+        sequencer.play();
+    }
+    if args.sequence_export.is_some() {
+        sequencer.start_export()?;
+        sequencer.exit_after_export = true;
+    }
+
     let event_loop = EventLoop::new().context("cannot create the event loop")?;
     let fov = args.fov;
     let mut app = App {
@@ -1666,6 +1805,7 @@ fn main() -> anyhow::Result<()> {
         accumulation: Accumulation { last_camera: None, frames: 0 },
         entities: Vec::new(),
         test,
+        sequencer,
         sky,
         every_base: None,
         ui_screenshot_requested: false,

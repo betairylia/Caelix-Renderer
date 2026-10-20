@@ -962,6 +962,20 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
 - `--test-edits`: timed brick edits on the test entity (adds it when
   `--test-entity` is absent). `--test-edit-interval <N>` (frames, 1..120,
   default 10), `--test-edit-pattern <wave|flicker>` (default `wave`).
+- `--sequence <PATH>`: a camera sequence JSON file to load at start (see
+  "Camera sequencer"); Save in the Sequencer window writes it. A missing file
+  is allowed (a warning; the sequencer starts empty with that path). Default
+  path of the Sequencer window: `<world dir>/<world file stem>.sequence.json`
+  with `--world`, else `sequence.json`.
+- `--sequence-play`: needs `--sequence`; start playing at once.
+- `--sequence-export <DIR>`: needs `--sequence`; export the sequence as
+  `frame-NNNNNN.png` into DIR once the world is complete, then exit (exit code
+  0 when every frame is written). Works with `--no-input`. Default directory
+  of the Sequencer window: the sequence file without `.json`, plus `-frames`.
+- `--sequence-warmup <N>`: export, frames rendered at the first frame's pose
+  before the first capture (NRD and upscaler history). Default 32.
+- `--sequence-samples <N>`: export, renders per exported frame (1..4096); the
+  last one is captured. Default 1.
 
 ### Test entity and brick edits
 
@@ -1005,6 +1019,84 @@ In the window, press `P` to log the current camera as a
 `--world` file (the Stats window's world line says "press L to load <file>"
 until then).
 
+### Camera sequencer
+
+`host-rs/caelix-app/src/sequence.rs`, Sequencer window. Fly around a scene,
+drop keyframes, preview the tour in real time, save it as JSON and export it
+as a PNG frame sequence.
+
+Model: a sequence is a list of keyframes. A keyframe holds a pose (position,
+pitch, yaw, vertical fov), a `hold` (seconds at rest at this pose) and a
+`duration` (seconds of travel to the next keyframe; to the first one when the
+sequence loops, unused for the last keyframe otherwise). The timeline is the
+holds and the travels in list order: keyframe i starts at the sum of the
+holds and travels before it. Without `loop` the length is every hold and
+every travel except the last keyframe's travel; with `loop` the last travel
+goes back to keyframe 0 and the time wraps.
+
+Interpolation of the 6-vector (x, y, z, pitch, yaw, fov):
+
+- `smooth` (default): a Catmull-Rom spline with non-uniform knots, as cubic
+  Hermite segments. The velocity at a keyframe is the difference of its two
+  neighbours over their travel times, so the velocity is continuous at the
+  keyframe even when the travel times differ. The camera is at rest (velocity
+  0) at a keyframe with a hold, and at the first and the last keyframe of a
+  sequence that does not loop.
+- `linear`: straight segments at constant speed.
+
+Yaw is always taken on the shortest arc: a travel from yaw 170 to -170 turns
+20 degrees through 180, not 340 degrees through 0.
+
+JSON format (version 1; a newer version is rejected, `hold` is optional and
+defaults to 0, durations below 0.01 s and an fps of 0 are clamped):
+
+```json
+{
+  "version": 1,
+  "name": "gallery tour",
+  "interpolation": "smooth",
+  "loop": false,
+  "fps": 30,
+  "keyframes": [
+    { "position": [60.0, 21.0, 0.0], "pitch": 0.0, "yaw": 0.0, "fov": 60.0, "hold": 1.0, "duration": 2.0 },
+    { "position": [60.0, 25.0, 40.0], "pitch": 5.0, "yaw": 30.0, "fov": 60.0, "duration": 2.0 }
+  ]
+}
+```
+
+Keys (in the window, not while a text field has the focus): `K` adds a
+keyframe at the camera (after the selected one, else at the end; its travel
+time is copied from the selected or the last keyframe, else 3 s) and logs it
+as a `--pose` line; `Space` plays and pauses; W/A/S/D/Q/E and the right mouse
+button stop a playback (the time stays). While the sequencer plays or
+exports, the movement keys do not move the camera.
+
+Export (Export button or `--sequence-export`): the frames are written as
+`frame-NNNNNN.png` (from `frame-000000.png`) at the window size, without the
+debug UI (the copy is recorded before the overlay). Frame f shows the
+sequence at time f / fps. Frame count: `floor(length * fps) + 1` (every frame
+time in [0, length]), or `round(length * fps)` when looping (times in
+[0, length), so the video loops without a repeated frame). The export waits
+for the complete world, then renders `warmup` frames at the first frame's pose
+(NRD and upscaler history), then `samples` renders per exported frame and
+captures the last one (in reference mode they accumulate into a clean offline
+frame; in pt mode NRD sees repeated frames). Each captured frame waits for
+the device to go idle (`caelix_vk::Context::wait_readback`), so every frame
+of the tour is captured and the export runs slower than real time. A writer
+thread encodes the PNGs (a queue of 8 frames). At the end the host logs
+`exported N frames to <dir> in S s (W x H)` and an ffmpeg line, which the
+window shows with a Copy button:
+
+```
+ffmpeg -framerate 30 -i "<dir>/frame-%06d.png" -c:v libx264 -pix_fmt yuv420p -crf 18 "<dir>.mp4"
+```
+
+Headless flow: `cargo run --release -p caelix-app -- --world <cxw> --no-input
+--size 1920x1080 --sequence tour.json --sequence-export out/` exports the tour
+and exits (a PNG write error exits with an error). The Screenshot button
+waits while an export runs. Measured 2026-10-20 (release, RTX 5080,
+p2-gallery, 640x360, pt mode): 61 frames with 8 warmup frames in 3.1 s.
+
 ### Debug UI
 
 The host draws a debug UI with [egui](https://github.com/emilk/egui) over the
@@ -1013,7 +1105,7 @@ rendered image. `F1` shows and hides it. Crates: `egui` 0.36.2 and
 and `egui-ash-renderer` 0.13.0 (dynamic rendering, default allocator) in
 `caelix-vk` (rendering, `overlay.rs`). `caelix-app` stays free of `ash`.
 
-Five separate egui windows in egui's default style (two changes: no window
+Six separate egui windows in egui's default style (two changes: no window
 and popup shadows, window titles at 15.5 points instead of 18). Each window
 can be dragged and collapsed, and each has collapsible sections:
 
@@ -1057,6 +1149,13 @@ can be dragged and collapsed, and each has collapsible sections:
   frames, pattern, "Step once", ticks, bricks uploaded and removed, queued
   uploads), Stats (flush ms newest and 1 s mean / max, AS builds per second,
   AS builds pending, finalized bricks per second).
+- **Sequencer** (bottom centre, collapsed unless `--sequence`; see "Camera
+  sequencer"): File (file path, Load, Save, New, name, interpolation, loop,
+  export fps), Transport (`|<`, Play / Pause, Stop, time slider), Keyframes
+  (per row: select, start time, hold, travel, pose, Go, Set, Dup, x; Add at
+  camera, Up, Down), Export (directory, warmup, samples, size, frame count,
+  Export / Cancel, progress, the ffmpeg line with Copy). File and keyframe
+  edits are disabled while an export runs.
 
 Input: egui sees every window event first. While the pointer is over a
 window (or egui drags a widget) the mouse look and the scroll wheel are
