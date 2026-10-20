@@ -95,7 +95,7 @@ struct FrameConstants
     float light_level_footprint;        // 632  world units per pixel: below -> level 0 cells, else level 1
     float light_min_emission;           // 636  Scene::light_min_emission()
     uint32_t frame_counter;             // 640  the renderer's render count (1, 2, ...)
-    uint32_t light_entity_mask;         // 644  reserved, 0
+    float light_nee_min_distance;       // 644  Scene::light_nee_min_distance(): the near-field split of the light NEE
     // ReSTIR DI (CAELIX_GI_FLAG_RESTIR_DI, docs/RESTIR_DI.md); every address 0 unless gi_flags has it.
     uint64_t di_initial;                // 648  DI reservoir buffer written by the trace kernel
     uint64_t di_prev;                   // 656  previous frame's final DI reservoirs

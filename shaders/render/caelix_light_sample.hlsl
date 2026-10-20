@@ -35,6 +35,15 @@ static const uint kLightCellProbes = 8;
 // A cell not looked up for this many frames is evicted by the fill pass.
 static const uint kLightCellMaxAge = 64;
 static const uint kNoLight = 0xFFFFFFFFu;
+// Light points closer than this (world units) to the receiver belong to the BSDF path, not to the
+// light NEE: TracePath keeps the emission of a list light that a segment hits closer than this,
+// and ReSTIR DI gives such points a zero target. Area sampling with a 1/d^2 term and a brick
+// choice that ignores the distance make the near field an extremely heavy-tailed estimate
+// (bistro: 14 % of the light missing after 512 frames; Artifacts/gi-experiments-20261020/
+// light-nee/diagnosis); the BSDF path finds near emitters with a bounded weight. Both sides use
+// the same distance from the same pushed-off origin, so the split is unbiased. Every kernel sets
+// it from CaelixFrameConstants::light_nee_min_distance before the first use.
+static float g_lightNeeMinDistance;
 
 uint64_t SplitMix64(uint64_t x)
 {
@@ -433,6 +442,10 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
         return float3(0.0f, 0.0f, 0.0f);
     }
     const float distance = sqrt(d2);
+    if (distance < g_lightNeeMinDistance)
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
     const float3 w = d / distance;
     const float cos_r = dot(n_r, w);
     const float cos_l = -dot(s.normal, w);

@@ -527,7 +527,12 @@ typedef struct CaelixLightOptions
                             encoding: an emissive voxel of strength 2 (64 x albedo) with an albedo
                             luminance of at least 0.3125, and every bright strength 3 voxel) */
     uint32_t max_bricks; /* 0 = 65536; 1 .. 1048576: the light table's capacity in bricks */
-    uint32_t reserved[2];
+    float nee_min_distance; /* 0 = 8.0 world units: light points closer than this to the receiver are
+                               left to the BSDF path (its hits of list lights closer than this keep
+                               their emission). Area sampling with 1/d^2 makes the near field an
+                               extremely heavy-tailed NEE estimate (bistro lost 14 % after 512
+                               frames); the split is unbiased. ReSTIR DI applies the same split. */
+    uint32_t reserved;
 } CaelixLightOptions;
 
 /* Scene-wide. The light table is built only once this function was called (a host that never calls

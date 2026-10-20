@@ -368,6 +368,25 @@ cornell, ashwick, bistro_dark, shroom for `reference`, `pt`, `pt_nee`, `pt_nee_c
 
 ## As built
 
+### Near field (Fable, 2026-10-21, after the bench)
+
+The bench found the converged light-NEE image 14 % too dark on bistro_dark, uniformly, at the
+bounce vertices (`Artifacts/gi-experiments-20261020/light-nee/README.md`). The diagnosis
+(`.../light-nee/diagnosis/README.md`, 20 shader variants on a clean copy of 50c8076) found no code
+bug: light points closer than about 8 voxels to the receiver make the NEE estimate extremely
+heavy-tailed (uniform area sampling with 1/d^2, a brick choice by power only), so 512 frames
+deliver only a fraction of their mean, and the step 1 rule had moved exactly those points from the
+BSDF path (bounded weight) into NEE. Fix, validated at 2 and 4 bounces (bistro 0.876 -> 0.9988,
+Cornell 0.9954 -> 0.9997, converged relative RMSE 1.135 -> 0.870): a distance split.
+`CaelixLightOptions::nee_min_distance` (0 = 8 world units; host `--light-nee-distance`) goes to
+`CaelixFrameConstants::light_nee_min_distance` (offset 644); `LightNextEvent` returns 0 for a
+point closer than that (before the shadow ray), `TracePath` keeps the emission of a list light hit
+closer than that (`hit.T`, same origin), and `DiGeometry` (ReSTIR DI target and shade) returns 0
+for such points. Both sides measure from the same pushed-off origin, so the split is unbiased.
+Consequence: light within 8 voxels of a lamp is found by the BSDF path only (1 spp noise there).
+The long-term alternative is MIS between NEE and BSDF hits, which needs a true NEE pdf at a hit
+point (the cell RIS weight is not one).
+
 Review change (Fable, after the implementation): the light table is opt-in. `Scene::EnsureLightTable`
 builds it only once `caelix_scene_set_light_options` was called (`lights_enabled_`); the Unity plugin
 never calls it and pays only the 4 B light words. The host calls it at scene creation; the tests

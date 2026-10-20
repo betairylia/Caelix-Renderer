@@ -200,6 +200,11 @@ public:
     {
         return light_min_emission_;
     }
+    // The near-field split of the light NEE (CaelixLightOptions::nee_min_distance after the default).
+    float light_nee_min_distance() const
+    {
+        return light_nee_min_distance_;
+    }
     // GPU time of the flush of `frame`, once that frame is safe. False when the
     // flush recorded no work, was not measured, or is not resolved yet.
     bool FlushMsForFrame(uint64_t frame, float& ms) const
@@ -442,6 +447,7 @@ private:
     std::vector<VkBufferCopy> light_moves_;   // inside light_words_, mirrors aabb_moves_ (4 B rows)
     VkDeviceSize zero_word_offset_ = 0;       // a zero u32 in the ring next to the NaN row
     float light_min_emission_ = 0.0f;         // set by Create (the default) and SetLightOptions
+    float light_nee_min_distance_ = 0.0f;     // same
     uint32_t light_max_bricks_ = 0;
     bool lights_dirty_ = false;               // the next flush rebuilds the table
     bool lights_enabled_ = false;             // caelix_scene_set_light_options was called: the table is built

@@ -710,6 +710,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.frame_counter = frame_counter_;
     constants.light_table = light_table;
     constants.light_min_emission = scene_.light_min_emission();
+    constants.light_nee_min_distance = scene_.light_nee_min_distance();
     if (light_nee)
     {
         constants.light_cells = light_cells_.address();

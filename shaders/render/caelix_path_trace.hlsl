@@ -436,8 +436,10 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
                           bounce.Direction, hit.normal, rng, medium);
         bounce_index += 1;
 
-        // A list light's emission belongs to the light NEE of the vertex the segment left.
-        if (!(segment_light_nee && shade.emission_luminance >= fc.light_min_emission))
+        // A list light's emission belongs to the light NEE of the vertex the segment left, except
+        // when the hit is closer than the near-field split (the near field is the BSDF path's).
+        if (!(segment_light_nee && shade.emission_luminance >= fc.light_min_emission &&
+              hit.T >= g_lightNeeMinDistance))
         {
             radiance += shade.emission * throughput;
         }
@@ -507,6 +509,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     g_blockEncoding = fc.encoding;
     g_materialTable = fc.materials;
     g_emissionScale = fc.emission_scale;
+    g_lightNeeMinDistance = fc.light_nee_min_distance;
     const bool restir = fc.gi_method == kGiRestir;
     g_forceDiffuse = (fc.gi_flags & kGiFlagDiffuseOnly) != 0u || restir;
     // ReSTIR DI: the renderer sets the flag only with light NEE, a light table and the DI buffers.

@@ -165,6 +165,10 @@ float DiGeometry(float3 position, float3 normal, float3 x_v, float3 n_v, out flo
         return 0.0f;
     }
     distance = sqrt(d2);
+    if (distance < g_lightNeeMinDistance)
+    {
+        return 0.0f;  // the near field is the BSDF path's (caelix_light_sample.hlsl)
+    }
     const float3 w = d / distance;
     const float cos_v = dot(n_v, w);
     const float cos_y = -dot(normal, w);

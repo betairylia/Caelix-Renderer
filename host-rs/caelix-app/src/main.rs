@@ -422,6 +422,10 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = 65536,
           value_parser = clap::value_parser!(u32).range(1..=1048576))]
     light_max_bricks: u32,
+    /// The near-field split of the light NEE in world units (0 = the library's default, 8): light
+    /// points closer than this are left to the BSDF path.
+    #[arg(long, value_name = "F", default_value_t = 0.0)]
+    light_nee_distance: f32,
     /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 288 bytes each).
     #[arg(long, value_name = "N", default_value_t = 65536)]
     light_cells: u32,
@@ -743,7 +747,8 @@ impl App {
         let light_options = CaelixLightOptions {
             min_emission: self.args.light_min_emission,
             max_bricks: self.args.light_max_bricks,
-            reserved: [0; 2],
+            nee_min_distance: self.args.light_nee_distance,
+            reserved: 0,
         };
         // SAFETY: the scene is live; light_options is valid for the call.
         let result = unsafe { caelix_scene_set_light_options(state.scene, &light_options) };

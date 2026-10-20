@@ -19,6 +19,8 @@ namespace {
 // docs/LIGHT_LIST.md).
 constexpr float kDefaultMinEmission = 20.0f;
 constexpr uint32_t kDefaultLightMaxBricks = 65536;
+// The near-field split (docs/LIGHT_LIST.md "Near field"): 8 voxels, validated on bistro and Cornell.
+constexpr float kDefaultNeeMinDistance = 8.0f;
 constexpr uint32_t kMaxLightMaxBricks = 1u << 20;
 // The header's count, dropped, capacity and pad: one readback slot.
 constexpr uint32_t kLightReadbackBytes = 16;
@@ -30,6 +32,7 @@ void Scene::CreateLightObjects()
     const VkDevice device = device_.device();
     light_min_emission_ = kDefaultMinEmission;
     light_max_bricks_ = kDefaultLightMaxBricks;
+    light_nee_min_distance_ = kDefaultNeeMinDistance;
     // Binding 0: the light table (a storage buffer; the compact kernel counts with atomics).
     VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT,
                                          nullptr};
@@ -96,6 +99,12 @@ CaelixResult Scene::SetLightOptions(const CaelixLightOptions& options)
                     static_cast<double>(options.min_emission));
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    if (!std::isfinite(options.nee_min_distance) || options.nee_min_distance < 0.0f)
+    {
+        CAELIX_LOGE("%s: nee_min_distance %g must be finite and >= 0", kFunction,
+                    static_cast<double>(options.nee_min_distance));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
     if (options.max_bricks > kMaxLightMaxBricks)
     {
         CAELIX_LOGE("%s: max_bricks %u is above the maximum %u", kFunction, options.max_bricks, kMaxLightMaxBricks);
@@ -107,6 +116,8 @@ CaelixResult Scene::SetLightOptions(const CaelixLightOptions& options)
     lights_dirty_ = true;
     const float min_emission = options.min_emission != 0.0f ? options.min_emission : kDefaultMinEmission;
     const uint32_t max_bricks = options.max_bricks != 0 ? options.max_bricks : kDefaultLightMaxBricks;
+    light_nee_min_distance_ =
+        options.nee_min_distance != 0.0f ? options.nee_min_distance : kDefaultNeeMinDistance;
     if (min_emission != light_min_emission_ || max_bricks != light_max_bricks_)
     {
         light_min_emission_ = min_emission;

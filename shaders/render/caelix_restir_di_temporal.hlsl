@@ -37,6 +37,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     g_blockEncoding = fc.encoding;
     g_materialTable = fc.materials;
     g_emissionScale = fc.emission_scale;
+    g_lightNeeMinDistance = fc.light_nee_min_distance;
 
     const uint2 pixel = thread_id.xy;
     const uint64_t output = DiReservoirAddress(fc.di_temp, fc, pixel);

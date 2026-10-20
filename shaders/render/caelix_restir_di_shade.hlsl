@@ -43,6 +43,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     g_blockEncoding = fc.encoding;
     g_materialTable = fc.materials;
     g_emissionScale = fc.emission_scale;
+    g_lightNeeMinDistance = fc.light_nee_min_distance;
 
     const uint2 pixel = thread_id.xy;
     // 0 or 2 spatial passes end in di_temp, one in di_out.

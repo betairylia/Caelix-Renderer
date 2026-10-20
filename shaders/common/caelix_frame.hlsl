@@ -93,7 +93,7 @@ struct CaelixFrameConstants
     float light_level_footprint;    // 632  world units per pixel: below -> level 0 (8-voxel cells), else level 1
     float light_min_emission;       // 636  the scene's threshold: list light when luminance(emission) >= it
     uint frame_counter;             // 640  the renderer's render count (1, 2, ...): cell touch and eviction
-    uint light_entity_mask;         // 644  reserved, 0
+    float light_nee_min_distance;   // 644  the near-field split of the light NEE (world units)
     // ReSTIR DI (render/caelix_restir_di.hlsl); every address 0 unless gi_flags has kGiFlagRestirDi.
     uint64_t di_initial;            // 648  DI reservoir buffer written by the trace kernel
     uint64_t di_prev;               // 656  previous frame's final DI reservoirs

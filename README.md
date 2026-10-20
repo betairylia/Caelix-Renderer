@@ -1052,8 +1052,10 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   list at every diffuse vertex (`CAELIX_GI_FLAG_LIGHT_NEE`, see "Light list
   and light NEE"). Scene options (set once, before the world loads):
   `--light-min-emission <F>` (list-light threshold on the emission luminance;
-  0 = the library default 20) and `--light-max-bricks <N>` (light table
-  capacity, 1..1048576, default 65536). Light cell options:
+  0 = the library default 20), `--light-max-bricks <N>` (light table
+  capacity, 1..1048576, default 65536) and `--light-nee-distance <F>` (the
+  near-field split in world units, 0 = the library default 8: light points
+  closer than this are left to the BSDF path). Light cell options:
   `--light-cells <N>` (a power of two, 1024..1048576, default 65536),
   `--light-candidates <N>` (1..64, default 8) and `--light-footprint <F>`
   (world units per pixel below which a vertex uses 8-voxel cells, else
