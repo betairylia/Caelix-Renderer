@@ -214,6 +214,113 @@ impl UpscaleQuality {
 /// Largest `--upscale-preset` / preset value of the debug UI.
 pub const MAX_UPSCALE_PRESET: u32 = 15;
 
+/// Global illumination method of the lighting modes (`CaelixGiMethod`, docs/GI_EXPERIMENTS.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+pub enum GiMethod {
+    /// The path tracer.
+    Pt,
+    /// Screen-space ReSTIR GI on the first diffuse bounce.
+    Restir,
+}
+
+impl GiMethod {
+    pub const ALL: [GiMethod; 2] = [GiMethod::Pt, GiMethod::Restir];
+
+    pub fn raw(self) -> u32 {
+        match self {
+            GiMethod::Pt => CaelixGiMethod_CAELIX_GI_PATH_TRACE as u32,
+            GiMethod::Restir => CaelixGiMethod_CAELIX_GI_RESTIR as u32,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GiMethod::Pt => "path trace",
+            GiMethod::Restir => "ReSTIR GI",
+        }
+    }
+}
+
+/// The GI experiment options (`CaelixGiOptions`). ReSTIR always forces the Lambert lobe
+/// (`CAELIX_GI_FLAG_DIFFUSE_ONLY`, the library does the same); the path tracer keeps its specular
+/// lobes unless `diffuse_only` is set, so that a comparison can use the same BSDF.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GiSettings {
+    pub method: GiMethod,
+    /// Path tracer: force the Lambert lobe at every vertex (ReSTIR always does).
+    pub diffuse_only: bool,
+    /// ReSTIR: reuse of the previous frame's reservoir.
+    pub temporal: bool,
+    /// ReSTIR: reuse of neighbour reservoirs.
+    pub spatial: bool,
+    /// ReSTIR: a shadow ray per spatial neighbour.
+    pub visibility: bool,
+    /// ReSTIR: Z-count MIS weights (with the shadow rays) instead of 1/M.
+    pub unbiased: bool,
+    pub temporal_m_cap: u32,
+    pub spatial_samples: u32,
+    pub spatial_passes: u32,
+    /// Pixels.
+    pub spatial_radius: f32,
+    /// Fraction of the view depth.
+    pub depth_threshold: f32,
+}
+
+impl Default for GiSettings {
+    fn default() -> Self {
+        Self {
+            method: GiMethod::Pt,
+            diffuse_only: false,
+            temporal: true,
+            spatial: true,
+            visibility: false,
+            unbiased: false,
+            temporal_m_cap: 20,
+            spatial_samples: 5,
+            spatial_passes: 1,
+            spatial_radius: 30.0,
+            depth_threshold: 0.1,
+        }
+    }
+}
+
+impl GiSettings {
+    /// The flags that the library receives (`CAELIX_GI_FLAG_*`).
+    pub fn flags(&self) -> u32 {
+        let mut flags = 0;
+        if self.diffuse_only || self.method == GiMethod::Restir {
+            flags |= CAELIX_GI_FLAG_DIFFUSE_ONLY;
+        }
+        if self.temporal {
+            flags |= CAELIX_GI_FLAG_TEMPORAL;
+        }
+        if self.spatial {
+            flags |= CAELIX_GI_FLAG_SPATIAL;
+        }
+        if self.visibility {
+            flags |= CAELIX_GI_FLAG_VISIBILITY;
+        }
+        if self.unbiased {
+            flags |= CAELIX_GI_FLAG_UNBIASED;
+        }
+        flags
+    }
+
+    /// `reset`: drop the reservoir history with the next render.
+    pub fn options(&self, reset: bool) -> CaelixGiOptions {
+        CaelixGiOptions {
+            method: self.method.raw(),
+            flags: self.flags(),
+            temporal_m_cap: self.temporal_m_cap,
+            spatial_samples: self.spatial_samples,
+            spatial_passes: self.spatial_passes,
+            spatial_radius: self.spatial_radius,
+            depth_threshold: self.depth_threshold,
+            reset: u32::from(reset),
+        }
+    }
+}
+
 /// Everything that `CaelixRenderOptions` holds, except the per-frame values (seed, reset).
 #[derive(Clone, Debug)]
 pub struct RenderSettings {
@@ -262,6 +369,8 @@ pub struct RenderSettings {
     pub upscale_preset: u32,
     /// DLSS SR: NGX auto exposure instead of the fixed exposure 1.0.
     pub upscale_auto_exposure: bool,
+    /// Lighting modes: the GI method and its options (`caelix_renderer_set_gi_options`).
+    pub gi: GiSettings,
 }
 
 impl RenderSettings {

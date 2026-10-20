@@ -1,6 +1,6 @@
 // Per-frame constants of the trace and composite kernels. Mirrors
 // lib/src/render/frame_constants.h; change both together. The kernel's only push constant is the device address of
-// one CaelixFrameConstants (544 bytes). Every field sits at an offset that is a multiple of its
+// one CaelixFrameConstants (608 bytes). Every field sits at an offset that is a multiple of its
 // size, so std430 and scalar layout rules give the same offsets.
 #ifndef CAELIX_FRAME_HLSL
 #define CAELIX_FRAME_HLSL
@@ -71,12 +71,27 @@ struct CaelixFrameConstants
     uint2 output_size;              // 520  the colour target's size (= size without an upscaler)
     uint2 upscale_src_size;         // 528  size of the encode kernel's source image
     uint upscaler;                  // 536  kUpscaler*: 2 = the trace writes the RR guide images
-    uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear) -> 544
+    uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear)
+    // ReSTIR GI (render/caelix_restir_gi.hlsl); every address 0 unless gi_method = kGiRestir.
+    uint64_t gi_initial;            // 544  reservoir buffer written by the trace kernel (initial samples)
+    uint64_t gi_prev;               // 552  previous frame's final reservoirs
+    uint64_t gi_temp;               // 560  temporal output / spatial ping-pong
+    uint64_t gi_out;                // 568  spatial ping-pong
+    uint gi_method;                 // 576  kGi*
+    uint gi_flags;                  // 580  kGiFlag*
+    uint gi_temporal_m_cap;         // 584
+    uint gi_spatial_samples;        // 588
+    float gi_spatial_radius;        // 592  pixels
+    uint gi_spatial_passes;         // 596
+    uint gi_history_valid;          // 600  1 = gi_prev holds last frame's reservoirs of this renderer
+    float gi_depth_threshold;       // 604  -> 608
 };
 
 struct CaelixTracePush
 {
     uint64_t frame_constants;  // device address of a CaelixFrameConstants
+    uint gi_pass;              // caelix_restir_gi_spatial: the spatial pass index; 0 for the other kernels
+    uint pad;
 };
 
 // CaelixDebugView
@@ -96,6 +111,17 @@ static const uint kViewNrdSpec = 10;       // path trace mode: denoised specular
 static const uint kUpscalerNone = 0;
 static const uint kUpscalerDlssSr = 1;
 static const uint kUpscalerDlssRr = 2;
+
+// CaelixGiMethod (CaelixFrameConstants::gi_method)
+static const uint kGiPathTrace = 0;
+static const uint kGiRestir = 1;
+
+// CAELIX_GI_FLAG_* (CaelixFrameConstants::gi_flags)
+static const uint kGiFlagTemporal = 1u << 0;
+static const uint kGiFlagSpatial = 1u << 1;
+static const uint kGiFlagVisibility = 1u << 2;
+static const uint kGiFlagUnbiased = 1u << 3;
+static const uint kGiFlagDiffuseOnly = 1u << 4;
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

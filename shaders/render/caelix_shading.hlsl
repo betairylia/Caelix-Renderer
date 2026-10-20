@@ -41,6 +41,10 @@ CAELIX_BINDING(CAELIX_SKY_BINDING_SAMPLER, 0) SamplerState g_sky_sampler;
 
 // Set by every kernel from CaelixFrameConstants::emission_scale before the first shade.
 static float g_emissionScale;
+// Set by every kernel that shades before the first shade: true with kGiFlagDiffuseOnly or with
+// ReSTIR GI (fc.gi_method = kGiRestir). ShadeVoxelHit then always takes the diffuse lobe at an
+// opaque block (the lobe's random number is still drawn, so the stream does not change).
+static bool g_forceDiffuse;
 
 static const float K_PI = 3.1415926535f;
 static const float K_TWO_PI = 6.283185307f;
@@ -293,7 +297,7 @@ struct CaelixShadeResult
 
 // Unity CaelixShadeVoxelHit.
 // Opaque branch: albedo and emission of the block, specular chance
-// lerp(metallic, 1, fresnel * smoothness), cosine-weighted diffuse direction
+// lerp(metallic, 1, fresnel * smoothness) (0 with g_forceDiffuse), cosine-weighted diffuse direction
 // normalize(N + unit), the specular direction lerped by smoothness, the lobe chosen
 // by one random number, k = 1, origin pushed off along N. The random numbers are
 // drawn in Unity's order (lobe, then the unit vector).
@@ -327,7 +331,7 @@ CaelixShadeResult ShadeVoxelHit(uint block, float3 hit_position, float3 ray_dire
     shade.albedo = material.albedo;
 
     const float fresnel = FresnelReflectAmountOpaque(1.0f, material.ior, ray_direction, normal);
-    const float specular_chance = lerp(material.metallic, 1.0f, fresnel * material.smoothness);
+    const float specular_chance = g_forceDiffuse ? 0.0f : lerp(material.metallic, 1.0f, fresnel * material.smoothness);
     const float do_specular = (RandomFloat01(rng) < specular_chance) ? 1.0f : 0.0f;
 
     float3 diffuse_dir = SafeNormalize(normal + RandomUnitVector(rng));

@@ -8,7 +8,9 @@
 // sun found by bounce sampling only, and a shadow under a floating block; a host
 // sky cubemap (primary miss, SH irradiance of diffuse bounces), the fog of the air
 // and the emission scale against closed forms. Two renderers over one flush must
-// agree on the motion of a moving entity, and render once per frame each.
+// agree on the motion of a moving entity, and render once per frame each. ReSTIR GI
+// without reuse must match the path tracer's reference image, and its reuse must keep
+// the mean within a bias bound.
 // Uses the public C ABI only.
 #include "test_scenes.h"
 
@@ -2886,6 +2888,242 @@ TEST_CASE("sky cubemap, fog and emission scale")
     caelix_renderer_release_target_views(renderer);  // also the cube view of the sky
     caelix_renderer_destroy(renderer);
     DestroySkyCube(rig.gpu, cube);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+// ReSTIR GI (caelix_renderer_set_gi_options, docs/GI_EXPERIMENTS.md): option validation, the
+// unbiasedness of the initial samples without reuse, and the bias of the reuse.
+
+namespace {
+
+// A grey floor (64 x 64 x 8 blocks, y in [-8, 0)), an 8 x 2 x 8 white emitter of emission 8
+// floating at y in [14, 16) and a grey wall at x in [40, 42) that casts a shadow; black sky, no
+// sun. The camera looks down at the floor from (10, 30, 10) toward (36, 0, 36).
+void UploadGiRoom(Rig& rig)
+{
+    World world;
+    FillBox(world, 0, -8, 0, 63, -1, 63, kGreyFloor);
+    FillBox(world, 28, 14, 28, 35, 15, 35, kWhiteEmitter8);
+    FillBox(world, 40, 0, 16, 41, 9, 47, kGreyFloor);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+}
+
+CaelixCamera GiRoomCamera()
+{
+    const double position[3] = {10.0, 30.0, 10.0};
+    const double forward[3] = {26.0, -30.0, 26.0};
+    return LookAlong(position, forward, std::tan(30.0 * 3.14159265358979323846 / 180.0));
+}
+
+CaelixGiOptions GiOptions(uint32_t method, uint32_t flags)
+{
+    CaelixGiOptions gi{};
+    gi.method = method;
+    gi.flags = flags;
+    return gi;
+}
+
+// Reference mode over `frames` frames (seeds seed0 ..), 3 bounces, black sky; the colour (the
+// running mean) is read back after the last frame and returned.
+std::vector<float> GiReference(Rig& rig, CaelixRenderer* renderer, TargetSet& set, const CaelixCamera& camera,
+                               uint32_t frames, uint32_t seed0)
+{
+    for (uint32_t i = 0; i < frames; ++i)
+    {
+        CaelixRenderOptions options = GlassOptions(CAELIX_MODE_REFERENCE, 3, 0, seed0 + i);
+        options.reset_accumulation = i == 0 ? 1u : 0u;
+        Render(rig, renderer, set, camera, options, i + 1 == frames);
+    }
+    const Target& color = *set.t[kColor];
+    std::vector<float> image(static_cast<size_t>(color.width) * color.height * 4);
+    std::memcpy(image.data(), color.bytes.data(), image.size() * sizeof(float));
+    return image;
+}
+
+// Comparison of a test image against a reference image (RGBA32F, kSize x kSize) over the lit
+// pixels of the reference: covered, max(rgb) above 1e-4 and below 4 (the emitter's own pixels,
+// deterministic emission 8, are left out so that the indirect light dominates the means).
+struct GiComparison
+{
+    uint32_t pixels = 0;
+    double ref_mean[3] = {0.0, 0.0, 0.0};
+    double test_mean[3] = {0.0, 0.0, 0.0};
+    double max_ratio_error = 0.0;  // max over channels of |test / ref - 1|
+    double psnr = 0.0;             // dB over the lit pixels, both clamped to [0, 1], peak 1
+};
+
+GiComparison CompareGi(const std::vector<float>& ref, const std::vector<float>& test)
+{
+    GiComparison c;
+    double squared = 0.0;
+    for (size_t p = 0; p < static_cast<size_t>(kSize) * kSize; ++p)
+    {
+        const float* r = &ref[p * 4];
+        const float* t = &test[p * 4];
+        const float peak = std::max(r[0], std::max(r[1], r[2]));
+        if (r[3] != 1.0f || !(peak > 1e-4f) || !(peak < 4.0f))
+        {
+            continue;
+        }
+        ++c.pixels;
+        for (int ch = 0; ch < 3; ++ch)
+        {
+            c.ref_mean[ch] += r[ch];
+            c.test_mean[ch] += t[ch];
+            const double d = std::clamp(static_cast<double>(t[ch]), 0.0, 1.0) -
+                             std::clamp(static_cast<double>(r[ch]), 0.0, 1.0);
+            squared += d * d;
+        }
+    }
+    REQUIRE(c.pixels > 1000);
+    for (int ch = 0; ch < 3; ++ch)
+    {
+        c.ref_mean[ch] /= c.pixels;
+        c.test_mean[ch] /= c.pixels;
+        c.max_ratio_error = std::max(c.max_ratio_error, std::abs(c.test_mean[ch] / c.ref_mean[ch] - 1.0));
+    }
+    const double mse = squared / (3.0 * c.pixels);
+    c.psnr = mse > 0.0 ? 10.0 * std::log10(1.0 / mse) : 99.0;
+    return c;
+}
+
+void PrintGi(const char* name, const GiComparison& c)
+{
+    std::printf("%s: %u lit pixels, mean ref %.5f %.5f %.5f, test %.5f %.5f %.5f, max ratio error %.4f, "
+                "PSNR %.2f dB\n",
+                name, c.pixels, c.ref_mean[0], c.ref_mean[1], c.ref_mean[2], c.test_mean[0], c.test_mean[1],
+                c.test_mean[2], c.max_ratio_error, c.psnr);
+}
+
+}  // namespace
+
+TEST_CASE("ReSTIR GI: set_gi_options validation")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+
+    const auto expect_invalid = [&](const CaelixGiOptions& bad) {
+        ExpectLibraryErrors(1, [&] {
+            REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+    };
+    CaelixGiOptions bad = GiOptions(2, 0);  // unknown method
+    expect_invalid(bad);
+    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 5);  // unknown flag
+    expect_invalid(bad);
+    bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
+    bad.spatial_samples = 9;
+    expect_invalid(bad);
+    bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
+    bad.spatial_passes = 3;
+    expect_invalid(bad);
+    bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
+    bad.spatial_radius = NAN;
+    expect_invalid(bad);
+    bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
+    bad.depth_threshold = -0.5f;
+    expect_invalid(bad);
+    ExpectLibraryErrors(1, [&] { REQUIRE(caelix_renderer_set_gi_options(renderer, nullptr) == CAELIX_ERROR_INVALID_ARGUMENT); });
+
+    CaelixGiOptions good = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL |
+                                                           CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY);
+    good.temporal_m_cap = 64;
+    good.spatial_samples = 8;
+    good.spatial_passes = 2;
+    good.spatial_radius = 12.5f;
+    good.depth_threshold = 0.05f;
+    good.reset = 1;
+    CHECK(caelix_renderer_set_gi_options(renderer, &good) == CAELIX_OK);
+    const CaelixGiOptions zero{};
+    CHECK(caelix_renderer_set_gi_options(renderer, &zero) == CAELIX_OK);
+    // No ReSTIR render yet: no reservoir buffer.
+    CaelixGiStats stats{};
+    caelix_renderer_get_gi_stats(renderer, &stats);
+    CHECK(stats.reservoir_bytes == 0);
+
+    caelix_renderer_destroy(renderer);
+    CloseRig(rig);
+}
+
+TEST_CASE("ReSTIR GI: without reuse it matches the path tracer; with reuse its bias stays bounded")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadGiRoom(rig);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = GiRoomCamera();
+    constexpr uint32_t kFrames = 256;
+
+    // 1. The path tracer with the Lambert lobe forced (the reference of the comparisons).
+    CaelixGiOptions gi = GiOptions(CAELIX_GI_PATH_TRACE, CAELIX_GI_FLAG_DIFFUSE_ONLY);
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = GiReference(rig, renderer, set, camera, kFrames, 5000);
+    CaelixGiStats stats{};
+    caelix_renderer_get_gi_stats(renderer, &stats);
+    CHECK(stats.reservoir_bytes == 0);
+    CHECK(stats.gi_ms == 0.0f);
+
+    // 2. ReSTIR GI without temporal and spatial reuse: every pixel's reservoir is its initial
+    //    sample, so the estimate is the path tracer's (other random numbers: the two means differ
+    //    by noise only).
+    gi = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_DIFFUSE_ONLY);
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> no_reuse = GiReference(rig, renderer, set, camera, kFrames, 9000);
+    caelix_renderer_get_gi_stats(renderer, &stats);
+    std::printf("ReSTIR GI stats: gi %.4f ms, reservoirs %llu bytes\n", stats.gi_ms,
+                static_cast<unsigned long long>(stats.reservoir_bytes));
+    CHECK(stats.reservoir_bytes == 4ull * kSize * kSize * 48);
+    CHECK(stats.gi_ms > 0.0f);
+    // The noise floor: two path tracer runs with other seeds. At 256 frames the pixel noise of
+    // this scene limits the PSNR to about 24 dB, so the check is against that floor, not a
+    // fixed value.
+    gi = GiOptions(CAELIX_GI_PATH_TRACE, CAELIX_GI_FLAG_DIFFUSE_ONLY);
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const GiComparison noise = CompareGi(pt, GiReference(rig, renderer, set, camera, kFrames, 13000));
+    PrintGi("path tracer vs path tracer, other seeds (noise floor)", noise);
+    const GiComparison unbiased = CompareGi(pt, no_reuse);
+    PrintGi("ReSTIR GI without reuse vs path tracer (256 frames)", unbiased);
+    CHECK(unbiased.max_ratio_error < 0.03);
+    CHECK(unbiased.psnr > noise.psnr - 1.0);
+
+    // 3. Temporal + spatial reuse (1/M weights, no visibility rays): biased; the mean must stay
+    //    within 10 percent of the path tracer's. Then with visibility rays and the unbiased
+    //    combination (reported, same bound).
+    gi = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_DIFFUSE_ONLY | CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL);
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const GiComparison reuse = CompareGi(pt, GiReference(rig, renderer, set, camera, kFrames, 17000));
+    PrintGi("ReSTIR GI temporal + spatial (biased) vs path tracer", reuse);
+    CHECK(reuse.max_ratio_error < 0.10);
+
+    gi.flags |= CAELIX_GI_FLAG_UNBIASED;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const GiComparison reuse_unbiased = CompareGi(pt, GiReference(rig, renderer, set, camera, kFrames, 21000));
+    PrintGi("ReSTIR GI temporal + spatial (unbiased) vs path tracer", reuse_unbiased);
+    CHECK(reuse_unbiased.max_ratio_error < 0.10);
+
+    // 4. Back to the path tracer: the image is the path tracer's again, bit for bit (same seeds).
+    gi = GiOptions(CAELIX_GI_PATH_TRACE, CAELIX_GI_FLAG_DIFFUSE_ONLY);
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt_again = GiReference(rig, renderer, set, camera, 4, 5000);
+    const std::vector<float> pt_short = [&] {
+        const CaelixGiOptions zero{};
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &zero) == CAELIX_OK);
+        return GiReference(rig, renderer, set, camera, 4, 5000);
+    }();
+    // Packed scenes have smoothness 0: DIFFUSE_ONLY changes nothing there.
+    CHECK(std::memcmp(pt_again.data(), pt_short.data(), pt_again.size() * sizeof(float)) == 0);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
     DestroyTarget(rig.gpu, color);
     CloseRig(rig);
 }

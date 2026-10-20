@@ -12,7 +12,7 @@ use winit::window::Window;
 
 use crate::camera::{self, Camera};
 use crate::sequence::{Interpolation, Playback, Sequencer, MIN_DURATION};
-use crate::settings::{Mode, RenderSettings, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
+use crate::settings::{GiMethod, Mode, RenderSettings, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
 use crate::testscene::{EditPattern, TestScene};
 use crate::world::EntityEntry;
 
@@ -39,6 +39,8 @@ pub struct Stats {
     pub upscaler_rr: Option<CaelixUpscalerQueryResult>,
     /// The renderer's current upscaler (`caelix_renderer_get_upscaler_info`).
     pub upscaler_info: CaelixUpscalerInfo,
+    /// The GI passes' time and reservoir memory (`caelix_renderer_get_gi_stats`).
+    pub gi: CaelixGiStats,
 }
 
 /// Why an upscaler query reported "unsupported", in words (`CaelixUpscalerUnsupportedReason`).
@@ -144,6 +146,8 @@ pub struct Panel<'a> {
     pub sequencer: &'a mut Sequencer,
     /// Output: the "Reset accumulation" button was pressed.
     pub reset_accumulation: bool,
+    /// Output: the GI "Reset history" button was pressed.
+    pub reset_gi_history: bool,
     /// Output: the "Screenshot" button was pressed.
     pub screenshot: bool,
 }
@@ -301,6 +305,8 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
             &[
                 ("of frame", t.frame_number.to_string()),
                 ("trace", format!("{:.2} ms", t.trace_ms)),
+                ("gi", format!("{:.2} ms", stats.gi.gi_ms)),
+                ("reservoirs", format!("{:.0} MB", stats.gi.reservoir_bytes as f64 / 1e6)),
                 ("denoise", format!("{:.2} ms", t.denoise_ms)),
                 ("upscale", format!("{:.2} ms", t.upscale_ms)),
                 ("composite", format!("{:.2} ms", t.composite_ms)),
@@ -482,6 +488,58 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         );
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.sky_on_miss, "sky on miss"));
         ui.add_enabled(!lighting, egui::Checkbox::new(&mut settings.shading, "Lambert (primary mode)"));
+    });
+
+    CollapsingHeader::new("GI").default_open(true).show(ui, |ui| {
+        let gi = &mut settings.gi;
+        let restir = lighting && gi.method == GiMethod::Restir;
+        Grid::new("render_gi").num_columns(2).show(ui, |ui| {
+            ui.label("method");
+            ui.add_enabled_ui(lighting, |ui| {
+                ComboBox::from_id_salt("gi_method").selected_text(gi.method.label()).show_ui(ui, |ui| {
+                    for method in GiMethod::ALL {
+                        ui.selectable_value(&mut gi.method, method, method.label());
+                    }
+                });
+            });
+            ui.end_row();
+
+            ui.label("M cap");
+            ui.add_enabled(restir && gi.temporal, Slider::new(&mut gi.temporal_m_cap, 1..=64));
+            ui.end_row();
+
+            ui.label("spatial samples");
+            ui.add_enabled(restir && gi.spatial, Slider::new(&mut gi.spatial_samples, 1..=8));
+            ui.end_row();
+
+            ui.label("spatial passes");
+            ui.add_enabled(restir && gi.spatial, Slider::new(&mut gi.spatial_passes, 1..=2));
+            ui.end_row();
+
+            ui.label("radius (px)");
+            ui.add_enabled(restir && gi.spatial, Slider::new(&mut gi.spatial_radius, 1.0..=100.0));
+            ui.end_row();
+
+            ui.label("depth threshold");
+            ui.add_enabled(restir, Slider::new(&mut gi.depth_threshold, 0.01..=1.0).logarithmic(true));
+            ui.end_row();
+        });
+        ui.add_enabled(
+            lighting && gi.method == GiMethod::Pt,
+            egui::Checkbox::new(&mut gi.diffuse_only, "diffuse only (path tracer; ReSTIR always)"),
+        );
+        ui.add_enabled(restir, egui::Checkbox::new(&mut gi.temporal, "temporal reuse"));
+        ui.add_enabled(restir, egui::Checkbox::new(&mut gi.spatial, "spatial reuse"));
+        ui.add_enabled(restir && gi.spatial, egui::Checkbox::new(&mut gi.visibility, "visibility rays"));
+        ui.add_enabled(restir && gi.spatial, egui::Checkbox::new(&mut gi.unbiased, "unbiased (Z weights)"));
+        if ui
+            .add_enabled(restir, egui::Button::new("Reset history"))
+            .on_hover_text("Drops the reservoirs of the previous frames once")
+            .clicked()
+        {
+            panel.reset_gi_history = true;
+        }
+        ui.label("Both methods force the Lambert lobe.");
     });
 
     CollapsingHeader::new("Sun").default_open(true).show(ui, |ui| {

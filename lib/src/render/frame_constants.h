@@ -6,7 +6,7 @@ namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
 // together. One per render call, in a host-visible buffer; its device address is
-// the only push constant of the trace and composite kernels. 544 bytes. Every field sits at an offset
+// the only push constant of the trace and composite kernels. 608 bytes. Every field sits at an offset
 // that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
 // std430 and scalar layout rules give the same offsets.
 struct FrameConstants
@@ -74,8 +74,21 @@ struct FrameConstants
     uint32_t upscale_src_size[2];       // 528  size of the encode kernel's source (upscaler output, or size on the fallback)
     uint32_t upscaler;                  // 536  0 none, 1 DLSS SR, 2 DLSS RR (the trace writes the RR guides)
     uint32_t upscale;                   // 540  1 = the composite / cross resolve write upscale_in instead of the colour target
+    // ReSTIR GI (CaelixGiOptions, docs/GI_EXPERIMENTS.md); every address 0 unless gi_method = RESTIR.
+    uint64_t gi_initial;                // 544  reservoir buffer written by the trace kernel (initial samples)
+    uint64_t gi_prev;                   // 552  previous frame's final reservoirs
+    uint64_t gi_temp;                   // 560  temporal output / spatial ping-pong
+    uint64_t gi_out;                    // 568  spatial ping-pong
+    uint32_t gi_method;                 // 576  CaelixGiMethod (RESTIR only in a lighting frame with bounces)
+    uint32_t gi_flags;                  // 580  CAELIX_GI_FLAG_*
+    uint32_t gi_temporal_m_cap;         // 584
+    uint32_t gi_spatial_samples;        // 588
+    float gi_spatial_radius;            // 592  pixels
+    uint32_t gi_spatial_passes;         // 596
+    uint32_t gi_history_valid;          // 600  1 = gi_prev holds last frame's reservoirs of this renderer
+    float gi_depth_threshold;           // 604
 };
-static_assert(sizeof(FrameConstants) == 544);
+static_assert(sizeof(FrameConstants) == 608);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -110,6 +123,11 @@ static_assert(offsetof(FrameConstants, output_size) == 520);
 static_assert(offsetof(FrameConstants, upscale_src_size) == 528);
 static_assert(offsetof(FrameConstants, upscaler) == 536);
 static_assert(offsetof(FrameConstants, upscale) == 540);
+static_assert(offsetof(FrameConstants, gi_initial) == 544);
+static_assert(offsetof(FrameConstants, gi_out) == 568);
+static_assert(offsetof(FrameConstants, gi_method) == 576);
+static_assert(offsetof(FrameConstants, gi_spatial_radius) == 592);
+static_assert(offsetof(FrameConstants, gi_depth_threshold) == 604);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).
@@ -125,11 +143,14 @@ constexpr uint32_t kTargetMotion = 1u << 4;
 constexpr uint32_t kTargetViewZ = 1u << 5;
 constexpr uint32_t kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
 
-// Push constants of the trace and composite kernels: the address of the frame's FrameConstants.
+// Push constants of the trace and composite kernels: the address of the frame's FrameConstants,
+// and the spatial pass index of the ReSTIR GI spatial kernel (0 for every other kernel).
 struct TracePush
 {
     uint64_t frame_constants;
+    uint32_t gi_pass;
+    uint32_t pad;
 };
-static_assert(sizeof(TracePush) == 8);
+static_assert(sizeof(TracePush) == 16);
 
 }  // namespace caelix

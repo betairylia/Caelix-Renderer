@@ -70,7 +70,9 @@ extern "C" {
    caelix_upscaler_query), the extension lists (caelix_upscaler_instance_extensions,
    caelix_upscaler_device_extensions), the jitter helpers (caelix_upscaler_jitter_phases,
    caelix_jitter_halton) and CaelixUpscalerInfo with caelix_renderer_get_upscaler_info, also without
-   a bump. A host built against an older version-2 header must be rebuilt (the library reads and
+   a bump. The GI experiment step added CaelixGiMethod, CAELIX_GI_FLAG_*, CaelixGiOptions,
+   caelix_renderer_set_gi_options, CaelixGiStats and caelix_renderer_get_gi_stats (no existing struct
+   changed), also without a bump. A host built against an older version-2 header must be rebuilt (the library reads and
    writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1092,6 +1094,57 @@ typedef struct CaelixUpscalerInfo
 /* Fills *out. Returns CAELIX_ERROR_INVALID_ARGUMENT (logged) for a NULL argument. */
 CAELIX_API CaelixResult caelix_renderer_get_upscaler_info(const CaelixRenderer* renderer,
                                                           CaelixUpscalerInfo* out);
+
+/* Global illumination method of the lighting modes (docs/GI_EXPERIMENTS.md). Experimental. */
+typedef enum CaelixGiMethod
+{
+    CAELIX_GI_PATH_TRACE = 0, /* the path tracer as before */
+    CAELIX_GI_RESTIR = 1      /* screen-space ReSTIR GI on the first diffuse bounce */
+} CaelixGiMethod;
+
+#define CAELIX_GI_FLAG_TEMPORAL (1u << 0)     /* temporal reuse (previous frame's reservoir) */
+#define CAELIX_GI_FLAG_SPATIAL (1u << 1)      /* spatial reuse */
+#define CAELIX_GI_FLAG_VISIBILITY (1u << 2)   /* a shadow ray per reused neighbour sample (occluded -> weight 0) */
+#define CAELIX_GI_FLAG_UNBIASED (1u << 3)     /* Z-count MIS instead of 1/M (implies VISIBILITY rays per neighbour) */
+#define CAELIX_GI_FLAG_DIFFUSE_ONLY (1u << 4) /* force the Lambert lobe at every vertex */
+
+/* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
+   bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
+   path, with the path's radiance from there on), then a temporal pass, up to two spatial passes and a
+   shade pass write the diffuse radiance that the composite (or NRD) reads. It forces the Lambert lobe
+   at every vertex, ignores sun NEE and the fog on the GI path, and writes no specular radiance. */
+typedef struct CaelixGiOptions
+{
+    uint32_t method;          /* CaelixGiMethod */
+    uint32_t flags;           /* CAELIX_GI_FLAG_* */
+    uint32_t temporal_m_cap;  /* 0 = 20; the previous reservoir's M is clamped to this before merging */
+    uint32_t spatial_samples; /* 0 = 5; 1 .. 8 neighbours per pass */
+    uint32_t spatial_passes;  /* 0 = 1; 1 .. 2 */
+    float spatial_radius;     /* pixels, 0 = 30 */
+    float depth_threshold;    /* 0 = 0.1: |x_v(q) - x_v(r)| must be below threshold * view_z(r) */
+    uint32_t reset;           /* 1 = drop the reservoir history with the next render */
+} CaelixGiOptions;
+
+/* Sets the GI options of the renderer; they apply from the next render on and stay until the next
+   call. Zero-initialised options = the path tracer. Lighting modes only (the primary mode ignores
+   them). CAELIX_MODE_REFERENCE accumulates the chosen method's output, so a biased method converges
+   to its biased image (that is how the bias is measured). A new method or new flags also drop the
+   reservoir history. With CAELIX_GI_PATH_TRACE and without CAELIX_GI_FLAG_DIFFUSE_ONLY the image is
+   the path tracer's, bit for bit. The reservoir buffers (4 x 48 bytes per pixel) are allocated at
+   the first ReSTIR render and kept until the renderer is destroyed (recreated on a size change).
+   Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
+   floats -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
+CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);
+
+typedef struct CaelixGiStats
+{
+    float gi_ms;              /* GPU time of the GI passes (temporal + spatial + shade) of the frame of
+                                 CaelixGpuTimings (0 when that frame ran no GI pass) */
+    uint64_t reservoir_bytes; /* bytes of the reservoir buffers currently allocated */
+} CaelixGiStats;
+
+/* Fills *out; a null argument is ignored. */
+CAELIX_API void caelix_renderer_get_gi_stats(const CaelixRenderer* renderer, CaelixGiStats* out);
 
 /* Reserved for later (not declared yet):
  *   caelix_scene_upload_brick_summaries - per-brick summaries for bricks that are known but not

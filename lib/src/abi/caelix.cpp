@@ -850,4 +850,31 @@ CAELIX_API CaelixResult caelix_renderer_get_upscaler_info(const CaelixRenderer* 
     return CAELIX_OK;
 }
 
+CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options)
+{
+    constexpr const char* kFunction = "caelix_renderer_set_gi_options";
+    if (renderer == nullptr || renderer->impl == nullptr || options == nullptr)
+    {
+        CAELIX_LOGE("%s: null argument", kFunction);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    try
+    {
+        return renderer->impl->SetGiOptions(*options);
+    }
+    catch (...)
+    {
+        return TranslateException(kFunction);
+    }
+}
+
+CAELIX_API void caelix_renderer_get_gi_stats(const CaelixRenderer* renderer, CaelixGiStats* out)
+{
+    if (renderer == nullptr || renderer->impl == nullptr || out == nullptr)
+    {
+        return;
+    }
+    renderer->impl->GetGiStats(*out);
+}
+
 }  // extern "C"

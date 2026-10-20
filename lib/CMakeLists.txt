@@ -110,7 +110,12 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_brick_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_scene_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_trace_set.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_restir_gi.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_restir_gi_temporal.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_restir_gi_spatial.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_restir_gi_shade.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_output.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite_set.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite.hlsl

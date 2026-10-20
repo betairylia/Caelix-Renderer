@@ -54,16 +54,19 @@
 //                   and specular = the transmission. APPROXIMATION: the hit distance is the
 //                   one of the lobe the path sampled (diffuse or specular), not always a
 //                   specular segment.
+//                   kGiFlagDiffuseOnly: every opaque vertex takes the diffuse lobe
+//                   (g_forceDiffuse). ReSTIR GI (fc.gi_method = kGiRestir, render/
+//                   caelix_restir_gi.hlsl): the diffuse lobe everywhere, no sun NEE and no fog
+//                   on the path; the first bounce of the path is stored as the pixel's initial
+//                   reservoir (fc.gi_initial) and the diffuse and specular radiance targets get
+//                   0: caelix_restir_gi_shade.hlsl writes the diffuse one after the reuse passes.
 //
 // Inputs: the push constant is the device address of the frame constants; the
 // scene's tables (page table, slot rows, group infos, entity infos) are read by
-// caelix_scene_trace.hlsl. The descriptors are the TLAS (binding 0, declared by
-// caelix_scene_trace.hlsl), the six host targets (bindings 1..6, no format
-// qualifier: format Unknown in SPIR-V, needs shaderStorageImageWriteWithoutFormat,
-// so every write is a float4 and the image keeps the components its format has)
-// and the internal targets of the lighting modes (bindings 7..18, fixed formats),
-// the sky cubemap (binding 19, sampled image) and its sampler (binding 20). Every
-// binding is PARTIALLY_BOUND:
+// caelix_scene_trace.hlsl. The descriptors are the trace set (render/caelix_trace_set.hlsl):
+// the TLAS (binding 0), the six host targets (bindings 1..6, format Unknown), the internal
+// targets of the lighting modes (bindings 7..18, fixed formats), the sky cubemap (binding 19,
+// sampled image) and its sampler (binding 20). Every binding is PARTIALLY_BOUND:
 // the library writes only the TLAS (when the scene has one), the present targets
 // and, in the lighting modes, the internal targets, and the kernel touches a
 // binding only then (has_tlas, target_mask, mode). Bindings 19 and 20 are written
@@ -75,34 +78,13 @@
 #include "common/caelix_block.hlsl"
 #include "render/caelix_scene_trace.hlsl"
 #include "common/caelix_material.hlsl"
-// The sky cubemap and its sampler (caelix_shading.hlsl declares them).
-#define CAELIX_SKY_BINDING_IMAGE 19
-#define CAELIX_SKY_BINDING_SAMPLER 20
+// The push constant, the targets and the sky bindings (before caelix_shading.hlsl).
+#include "render/caelix_trace_set.hlsl"
 #include "render/caelix_shading.hlsl"
 // NRD's front-end packing (normal + roughness, radiance + normalized hit distance);
 // NRDConfig.hlsli next to it fixes the encodings NRD was built with.
 #include "NRD.hlsli"
-
-CAELIX_PUSH_CONSTANTS(CaelixTracePush, g_push);
-CAELIX_BINDING(1, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_color;
-CAELIX_BINDING(2, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_albedo;
-CAELIX_BINDING(3, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_normal;
-CAELIX_BINDING(4, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_depth;
-CAELIX_BINDING(5, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_motion;
-CAELIX_BINDING(6, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_view_z;
-// Internal targets of the lighting modes (lib/src/render/renderer.h, InternalTargets).
-CAELIX_BINDING(7, 0) CAELIX_FORMAT("r32f") RWTexture2D<float4> g_int_view_z;
-CAELIX_BINDING(8, 0) CAELIX_FORMAT("rgb10a2") RWTexture2D<float4> g_int_normal_roughness;
-CAELIX_BINDING(9, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_motion;
-CAELIX_BINDING(10, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_albedo;
-CAELIX_BINDING(11, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_deterministic;
-CAELIX_BINDING(12, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_diff;
-CAELIX_BINDING(13, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_spec;
-CAELIX_BINDING(14, 0) CAELIX_FORMAT("r32f") RWTexture2D<float4> g_int_depth;
-CAELIX_BINDING(15, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_diffuse_albedo;
-CAELIX_BINDING(16, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_specular_albedo;
-CAELIX_BINDING(17, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_rr_normal_roughness;
-CAELIX_BINDING(18, 0) CAELIX_FORMAT("r16f") RWTexture2D<float4> g_int_rr_hit_dist;
+#include "render/caelix_restir_gi.hlsl"
 
 static const float kRayTMax = 1e30f;
 static const uint kStepsHeatMax = 64;
@@ -290,11 +272,34 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // still sees the disk, so the sun is counted once on every path. Shadow rays treat
 // glass as opaque. NEE draws from its own random stream, so the BSDF path consumes
 // the same random numbers with NEE on or off.
-CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
-                            uint medium, inout uint rng, out float4 stochastic)
+//
+// ReSTIR GI (`restir`): sun NEE is off and the segments see no fog (the GI path ignores
+// both); the first segment's end is returned in `gi` as the initial sample, and its
+// throughput restarts at 1 there, so the returned radiance is L_o(x_s) (the emission of the
+// first bounce hit plus the continuation from it), or the sky of a first segment that misses.
+// Without `restir` the path is the same as before (no extra random number, same order).
+struct GiInitialSample
 {
+    bool valid;            // the path had a first segment (bounce_count >= 1)
+    bool sky;              // the first segment missed: sample_pos is its direction
+    float3 sample_pos;     // x_s: the first bounce hit, or the direction of a sky sample
+    float3 sample_normal;  // n_s (a hit sample)
+    float3 radiance;       // L_o(x_s -> x_v)
+    float cos_theta_v;     // max(0, dot(n_v, first bounce direction))
+};
+
+CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
+                            uint medium, bool restir, inout uint rng, out float4 stochastic,
+                            out GiInitialSample gi)
+{
+    gi.valid = false;
+    gi.sky = false;
+    gi.sample_pos = float3(0.0f, 0.0f, 0.0f);
+    gi.sample_normal = float3(0.0f, 0.0f, 0.0f);
+    gi.radiance = float3(0.0f, 0.0f, 0.0f);
+    gi.cos_theta_v = 0.0f;
     uint nee_rng = InitRandom(pixel, fc.frame_seed ^ 0x68E31DA4u);
-    const bool nee = (fc.flags & kRenderFlagSunNee) != 0u && any(fc.sun_radiance.xyz > 0.0f);
+    const bool nee = !restir && (fc.flags & kRenderFlagSunNee) != 0u && any(fc.sun_radiance.xyz > 0.0f);
     const uint surface_block = (surface.attrib >> 16) & 0xFFFFu;
     const CaelixShadeResult primary_shade =
         ShadeVoxelHit(surface_block, ray.Origin + ray.Direction * surface.T, ray.Direction,
@@ -327,6 +332,10 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     bounce.Direction = primary_shade.bounce_direction;
     bounce.TMin = 0.0f;
     bounce.TMax = fc.t_max;
+    if (restir)
+    {
+        gi.cos_theta_v = max(0.0f, dot(surface.normal, bounce.Direction));
+    }
 
     // Unity's stochastic bounce counter: 1 after the primary shade, +1 per shaded
     // bounce hit; the loop runs while it is <= bounce_count, so bounce_count
@@ -337,10 +346,20 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     {
         const TraceResult hit = TraceScene(fc, bounce);
         // The segment ran inside `medium` (a miss has T = 0: the sky is not attenuated and
-        // the fog adds nothing).
-        TraverseSegment(fc, medium, hit.T, throughput, radiance);
+        // the fog adds nothing). The GI path ignores the fog.
+        if (!restir)
+        {
+            TraverseSegment(fc, medium, hit.T, throughput, radiance);
+        }
         if (!hit.hit)
         {
+            if (restir && first_segment)
+            {
+                // A sky sample: the radiance below with throughput 1.
+                gi.sky = true;
+                gi.sample_pos = bounce.Direction;
+                throughput = float3(1.0f, 1.0f, 1.0f);
+            }
             radiance += (segment_diffuse
                              ? SkyDiffuseMiss(fc, segment_normal, bounce.Direction, segment_sees_sun)
                              : SkySpecularMiss(fc, bounce.Direction, segment_roughness, segment_sees_sun)) *
@@ -351,6 +370,13 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         {
             first_segment_t = hit.T;
             first_segment = false;
+            if (restir)
+            {
+                // The sample point: L_o(x_s) starts here with throughput 1.
+                gi.sample_pos = bounce.Origin + bounce.Direction * hit.T;
+                gi.sample_normal = hit.normal;
+                throughput = float3(1.0f, 1.0f, 1.0f);
+            }
         }
         const CaelixShadeResult shade =
             ShadeVoxelHit((hit.attrib >> 16) & 0xFFFFu, bounce.Origin + bounce.Direction * hit.T,
@@ -384,6 +410,11 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         segment_roughness = shade.roughness;
     }
     stochastic = float4(SanitizeRadiance(radiance), first_segment_t);
+    if (restir)
+    {
+        gi.radiance = radiance;
+        gi.valid = fc.bounce_count >= 1u;
+    }
     return primary_shade;
 }
 
@@ -410,6 +441,8 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     g_blockEncoding = fc.encoding;
     g_materialTable = fc.materials;
     g_emissionScale = fc.emission_scale;
+    const bool restir = fc.gi_method == kGiRestir;
+    g_forceDiffuse = (fc.gi_flags & kGiFlagDiffuseOnly) != 0u || restir;
 
     // Pixel -> ray. Row 0 is the top row of the image.
     RayDesc ray;
@@ -582,12 +615,16 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         float4 rr_normal_roughness = float4(0.0f, 0.0f, 0.0f, 0.0f);
         float rr_hit_distance = kHalfMax;
 
+        // ReSTIR GI: the pixel's initial reservoir (empty without a surface or a usable sample).
+        GiReservoir gi_reservoir = GiEmptyReservoir();
+
         CAELIX_BRANCH
         if (surface)
         {
             float4 stochastic;
-            const CaelixShadeResult shade =
-                TracePath(fc, pixel, chain.ray, chain.surface, chain.medium, rng, stochastic);
+            GiInitialSample gi_sample;
+            const CaelixShadeResult shade = TracePath(fc, pixel, chain.ray, chain.surface, chain.medium, restir,
+                                                      rng, stochastic, gi_sample);
             // The chain's transmission modulates everything the surface sends (Unity:
             // AlbedoTarget = throughput * albedo, deterministic = throughput * emission).
             material_albedo = chain.throughput * shade.albedo;
@@ -630,6 +667,28 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             }
 
             CAELIX_BRANCH
+            if (restir)
+            {
+                // The first bounce was cosine-sampled (pdf cos / pi), so W = pi / cos and
+                // L_o * cos / pi * W = L_o, the path tracer's estimate. A sample with cos 0
+                // (a refracted first bounce of rough glass, a grazing direction) is worthless
+                // and stays invalid. The shade pass writes the diffuse radiance.
+                const float W = gi_sample.cos_theta_v > 0.0f ? K_PI / gi_sample.cos_theta_v : 0.0f;
+                if (gi_sample.valid && W > 0.0f)
+                {
+                    gi_reservoir.sample_pos = gi_sample.sample_pos;
+                    gi_reservoir.sample_flags =
+                        (gi_sample.sky ? kGiSampleSky : GiFaceIndex(gi_sample.sample_normal)) | kGiSampleValid;
+                    gi_reservoir.radiance = SanitizeRadiance(gi_sample.radiance);
+                    gi_reservoir.W = W;
+                    gi_reservoir.visible_pos = shade.bounce_origin;
+                    gi_reservoir.visible_flags_m = GiFaceIndex(normal) | (1u << kGiMShift);
+                }
+                diffuse = float4(0.0f, 0.0f, 0.0f, 0.0f);
+                specular = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+
+            CAELIX_BRANCH
             if (rr_guides)
             {
                 const uint surface_block = (chain.surface.attrib >> 16) & 0xFFFFu;
@@ -662,6 +721,11 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             // The chain went through at least one interface and left the scene: the sky in
             // the last direction times the transmission (Unity: delta miss).
             deterministic = chain.throughput * SkyRadiance(fc, chain.ray.Direction) + chain.inscatter;
+        }
+        CAELIX_BRANCH
+        if (restir)
+        {
+            StoreGiReservoir(GiReservoirAddress(fc.gi_initial, fc, pixel), gi_reservoir);
         }
         g_int_normal_roughness[pixel] = normal_roughness;
         // Coverage is albedo.a.

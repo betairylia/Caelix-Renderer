@@ -1,5 +1,5 @@
 // Renderer::Render: validation, descriptors, frame constants, barriers and the
-// pass sequence (sky SH, trace, NRD, composite, upscaler, encode).
+// pass sequence (sky SH, trace, ReSTIR GI, NRD, composite, upscaler, encode).
 #include "render/renderer.h"
 
 #include "core/log.h"
@@ -17,7 +17,8 @@
 namespace caelix {
 namespace {
 
-// [numthreads(8, 8, 1)] in caelix_path_trace.hlsl, caelix_composite.hlsl and caelix_upscale_encode.hlsl.
+// [numthreads(8, 8, 1)] in caelix_path_trace.hlsl, caelix_composite.hlsl, caelix_upscale_encode.hlsl and
+// the caelix_restir_gi_* kernels.
 constexpr uint32_t kWorkgroupSize = 8;
 // The smallest output of an upscaler (DLSS: 64 x 32).
 constexpr uint32_t kMinUpscaleOutputWidth = 64;
@@ -25,6 +26,12 @@ constexpr uint32_t kMinUpscaleOutputHeight = 32;
 constexpr uint32_t kDebugViewCount = 11;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_NRD_SPEC
 constexpr uint32_t kModeCount = 3;
 constexpr float kDefaultSunAngularRadius = 0.00873f;  // 0.5 degrees
+// CaelixGiOptions defaults (a zero field takes them).
+constexpr uint32_t kDefaultGiTemporalMCap = 20;
+constexpr uint32_t kDefaultGiSpatialSamples = 5;
+constexpr uint32_t kDefaultGiSpatialPasses = 1;
+constexpr float kDefaultGiSpatialRadius = 30.0f;
+constexpr float kDefaultGiDepthThreshold = 0.1f;
 
 bool FormatAccepted(const TargetSpec& spec, VkFormat format)
 {
@@ -340,14 +347,22 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     composite_timer_.Resolve(safe);
     denoise_timer_.Resolve(safe);
     upscale_timer_.Resolve(safe);
+    gi_timer_.Resolve(safe);
     FreeRetired(safe);
 
-    // Internal targets of the lighting modes and the NRD executor (before anything is
-    // recorded: the allocations can throw).
+    // ReSTIR GI: lighting modes with at least one bounce (the initial sample is the first bounce).
+    const bool restir = lighting && gi_options_.method == CAELIX_GI_RESTIR && options.bounce_count >= 1;
+
+    // Internal targets of the lighting modes, the reservoir buffers and the NRD executor (before
+    // anything is recorded: the allocations can throw).
     bool restart_accumulation = options.reset_accumulation != 0 || options.mode != last_mode_;
     if (lighting && EnsureInternalTargets(width, height, frame.frame_number))
     {
         restart_accumulation = true;
+    }
+    if (restir)
+    {
+        EnsureGiBuffers(width, height, frame.frame_number);
     }
     bool nrd_error = false;
     NrdExecutor* denoiser = nullptr;
@@ -595,6 +610,30 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     }
     constants.emission_scale = options.emission_scale > 0.0f ? options.emission_scale : 1.0f;
     constants.sky_sh = sky_sh_buffer_.address();
+    // ReSTIR GI. DIFFUSE_ONLY applies to both methods; the other fields only with ReSTIR. The
+    // history is valid when the previous frame of this renderer ran ReSTIR with the same method and
+    // flags on the same buffers and nothing restarted (reset_accumulation, mode change, new targets).
+    constants.gi_flags =
+        restir ? gi_options_.flags : (gi_options_.flags & static_cast<uint32_t>(CAELIX_GI_FLAG_DIFFUSE_ONLY));
+    if (restir)
+    {
+        constants.gi_method = CAELIX_GI_RESTIR;
+        constants.gi_initial = GiAddress(kGiInitial);
+        constants.gi_prev = GiAddress(kGiPrev);
+        constants.gi_temp = GiAddress(kGiTemp);
+        constants.gi_out = GiAddress(kGiOut);
+        constants.gi_temporal_m_cap =
+            gi_options_.temporal_m_cap != 0 ? gi_options_.temporal_m_cap : kDefaultGiTemporalMCap;
+        constants.gi_spatial_samples =
+            gi_options_.spatial_samples != 0 ? gi_options_.spatial_samples : kDefaultGiSpatialSamples;
+        constants.gi_spatial_passes =
+            gi_options_.spatial_passes != 0 ? gi_options_.spatial_passes : kDefaultGiSpatialPasses;
+        constants.gi_spatial_radius =
+            gi_options_.spatial_radius != 0.0f ? gi_options_.spatial_radius : kDefaultGiSpatialRadius;
+        constants.gi_depth_threshold =
+            gi_options_.depth_threshold != 0.0f ? gi_options_.depth_threshold : kDefaultGiDepthThreshold;
+        constants.gi_history_valid = gi_history_valid_ && !restart_accumulation ? 1u : 0u;
+    }
     if (sky)
     {
         constants.sky_cubemap = 1;
@@ -608,7 +647,9 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     // ALL_COMMANDS) -> the kernels' writes. Lighting modes: the internal targets'
     // first use (UNDEFINED -> GENERAL), else a memory barrier that orders the
     // previous frame's kernel reads and writes before this frame's (also the previous
-    // frame's reads of sky_sh_buffer_ before this frame's SH write). The first render
+    // frame's reads of sky_sh_buffer_ before this frame's SH write, and the previous frame's
+    // ReSTIR GI reads and writes of the reservoir buffers before this frame's: the memory
+    // barrier is global, so it covers the buffers too). The first render
     // call on the device (any renderer) moves the device's fallback sky cube to GENERAL.
     {
         Barriers before;
@@ -679,6 +720,56 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     vkCmdPushConstants(cmd, trace.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
     timer_.End(cmd);
+
+    // ReSTIR GI: temporal, spatial (SPATIAL flag, gi_spatial_passes times), shade; a compute ->
+    // compute memory barrier before each pass orders the previous pass's writes before its reads.
+    // The shade pass writes the diffuse radiance target; the barrier after it orders that write
+    // before NRD or the composite. Every GI pipeline has the trace's pipeline layout, so the trace
+    // set stays bound.
+    bool gi_ran = false;
+    if (restir)
+    {
+        const auto pass_barrier = [cmd] {
+            Barriers pass;
+            pass.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            pass.Record(cmd);
+        };
+        const auto dispatch = [&](const ComputePipeline& kernel, uint32_t gi_pass) {
+            TracePush gi_push = push;
+            gi_push.gi_pass = gi_pass;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline());
+            vkCmdPushConstants(cmd, kernel.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gi_push), &gi_push);
+            vkCmdDispatch(cmd, groups_x, groups_y, 1);
+        };
+        pass_barrier();
+        const bool timed = gi_timer_.Begin(cmd, frame.frame_number, safe);
+        dispatch(kernels_.restir_temporal(), 0);
+        const uint32_t spatial_passes =
+            (gi_options_.flags & CAELIX_GI_FLAG_SPATIAL) != 0 ? constants.gi_spatial_passes : 0u;
+        for (uint32_t p = 0; p < spatial_passes; ++p)
+        {
+            pass_barrier();
+            dispatch(kernels_.restir_spatial(), p);
+        }
+        pass_barrier();
+        dispatch(kernels_.restir_shade(), 0);
+        if (timed)
+        {
+            gi_timer_.End(cmd);
+        }
+        pass_barrier();
+        // The final reservoirs (temp after 0 or 2 spatial passes, out after 1) become the next
+        // frame's prev; the old prev and the other ping-pong buffer become temp and out.
+        const uint32_t final_buffer = gi_index_[spatial_passes == 1 ? kGiOut : kGiTemp];
+        const uint32_t other_buffer = gi_index_[spatial_passes == 1 ? kGiTemp : kGiOut];
+        gi_index_[kGiTemp] = gi_index_[kGiPrev];
+        gi_index_[kGiOut] = other_buffer;
+        gi_index_[kGiPrev] = final_buffer;
+        gi_last_frame_ = frame.frame_number;
+        gi_ran = true;
+    }
 
     // NRD (path trace mode with denoising). Its first dispatch waits for the trace's
     // writes, its last barrier orders its outputs before the composite.
@@ -867,6 +958,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     last_mode_ = options.mode;
     if (lighting)
     {
+        // A lighting frame without ReSTIR breaks the reservoir history.
+        gi_history_valid_ = gi_ran;
         internal_needs_init_ = false;
         internal_last_frame_ = frame.frame_number;
         accum_count_ =

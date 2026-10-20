@@ -62,10 +62,20 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // executor is created at the first denoised render and recreated (history lost)
 // when the size changes, the old one is destroyed once its last frame is safe.
 // Per-frame resources
-// live in a ring of slots (four descriptor sets + 544-byte constants buffer); a
+// live in a ring of slots (four descriptor sets + 608-byte constants buffer); a
 // slot is reused only when its frame is safe. The camera of each successful
 // render call is kept as the previous camera of the next one (motion targets). A
 // renderer renders at most once per frame number (last_frame_).
+//
+// ReSTIR GI (CaelixGiOptions::method = CAELIX_GI_RESTIR, lighting modes with bounces;
+// docs/GI_EXPERIMENTS.md): the trace kernel stores one initial reservoir per pixel, then
+// caelix_restir_gi_temporal, up to two caelix_restir_gi_spatial passes and
+// caelix_restir_gi_shade (all with the trace set and TracePush; gi_pass = the spatial pass)
+// run between the trace and NRD / the composite, and the shade pass writes the diffuse
+// radiance target. Four reservoir buffers (48 bytes per pixel each): initial, prev (the
+// previous frame's final reservoirs), temp and out (ping-pong); after a ReSTIR frame the
+// final one becomes prev. Created at the first ReSTIR render, recreated (old ones retired
+// until safe) when the render size changes, kept while another method runs.
 //
 // Internal targets (lighting modes only): created at the first lighting render,
 // recreated when the host target size changes (the old images are destroyed once
@@ -88,6 +98,9 @@ public:
     void GetTimings(CaelixGpuTimings& out) const;
     void GetNrdInfo(CaelixNrdInfo& out) const;
     void GetUpscalerInfo(CaelixUpscalerInfo& out) const;
+    // caelix_renderer_set_gi_options: validates (INVALID_ARGUMENT, logged) and stores the options.
+    CaelixResult SetGiOptions(const CaelixGiOptions& options);
+    void GetGiStats(CaelixGiStats& out) const;
 
 private:
     static constexpr uint32_t kInitialSlots = 3;
@@ -158,6 +171,21 @@ private:
         uint64_t frame = 0;  // the last frame that used it
         std::unique_ptr<NrdExecutor> executor;
     };
+    // ReSTIR GI reservoir buffers, indexed through gi_index_.
+    enum GiBuffer : uint32_t
+    {
+        kGiInitial,  // the trace kernel's initial samples
+        kGiPrev,     // the previous ReSTIR frame's final reservoirs
+        kGiTemp,     // the temporal output, spatial ping-pong
+        kGiOut,      // spatial ping-pong
+        kGiBufferCount
+    };
+    using GiBuffers = std::array<GpuBuffer, kGiBufferCount>;
+    struct RetiredGiBuffers
+    {
+        uint64_t frame = 0;  // the last frame that used them
+        GiBuffers buffers;
+    };
     struct RetiredUpscaler
     {
         uint64_t frame = 0;  // the last frame that used them
@@ -194,7 +222,17 @@ private:
     // Creates the internal targets when they are missing or have another size; the
     // old ones are retired until `frame` is safe. Returns true when it created them.
     bool EnsureInternalTargets(uint32_t width, uint32_t height, uint64_t frame);
-    // Destroys retired internal targets, NRD executors and upscalers whose frame is <= safe_frame.
+    // Creates the ReSTIR GI reservoir buffers when they are missing or of another size; the old
+    // ones are retired until `frame` is safe and the history is dropped. Returns true when it
+    // created them.
+    bool EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame);
+    // The device address of reservoir buffer `which` (GiBuffer) under the current rotation.
+    uint64_t GiAddress(GiBuffer which) const
+    {
+        return gi_buffers_[gi_index_[which]].address();
+    }
+    // Destroys retired internal targets, reservoir buffers, NRD executors and upscalers whose
+    // frame is <= safe_frame.
     void FreeRetired(uint64_t safe_frame);
     // The render size of `upscaler` at `quality` for an output_width x output_height colour target
     // (renderer_upscale.cpp): CAELIX_OK and the size, or CAELIX_ERROR_UNSUPPORTED (logged once per
@@ -264,6 +302,17 @@ private:
     std::vector<RetiredUpscaler> retired_upscalers_;
     std::chrono::steady_clock::time_point upscale_last_time_{};
     bool upscale_unsupported_logged_ = false;  // the build has no upscaler: logged once
+    // ReSTIR GI (lighting modes with CaelixGiOptions::method = CAELIX_GI_RESTIR).
+    CaelixGiOptions gi_options_{};       // zero = the path tracer
+    bool gi_history_valid_ = false;      // the buffer at gi_index_[kGiPrev] holds the previous frame's reservoirs
+    GiBuffers gi_buffers_;               // created at the first ReSTIR render
+    std::array<uint32_t, kGiBufferCount> gi_index_{kGiInitial, kGiPrev, kGiTemp, kGiOut};  // role -> buffer
+    uint32_t gi_width_ = 0;              // size of gi_buffers_
+    uint32_t gi_height_ = 0;
+    uint64_t gi_reservoir_bytes_ = 0;    // bytes of gi_buffers_
+    uint64_t gi_last_frame_ = 0;         // the last frame that used gi_buffers_
+    std::vector<RetiredGiBuffers> retired_gi_;
+    GpuTimer gi_timer_;                  // temporal + spatial + shade dispatches
 };
 
 }  // namespace caelix

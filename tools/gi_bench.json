@@ -1,0 +1,33 @@
+{
+  "size": "1920x1080",
+  "scenes": [
+    {
+      "name": "cornell",
+      "world": "F:/RP_Games/Caelix-family/ScenesPlayground/Artifacts/gi-cornell-20261020/out/cornell.cxw",
+      "pose": "24.0,20.0,1.5,0.0,0.0",
+      "fov": 60,
+      "extra": ["--sky-zenith", "0,0,0", "--sky-horizon", "0,0,0", "--sky-ground", "0,0,0"]
+    },
+    {
+      "name": "ashwick",
+      "world": "F:/RP_Games/Caelix-family/VoxelTestScenes/aigc/ashwick-r2.packed.cxw",
+      "pose": "3358.5,56.7,1907.9,1.900,44.400",
+      "fov": 60,
+      "extra": ["--sky-zenith", "0,0,0", "--sky-horizon", "0,0,0", "--sky-ground", "0,0,0"]
+    },
+    {
+      "name": "bistro_dark",
+      "world": "F:/RP_Games/Titania/saves/bistro-combined.8192.packed.cxw",
+      "pose": "1761.5,239.9,2456.0,-1.119,-127.260",
+      "fov": 60,
+      "extra": ["--sky-zenith", "0,0,0", "--sky-horizon", "0,0,0", "--sky-ground", "0,0,0"]
+    },
+    {
+      "name": "bistro_sky",
+      "world": "F:/RP_Games/Titania/saves/bistro-combined.8192.packed.cxw",
+      "pose": "1761.5,239.9,2456.0,-1.119,-127.260",
+      "fov": 60,
+      "extra": []
+    }
+  ]
+}

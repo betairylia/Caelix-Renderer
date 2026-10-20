@@ -58,7 +58,10 @@ use winit::window::{Window, WindowId};
 
 use camera::Camera;
 use sequence::{Playback, Sequence, Sequencer};
-use settings::{same_options, Encoding, Mode, RenderSettings, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
+use settings::{
+    same_options, Encoding, GiMethod, GiSettings, Mode, RenderSettings, UpscaleQuality, Upscaler, View,
+    MAX_UPSCALE_PRESET,
+};
 use testscene::{EditPattern, TestScene};
 
 /// Free camera: default speed in world units (blocks) per second.
@@ -366,6 +369,42 @@ struct Args {
     /// them (clean offline frames).
     #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=4096))]
     sequence_samples: u32,
+    /// Lighting modes: the global illumination method (docs/GI_EXPERIMENTS.md). restir: screen-space
+    /// ReSTIR GI on the first bounce (Lambert lobe at every vertex, no sun NEE, no fog on the GI
+    /// path, no specular radiance).
+    #[arg(long, value_enum, default_value_t = GiMethod::Pt)]
+    gi: GiMethod,
+    /// Path tracer: force the Lambert lobe at every vertex (what --gi restir always does), for a
+    /// comparison on the same BSDF.
+    #[arg(long)]
+    gi_diffuse_only: bool,
+    /// ReSTIR GI: no temporal reuse.
+    #[arg(long)]
+    gi_no_temporal: bool,
+    /// ReSTIR GI: no spatial reuse.
+    #[arg(long)]
+    gi_no_spatial: bool,
+    /// ReSTIR GI: a shadow ray per spatial neighbour (an occluded neighbour sample gets weight 0).
+    #[arg(long)]
+    gi_visibility: bool,
+    /// ReSTIR GI: Z-count MIS weights instead of 1/M (implies the shadow rays of --gi-visibility).
+    #[arg(long)]
+    gi_unbiased: bool,
+    /// ReSTIR GI: the previous frame's M is clamped to N before the temporal merge (1..64).
+    #[arg(long, value_name = "N", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=64))]
+    gi_m_cap: u32,
+    /// ReSTIR GI: neighbours per spatial pass (1..8).
+    #[arg(long, value_name = "N", default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=8))]
+    gi_spatial_samples: u32,
+    /// ReSTIR GI: spatial passes (1..2).
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=2))]
+    gi_spatial_passes: u32,
+    /// ReSTIR GI: radius of the spatial neighbour disk in pixels.
+    #[arg(long, value_name = "F", default_value_t = 30.0)]
+    gi_radius: f32,
+    /// ReSTIR GI: a reused reservoir's visible point must lie within F * view depth of the pixel's.
+    #[arg(long, value_name = "F", default_value_t = 0.1)]
+    gi_depth_threshold: f32,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -565,6 +604,8 @@ struct App {
     upscaler_support: Option<UpscalerSupport>,
     /// The newest upscaler state that was logged (a change is logged once).
     last_upscaler_info: Option<CaelixUpscalerInfo>,
+    /// The GI settings the library holds (`caelix_renderer_set_gi_options` runs when they change).
+    last_gi: Option<GiSettings>,
     error: Option<anyhow::Error>,
 }
 
@@ -745,6 +786,7 @@ impl App {
             }
             let mut ui_frame = None;
             let mut ui_reset = false;
+            let mut ui_gi_reset = false;
             if let Some(ui) = state.ui.as_mut().filter(|ui| ui.visible) {
                 let stats = ui::Stats {
                     timings: gpu_timings(state.renderer),
@@ -766,6 +808,7 @@ impl App {
                     upscaler_sr: self.upscaler_support.map(|s| s.sr),
                     upscaler_rr: self.upscaler_support.map(|s| s.rr),
                     upscaler_info: upscaler_info(state.renderer),
+                    gi: gi_stats(state.renderer),
                 };
                 let mut panel = ui::Panel {
                     stats: &stats,
@@ -776,10 +819,12 @@ impl App {
                     test: &mut self.test,
                     sequencer: &mut self.sequencer,
                     reset_accumulation: false,
+                    reset_gi_history: false,
                     screenshot: false,
                 };
                 ui_frame = Some(ui.run(&state.window, &mut panel));
                 ui_reset = panel.reset_accumulation;
+                ui_gi_reset = panel.reset_gi_history;
                 if panel.screenshot {
                     self.ui_screenshot_requested = true;
                 }
@@ -917,10 +962,28 @@ impl App {
             let options_changed = self.last_options.is_none_or(|last| !same_options(&last, &options));
             self.accumulation.last_camera = Some(camera);
             self.last_options = Some(options);
+            // GI options: sent when they changed (a new method or new flags also drop the reservoir
+            // history; the Reset history button drops it once). They change the reference image.
+            let gi = self.settings.gi;
+            let gi_changed = self.last_gi != Some(gi);
+            if gi_changed || ui_gi_reset {
+                let reset_history = ui_gi_reset
+                    || self.last_gi.is_none_or(|last| last.method != gi.method || last.flags() != gi.flags());
+                let gi_options = gi.options(reset_history);
+                // SAFETY: the renderer is live; gi_options is valid for the call.
+                let result = unsafe { caelix_renderer_set_gi_options(state.renderer, &gi_options) };
+                if result != CaelixResult_CAELIX_OK {
+                    bail!("caelix_renderer_set_gi_options({gi:?}) failed: CaelixResult {result}");
+                }
+                if gi_changed {
+                    log::info!("gi: {gi:?}");
+                }
+                self.last_gi = Some(gi);
+            }
             let reset_accumulation = ui_reset
                 || !world_ready
                 || (self.settings.mode == Mode::Ref
-                    && (camera_changed || options_changed || entity_moved || test_edited));
+                    && (camera_changed || options_changed || gi_changed || entity_moved || test_edited));
             self.accumulation.frames = if reset_accumulation { 1 } else { self.accumulation.frames + 1 };
             options.reset_accumulation = u32::from(reset_accumulation);
             // SAFETY: the command buffer is recording after this frame's flush; the image is
@@ -1056,6 +1119,13 @@ impl App {
                                 / self.timing.window_start.elapsed().as_secs_f64().max(1e-3)
                         };
                         log::info!("{}", timing_line(state.renderer, fps));
+                        // One machine-readable line on stdout for the GI bench runner.
+                        let timings = gpu_timings(state.renderer);
+                        let gi = gi_stats(state.renderer);
+                        println!(
+                            "timings: trace_ms={:.3} gi_ms={:.3} denoise_ms={:.3} composite_ms={:.3} upscale_ms={:.3}",
+                            timings.trace_ms, gi.gi_ms, timings.denoise_ms, timings.composite_ms, timings.upscale_ms
+                        );
                         self.screenshot = Screenshot::Done;
                         if self.args.exit_after_screenshot {
                             event_loop.exit();
@@ -1405,6 +1475,14 @@ fn scene_stats(scene: *const CaelixScene) -> CaelixSceneStats {
     stats
 }
 
+fn gi_stats(renderer: *const CaelixRenderer) -> CaelixGiStats {
+    // SAFETY: CaelixGiStats holds only numbers, so all-zero is a valid value.
+    let mut stats: CaelixGiStats = unsafe { std::mem::zeroed() };
+    // SAFETY: the renderer is live and stats is writable.
+    unsafe { caelix_renderer_get_gi_stats(renderer, &mut stats) };
+    stats
+}
+
 /// All zero when the call fails.
 fn nrd_info(renderer: *const CaelixRenderer) -> CaelixNrdInfo {
     // SAFETY: CaelixNrdInfo is a plain C struct of integers; all zero is a valid value.
@@ -1457,14 +1535,22 @@ fn upscaler_info_line(info: &CaelixUpscalerInfo) -> String {
     )
 }
 
-/// "Caelix Renderer | trace 1.23 ms | denoise 0.40 ms | upscale 0.49 ms | composite 0.05 ms |
-/// flush 0.45 ms | 144 fps"
+/// "Caelix Renderer | trace 1.23 ms | gi 0.31 ms (177 MB) | denoise 0.40 ms | upscale 0.49 ms |
+/// composite 0.05 ms | flush 0.45 ms | 144 fps"
 fn timing_line(renderer: *const CaelixRenderer, fps: f64) -> String {
     let timings = gpu_timings(renderer);
+    let gi = gi_stats(renderer);
     format!(
-        "Caelix Renderer | trace {:.2} ms | denoise {:.2} ms | upscale {:.2} ms | composite {:.2} ms | \
-         flush {:.2} ms | {:.0} fps",
-        timings.trace_ms, timings.denoise_ms, timings.upscale_ms, timings.composite_ms, timings.flush_ms, fps
+        "Caelix Renderer | trace {:.2} ms | gi {:.2} ms ({:.0} MB) | denoise {:.2} ms | upscale {:.2} ms | \
+         composite {:.2} ms | flush {:.2} ms | {:.0} fps",
+        timings.trace_ms,
+        gi.gi_ms,
+        gi.reservoir_bytes as f64 / 1e6,
+        timings.denoise_ms,
+        timings.upscale_ms,
+        timings.composite_ms,
+        timings.flush_ms,
+        fps
     )
 }
 
@@ -1736,6 +1822,19 @@ fn main() -> anyhow::Result<()> {
         upscale_quality: args.upscale_quality,
         upscale_preset: args.upscale_preset,
         upscale_auto_exposure: args.upscale_auto_exposure,
+        gi: GiSettings {
+            method: args.gi,
+            diffuse_only: args.gi_diffuse_only,
+            temporal: !args.gi_no_temporal,
+            spatial: !args.gi_no_spatial,
+            visibility: args.gi_visibility,
+            unbiased: args.gi_unbiased,
+            temporal_m_cap: args.gi_m_cap,
+            spatial_samples: args.gi_spatial_samples,
+            spatial_passes: args.gi_spatial_passes,
+            spatial_radius: args.gi_radius,
+            depth_threshold: args.gi_depth_threshold,
+        },
     };
 
     if !(1..=120).contains(&args.test_edit_interval) {
@@ -1823,6 +1922,7 @@ fn main() -> anyhow::Result<()> {
         nrd_frames: 0,
         upscaler_support: None,
         last_upscaler_info: None,
+        last_gi: None,
         error: None,
     };
     let run_result = event_loop.run_app(&mut app);

@@ -108,6 +108,16 @@ RenderKernels::RenderKernels(Device& device)
         const std::vector<uint32_t> encode_spirv = LoadShader("caelix_upscale_encode");
         upscale_encode_ = ComputePipeline(vk_device, encode_spirv, sizeof(TracePush), "caelix_upscale_encode",
                                           encode_layout_);
+        // ReSTIR GI: the trace set (TLAS for the visibility rays, the internal targets).
+        const std::vector<uint32_t> temporal_spirv = LoadShader("caelix_restir_gi_temporal");
+        restir_temporal_ = ComputePipeline(vk_device, temporal_spirv, sizeof(TracePush),
+                                           "caelix_restir_gi_temporal", trace_layout_);
+        const std::vector<uint32_t> spatial_spirv = LoadShader("caelix_restir_gi_spatial");
+        restir_spatial_ = ComputePipeline(vk_device, spatial_spirv, sizeof(TracePush), "caelix_restir_gi_spatial",
+                                          trace_layout_);
+        const std::vector<uint32_t> shade_spirv = LoadShader("caelix_restir_gi_shade");
+        restir_shade_ = ComputePipeline(vk_device, shade_spirv, sizeof(TracePush), "caelix_restir_gi_shade",
+                                        trace_layout_);
 
         // The sky sampler: trilinear, clamp to edge (a cube view samples across faces anyway),
         // every mip (the kernels clamp the lod to sky_max_lod).
@@ -143,6 +153,9 @@ RenderKernels::RenderKernels(Device& device)
         cross_resolve_ = ComputePipeline();
         sky_sh_ = ComputePipeline();
         upscale_encode_ = ComputePipeline();
+        restir_temporal_ = ComputePipeline();
+        restir_spatial_ = ComputePipeline();
+        restir_shade_ = ComputePipeline();
         if (sky_sampler_ != VK_NULL_HANDLE)
         {
             vkDestroySampler(vk_device, sky_sampler_, nullptr);
@@ -158,7 +171,8 @@ RenderKernels::RenderKernels(Device& device)
         throw;
     }
     CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_composite, caelix_cross_resolve, "
-                "caelix_sky_sh, caelix_upscale_encode");
+                "caelix_sky_sh, caelix_upscale_encode, caelix_restir_gi_temporal, caelix_restir_gi_spatial, "
+                "caelix_restir_gi_shade");
 }
 
 RenderKernels::~RenderKernels()
@@ -174,6 +188,9 @@ RenderKernels::~RenderKernels()
     cross_resolve_ = ComputePipeline();
     sky_sh_ = ComputePipeline();
     upscale_encode_ = ComputePipeline();
+    restir_temporal_ = ComputePipeline();
+    restir_spatial_ = ComputePipeline();
+    restir_shade_ = ComputePipeline();
     if (trace_layout_ != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorSetLayout(device, trace_layout_, nullptr);

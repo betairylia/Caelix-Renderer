@@ -5,3 +5,5 @@ host-rs/target/
 *.user
 .idea/
 .vscode/
+build-gi/
+__pycache__/

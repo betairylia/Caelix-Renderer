@@ -245,7 +245,21 @@ Moving camera: the sequencer export of a short path with `--gi restir` to see di
 
 Known limitations of phase 1 (accepted): moving entities lose temporal history when they move
 more than `depth_threshold * view_z` per frame (the visible point is compared in world space);
-glass/PSR pixels are treated like opaque ones; no boiling filter.
+glass/PSR pixels are treated like opaque ones; ReSTIR mode writes no specular radiance; the
+visible normal is the axis of the face index, exact for unrotated entities only; no boiling
+filter. The host sets DIFFUSE_ONLY for `--gi restir` (the library forces it anyway) and for
+`--gi pt` only with `--gi-diffuse-only`; the packed test scenes have no specular materials, so
+the bench compares one BSDF either way.
+
+Implementation notes (2026-10-20, as built): `GiMergeCandidate` returns whether the candidate was
+selected (the Z count needs it). In the unbiased Z count, the receiver's own term needs no extra
+ray (a neighbour's Y was selected only after the visibility ray from the receiver passed) and the
+neighbour that owns Y counts without a ray. Fixture results (`caelix_trace_test`, 256 frames):
+ReSTIR without reuse is within the noise floor of the path tracer (0.78 % mean error vs 0.60 %
+between two path tracer seeds); temporal + spatial with 1/M weights is 3.2 % darker, with Z
+weights 1.0 % darker. On ashwick at 1024 reference frames: 1/M mean ratio 0.90 / 0.93 / 0.98 per
+channel, Z weights 0.996 / 1.000 / 1.001; GI cost 0.10 ms without reuse, 0.43 ms with 1/M,
+3.37 ms with Z weights at 1280x720.
 
 ## Phase 2 (planned): brick-keyed world-space reservoirs
 

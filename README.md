@@ -328,15 +328,17 @@ flush builds the TLAS that the render binds.
   albedo, normal, depth, motion and view_z targets as storage images without a
   format qualifier, bindings 7..13 the internal targets of the lighting modes
   with fixed formats, binding 14 the sky cubemap as a sampled image and 15 its
-  sampler) and one push constant, the device address of a 528-byte
-  `CaelixFrameConstants` block (`shaders/common/caelix_frame.hlsl`,
+  sampler) and one push constant (`CaelixTracePush`, 16 bytes: the device address
+  of a 608-byte `CaelixFrameConstants` block and the spatial pass index of the
+  ReSTIR GI spatial kernel) (`shaders/common/caelix_frame.hlsl`,
   `lib/src/render/frame_constants.h`): camera, target size, the addresses of the page
   table, slot tables, group infos, entity infos and the material table, the record layout, group
   shift, encoding, view, flags, sun and sky, the rows of the host projection,
   the previous render call's camera, the present-target mask, the miss values,
   `has_prev_camera` / `has_tlas`, and the lighting parameters (mode, bounces,
   seed, accumulation count, exposure, sun and sky, sRGB output, `t_max`, fog,
-  emission scale, sky cubemap parameters and the SH buffer address). The
+  emission scale, sky cubemap parameters and the SH buffer address, the ReSTIR
+  GI reservoir addresses and options). The
   composite kernel has its own set (binding 0 the colour target, bindings 1..8
   internal targets, 9 the sky cubemap, 10 its sampler) and the same push
   constant. Every binding is `PARTIALLY_BOUND`
@@ -624,6 +626,24 @@ hard sun shadows (its pre-pass and blur radii, 30 pixels, do not see the
 shadow; NVIDIA's answer is a separate shadow denoiser, SIGMA). Images and
 numbers: `Artifacts/native-renderer-step6b-20261014/`.
 
+### GI experiments (ReSTIR GI, phase 1)
+
+`caelix_renderer_set_gi_options` (`CaelixGiOptions`) selects the global
+illumination method of the lighting modes: the path tracer
+(`CAELIX_GI_PATH_TRACE`, the default) or screen-space ReSTIR GI
+(`CAELIX_GI_RESTIR`) on the first diffuse bounce. ReSTIR GI forces the
+Lambert lobe, ignores sun NEE and the fog on its path and writes no specular
+radiance; the trace kernel stores one initial reservoir per pixel, then the
+temporal, spatial (0 to 2 passes) and shade kernels
+(`shaders/render/caelix_restir_gi_*.hlsl`, the trace descriptor set) write the
+diffuse radiance target before NRD and the composite. Four reservoir buffers
+of 48 bytes per pixel (177 MB at 1280x720). `CAELIX_GI_FLAG_DIFFUSE_ONLY`
+forces the Lambert lobe for the path tracer too. `caelix_renderer_get_gi_stats`
+reports the GPU time of the GI passes and the reservoir memory. Design,
+measurement protocol and results: `docs/GI_EXPERIMENTS.md`. The host flags are
+`--gi` and `--gi-*` (see "Running the host"), the debug UI has a GI section in
+the Render window.
+
 ### Render targets and G-buffer mode
 
 `CaelixRenderTargets` has six targets. Each is optional: a target is present
@@ -835,6 +855,16 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   differ and nothing is flagged. On the slab (the second interface still
   random) the mean of 128 checkerboard frames is within 0.02 % of the
   stochastic reference.
+- `caelix_trace_test`, ReSTIR GI cases (reference mode, black sky, a grey floor
+  and wall under an 8 x 2 x 8 emitter of emission 8, 256 frames, 3 bounces):
+  `caelix_renderer_set_gi_options` rejects an unknown method or flag,
+  `spatial_samples` 9, `spatial_passes` 3, a NaN radius and a negative depth
+  threshold; ReSTIR GI without reuse matches the path tracer (mean within
+  0.8 %, PSNR 24.0 dB against a noise floor of 23.9 dB between two path
+  tracer runs); temporal + spatial reuse stays within 10 % of the path tracer
+  (1/M weights: -3.2 %; unbiased Z weights: -1.0 %, the temporal reuse has no
+  visibility ray); after switching back the path tracer image is bit-identical
+  with and without `CAELIX_GI_FLAG_DIFFUSE_ONLY` (packed materials are diffuse).
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -976,6 +1006,18 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   before the first capture (NRD and upscaler history). Default 32.
 - `--sequence-samples <N>`: export, renders per exported frame (1..4096); the
   last one is captured. Default 1.
+- `--gi <pt|restir>`: lighting modes, the GI method (see "GI experiments").
+  Default `pt`. ReSTIR always uses the Lambert lobe at every vertex;
+  `--gi-diffuse-only` makes the path tracer do the same
+  (`CAELIX_GI_FLAG_DIFFUSE_ONLY`) for a comparison on one BSDF. ReSTIR GI options:
+  `--gi-no-temporal`, `--gi-no-spatial`, `--gi-visibility` (a shadow ray per
+  spatial neighbour), `--gi-unbiased` (Z-count MIS weights, with the shadow
+  rays), `--gi-m-cap <N>` (1..64, default 20), `--gi-spatial-samples <N>`
+  (1..8, default 5), `--gi-spatial-passes <N>` (1..2, default 1),
+  `--gi-radius <F>` (pixels, default 30), `--gi-depth-threshold <F>`
+  (fraction of the view depth, default 0.1). With `--screenshot` the host also
+  prints `timings: trace_ms=... gi_ms=... denoise_ms=... composite_ms=...
+  upscale_ms=...` on stdout when the PNG is written.
 
 ### Test entity and brick edits
 
@@ -1111,7 +1153,8 @@ can be dragged and collapsed, and each has collapsible sections:
 
 - **Stats**: fps (1 s window), frame number, target size; the GPU times of
   the newest timed frame (trace, denoise, composite, flush,
-  `caelix_renderer_get_gpu_timings`); the scene stats (entities, groups,
+  `caelix_renderer_get_gpu_timings`; GI passes and reservoir MB,
+  `caelix_renderer_get_gi_stats`); the scene stats (entities, groups,
   resident bricks, record and slot table MiB, acceleration structure builds
   pending); the NRD line (version, size, pool MiB, dispatches) and the world
   load state.
@@ -1124,8 +1167,12 @@ can be dragged and collapsed, and each has collapsible sections:
   (0.1..10 degrees); the sky: "cubemap (--sky)" (disabled without `--sky`;
   the face size and mip count) and the zenith, horizon and ground colours
   (greyed out while the cubemap is in use); fog density (logarithmic, 0..1
-  per unit) and colour; the materials' emission scale (logarithmic, 0..64).
-  "Reset accumulation" sets `reset_accumulation` for one frame (reference and
+  per unit) and colour; the materials' emission scale (logarithmic, 0..64);
+  the GI section: method, ReSTIR GI M cap (1..64), spatial samples (1..8),
+  spatial passes (1..2), radius (1..100 px), depth threshold (logarithmic,
+  0.01..1), temporal / spatial reuse, visibility rays, unbiased; "Reset
+  history" drops the reservoir history once. A GI change restarts the
+  reference accumulation. "Reset accumulation" sets `reset_accumulation` for one frame (reference and
   NRD history); in reference mode the accumulated frame count is shown.
   "Screenshot" writes `screenshot-<frame>.png` to `--screenshot-dir`.
   The command line gives the initial values; a value that the UI does not
@@ -1195,7 +1242,7 @@ it adds one scene entity per file entity, then streams the bricks:
   presents. When the swapchain was recreated, the host calls
   `caelix_renderer_release_target_views` first.
 - The window title shows the GPU times once per second
-  (`Caelix Renderer | trace 0.53 ms | denoise 0.23 ms | composite 0.01 ms | flush 0.00 ms | 144 fps`); the same line
+  (`Caelix Renderer | trace 0.53 ms | gi 0.00 ms (0 MB) | denoise 0.23 ms | upscale 0.00 ms | composite 0.01 ms | flush 0.00 ms | 144 fps`); the same line
   is logged at info level every 120 frames and when a screenshot is written.
   The Stats window of the debug UI shows the same values.
   At the second frame of the renderer's NRD instance the host logs one NRD line

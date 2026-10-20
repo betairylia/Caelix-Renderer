@@ -1,4 +1,5 @@
-// Renderer creation, frame slots, target views, internal targets and timings.
+// Renderer creation, frame slots, target views, internal targets, ReSTIR GI buffers and options,
+// and timings.
 #include "render/renderer.h"
 
 #include "core/log.h"
@@ -7,6 +8,7 @@
 #include "scene/scene.h"
 
 #include <algorithm>
+#include <cmath>
 #include <iterator>
 #include <utility>
 
@@ -45,6 +47,7 @@ CaelixResult Renderer::Create(Device& device, RenderKernels& kernels, Scene& sce
     renderer->composite_timer_ = GpuTimer(device);
     renderer->denoise_timer_ = GpuTimer(device);
     renderer->upscale_timer_ = GpuTimer(device);
+    renderer->gi_timer_ = GpuTimer(device);
     CAELIX_LOGI("renderer created (shared kernels), %u frame slots", kInitialSlots);
     out = std::move(renderer);
     return CAELIX_OK;
@@ -284,9 +287,109 @@ bool Renderer::EnsureInternalTargets(uint32_t width, uint32_t height, uint64_t f
     return true;
 }
 
+bool Renderer::EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame)
+{
+    if (gi_buffers_[0].valid() && gi_width_ == width && gi_height_ == height)
+    {
+        return false;
+    }
+    if (gi_buffers_[0].valid())
+    {
+        RetiredGiBuffers retired;
+        retired.frame = gi_last_frame_;
+        retired.buffers = std::move(gi_buffers_);
+        retired_gi_.push_back(std::move(retired));
+        gi_reservoir_bytes_ = 0;
+    }
+    // 48 bytes per pixel (GiReservoir, shaders/render/caelix_restir_gi.hlsl). On a throw the
+    // buffers created so far are destroyed with `fresh`, and the next ReSTIR render tries again.
+    constexpr VkDeviceSize kReservoirBytes = 48;
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * kReservoirBytes;
+    GiBuffers fresh;
+    for (GpuBuffer& buffer : fresh)
+    {
+        buffer = GpuBuffer::DeviceLocalWithUsage(
+            device_.allocator(), device_.device(), bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    }
+    gi_buffers_ = std::move(fresh);
+    gi_index_ = {kGiInitial, kGiPrev, kGiTemp, kGiOut};
+    gi_width_ = width;
+    gi_height_ = height;
+    gi_reservoir_bytes_ = bytes * kGiBufferCount;
+    gi_last_frame_ = frame;
+    gi_history_valid_ = false;
+    CAELIX_LOGI("renderer: ReSTIR GI reservoirs created at %ux%u (%.1f MiB)", width, height,
+                static_cast<double>(gi_reservoir_bytes_) / (1024.0 * 1024.0));
+    return true;
+}
+
+CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
+{
+    constexpr const char* kFunction = "caelix_renderer_set_gi_options";
+    constexpr uint32_t kKnownFlags = CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_VISIBILITY |
+                                     CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY;
+    if (options.method > CAELIX_GI_RESTIR)
+    {
+        CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if ((options.flags & ~kKnownFlags) != 0)
+    {
+        CAELIX_LOGE("%s: unknown flags 0x%x", kFunction, options.flags & ~kKnownFlags);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (options.spatial_samples > 8)
+    {
+        CAELIX_LOGE("%s: spatial_samples %u is above the maximum 8", kFunction, options.spatial_samples);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (options.spatial_passes > 2)
+    {
+        CAELIX_LOGE("%s: spatial_passes %u is above the maximum 2", kFunction, options.spatial_passes);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (!std::isfinite(options.spatial_radius) || options.spatial_radius < 0.0f)
+    {
+        CAELIX_LOGE("%s: spatial_radius %g must be finite and >= 0", kFunction,
+                    static_cast<double>(options.spatial_radius));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (!std::isfinite(options.depth_threshold) || options.depth_threshold < 0.0f)
+    {
+        CAELIX_LOGE("%s: depth_threshold %g must be finite and >= 0", kFunction,
+                    static_cast<double>(options.depth_threshold));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    // Reservoirs of another method or other reuse flags are not a valid history.
+    if (options.reset != 0 || options.method != gi_options_.method || options.flags != gi_options_.flags)
+    {
+        gi_history_valid_ = false;
+    }
+    gi_options_ = options;
+    gi_options_.reset = 0;
+    return CAELIX_OK;
+}
+
+void Renderer::GetGiStats(CaelixGiStats& out) const
+{
+    out = CaelixGiStats{};
+    out.reservoir_bytes = gi_reservoir_bytes_;
+    // The frame of GetTimings (trace_ms); 0 when that frame ran no GI pass.
+    const uint64_t frame = timer_.latest_frame();
+    float gi_ms = 0.0f;
+    if (frame != 0 && gi_timer_.MsForFrame(frame, gi_ms))
+    {
+        out.gi_ms = gi_ms;
+    }
+}
+
 void Renderer::FreeRetired(uint64_t safe_frame)
 {
     std::erase_if(retired_, [safe_frame](const RetiredImages& retired) {
+        return retired.frame <= safe_frame;
+    });
+    std::erase_if(retired_gi_, [safe_frame](const RetiredGiBuffers& retired) {
         return retired.frame <= safe_frame;
     });
     std::erase_if(retired_nrd_, [safe_frame](const RetiredDenoiser& retired) {
