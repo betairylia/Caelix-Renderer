@@ -62,7 +62,7 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // executor is created at the first denoised render and recreated (history lost)
 // when the size changes, the old one is destroyed once its last frame is safe.
 // Per-frame resources
-// live in a ring of slots (four descriptor sets + 672-byte constants buffer); a
+// live in a ring of slots (four descriptor sets + 704-byte constants buffer); a
 // slot is reused only when its frame is safe. The camera of each successful
 // render call is kept as the previous camera of the next one (motion targets). A
 // renderer renders at most once per frame number (last_frame_).
@@ -85,6 +85,16 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // its own timer (CaelixGiStats::light_fill_ms); a compute -> compute barrier orders its writes before
 // the trace, which reads the reservoirs and inserts new cells. frame_counter_ (the render count) is
 // the cells' clock.
+//
+// ReSTIR DI (CAELIX_GI_FLAG_RESTIR_DI with LIGHT_NEE, lighting modes with bounces and a light
+// table; docs/RESTIR_DI.md): the trace kernel stores one initial DI reservoir per pixel, then
+// caelix_restir_di_temporal, up to two caelix_restir_di_spatial passes and caelix_restir_di_shade run
+// after the ReSTIR GI passes (when those run) and before NRD / the composite; the shade pass adds
+// the direct light of the list lights to the diffuse radiance target. Four DI reservoir buffers
+// (32 bytes per pixel each), rotated, created, retired and resized as the GI buffers (di_*). The DI
+// history is also dropped when the scene's light table was rebuilt since this renderer's previous
+// render (CaelixLightStats::rebuilds changed: entry indices may have moved). gi_timer_ brackets
+// the GI and the DI passes.
 //
 // Internal targets (lighting modes only): created at the first lighting render,
 // recreated when the host target size changes (the old images are destroyed once
@@ -240,6 +250,8 @@ private:
     // ones are retired until `frame` is safe and the history is dropped. Returns true when it
     // created them.
     bool EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame);
+    // The same for the ReSTIR DI reservoir buffers (32 bytes per pixel).
+    bool EnsureDiBuffers(uint32_t width, uint32_t height, uint64_t frame);
     // Creates the light cells when they are missing or of another capacity; the old buffer is
     // retired until `frame` is safe. A new buffer is zero-filled by the next render
     // (light_cells_need_clear_).
@@ -248,6 +260,11 @@ private:
     uint64_t GiAddress(GiBuffer which) const
     {
         return gi_buffers_[gi_index_[which]].address();
+    }
+    // The device address of DI reservoir buffer `which` (same roles) under the DI rotation.
+    uint64_t DiAddress(GiBuffer which) const
+    {
+        return di_buffers_[di_index_[which]].address();
     }
     // Destroys retired internal targets, reservoir buffers, NRD executors and upscalers whose
     // frame is <= safe_frame.
@@ -330,7 +347,17 @@ private:
     uint64_t gi_reservoir_bytes_ = 0;    // bytes of gi_buffers_
     uint64_t gi_last_frame_ = 0;         // the last frame that used gi_buffers_
     std::vector<RetiredGiBuffers> retired_gi_;
-    GpuTimer gi_timer_;                  // temporal + spatial + shade dispatches
+    GpuTimer gi_timer_;                  // temporal + spatial + shade dispatches (GI and DI)
+    // ReSTIR DI (CAELIX_GI_FLAG_RESTIR_DI): the same roles as the GI buffers, 32 bytes per pixel.
+    bool di_history_valid_ = false;      // the buffer at di_index_[kGiPrev] holds the previous frame's DI reservoirs
+    GiBuffers di_buffers_;               // created at the first ReSTIR DI render
+    std::array<uint32_t, kGiBufferCount> di_index_{kGiInitial, kGiPrev, kGiTemp, kGiOut};
+    uint32_t di_width_ = 0;
+    uint32_t di_height_ = 0;
+    uint64_t di_reservoir_bytes_ = 0;
+    uint64_t di_last_frame_ = 0;         // the last frame that used di_buffers_
+    uint64_t di_light_rebuilds_ = 0;     // CaelixLightStats::rebuilds at the previous ReSTIR DI render
+    std::vector<RetiredGiBuffers> retired_di_;
     // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE).
     GpuBuffer light_cells_;                  // capacity x 288 bytes (render/caelix_light_sample.hlsl)
     uint32_t light_cell_capacity_ = 0;       // cells of light_cells_

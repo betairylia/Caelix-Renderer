@@ -1060,6 +1060,16 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   32-voxel cells; default 0.25). The debug UI's GI section has the same
   controls and the GPU times show the light fill, the cell memory and the
   light table's bricks and drops.
+- `--gi-restir-di`: needs `--gi-light-nee`; both GI methods, per-pixel ReSTIR
+  DI on the light list at the primary surface (`CAELIX_GI_FLAG_RESTIR_DI`,
+  docs/RESTIR_DI.md): the primary vertex's one-sample light NEE is replaced by
+  a reservoir with temporal and spatial reuse and one shadow ray per pixel.
+  The ReSTIR GI reuse options above (`--gi-no-temporal`, `--gi-no-spatial`,
+  `--gi-visibility`, `--gi-unbiased`, `--gi-m-cap`, `--gi-spatial-*`,
+  `--gi-radius`, `--gi-depth-threshold`) apply to it as well.
+  `--gi-di-candidates <N>` (1..32, default 4): initial light candidates per
+  pixel. The GI section of the debug UI has a "ReSTIR DI" checkbox and a "DI
+  candidates" slider; `gi_ms` includes the DI passes.
 
 ### Test entity and brick edits
 

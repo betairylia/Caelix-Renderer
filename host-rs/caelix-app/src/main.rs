@@ -432,6 +432,13 @@ struct Args {
     /// cells, else 32-voxel cells.
     #[arg(long, value_name = "F", default_value_t = 0.25)]
     light_footprint: f32,
+    /// Both GI methods, with --gi-light-nee: per-pixel ReSTIR DI on the light list at the primary
+    /// surface (docs/RESTIR_DI.md); the --gi-* reuse options apply to it.
+    #[arg(long)]
+    gi_restir_di: bool,
+    /// ReSTIR DI: initial light candidates per pixel (1..32).
+    #[arg(long, value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=32))]
+    gi_di_candidates: u32,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -2056,8 +2063,13 @@ fn main() -> anyhow::Result<()> {
             light_cells: args.light_cells,
             light_candidates: args.light_candidates,
             light_footprint: args.light_footprint,
+            restir_di: args.gi_restir_di,
+            di_candidates: args.gi_di_candidates,
         },
     };
+    if args.gi_restir_di && !args.gi_light_nee {
+        bail!("--gi-restir-di needs --gi-light-nee");
+    }
     if !args.light_cells.is_power_of_two() || !(1024..=1048576).contains(&args.light_cells) {
         bail!("--light-cells {} must be a power of two in 1024..1048576", args.light_cells);
     }

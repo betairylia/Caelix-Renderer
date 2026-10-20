@@ -273,6 +273,11 @@ pub struct GiSettings {
     pub light_candidates: u32,
     /// World units per pixel below which a vertex uses 8-voxel cells (else 32-voxel cells).
     pub light_footprint: f32,
+    /// Both methods, with `light_nee`: per-pixel ReSTIR DI on the light list at the primary surface
+    /// (`CAELIX_GI_FLAG_RESTIR_DI`, docs/RESTIR_DI.md); it uses the reuse settings above.
+    pub restir_di: bool,
+    /// ReSTIR DI: initial light candidates per pixel (1..32).
+    pub di_candidates: u32,
 }
 
 impl Default for GiSettings {
@@ -293,6 +298,8 @@ impl Default for GiSettings {
             light_cells: 65536,
             light_candidates: 8,
             light_footprint: 0.25,
+            restir_di: false,
+            di_candidates: 4,
         }
     }
 }
@@ -318,6 +325,10 @@ impl GiSettings {
         }
         if self.light_nee {
             flags |= CAELIX_GI_FLAG_LIGHT_NEE;
+            // RESTIR_DI needs LIGHT_NEE (the library rejects it alone).
+            if self.restir_di {
+                flags |= CAELIX_GI_FLAG_RESTIR_DI;
+            }
         }
         flags
     }
@@ -336,7 +347,7 @@ impl GiSettings {
             light_cell_capacity: self.light_cells,
             light_candidates: self.light_candidates,
             light_level_footprint: self.light_footprint,
-            light_reserved: 0,
+            di_candidates: self.di_candidates,
         }
     }
 }

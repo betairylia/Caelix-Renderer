@@ -554,7 +554,8 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
 
     CollapsingHeader::new("GI").default_open(demo).show(ui, |ui| {
         let gi = &mut settings.gi;
-        let restir = lighting && gi.method == GiMethod::Restir;
+        // The reuse settings serve ReSTIR GI and ReSTIR DI.
+        let restir = lighting && (gi.method == GiMethod::Restir || (gi.light_nee && gi.restir_di));
         Grid::new("render_gi").num_columns(2).show(ui, |ui| {
             ui.label("method");
             ui.add_enabled_ui(lighting, |ui| {
@@ -605,8 +606,16 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             ui.label("light footprint");
             ui.add_enabled(light, Slider::new(&mut gi.light_footprint, 0.01..=4.0).logarithmic(true));
             ui.end_row();
+
+            ui.label("DI candidates");
+            ui.add_enabled(light && gi.restir_di, Slider::new(&mut gi.di_candidates, 1..=32));
+            ui.end_row();
         });
         ui.add_enabled(lighting, egui::Checkbox::new(&mut gi.light_nee, "light NEE (light list)"));
+        ui.add_enabled(
+            lighting && gi.light_nee,
+            egui::Checkbox::new(&mut gi.restir_di, "ReSTIR DI (light list, primary surface)"),
+        );
         ui.add_enabled(
             lighting && gi.method == GiMethod::Pt,
             egui::Checkbox::new(&mut gi.diffuse_only, "diffuse only (path tracer; ReSTIR always)"),

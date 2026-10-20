@@ -32,6 +32,10 @@ RUNS = {
     # Light list (docs/LIGHT_LIST.md): next-event estimation on list lights.
     "pt_nee": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee",
     "pt_nee_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee",
+    # Per-pixel ReSTIR DI on the light list (docs/RESTIR_DI.md).
+    "di": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di",
+    "di_unbiased": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di --gi-unbiased",
+    "di_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --gi-restir-di",
 }
 
 TIMINGS_RE = re.compile(r"timings:((?:\s+\w+=[-+0-9.eE]+)+)")

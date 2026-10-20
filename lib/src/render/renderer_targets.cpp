@@ -328,6 +328,43 @@ bool Renderer::EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame)
     return true;
 }
 
+bool Renderer::EnsureDiBuffers(uint32_t width, uint32_t height, uint64_t frame)
+{
+    if (di_buffers_[0].valid() && di_width_ == width && di_height_ == height)
+    {
+        return false;
+    }
+    if (di_buffers_[0].valid())
+    {
+        RetiredGiBuffers retired;
+        retired.frame = di_last_frame_;
+        retired.buffers = std::move(di_buffers_);
+        retired_di_.push_back(std::move(retired));
+        di_reservoir_bytes_ = 0;
+    }
+    // 32 bytes per pixel (DiReservoir, shaders/render/caelix_restir_di.hlsl). On a throw the
+    // buffers created so far are destroyed with `fresh`, and the next ReSTIR DI render tries again.
+    constexpr VkDeviceSize kReservoirBytes = 32;
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * kReservoirBytes;
+    GiBuffers fresh;
+    for (GpuBuffer& buffer : fresh)
+    {
+        buffer = GpuBuffer::DeviceLocalWithUsage(
+            device_.allocator(), device_.device(), bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    }
+    di_buffers_ = std::move(fresh);
+    di_index_ = {kGiInitial, kGiPrev, kGiTemp, kGiOut};
+    di_width_ = width;
+    di_height_ = height;
+    di_reservoir_bytes_ = bytes * kGiBufferCount;
+    di_last_frame_ = frame;
+    di_history_valid_ = false;
+    CAELIX_LOGI("renderer: ReSTIR DI reservoirs created at %ux%u (%.1f MiB)", width, height,
+                static_cast<double>(di_reservoir_bytes_) / (1024.0 * 1024.0));
+    return true;
+}
+
 void Renderer::EnsureLightCells(uint32_t capacity, uint64_t frame)
 {
     if (light_cells_.valid() && light_cell_capacity_ == capacity)
@@ -354,7 +391,7 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
     constexpr const char* kFunction = "caelix_renderer_set_gi_options";
     constexpr uint32_t kKnownFlags = CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_VISIBILITY |
                                      CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY |
-                                     CAELIX_GI_FLAG_LIGHT_NEE;
+                                     CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
@@ -406,10 +443,21 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                     static_cast<double>(options.light_level_footprint));
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
-    // Reservoirs of another method or other reuse flags are not a valid history.
+    if ((options.flags & CAELIX_GI_FLAG_RESTIR_DI) != 0 && (options.flags & CAELIX_GI_FLAG_LIGHT_NEE) == 0)
+    {
+        CAELIX_LOGE("%s: CAELIX_GI_FLAG_RESTIR_DI needs CAELIX_GI_FLAG_LIGHT_NEE", kFunction);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (options.di_candidates > 32)
+    {
+        CAELIX_LOGE("%s: di_candidates %u is above the maximum 32", kFunction, options.di_candidates);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    // Reservoirs of another method or other reuse flags are not a valid history (GI and DI).
     if (options.reset != 0 || options.method != gi_options_.method || options.flags != gi_options_.flags)
     {
         gi_history_valid_ = false;
+        di_history_valid_ = false;
     }
     gi_options_ = options;
     gi_options_.reset = 0;
@@ -419,7 +467,7 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
 void Renderer::GetGiStats(CaelixGiStats& out) const
 {
     out = CaelixGiStats{};
-    out.reservoir_bytes = gi_reservoir_bytes_;
+    out.reservoir_bytes = gi_reservoir_bytes_ + di_reservoir_bytes_;
     // The frame of GetTimings (trace_ms); 0 when that frame ran no GI pass.
     const uint64_t frame = timer_.latest_frame();
     float gi_ms = 0.0f;
@@ -441,6 +489,9 @@ void Renderer::FreeRetired(uint64_t safe_frame)
         return retired.frame <= safe_frame;
     });
     std::erase_if(retired_gi_, [safe_frame](const RetiredGiBuffers& retired) {
+        return retired.frame <= safe_frame;
+    });
+    std::erase_if(retired_di_, [safe_frame](const RetiredGiBuffers& retired) {
         return retired.frame <= safe_frame;
     });
     std::erase_if(retired_light_cells_, [safe_frame](const RetiredLightCells& retired) {

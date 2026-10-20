@@ -3016,7 +3016,7 @@ TEST_CASE("ReSTIR GI: set_gi_options validation")
     };
     CaelixGiOptions bad = GiOptions(2, 0);  // unknown method
     expect_invalid(bad);
-    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 6);  // unknown flag
+    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 7);  // unknown flag
     expect_invalid(bad);
     bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
     bad.spatial_samples = 9;
@@ -3489,5 +3489,175 @@ TEST_CASE("cells fill and sample")
     caelix_renderer_release_target_views(renderer);
     caelix_renderer_destroy(renderer);
     DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+namespace {
+
+// PSNR over every pixel of two size x size RGBA32F images (both clamped to [0, 1], peak 1).
+double PixelPsnr(const std::vector<float>& ref, const std::vector<float>& test, uint32_t size)
+{
+    double squared = 0.0;
+    for (size_t p = 0; p < static_cast<size_t>(size) * size; ++p)
+    {
+        for (int ch = 0; ch < 3; ++ch)
+        {
+            const double d = std::clamp(static_cast<double>(test[p * 4 + ch]), 0.0, 1.0) -
+                             std::clamp(static_cast<double>(ref[p * 4 + ch]), 0.0, 1.0);
+            squared += d * d;
+        }
+    }
+    const double mse = squared / (3.0 * size * size);
+    return mse > 0.0 ? 10.0 * std::log10(1.0 / mse) : 99.0;
+}
+
+// Linear RMSE (no clamp) over every pixel and channel.
+double PixelRmse(const std::vector<float>& ref, const std::vector<float>& test, uint32_t size)
+{
+    double squared = 0.0;
+    for (size_t p = 0; p < static_cast<size_t>(size) * size; ++p)
+    {
+        for (int ch = 0; ch < 3; ++ch)
+        {
+            const double d = static_cast<double>(test[p * 4 + ch]) - static_cast<double>(ref[p * 4 + ch]);
+            squared += d * d;
+        }
+    }
+    return std::sqrt(squared / (3.0 * size * size));
+}
+
+std::vector<float> ColorPixels(const Target& color)
+{
+    std::vector<float> image(static_cast<size_t>(color.width) * color.height * 4);
+    std::memcpy(image.data(), color.bytes.data(), image.size() * sizeof(float));
+    return image;
+}
+
+}  // namespace
+
+TEST_CASE("ReSTIR DI unbiased")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadLightBox(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 1);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> nee = LightReference(rig, renderer, set, camera, 1024, 200000);
+    // The noise floor (reported only): light NEE against itself with other seeds.
+    const std::vector<float> nee2 = LightReference(rig, renderer, set, camera, 1024, 700000);
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL |
+               CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> di = LightReference(rig, renderer, set, camera, 1024, 400000);
+
+    CaelixGiStats stats{};
+    caelix_renderer_get_gi_stats(renderer, &stats);
+    const LightComparison c = CompareLight(nee, di, kBoxSize);
+    const double psnr = PixelPsnr(nee, di, kBoxSize);
+    const double floor_psnr = PixelPsnr(nee, nee2, kBoxSize);
+    const LightComparison floor_c = CompareLight(nee, nee2, kBoxSize);
+    std::printf("ReSTIR DI (unbiased) vs light NEE, 1024 frames each: mean %.5f vs %.5f, ratio %.4f, "
+                "16x16 block PSNR %.2f dB, pixel PSNR %.2f dB; light NEE vs light NEE: ratio %.4f, pixel PSNR "
+                "%.2f dB; reservoir bytes %llu, gi %.4f ms\n",
+                c.test_mean, c.ref_mean, c.ratio, c.block_psnr, psnr, floor_c.ratio, floor_psnr,
+                static_cast<unsigned long long>(stats.reservoir_bytes), stats.gi_ms);
+    CHECK(stats.reservoir_bytes == 4ull * 32ull * kBoxSize * kBoxSize);
+    CHECK(c.ref_mean > 0.01);
+    CHECK(c.ratio > 0.97);
+    CHECK(c.ratio < 1.03);
+    CHECK(psnr > 30.0);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("ReSTIR DI lowers the error")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadLightBox(rig);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> reference = LightReference(rig, renderer, set, camera, 1024, 500000);
+
+    // One path trace frame after 64 warm-up frames (the same seeds for each variant).
+    const auto single_frame_rmse = [&](uint32_t flags) {
+        CaelixGiOptions options{};
+        options.flags = flags;
+        options.reset = 1;
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &options) == CAELIX_OK);
+        for (uint32_t i = 0; i <= 64; ++i)
+        {
+            Render(rig, renderer, set, camera, GlassOptions(CAELIX_MODE_PATH_TRACE, 4, 0, 600000 + i), i == 64);
+        }
+        return PixelRmse(reference, ColorPixels(color), kBoxSize);
+    };
+    const double nee = single_frame_rmse(CAELIX_GI_FLAG_LIGHT_NEE);
+    const double di = single_frame_rmse(CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI |
+                                        CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL);
+    const double di_unbiased =
+        single_frame_rmse(CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL |
+                          CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED);
+    std::printf("single frame RMSE against the 1024-frame light NEE reference: light NEE %.5f, ReSTIR DI %.5f "
+                "(%.3fx), ReSTIR DI unbiased %.5f (%.3fx)\n",
+                nee, di, di / nee, di_unbiased, di_unbiased / nee);
+    CHECK(di < nee);
+    CHECK(di_unbiased < nee);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("RESTIR_DI needs LIGHT_NEE")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+
+    CaelixGiOptions bad{};
+    bad.flags = CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.method = CAELIX_GI_RESTIR;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.method = CAELIX_GI_PATH_TRACE;
+    bad.flags = CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_LIGHT_NEE;
+    bad.di_candidates = 33;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    CaelixGiOptions good{};
+    good.flags = CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_LIGHT_NEE;
+    good.di_candidates = 32;
+    CHECK(caelix_renderer_set_gi_options(renderer, &good) == CAELIX_OK);
+
+    caelix_renderer_destroy(renderer);
     CloseRig(rig);
 }

@@ -155,13 +155,74 @@ struct LightSample
     float3 normal;    // world normal of the face
     float3 radiance;  // the voxel's emission times emission_scale
     float pdf_area;   // probability density per unit area of the point within the brick
+    // The indices that name the point (LightPointAt rebuilds it from them; docs/RESTIR_DI.md):
+    uint voxel;       // v = x | y << 3 | z << 6 inside the entry's brick
+    uint face;        // +X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5 (entity-local axes)
+    float2 uv;        // the point on the face in (-0.5, 0.5)^2 along (e1, e2) of LightFaceBasis
 };
+
+// The world frame of voxel `voxel` of `entry` under the entity's CURRENT transform: the voxel
+// centre and the three entity axes (the rotation part of the rows).
+struct LightVoxelFrame
+{
+    float3 centre;
+    float3 axes[3];
+};
+
+LightVoxelFrame LightVoxelFrameOf(CaelixFrameConstants fc, LightEntry entry, uint3 voxel)
+{
+    float4 r0;
+    float4 r1;
+    float4 r2;
+    EntityCurRows(fc, entry.entity, r0, r1, r2);
+    const float3 centre_local = float3(entry.origin + int3(voxel)) + 0.5f;
+    const float4 h = float4(centre_local, 1.0f);
+    LightVoxelFrame f;
+    f.centre = float3(dot(r0, h), dot(r1, h), dot(r2, h));
+    f.axes[0] = float3(r0.x, r1.x, r2.x);
+    f.axes[1] = float3(r0.y, r1.y, r2.y);
+    f.axes[2] = float3(r0.z, r1.z, r2.z);
+    return f;
+}
+
+// The outward normal of `face` (+X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5) and its basis: e1 = entity axis
+// (a + 1) % 3, e2 = entity axis (a + 2) % 3 of the face axis a = face >> 1. SampleLightEntry and
+// LightPointAt share it, so a stored uv names the same point in both.
+void LightFaceBasis(LightVoxelFrame f, uint face, out float3 normal, out float3 e1, out float3 e2)
+{
+    const uint axis = face >> 1;
+    const float sign = (face & 1u) != 0u ? -1.0f : 1.0f;
+    normal = f.axes[axis] * sign;
+    e1 = f.axes[(axis + 1u) % 3u];
+    e2 = f.axes[(axis + 2u) % 3u];
+}
+
+// The point at `uv` on the face (normal, e1, e2) of the voxel of frame `f`.
+float3 LightFacePoint(LightVoxelFrame f, float3 normal, float3 e1, float3 e2, float2 uv)
+{
+    return f.centre + 0.5f * normal + uv.x * e1 + uv.y * e2;
+}
+
+// The uv quantization of the ReSTIR DI reservoir (2 x unorm16): u in [0, 1) -> q = floor(u * 65536),
+// and back to the centre of cell q in (-0.5, 0.5).
+uint LightUvQuantize(float u)
+{
+    return min(uint(u * 65536.0f), 65535u);
+}
+
+float LightUvDequantize(uint q)
+{
+    return (float(q) + 0.5f) * (1.0f / 65536.0f) - 0.5f;
+}
 
 // A point on a list-light voxel of `entry` as seen from the receiver `x_r` (section 2.1): a slice by
 // its region weight, a voxel of the slice uniformly, one of the axis faces that face the receiver
 // uniformly, and a point uniformly on that face (area 1). Whether the face is covered by a neighbour
 // is not tested (the shadow ray finds it). The brick's own probability is not in pdf_area.
-LightSample SampleLightEntry(CaelixFrameConstants fc, LightEntry entry, float3 x_r, inout uint rng)
+// `quantize_uv`: the point is the centre of its unorm16 uv cell (LightUvQuantize), so that the
+// ReSTIR DI reservoir, which stores the uv in 2 x 16 bits, names exactly the sampled point.
+LightSample SampleLightEntryWith(CaelixFrameConstants fc, LightEntry entry, float3 x_r, bool quantize_uv,
+                                 inout uint rng)
 {
     LightSample s;
     s.valid = false;
@@ -169,6 +230,9 @@ LightSample SampleLightEntry(CaelixFrameConstants fc, LightEntry entry, float3 x
     s.normal = float3(0.0f, 0.0f, 0.0f);
     s.radiance = float3(0.0f, 0.0f, 0.0f);
     s.pdf_area = 0.0f;
+    s.voxel = 0u;
+    s.face = 0u;
+    s.uv = float2(0.0f, 0.0f);
     const float u_region = RandomFloat01(rng);
     const float u_voxel = RandomFloat01(rng);
     const float u_face = RandomFloat01(rng);
@@ -222,24 +286,14 @@ LightSample SampleLightEntry(CaelixFrameConstants fc, LightEntry entry, float3 x
     const uint3 voxel = uint3(bit & 7u, bit >> 3, slice);
 
     // 3. Face: the axis faces whose outward normal points to the receiver's side of the centre.
-    float4 r0;
-    float4 r1;
-    float4 r2;
-    EntityCurRows(fc, entry.entity, r0, r1, r2);
-    const float3 centre_local = float3(entry.origin + int3(voxel)) + 0.5f;
-    const float4 h = float4(centre_local, 1.0f);
-    const float3 centre = float3(dot(r0, h), dot(r1, h), dot(r2, h));
-    float3 axes[3];
-    axes[0] = float3(r0.x, r1.x, r2.x);
-    axes[1] = float3(r0.y, r1.y, r2.y);
-    axes[2] = float3(r0.z, r1.z, r2.z);
-    const float3 to_receiver = x_r - centre;
+    const LightVoxelFrame frame = LightVoxelFrameOf(fc, entry, voxel);
+    const float3 to_receiver = x_r - frame.centre;
     float signs[3];
     uint faces = 0;
     CAELIX_UNROLL
     for (uint a = 0; a < 3; ++a)
     {
-        const float d = dot(axes[a], to_receiver);
+        const float d = dot(frame.axes[a], to_receiver);
         signs[a] = d > 0.0f ? 1.0f : (d < 0.0f ? -1.0f : 0.0f);
         faces += signs[a] != 0.0f ? 1u : 0u;
     }
@@ -266,18 +320,53 @@ LightSample SampleLightEntry(CaelixFrameConstants fc, LightEntry entry, float3 x
             }
         }
     }
-    const float3 face_normal = axes[axis] * signs[axis];
-    const float3 e1 = axes[(axis + 1u) % 3u];
-    const float3 e2 = axes[(axis + 2u) % 3u];
+    const uint face = axis * 2u + (signs[axis] < 0.0f ? 1u : 0u);
+    float3 face_normal;
+    float3 e1;
+    float3 e2;
+    LightFaceBasis(frame, face, face_normal, e1, e2);
 
     // 4. Point, radiance and density.
-    s.position = centre + 0.5f * face_normal + (u_s - 0.5f) * e1 + (u_t - 0.5f) * e2;
+    s.uv = quantize_uv ? float2(LightUvDequantize(LightUvQuantize(u_s)), LightUvDequantize(LightUvQuantize(u_t)))
+                       : float2(u_s - 0.5f, u_t - 0.5f);
+    s.position = LightFacePoint(frame, face_normal, e1, e2, s.uv);
     s.normal = face_normal;
     const uint value = BrickVoxelValue(fc, entry.group, entry.id, voxel);
     s.radiance = GET_MATERIAL(value).emission * g_emissionScale;
     s.pdf_area = (entry.region_weight[slice] / entry.total_weight) * (1.0f / float(n)) * (1.0f / float(faces));
+    s.voxel = bit | (slice << 6);
+    s.face = face;
     s.valid = s.pdf_area > 0.0f;
     return s;
+}
+
+LightSample SampleLightEntry(CaelixFrameConstants fc, LightEntry entry, float3 x_r, inout uint rng)
+{
+    return SampleLightEntryWith(fc, entry, x_r, false, rng);
+}
+
+// A light point rebuilt from the indices that a LightSample named (ReSTIR DI, docs/RESTIR_DI.md):
+// voxel v (x | y << 3 | z << 6) of `entry`, its face and the uv on it, under the entity's current
+// transform. The same frame, basis and point expressions as SampleLightEntryWith.
+struct LightPoint
+{
+    float3 position;
+    float3 normal;
+    float3 radiance;
+};
+
+LightPoint LightPointAt(CaelixFrameConstants fc, LightEntry entry, uint voxel_index, uint face, float2 uv)
+{
+    const uint3 voxel = uint3(voxel_index & 7u, (voxel_index >> 3) & 7u, (voxel_index >> 6) & 7u);
+    const LightVoxelFrame frame = LightVoxelFrameOf(fc, entry, voxel);
+    float3 e1;
+    float3 e2;
+    LightPoint p;
+    LightFaceBasis(frame, min(face, 5u), p.normal, e1, e2);
+    p.position = LightFacePoint(frame, p.normal, e1, e2, uv);
+    const uint value = BrickVoxelValue(fc, entry.group, entry.id, voxel);
+    p.radiance = GET_MATERIAL(value).emission * g_emissionScale;
+    return p;
 }
 
 // Next-event estimation on the light list at a diffuse path vertex (section 2.3): the receiver

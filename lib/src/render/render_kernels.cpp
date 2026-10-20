@@ -119,6 +119,16 @@ RenderKernels::RenderKernels(Device& device)
         const std::vector<uint32_t> shade_spirv = LoadShader("caelix_restir_gi_shade");
         restir_shade_ = ComputePipeline(vk_device, shade_spirv, sizeof(TracePush), "caelix_restir_gi_shade",
                                         trace_layout_);
+        // ReSTIR DI (docs/RESTIR_DI.md): the trace set (TLAS for the shadow rays, the internal targets).
+        const std::vector<uint32_t> di_temporal_spirv = LoadShader("caelix_restir_di_temporal");
+        restir_di_temporal_ = ComputePipeline(vk_device, di_temporal_spirv, sizeof(TracePush),
+                                              "caelix_restir_di_temporal", trace_layout_);
+        const std::vector<uint32_t> di_spatial_spirv = LoadShader("caelix_restir_di_spatial");
+        restir_di_spatial_ = ComputePipeline(vk_device, di_spatial_spirv, sizeof(TracePush),
+                                             "caelix_restir_di_spatial", trace_layout_);
+        const std::vector<uint32_t> di_shade_spirv = LoadShader("caelix_restir_di_shade");
+        restir_di_shade_ = ComputePipeline(vk_device, di_shade_spirv, sizeof(TracePush), "caelix_restir_di_shade",
+                                           trace_layout_);
         // Light cell fill (docs/LIGHT_LIST.md): the trace set (binding 21 the cells).
         const std::vector<uint32_t> cells_spirv = LoadShader("caelix_light_cells");
         light_cells_ = ComputePipeline(vk_device, cells_spirv, sizeof(TracePush), "caelix_light_cells",
@@ -161,6 +171,9 @@ RenderKernels::RenderKernels(Device& device)
         restir_temporal_ = ComputePipeline();
         restir_spatial_ = ComputePipeline();
         restir_shade_ = ComputePipeline();
+        restir_di_temporal_ = ComputePipeline();
+        restir_di_spatial_ = ComputePipeline();
+        restir_di_shade_ = ComputePipeline();
         light_cells_ = ComputePipeline();
         if (sky_sampler_ != VK_NULL_HANDLE)
         {
@@ -178,7 +191,8 @@ RenderKernels::RenderKernels(Device& device)
     }
     CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_composite, caelix_cross_resolve, "
                 "caelix_sky_sh, caelix_upscale_encode, caelix_restir_gi_temporal, caelix_restir_gi_spatial, "
-                "caelix_restir_gi_shade, caelix_light_cells");
+                "caelix_restir_gi_shade, caelix_restir_di_temporal, caelix_restir_di_spatial, caelix_restir_di_shade, "
+                "caelix_light_cells");
 }
 
 RenderKernels::~RenderKernels()
@@ -197,6 +211,9 @@ RenderKernels::~RenderKernels()
     restir_temporal_ = ComputePipeline();
     restir_spatial_ = ComputePipeline();
     restir_shade_ = ComputePipeline();
+    restir_di_temporal_ = ComputePipeline();
+    restir_di_spatial_ = ComputePipeline();
+    restir_di_shade_ = ComputePipeline();
     light_cells_ = ComputePipeline();
     if (trace_layout_ != VK_NULL_HANDLE)
     {

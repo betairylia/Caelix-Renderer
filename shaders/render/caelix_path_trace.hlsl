@@ -65,6 +65,13 @@
 //                   (LightNextEvent) and the segment that leaves it does not count the emission
 //                   of the list light it hits; in ReSTIR mode the primary vertex's light NEE goes
 //                   to the diffuse target unpacked (the shade pass adds the reservoir to it).
+//                   kGiFlagRestirDi (docs/RESTIR_DI.md, render/caelix_restir_di.hlsl; with
+//                   kGiFlagLightNee): the primary vertex's light NEE is replaced by the pixel's
+//                   initial DI reservoir (fc.di_initial, di_candidates candidates, no shadow ray),
+//                   written for every opaque primary surface (the diffuse-lobe bit tells the DI
+//                   shade pass whether to add its contribution); the first segment after a
+//                   diffuse primary vertex still skips list-light emission. The bounce vertices keep
+//                   their light NEE.
 //
 // Inputs: the push constant is the device address of the frame constants; the
 // scene's tables (page table, slot rows, group infos, entity infos) are read by
@@ -92,6 +99,7 @@
 #include "NRD.hlsli"
 #include "render/caelix_restir_gi.hlsl"
 #include "render/caelix_light_sample.hlsl"
+#include "render/caelix_restir_di.hlsl"
 
 static const float kRayTMax = 1e30f;
 static const uint kStepsHeatMax = 64;
@@ -293,6 +301,9 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // emission. A segment that leaves a vertex without light NEE (a specular lobe) still counts it.
 // `primary_light` receives the primary vertex's light NEE; with `restir` it is not in the
 // returned radiance (the caller writes it to the diffuse target, the shade pass adds it).
+// `restir_di` (ReSTIR DI): the primary vertex draws no light NEE (primary_light stays 0, the DI
+// passes add the direct light of the list lights there), but its first segment still skips the
+// emission of a list light it hits when the vertex took the diffuse lobe.
 struct GiInitialSample
 {
     bool valid;            // the path had a first segment (bounce_count >= 1)
@@ -311,7 +322,7 @@ float3 LightCellPoint(TraceResult hit)
 }
 
 CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
-                            uint medium, bool restir, inout uint rng, out float4 stochastic,
+                            uint medium, bool restir, bool restir_di, inout uint rng, out float4 stochastic,
                             out GiInitialSample gi, out float3 primary_light)
 {
     gi.valid = false;
@@ -356,12 +367,15 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     CAELIX_BRANCH
     if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
     {
-        primary_light = LightNextEvent(fc, primary_shade.bounce_origin, surface.normal, surface.group,
-                                       LightCellPoint(surface), light_rng) *
-                        throughput;
-        if (!restir)
+        if (!restir_di)
         {
-            radiance += primary_light;
+            primary_light = LightNextEvent(fc, primary_shade.bounce_origin, surface.normal, surface.group,
+                                           LightCellPoint(surface), light_rng) *
+                            throughput;
+            if (!restir)
+            {
+                radiance += primary_light;
+            }
         }
         segment_light_nee = true;
     }
@@ -495,6 +509,8 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     g_emissionScale = fc.emission_scale;
     const bool restir = fc.gi_method == kGiRestir;
     g_forceDiffuse = (fc.gi_flags & kGiFlagDiffuseOnly) != 0u || restir;
+    // ReSTIR DI: the renderer sets the flag only with light NEE, a light table and the DI buffers.
+    const bool restir_di = (fc.gi_flags & kGiFlagRestirDi) != 0u && fc.di_initial != 0u;
 
     // Pixel -> ray. Row 0 is the top row of the image.
     RayDesc ray;
@@ -669,6 +685,8 @@ void main(uint3 thread_id : SV_DispatchThreadID)
 
         // ReSTIR GI: the pixel's initial reservoir (empty without a surface or a usable sample).
         GiReservoir gi_reservoir = GiEmptyReservoir();
+        // ReSTIR DI: the pixel's initial DI reservoir (empty without an opaque surface or bounces).
+        DiReservoir di_reservoir = DiEmptyReservoir();
 
         CAELIX_BRANCH
         if (surface)
@@ -677,7 +695,15 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             GiInitialSample gi_sample;
             float3 primary_light;
             const CaelixShadeResult shade = TracePath(fc, pixel, chain.ray, chain.surface, chain.medium, restir,
-                                                      rng, stochastic, gi_sample, primary_light);
+                                                      restir_di, rng, stochastic, gi_sample, primary_light);
+            CAELIX_BRANCH
+            if (restir_di && fc.bounce_count >= 1u && IsOpaque(int((chain.surface.attrib >> 16) & 0xFFFFu)))
+            {
+                // x_v and the face as for the step 1 NEE of TracePath (the pushed-off primary point).
+                di_reservoir = DiInitialReservoir(fc, pixel, shade.bounce_origin, GiFaceIndex(chain.surface.normal),
+                                                  !shade.specular_lobe, chain.surface.group,
+                                                  LightCellPoint(chain.surface));
+            }
             // The chain's transmission modulates everything the surface sends (Unity:
             // AlbedoTarget = throughput * albedo, deterministic = throughput * emission).
             material_albedo = chain.throughput * shade.albedo;
@@ -781,6 +807,11 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         if (restir)
         {
             StoreGiReservoir(GiReservoirAddress(fc.gi_initial, fc, pixel), gi_reservoir);
+        }
+        CAELIX_BRANCH
+        if (restir_di)
+        {
+            StoreDiReservoir(DiReservoirAddress(fc.di_initial, fc, pixel), di_reservoir);
         }
         g_int_normal_roughness[pixel] = normal_roughness;
         // Coverage is albedo.a.

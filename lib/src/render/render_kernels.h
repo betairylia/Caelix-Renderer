@@ -79,7 +79,8 @@ struct NrdKernels
 //   encode set, every binding PARTIALLY_BOUND;
 // - the compute pipelines caelix_path_trace, caelix_composite, caelix_cross_resolve,
 //   caelix_sky_sh, caelix_upscale_encode and the ReSTIR GI kernels caelix_restir_gi_temporal,
-//   caelix_restir_gi_spatial and caelix_restir_gi_shade and the light cell fill caelix_light_cells
+//   caelix_restir_gi_spatial and caelix_restir_gi_shade, the ReSTIR DI kernels caelix_restir_di_temporal,
+//   caelix_restir_di_spatial and caelix_restir_di_shade and the light cell fill caelix_light_cells
 //   (trace set) (push constant TracePush);
 // - the sky sampler (linear, mipmapped, clamp to edge) and the fallback sky cube (1 x 1
 //   RGBA8), bound in every sky binding when the host gives no cubemap. The first render
@@ -144,6 +145,18 @@ public:
     {
         return restir_shade_;
     }
+    const ComputePipeline& restir_di_temporal() const
+    {
+        return restir_di_temporal_;
+    }
+    const ComputePipeline& restir_di_spatial() const
+    {
+        return restir_di_spatial_;
+    }
+    const ComputePipeline& restir_di_shade() const
+    {
+        return restir_di_shade_;
+    }
     const ComputePipeline& light_cells() const
     {
         return light_cells_;
@@ -189,6 +202,9 @@ private:
     ComputePipeline restir_temporal_;         // shaders/render/caelix_restir_gi_temporal.hlsl, trace set
     ComputePipeline restir_spatial_;          // shaders/render/caelix_restir_gi_spatial.hlsl, trace set
     ComputePipeline restir_shade_;            // shaders/render/caelix_restir_gi_shade.hlsl, trace set
+    ComputePipeline restir_di_temporal_;      // shaders/render/caelix_restir_di_temporal.hlsl, trace set
+    ComputePipeline restir_di_spatial_;       // shaders/render/caelix_restir_di_spatial.hlsl, trace set
+    ComputePipeline restir_di_shade_;         // shaders/render/caelix_restir_di_shade.hlsl, trace set
     ComputePipeline light_cells_;             // shaders/render/caelix_light_cells.hlsl, trace set
     VkSampler sky_sampler_ = VK_NULL_HANDLE;  // linear, mipmapped, clamp to edge
     GpuImage fallback_sky_;                   // 1 x 1 RGBA8 cube bound without a host cubemap

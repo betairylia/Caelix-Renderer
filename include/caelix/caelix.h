@@ -75,7 +75,9 @@ extern "C" {
    changed), also without a bump. The light list step (docs/LIGHT_LIST.md) added CaelixLightOptions,
    caelix_scene_set_light_options, CaelixLightStats, caelix_scene_get_light_stats and
    CAELIX_GI_FLAG_LIGHT_NEE, and appended the light cell fields to the experimental CaelixGiOptions
-   (32 -> 48 bytes) and CaelixGiStats (16 -> 32 bytes), also without a bump. A host built against an older version-2 header must be rebuilt (the library reads and
+   (32 -> 48 bytes) and CaelixGiStats (16 -> 32 bytes), also without a bump. The ReSTIR DI step
+   (docs/RESTIR_DI.md) added CAELIX_GI_FLAG_RESTIR_DI and renamed CaelixGiOptions::light_reserved to
+   di_candidates (same size). A host built against an older version-2 header must be rebuilt (the library reads and
    writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1153,6 +1155,8 @@ typedef enum CaelixGiMethod
 #define CAELIX_GI_FLAG_DIFFUSE_ONLY (1u << 4) /* force the Lambert lobe at every vertex */
 #define CAELIX_GI_FLAG_LIGHT_NEE (1u << 5)    /* next-event estimation on the scene's light list at every
                                                  diffuse vertex (docs/LIGHT_LIST.md); both methods */
+#define CAELIX_GI_FLAG_RESTIR_DI (1u << 6)    /* per-pixel ReSTIR DI on the light list at the primary
+                                                 surface (docs/RESTIR_DI.md); needs LIGHT_NEE; both methods */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
@@ -1164,7 +1168,12 @@ typedef enum CaelixGiMethod
    CaelixLightOptions) through the renderer's light cells (world-space reservoirs keyed by entity,
    level and cell coordinate, refilled before every trace) and traces a shadow ray; a segment that
    leaves such a vertex no longer counts the emission of the list light it hits. The light_* fields
-   size the cells. */
+   size the cells.
+   CAELIX_GI_FLAG_RESTIR_DI (with LIGHT_NEE, either method, bounce_count >= 1): the primary vertex's
+   one-sample light NEE is replaced by per-pixel ReSTIR DI: di_candidates initial light points per
+   pixel, then temporal and spatial reuse with the TEMPORAL, SPATIAL, VISIBILITY and UNBIASED flags
+   and the reuse fields above, and one shadow ray per pixel; the result is added to the diffuse
+   radiance (after ReSTIR GI's). The bounce vertices keep the one-sample light NEE. */
 typedef struct CaelixGiOptions
 {
     uint32_t method;          /* CaelixGiMethod */
@@ -1180,7 +1189,7 @@ typedef struct CaelixGiOptions
     uint32_t light_candidates;    /* 0 = 8; 1 .. 64 candidates per cell reservoir and frame */
     float light_level_footprint;  /* 0 = 0.25: a vertex whose pixel footprint (world units per pixel at
                                      its camera distance) is below this uses 8-voxel cells, else 32 */
-    uint32_t light_reserved;      /* 0 */
+    uint32_t di_candidates;       /* 0 = 4; 1 .. 32 initial light candidates per pixel (RESTIR_DI) */
 } CaelixGiOptions;
 
 /* Sets the GI options of the renderer; they apply from the next render on and stay until the next
@@ -1189,19 +1198,23 @@ typedef struct CaelixGiOptions
    to its biased image (that is how the bias is measured). A new method or new flags also drop the
    reservoir history. With CAELIX_GI_PATH_TRACE and without CAELIX_GI_FLAG_DIFFUSE_ONLY the image is
    the path tracer's, bit for bit. The reservoir buffers (4 x 48 bytes per pixel) are allocated at
-   the first ReSTIR render and kept until the renderer is destroyed (recreated on a size change).
+   the first ReSTIR render and kept until the renderer is destroyed (recreated on a size change);
+   the DI reservoir buffers (4 x 32 bytes per pixel) likewise at the first render with
+   CAELIX_GI_FLAG_RESTIR_DI. The DI history is also dropped when the scene's light table was rebuilt
+   since the renderer's previous render.
    The light cells (light_cell_capacity x 288 bytes) are allocated at the first render with
    CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity changes.
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,
-   light_candidates > 64 -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
+   light_candidates > 64, CAELIX_GI_FLAG_RESTIR_DI without CAELIX_GI_FLAG_LIGHT_NEE, di_candidates > 32
+   -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);
 
 typedef struct CaelixGiStats
 {
-    float gi_ms;              /* GPU time of the GI passes (temporal + spatial + shade) of the frame of
-                                 CaelixGpuTimings (0 when that frame ran no GI pass) */
-    uint64_t reservoir_bytes; /* bytes of the reservoir buffers currently allocated */
+    float gi_ms;              /* GPU time of the GI and DI reuse passes (temporal + spatial + shade) of the
+                                 frame of CaelixGpuTimings (0 when that frame ran no reuse pass) */
+    uint64_t reservoir_bytes; /* bytes of the GI and DI reservoir buffers currently allocated */
     uint64_t light_cell_bytes; /* bytes of the light cell table currently allocated */
     float light_fill_ms;       /* GPU time of the light cell fill of the frame of CaelixGpuTimings (0 when
                                   that frame ran no fill) */
