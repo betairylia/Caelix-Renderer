@@ -9,13 +9,12 @@
 // distance, or with d's when the stored radiance is 0 (no other sample). Only a pixel whose path
 // took the diffuse lobe at the primary vertex (kDiDiffuseLobe) receives it: that is where step 1's
 // one-sample NEE ran. Nothing is written to the diffuse target for a pixel without a contribution.
-// Visibility reuse (without kGiFlagUnbiased): when the shadow ray is occluded, the final reservoir
-// (the next frame's di_prev) is stored again with W = 0. This is a bias (the next frame's temporal
-// merge treats the occluded sample as worthless although its target function is not 0) that
-// removes most occluded samples from the history: a light voxel set into a wall, whose covered
-// side faces are sampled as often as its open face, otherwise keeps occluded samples for many
-// frames. With kGiFlagUnbiased the reservoir is left as it is (the Z counts of the reuse passes
-// assume reservoirs whose support does not depend on visibility).
+// No visibility reuse: an occluded final sample contributes 0 this frame and the reservoir is left
+// as it is. Pruning it (W = 0 or an empty reservoir) makes the pixel's history a distribution
+// proportional to target x visibility FROM THIS PIXEL; the spatial pass of the neighbours then
+// counts this pixel's M (1/M or Z by target support) for samples it can no longer hold (occluded
+// here, visible there), which lost 33 % of the direct light on bistro. Variance is the price: a
+// light voxel set into a wall keeps occluded side-face samples in the history for some frames.
 //
 // Descriptors: render/caelix_trace_set.hlsl (TLAS, internal view z, diffuse radiance).
 #include "common/caelix_platform.hlsl"
@@ -65,15 +64,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     const float geometry = DiGeometry(light.position, light.normal, x_v, n_v, distance);
     if (!(geometry > 0.0f) || !DiVisible(fc, x_v, light))
     {
-        // Visibility reuse (Bitterli et al. 2020, section 4.4), not with kGiFlagUnbiased: an occluded
-        // sample is dropped from the final reservoir (W = 0, M kept), so the next frame's temporal
-        // pass does not carry it on.
-        if ((fc.gi_flags & kGiFlagUnbiased) == 0u)
-        {
-            r.W = 0.0f;
-            StoreDiReservoir(final_address, r);
-        }
-        return;
+        return;  // occluded: nothing this frame, the history is not pruned (see the header)
     }
     const float3 contribution = light.radiance * (geometry * r.W);
     const float4 stored = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_int_diff[pixel]);

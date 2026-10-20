@@ -7,10 +7,14 @@
 // inside the image and DiSimilar accepts it (a surface, the same visible face, visible points
 // closer than gi_depth_threshold * view_z); its M is clamped to gi_temporal_m_cap. Merge weight
 // p_hat_r(y_prev) * W_prev * min(M_prev, cap), with the light point rebuilt under the current
-// transforms; no Jacobian, no visibility ray. kGiFlagUnbiased: the MIS denominator is Z = the M of
-// the pixel and of the previous reservoir where the selected sample has a nonzero target function
-// (at the previous reservoir's own visible point and face), instead of M. A pixel without a
-// surface (M 0) stores an empty reservoir.
+// transforms; no Jacobian, no visibility ray. The MIS denominator is always M (1/M weights), also
+// with kGiFlagUnbiased: a Z count here is UNSAFE. When the selected sample's target function at the
+// previous reservoir's point is 0 (a rare near-field or horizon boundary case under the jitter, or
+// a different surface under the same pixel) Z drops to the pixel's own M (1) and W becomes ~cap
+// times too large; the history keeps that W, the next frames select it again, and a second such
+// event multiplies it again, up to inf (the pixel then stays black: measured as a 40 % loss on
+// bistro with temporal + spatial reuse). The spatial pass keeps its Z (no feedback there). A pixel
+// without a surface (M 0) stores an empty reservoir.
 //
 // Descriptors: render/caelix_trace_set.hlsl (internal motion and view z, light table reads).
 #include "common/caelix_platform.hlsl"
@@ -75,21 +79,6 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             }
         }
     }
-    uint count = merge.m;
-    CAELIX_BRANCH
-    if ((fc.gi_flags & kGiFlagUnbiased) != 0u)
-    {
-        // Z: the reservoirs whose own target function is nonzero at the selected sample (the
-        // targets have no visibility, so no shadow ray).
-        count = 0u;
-        if (DiTargetPdf(merge.selected_light, x_v, n_v) > 0.0f)
-        {
-            count += DiM(own);
-        }
-        if (has_prev && DiTargetPdf(merge.selected_light, prev.visible_pos, GiFaceNormal(DiVisibleFace(prev))) > 0.0f)
-        {
-            count += m_prev;
-        }
-    }
-    StoreDiReservoir(output, DiMergeFinishWithCount(merge, x_v, own.visible_flags_m, count));
+    // 1/M in every mode (see the header: a Z count feeds back through the history).
+    StoreDiReservoir(output, DiMergeFinishWithCount(merge, x_v, own.visible_flags_m, merge.m));
 }

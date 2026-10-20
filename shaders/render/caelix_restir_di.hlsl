@@ -272,6 +272,11 @@ DiReservoir DiMergeFinishWithCount(DiMerge s, float3 x_v_r, uint own_flags, uint
     r.W = (s.p_hat_selected > 0.0f && s.w_sum > 0.0f && count > 0u)
               ? s.w_sum / (float(count) * s.p_hat_selected)
               : 0.0f;
+    // A non-finite W would live in the history forever (every later merge selects it).
+    if (!isfinite(r.W))
+    {
+        r.W = 0.0f;
+    }
     r.visible_pos = x_v_r;
     r.visible_flags_m = (own_flags & kDiVisibleFlagsMask) | (min(s.m, 0xFFFFFFu) << kDiMShift);
     return r;

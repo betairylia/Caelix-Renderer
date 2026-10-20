@@ -57,7 +57,14 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     uint rng = InitRandom(pixel, fc.frame_seed ^ (0x3B5A9D27u + g_push.gi_pass * 0x9E3779B9u));
 
     const bool unbiased = (fc.gi_flags & kGiFlagUnbiased) != 0u;
-    const bool trace_visibility = (fc.gi_flags & (kGiFlagVisibility | kGiFlagUnbiased)) != 0u;
+    // No visibility rays in the DI reuse (kGiFlagVisibility is ignored here): the DI targets have no
+    // visibility, so Z by target support alone is unbiased (bistro 0.994 against 0.896 with 1/M)
+    // and the shade pass's final shadow ray handles the visibility. Rays in the merge weights plus
+    // visibility from the counted neighbours in Z (Bitterli et al. 2020, section 4.3) measured 1.27
+    // (too bright: the pixel's own weight has no visibility test, so the techniques are not
+    // consistent) at 11 ms; not worth fixing while the shade ray gives an unbiased result.
+    const bool trace_visibility = false;
+    int selected = -1;  // the accepted neighbour whose sample was selected; -1 = the pixel's own
     // The accepted neighbours (counted in M): their visible points and face + M words, for Z.
     float3 accepted_pos[kGiMaxSpatialSamples];
     uint accepted_face_m[kGiMaxSpatialSamples];
@@ -89,7 +96,10 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         {
             visibility = DiVisible(fc, x_v, light) ? 1.0f : 0.0f;
         }
-        DiMergeCandidate(merge, c, light, p_hat, DiM(c), visibility, rng);
+        if (DiMergeCandidate(merge, c, light, p_hat, DiM(c), visibility, rng))
+        {
+            selected = int(accepted_count);
+        }
         accepted_pos[accepted_count] = c.visible_pos;
         accepted_face_m[accepted_count] = c.visible_flags_m;
         ++accepted_count;
@@ -109,7 +119,12 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         for (uint k = 0u; k < accepted_count; ++k)
         {
             const float3 n_k = GiFaceNormal(accepted_face_m[k] & kGiVisibleFaceMask);
-            if (DiTargetPdf(y, accepted_pos[k], n_k) > 0.0f)
+            if (!(DiTargetPdf(y, accepted_pos[k], n_k) > 0.0f))
+            {
+                continue;
+            }
+            // The neighbour that owned Y sees it by construction (its weight passed the ray).
+            if (!trace_visibility || int(k) == selected || DiVisible(fc, accepted_pos[k], y))
             {
                 count += accepted_face_m[k] >> kDiMShift;
             }

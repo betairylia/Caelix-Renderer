@@ -1155,8 +1155,13 @@ typedef enum CaelixGiMethod
 
 #define CAELIX_GI_FLAG_TEMPORAL (1u << 0)     /* temporal reuse (previous frame's reservoir) */
 #define CAELIX_GI_FLAG_SPATIAL (1u << 1)      /* spatial reuse */
-#define CAELIX_GI_FLAG_VISIBILITY (1u << 2)   /* a shadow ray per reused neighbour sample (occluded -> weight 0) */
-#define CAELIX_GI_FLAG_UNBIASED (1u << 3)     /* Z-count MIS instead of 1/M (implies VISIBILITY rays per neighbour) */
+#define CAELIX_GI_FLAG_VISIBILITY (1u << 2)   /* ReSTIR GI: a shadow ray per reused neighbour sample (occluded ->
+                                                 weight 0). ReSTIR DI ignores it (its shade pass traces the ray) */
+#define CAELIX_GI_FLAG_UNBIASED (1u << 3)     /* Z-count MIS instead of 1/M. ReSTIR GI: implies VISIBILITY rays
+                                                 per neighbour. ReSTIR DI: Z by target support in the SPATIAL
+                                                 pass only (the temporal pass is 1/M in every mode), no rays;
+                                                 recommended for DI (1/M loses ~10 % where the supports differ:
+                                                 horizon, near-field split) */
 #define CAELIX_GI_FLAG_DIFFUSE_ONLY (1u << 4) /* force the Lambert lobe at every vertex */
 #define CAELIX_GI_FLAG_LIGHT_NEE (1u << 5)    /* next-event estimation on the scene's light list at every
                                                  diffuse vertex (docs/LIGHT_LIST.md); both methods */

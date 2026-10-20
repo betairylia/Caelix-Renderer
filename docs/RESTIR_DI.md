@@ -90,6 +90,37 @@ includes the DI buffers.
 
 ## As built
 
+### Review changes (Fable, 2026-10-21, after the bench)
+
+The first bench (`Artifacts/gi-experiments-20261020/light-nee-di/README.md`) found the converged DI
+image 15 % dark on bistro with temporal + spatial reuse (43 % of the direct light alone), while
+each reuse alone was fine. Found by shader-variant experiments on the bistro `--bounces 1` pair
+(`light-nee-di/extra/diag/`, scratch `dib1/`), three causes, all fixed in the commit after
+acbffda:
+
+1. **Z count in the temporal pass (40 %).** With UNBIASED the temporal pass counted the previous
+   reservoir only where the selected sample's target at the previous visible point was nonzero.
+   That is rarely 0 while the current target is nonzero (near-field or horizon boundary under the
+   jitter, another surface under the pixel), and then Z = 1 gives W ~ cap times too large; the
+   history keeps and re-selects it, a second event multiplies it again, up to inf, and the pixel
+   stays black. The temporal pass is now 1/M in every mode; `DiMergeFinishWithCount` zeroes a
+   non-finite W.
+2. **Visibility reuse in the shade pass (33 % with 1/M).** Pruning an occluded final sample makes
+   the pixel's history a distribution proportional to target x visibility from that pixel; the
+   neighbours' spatial merges count its M for samples it can no longer hold. No pruning now: an
+   occluded final sample contributes 0 for the frame (variance).
+3. **Visibility rays in the DI reuse.** UNBIASED no longer implies rays (the DI targets have no
+   visibility, so Z by target support is unbiased without them: bistro 0.994 against 0.896 with
+   1/M); rays in the weights with visibility in Z measured 1.27 at 11 ms (the pixel's own weight
+   has no visibility test). VISIBILITY is ignored by the DI passes.
+
+Measured on bistro_dark, direct light only, 512 frames against the 2048-frame reference, linear
+mean ratio: 1/M temporal + spatial 0.896 (the known 1/M bias where supports differ: horizon and
+the near-field split), UNBIASED 0.994. Recommended DI flags: TEMPORAL | SPATIAL | UNBIASED.
+Lesson for the tools: the host loads `caelix_renderer.dll` from its own directory (the cargo build
+copies it), so a library rebuild needs the copy or `CAELIX_LIB_DIR` at cargo build time; the
+first hour of this diagnosis ran a stale DLL.
+
 Built on 2026-10-21 (branch `gi-experiments`, on top of 50c8076). Files:
 `shaders/render/caelix_restir_di.hlsl` (reservoir, light point, target, merge, initial
 candidates), `caelix_restir_di_temporal.hlsl`, `caelix_restir_di_spatial.hlsl`,
