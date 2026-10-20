@@ -1,0 +1,22 @@
+Third-party Rust crates in caelix-app.exe
+=========================================
+
+caelix-app.exe contains the following Rust crates. Each license text below
+applies to the crates listed above it.
+
+Overview:
+{{#each overview}}
+  {{{name}}}: {{count}} crate(s)
+{{/each}}
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}} ({{id}})
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}
