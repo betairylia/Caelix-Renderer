@@ -170,7 +170,12 @@ binding 9 (sky 10, sampler 11); the encode set is a fourth set per frame slot. F
 - Motion vectors: render-resolution pixels, top-left origin, y down, value added to the current
   pixel gives the previous pixel: exactly our `motion` (previous - current). MV scale 1,
   `MVLowRes` set, `MVJittered` not set (our motion has no jitter).
-- Jitter: render pixels, same axes as the MVs, in [-0.5, 0.5]: `CaelixCamera::jitter`.
+- Jitter: render pixels, same axes as the MVs, in [-0.5, 0.5], but it is the PROJECTION's pixel
+  offset (the content shift; the NVIDIA sample passes `PlanarView::GetPixelOffset`, whose matrix
+  translates NDC by +2 o / size), which is the negative of our sample offset
+  (`CaelixSamplePosition = pixel + 0.5 + jitter`). The library passes `-CaelixCamera::jitter`
+  (fixed 2026-10-20 after the first builds shook; NRD keeps +jitter, its `cameraJitter` is the
+  sample offset).
 - Depth: device depth of the host projection; `DepthInverted` when the projection is reverse Z,
   detected per call (depth at view z = 2 near below the depth at z = near). RR: hardware depth
   (`InUseHWDepth = HW`) with the same image.

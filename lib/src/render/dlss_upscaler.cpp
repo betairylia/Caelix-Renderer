@@ -619,8 +619,12 @@ bool DlssUpscaler::Evaluate(VkCommandBuffer cmd, const UpscalerInputs& in)
         eval.pInOutput = &output;
         eval.pInDepth = &depth;
         eval.pInMotionVectors = &motion;
-        eval.InJitterOffsetX = in.jitter[0];
-        eval.InJitterOffsetY = in.jitter[1];
+        // NGX's jitter is the projection's pixel offset (the content shift: the NVIDIA sample
+        // passes PlanarView::GetPixelOffset, whose matrix translates NDC by +2 o / size), which
+        // is the NEGATIVE of our sample offset (CaelixSamplePosition = pixel + 0.5 + jitter). The
+        // wrong sign makes the image shake.
+        eval.InJitterOffsetX = -in.jitter[0];
+        eval.InJitterOffsetY = -in.jitter[1];
         eval.InRenderSubrectDimensions.Width = desc_.render_width;
         eval.InRenderSubrectDimensions.Height = desc_.render_height;
         eval.InReset = in.reset ? 1 : 0;
@@ -642,8 +646,12 @@ bool DlssUpscaler::Evaluate(VkCommandBuffer cmd, const UpscalerInputs& in)
         eval.Feature.pInOutput = &output;
         eval.pInDepth = &depth;
         eval.pInMotionVectors = &motion;
-        eval.InJitterOffsetX = in.jitter[0];
-        eval.InJitterOffsetY = in.jitter[1];
+        // NGX's jitter is the projection's pixel offset (the content shift: the NVIDIA sample
+        // passes PlanarView::GetPixelOffset, whose matrix translates NDC by +2 o / size), which
+        // is the NEGATIVE of our sample offset (CaelixSamplePosition = pixel + 0.5 + jitter). The
+        // wrong sign makes the image shake.
+        eval.InJitterOffsetX = -in.jitter[0];
+        eval.InJitterOffsetY = -in.jitter[1];
         eval.InRenderSubrectDimensions.Width = desc_.render_width;
         eval.InRenderSubrectDimensions.Height = desc_.render_height;
         eval.InReset = in.reset ? 1 : 0;
