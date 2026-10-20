@@ -50,6 +50,8 @@ public:
                                           VkDeviceSize size, VkBufferUsageFlags usage);
     // A persistently mapped, host-visible upload buffer (transfer src).
     static GpuBuffer HostUpload(VmaAllocator allocator, VkDevice device, VkDeviceSize size);
+    // A persistently mapped, host-visible readback buffer (transfer dst, random host reads).
+    static GpuBuffer HostReadback(VmaAllocator allocator, VkDevice device, VkDeviceSize size);
 
     bool valid() const
     {
@@ -76,6 +78,9 @@ public:
     // Makes host writes in [offset, offset + size) visible to the device. No-op
     // on host-coherent memory.
     void FlushHostWrites(VkDeviceSize offset, VkDeviceSize size) const;
+    // Makes device writes in [offset, offset + size) visible to host reads (after the GPU work
+    // that wrote them has completed). No-op on host-coherent memory.
+    void InvalidateHostReads(VkDeviceSize offset, VkDeviceSize size) const;
 
     void Reset();
 

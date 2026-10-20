@@ -409,6 +409,29 @@ struct Args {
     /// ReSTIR GI: a reused reservoir's visible point must lie within F * view depth of the pixel's.
     #[arg(long, value_name = "F", default_value_t = 0.1)]
     gi_depth_threshold: f32,
+    /// Both GI methods: next-event estimation on the scene's light list (emissive voxels whose
+    /// emission luminance is at least --light-min-emission) at every diffuse vertex
+    /// (docs/LIGHT_LIST.md).
+    #[arg(long)]
+    gi_light_nee: bool,
+    /// The scene's list-light threshold: luminance of a material's emission (0 = the library's
+    /// default, 20: packed strength 2 with a bright albedo, every bright strength 3).
+    #[arg(long, value_name = "F", default_value_t = 0.0)]
+    light_min_emission: f32,
+    /// The scene's light table capacity in bricks (bricks beyond it are dropped and counted).
+    #[arg(long, value_name = "N", default_value_t = 65536,
+          value_parser = clap::value_parser!(u32).range(1..=1048576))]
+    light_max_bricks: u32,
+    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 288 bytes each).
+    #[arg(long, value_name = "N", default_value_t = 65536)]
+    light_cells: u32,
+    /// Light NEE: candidates per cell reservoir and frame (1..64).
+    #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64))]
+    light_candidates: u32,
+    /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 8-voxel
+    /// cells, else 32-voxel cells.
+    #[arg(long, value_name = "F", default_value_t = 0.25)]
+    light_footprint: f32,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -709,6 +732,17 @@ impl App {
         if let Some(path) = self.args.materials.as_deref() {
             materials::apply(state.scene, path)?;
         }
+        // The light list options hold for the whole scene: set before the world loads.
+        let light_options = CaelixLightOptions {
+            min_emission: self.args.light_min_emission,
+            max_bricks: self.args.light_max_bricks,
+            reserved: [0; 2],
+        };
+        // SAFETY: the scene is live; light_options is valid for the call.
+        let result = unsafe { caelix_scene_set_light_options(state.scene, &light_options) };
+        if result != CaelixResult_CAELIX_OK {
+            bail!("caelix_scene_set_light_options failed: CaelixResult {result} (see the library log)");
+        }
         // SAFETY: the device and the scene are live; the out pointer is valid for the call.
         let result = unsafe { caelix_renderer_create(state.caelix_device, state.scene, &mut state.renderer) };
         if result != CaelixResult_CAELIX_OK || state.renderer.is_null() {
@@ -823,6 +857,7 @@ impl App {
                     upscaler_rr: self.upscaler_support.map(|s| s.rr),
                     upscaler_info: upscaler_info(state.renderer),
                     gi: gi_stats(state.renderer),
+                    light: light_stats(state.scene),
                     world_name: state.loader.as_ref().and(self.args.world.as_deref()).map(file_name),
                     world_note: self.world_note.clone(),
                     sky_name: self.sky_path.as_deref().map(file_name),
@@ -1143,8 +1178,19 @@ impl App {
                         let timings = gpu_timings(state.renderer);
                         let gi = gi_stats(state.renderer);
                         println!(
-                            "timings: trace_ms={:.3} gi_ms={:.3} denoise_ms={:.3} composite_ms={:.3} upscale_ms={:.3}",
-                            timings.trace_ms, gi.gi_ms, timings.denoise_ms, timings.composite_ms, timings.upscale_ms
+                            "timings: trace_ms={:.3} gi_ms={:.3} light_ms={:.3} denoise_ms={:.3} composite_ms={:.3} \
+                             upscale_ms={:.3}",
+                            timings.trace_ms,
+                            gi.gi_ms,
+                            gi.light_fill_ms,
+                            timings.denoise_ms,
+                            timings.composite_ms,
+                            timings.upscale_ms
+                        );
+                        let light = light_stats(state.scene);
+                        println!(
+                            "light: bricks={} dropped={} table_bytes={} cell_bytes={}",
+                            light.bricks, light.bricks_dropped, light.table_bytes, gi.light_cell_bytes
                         );
                         self.screenshot = Screenshot::Done;
                         if self.args.exit_after_screenshot {
@@ -1638,6 +1684,14 @@ fn scene_stats(scene: *const CaelixScene) -> CaelixSceneStats {
     stats
 }
 
+fn light_stats(scene: *const CaelixScene) -> CaelixLightStats {
+    // SAFETY: CaelixLightStats holds only integers, so all-zero is a valid value.
+    let mut stats: CaelixLightStats = unsafe { std::mem::zeroed() };
+    // SAFETY: the scene is live and stats is writable.
+    unsafe { caelix_scene_get_light_stats(scene, &mut stats) };
+    stats
+}
+
 fn gi_stats(renderer: *const CaelixRenderer) -> CaelixGiStats {
     // SAFETY: CaelixGiStats holds only numbers, so all-zero is a valid value.
     let mut stats: CaelixGiStats = unsafe { std::mem::zeroed() };
@@ -1698,17 +1752,18 @@ fn upscaler_info_line(info: &CaelixUpscalerInfo) -> String {
     )
 }
 
-/// "Caelix Renderer | trace 1.23 ms | gi 0.31 ms (177 MB) | denoise 0.40 ms | upscale 0.49 ms |
-/// composite 0.05 ms | flush 0.45 ms | 144 fps"
+/// "Caelix Renderer | trace 1.23 ms | gi 0.31 ms (177 MB) | light 0.05 ms | denoise 0.40 ms |
+/// upscale 0.49 ms | composite 0.05 ms | flush 0.45 ms | 144 fps"
 fn timing_line(renderer: *const CaelixRenderer, fps: f64) -> String {
     let timings = gpu_timings(renderer);
     let gi = gi_stats(renderer);
     format!(
-        "Caelix Renderer | trace {:.2} ms | gi {:.2} ms ({:.0} MB) | denoise {:.2} ms | upscale {:.2} ms | \
-         composite {:.2} ms | flush {:.2} ms | {:.0} fps",
+        "Caelix Renderer | trace {:.2} ms | gi {:.2} ms ({:.0} MB) | light {:.2} ms | denoise {:.2} ms | \
+         upscale {:.2} ms | composite {:.2} ms | flush {:.2} ms | {:.0} fps",
         timings.trace_ms,
         gi.gi_ms,
         gi.reservoir_bytes as f64 / 1e6,
+        gi.light_fill_ms,
         timings.denoise_ms,
         timings.upscale_ms,
         timings.composite_ms,
@@ -1997,8 +2052,21 @@ fn main() -> anyhow::Result<()> {
             spatial_passes: args.gi_spatial_passes,
             spatial_radius: args.gi_radius,
             depth_threshold: args.gi_depth_threshold,
+            light_nee: args.gi_light_nee,
+            light_cells: args.light_cells,
+            light_candidates: args.light_candidates,
+            light_footprint: args.light_footprint,
         },
     };
+    if !args.light_cells.is_power_of_two() || !(1024..=1048576).contains(&args.light_cells) {
+        bail!("--light-cells {} must be a power of two in 1024..1048576", args.light_cells);
+    }
+    if !args.light_footprint.is_finite() || args.light_footprint < 0.0 {
+        bail!("--light-footprint {} must be a finite value >= 0", args.light_footprint);
+    }
+    if !args.light_min_emission.is_finite() || args.light_min_emission < 0.0 {
+        bail!("--light-min-emission {} must be a finite value >= 0", args.light_min_emission);
+    }
 
     if !(1..=120).contains(&args.test_edit_interval) {
         bail!("--test-edit-interval {} is outside 1..120", args.test_edit_interval);

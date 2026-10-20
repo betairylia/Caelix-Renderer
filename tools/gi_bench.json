@@ -28,6 +28,13 @@
       "pose": "3523.0,479.8,4912.0,-1.119,-127.260",
       "fov": 60,
       "extra": []
+    },
+    {
+      "name": "shroom",
+      "world": "F:/RP_Games/Caelix-family/ScenesPlayground/Artifacts/ancient-shroom-forest-20261015/out/ancient-shroom-forest.cxw",
+      "pose": null,
+      "fov": 60,
+      "extra": ["--sky-zenith", "0,0,0", "--sky-horizon", "0,0,0", "--sky-ground", "0,0,0"]
     }
   ]
 }

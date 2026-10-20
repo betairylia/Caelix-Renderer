@@ -264,6 +264,15 @@ pub struct GiSettings {
     pub spatial_radius: f32,
     /// Fraction of the view depth.
     pub depth_threshold: f32,
+    /// Both methods: next-event estimation on the scene's light list (`CAELIX_GI_FLAG_LIGHT_NEE`,
+    /// docs/LIGHT_LIST.md).
+    pub light_nee: bool,
+    /// Light cells (a power of two, 1024..1048576).
+    pub light_cells: u32,
+    /// Candidates per cell reservoir and frame (1..64).
+    pub light_candidates: u32,
+    /// World units per pixel below which a vertex uses 8-voxel cells (else 32-voxel cells).
+    pub light_footprint: f32,
 }
 
 impl Default for GiSettings {
@@ -280,6 +289,10 @@ impl Default for GiSettings {
             spatial_passes: 1,
             spatial_radius: 30.0,
             depth_threshold: 0.1,
+            light_nee: false,
+            light_cells: 65536,
+            light_candidates: 8,
+            light_footprint: 0.25,
         }
     }
 }
@@ -303,6 +316,9 @@ impl GiSettings {
         if self.unbiased {
             flags |= CAELIX_GI_FLAG_UNBIASED;
         }
+        if self.light_nee {
+            flags |= CAELIX_GI_FLAG_LIGHT_NEE;
+        }
         flags
     }
 
@@ -317,6 +333,10 @@ impl GiSettings {
             spatial_radius: self.spatial_radius,
             depth_threshold: self.depth_threshold,
             reset: u32::from(reset),
+            light_cell_capacity: self.light_cells,
+            light_candidates: self.light_candidates,
+            light_level_footprint: self.light_footprint,
+            light_reserved: 0,
         }
     }
 }

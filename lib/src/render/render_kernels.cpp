@@ -64,7 +64,7 @@ RenderKernels::RenderKernels(Device& device)
     try
     {
         // Trace set: binding 0 the TLAS, bindings 1..6 the host targets, 7..18 the
-        // internal targets, 19 the sky cubemap, 20 its sampler. Every binding is
+        // internal targets, 19 the sky cubemap, 20 its sampler, 21 the light cells. Every binding is
         // PARTIALLY_BOUND (descriptorBindingPartiallyBound, a device requirement): a render
         // call writes only the TLAS when there is one, the targets that are present, the
         // internal targets in the lighting modes and the sky bindings, and the kernel
@@ -74,6 +74,7 @@ RenderKernels::RenderKernels(Device& device)
         trace_types[0] = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         trace_types[kTraceSkyBinding] = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         trace_types[kTraceSkyBinding + 1] = VK_DESCRIPTOR_TYPE_SAMPLER;
+        trace_types[kTraceLightCellsBinding] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         trace_layout_ = CreateSetLayout(vk_device, kTraceBindingCount, trace_types);
         // Composite set: binding 0 the host colour target, 1..8 internal targets, 9 the upscale
         // input, 10 the sky cubemap, 11 its sampler. The cross resolve kernel uses the same layout
@@ -118,6 +119,10 @@ RenderKernels::RenderKernels(Device& device)
         const std::vector<uint32_t> shade_spirv = LoadShader("caelix_restir_gi_shade");
         restir_shade_ = ComputePipeline(vk_device, shade_spirv, sizeof(TracePush), "caelix_restir_gi_shade",
                                         trace_layout_);
+        // Light cell fill (docs/LIGHT_LIST.md): the trace set (binding 21 the cells).
+        const std::vector<uint32_t> cells_spirv = LoadShader("caelix_light_cells");
+        light_cells_ = ComputePipeline(vk_device, cells_spirv, sizeof(TracePush), "caelix_light_cells",
+                                       trace_layout_);
 
         // The sky sampler: trilinear, clamp to edge (a cube view samples across faces anyway),
         // every mip (the kernels clamp the lod to sky_max_lod).
@@ -156,6 +161,7 @@ RenderKernels::RenderKernels(Device& device)
         restir_temporal_ = ComputePipeline();
         restir_spatial_ = ComputePipeline();
         restir_shade_ = ComputePipeline();
+        light_cells_ = ComputePipeline();
         if (sky_sampler_ != VK_NULL_HANDLE)
         {
             vkDestroySampler(vk_device, sky_sampler_, nullptr);
@@ -172,7 +178,7 @@ RenderKernels::RenderKernels(Device& device)
     }
     CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_composite, caelix_cross_resolve, "
                 "caelix_sky_sh, caelix_upscale_encode, caelix_restir_gi_temporal, caelix_restir_gi_spatial, "
-                "caelix_restir_gi_shade");
+                "caelix_restir_gi_shade, caelix_light_cells");
 }
 
 RenderKernels::~RenderKernels()
@@ -191,6 +197,7 @@ RenderKernels::~RenderKernels()
     restir_temporal_ = ComputePipeline();
     restir_spatial_ = ComputePipeline();
     restir_shade_ = ComputePipeline();
+    light_cells_ = ComputePipeline();
     if (trace_layout_ != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorSetLayout(device, trace_layout_, nullptr);

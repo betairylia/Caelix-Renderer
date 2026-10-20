@@ -577,6 +577,38 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
     return scene->impl->GetMaterial(code, *out);
 }
 
+CAELIX_API CaelixResult caelix_scene_set_light_options(CaelixScene* scene, const CaelixLightOptions* options)
+{
+    constexpr const char* kFunction = "caelix_scene_set_light_options";
+    caelix::Scene* impl = SceneFor(scene, kFunction);
+    if (impl == nullptr)
+    {
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (options == nullptr)
+    {
+        CAELIX_LOGE("%s: options is null", kFunction);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    try
+    {
+        return impl->SetLightOptions(*options);
+    }
+    catch (...)
+    {
+        return TranslateException(kFunction);
+    }
+}
+
+CAELIX_API void caelix_scene_get_light_stats(const CaelixScene* scene, CaelixLightStats* out)
+{
+    if (scene == nullptr || scene->impl == nullptr || out == nullptr)
+    {
+        return;
+    }
+    scene->impl->GetLightStats(*out);
+}
+
 CAELIX_API CaelixResult caelix_renderer_create(CaelixDevice* device, CaelixScene* scene,
                                                CaelixRenderer** out_renderer)
 {

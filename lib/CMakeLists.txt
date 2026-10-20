@@ -38,6 +38,7 @@ add_library(caelix_renderer SHARED
   src/scene/scene_bricks.cpp
   src/scene/scene_entities.cpp
   src/scene/scene_flush.cpp
+  src/scene/scene_lights.cpp
   src/scene/scene_materials.cpp
   src/scene/material_table.cpp
   src/scene/material_table.h
@@ -106,13 +107,18 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_block.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_frame.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_material.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_light.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_finalize.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_compact.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_scan.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_brick_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_scene_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_trace_set.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_restir_gi.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_sample.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_cells.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_restir_gi_temporal.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_restir_gi_spatial.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_restir_gi_shade.hlsl

@@ -6,7 +6,7 @@ namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
 // together. One per render call, in a host-visible buffer; its device address is
-// the only push constant of the trace and composite kernels. 608 bytes. Every field sits at an offset
+// the only push constant of the trace and composite kernels. 672 bytes. Every field sits at an offset
 // that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
 // std430 and scalar layout rules give the same offsets.
 struct FrameConstants
@@ -87,8 +87,18 @@ struct FrameConstants
     uint32_t gi_spatial_passes;         // 596
     uint32_t gi_history_valid;          // 600  1 = gi_prev holds last frame's reservoirs of this renderer
     float gi_depth_threshold;           // 604
+    // Light list (docs/LIGHT_LIST.md); addresses 0 = none.
+    uint64_t light_table;               // 608  Scene::light_table_address()
+    uint64_t light_cells;               // 616  the renderer's light cells; 0 without CAELIX_GI_FLAG_LIGHT_NEE
+    uint32_t light_cell_capacity;       // 624  cells (a power of two)
+    uint32_t light_candidates;          // 628  K: candidates per cell reservoir
+    float light_level_footprint;        // 632  world units per pixel: below -> level 0 cells, else level 1
+    float light_min_emission;           // 636  Scene::light_min_emission()
+    uint32_t frame_counter;             // 640  the renderer's render count (1, 2, ...)
+    uint32_t light_entity_mask;         // 644  reserved, 0
+    uint32_t pad_648[6];                // 648 .. 671
 };
-static_assert(sizeof(FrameConstants) == 608);
+static_assert(sizeof(FrameConstants) == 672);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -128,6 +138,11 @@ static_assert(offsetof(FrameConstants, gi_out) == 568);
 static_assert(offsetof(FrameConstants, gi_method) == 576);
 static_assert(offsetof(FrameConstants, gi_spatial_radius) == 592);
 static_assert(offsetof(FrameConstants, gi_depth_threshold) == 604);
+static_assert(offsetof(FrameConstants, light_table) == 608);
+static_assert(offsetof(FrameConstants, light_cells) == 616);
+static_assert(offsetof(FrameConstants, light_cell_capacity) == 624);
+static_assert(offsetof(FrameConstants, light_min_emission) == 636);
+static_assert(offsetof(FrameConstants, frame_counter) == 640);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

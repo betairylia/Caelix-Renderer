@@ -60,6 +60,11 @@
 //                   on the path; the first bounce of the path is stored as the pixel's initial
 //                   reservoir (fc.gi_initial) and the diffuse and specular radiance targets get
 //                   0: caelix_restir_gi_shade.hlsl writes the diffuse one after the reuse passes.
+//                   kGiFlagLightNee (docs/LIGHT_LIST.md, render/caelix_light_sample.hlsl): every
+//                   diffuse vertex with a next segment also samples the scene's light list
+//                   (LightNextEvent) and the segment that leaves it does not count the emission
+//                   of the list light it hits; in ReSTIR mode the primary vertex's light NEE goes
+//                   to the diffuse target unpacked (the shade pass adds the reservoir to it).
 //
 // Inputs: the push constant is the device address of the frame constants; the
 // scene's tables (page table, slot rows, group infos, entity infos) are read by
@@ -78,6 +83,7 @@
 #include "common/caelix_block.hlsl"
 #include "render/caelix_scene_trace.hlsl"
 #include "common/caelix_material.hlsl"
+#include "common/caelix_light.hlsl"
 // The push constant, the targets and the sky bindings (before caelix_shading.hlsl).
 #include "render/caelix_trace_set.hlsl"
 #include "render/caelix_shading.hlsl"
@@ -85,6 +91,7 @@
 // NRDConfig.hlsli next to it fixes the encodings NRD was built with.
 #include "NRD.hlsli"
 #include "render/caelix_restir_gi.hlsl"
+#include "render/caelix_light_sample.hlsl"
 
 static const float kRayTMax = 1e30f;
 static const uint kStepsHeatMax = 64;
@@ -278,6 +285,14 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // throughput restarts at 1 there, so the returned radiance is L_o(x_s) (the emission of the
 // first bounce hit plus the continuation from it), or the sky of a first segment that misses.
 // Without `restir` the path is the same as before (no extra random number, same order).
+//
+// Light NEE (kGiFlagLightNee with a light table): at the same vertices as the sun NEE
+// (diffuse lobe, a next segment exists) LightNextEvent * throughput is added, from its own
+// random stream; the segment that leaves such a vertex skips the emission of a list light it
+// hits (luminance of the emission >= fc.light_min_emission), so NEE replaces exactly that
+// emission. A segment that leaves a vertex without light NEE (a specular lobe) still counts it.
+// `primary_light` receives the primary vertex's light NEE; with `restir` it is not in the
+// returned radiance (the caller writes it to the diffuse target, the shade pass adds it).
 struct GiInitialSample
 {
     bool valid;            // the path had a first segment (bounce_count >= 1)
@@ -288,9 +303,16 @@ struct GiInitialSample
     float cos_theta_v;     // max(0, dot(n_v, first bounce direction))
 };
 
+// The entity-local point of a hit for its light cell: a quarter voxel into the air along the face
+// normal, so that the cell is the one of the space the vertex sees.
+float3 LightCellPoint(TraceResult hit)
+{
+    return hit.object_hit + 0.25f * float3(UnpackObjectNormal(hit.attrib));
+}
+
 CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
                             uint medium, bool restir, inout uint rng, out float4 stochastic,
-                            out GiInitialSample gi)
+                            out GiInitialSample gi, out float3 primary_light)
 {
     gi.valid = false;
     gi.sky = false;
@@ -300,6 +322,9 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     gi.cos_theta_v = 0.0f;
     uint nee_rng = InitRandom(pixel, fc.frame_seed ^ 0x68E31DA4u);
     const bool nee = !restir && (fc.flags & kRenderFlagSunNee) != 0u && any(fc.sun_radiance.xyz > 0.0f);
+    uint light_rng = InitRandom(pixel, fc.frame_seed ^ 0x7F4A7C15u);
+    const bool light_nee = (fc.gi_flags & kGiFlagLightNee) != 0u && fc.light_table != 0u;
+    primary_light = float3(0.0f, 0.0f, 0.0f);
     const uint surface_block = (surface.attrib >> 16) & 0xFFFFu;
     const CaelixShadeResult primary_shade =
         ShadeVoxelHit(surface_block, ray.Origin + ray.Direction * surface.T, ray.Direction,
@@ -325,6 +350,20 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     {
         radiance += SunNextEvent(fc, primary_shade.bounce_origin, surface.normal, nee_rng) * throughput;
         segment_sees_sun = false;
+    }
+    // Light NEE at the primary vertex.
+    bool segment_light_nee = false;
+    CAELIX_BRANCH
+    if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
+    {
+        primary_light = LightNextEvent(fc, primary_shade.bounce_origin, surface.normal, surface.group,
+                                       LightCellPoint(surface), light_rng) *
+                        throughput;
+        if (!restir)
+        {
+            radiance += primary_light;
+        }
+        segment_light_nee = true;
     }
 
     RayDesc bounce;
@@ -383,7 +422,11 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
                           bounce.Direction, hit.normal, rng, medium);
         bounce_index += 1;
 
-        radiance += shade.emission * throughput;
+        // A list light's emission belongs to the light NEE of the vertex the segment left.
+        if (!(segment_light_nee && shade.emission_luminance >= fc.light_min_emission))
+        {
+            radiance += shade.emission * throughput;
+        }
         throughput *= shade.albedo / max(0.001f, shade.k);
 
         segment_sees_sun = true;
@@ -392,6 +435,15 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         {
             radiance += SunNextEvent(fc, shade.bounce_origin, hit.normal, nee_rng) * throughput;
             segment_sees_sun = false;
+        }
+        segment_light_nee = false;
+        CAELIX_BRANCH
+        if (light_nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
+        {
+            radiance += LightNextEvent(fc, shade.bounce_origin, hit.normal, hit.group, LightCellPoint(hit),
+                                       light_rng) *
+                        throughput;
+            segment_light_nee = true;
         }
 
         // Russian roulette: dark paths stop early. A zero throughput must stop here,
@@ -623,8 +675,9 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         {
             float4 stochastic;
             GiInitialSample gi_sample;
+            float3 primary_light;
             const CaelixShadeResult shade = TracePath(fc, pixel, chain.ray, chain.surface, chain.medium, restir,
-                                                      rng, stochastic, gi_sample);
+                                                      rng, stochastic, gi_sample, primary_light);
             // The chain's transmission modulates everything the surface sends (Unity:
             // AlbedoTarget = throughput * albedo, deterministic = throughput * emission).
             material_albedo = chain.throughput * shade.albedo;
@@ -684,7 +737,9 @@ void main(uint3 thread_id : SV_DispatchThreadID)
                     gi_reservoir.visible_pos = shade.bounce_origin;
                     gi_reservoir.visible_flags_m = GiFaceIndex(normal) | (1u << kGiMShift);
                 }
-                diffuse = float4(0.0f, 0.0f, 0.0f, 0.0f);
+                // The primary vertex's light NEE (0 without the flag), unpacked: the shade pass adds
+                // the reservoir's contribution to it and packs the sum.
+                diffuse = float4(SanitizeRadiance(primary_light), 0.0f);
                 specular = float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
 

@@ -62,7 +62,7 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // executor is created at the first denoised render and recreated (history lost)
 // when the size changes, the old one is destroyed once its last frame is safe.
 // Per-frame resources
-// live in a ring of slots (four descriptor sets + 608-byte constants buffer); a
+// live in a ring of slots (four descriptor sets + 672-byte constants buffer); a
 // slot is reused only when its frame is safe. The camera of each successful
 // render call is kept as the previous camera of the next one (motion targets). A
 // renderer renders at most once per frame number (last_frame_).
@@ -76,6 +76,15 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // previous frame's final reservoirs), temp and out (ping-pong); after a ReSTIR frame the
 // final one becomes prev. Created at the first ReSTIR render, recreated (old ones retired
 // until safe) when the render size changes, kept while another method runs.
+//
+// Light NEE (CAELIX_GI_FLAG_LIGHT_NEE, lighting modes; docs/LIGHT_LIST.md): the renderer owns the
+// light cells (CaelixGiOptions::light_cell_capacity x 288 bytes, trace set binding 21), created and
+// zero-filled at the first render with the flag, recreated (the old buffer retired until safe) when
+// the capacity changes, kept while the flag is off. When the scene has a light table, the light cell
+// fill (caelix_light_cells, trace set, TracePush) runs before the sky SH kernel and the trace, with
+// its own timer (CaelixGiStats::light_fill_ms); a compute -> compute barrier orders its writes before
+// the trace, which reads the reservoirs and inserts new cells. frame_counter_ (the render count) is
+// the cells' clock.
 //
 // Internal targets (lighting modes only): created at the first lighting render,
 // recreated when the host target size changes (the old images are destroyed once
@@ -186,6 +195,11 @@ private:
         uint64_t frame = 0;  // the last frame that used them
         GiBuffers buffers;
     };
+    struct RetiredLightCells
+    {
+        uint64_t frame = 0;  // the last frame that used it
+        GpuBuffer buffer;
+    };
     struct RetiredUpscaler
     {
         uint64_t frame = 0;  // the last frame that used them
@@ -226,6 +240,10 @@ private:
     // ones are retired until `frame` is safe and the history is dropped. Returns true when it
     // created them.
     bool EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame);
+    // Creates the light cells when they are missing or of another capacity; the old buffer is
+    // retired until `frame` is safe. A new buffer is zero-filled by the next render
+    // (light_cells_need_clear_).
+    void EnsureLightCells(uint32_t capacity, uint64_t frame);
     // The device address of reservoir buffer `which` (GiBuffer) under the current rotation.
     uint64_t GiAddress(GiBuffer which) const
     {
@@ -313,6 +331,14 @@ private:
     uint64_t gi_last_frame_ = 0;         // the last frame that used gi_buffers_
     std::vector<RetiredGiBuffers> retired_gi_;
     GpuTimer gi_timer_;                  // temporal + spatial + shade dispatches
+    // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE).
+    GpuBuffer light_cells_;                  // capacity x 288 bytes (render/caelix_light_sample.hlsl)
+    uint32_t light_cell_capacity_ = 0;       // cells of light_cells_
+    bool light_cells_need_clear_ = false;    // light_cells_ is new: the next render zero-fills it
+    uint64_t light_cells_last_frame_ = 0;    // the last frame that used light_cells_
+    std::vector<RetiredLightCells> retired_light_cells_;
+    GpuTimer light_timer_;                   // the light cell fill
+    uint32_t frame_counter_ = 0;             // render calls of this renderer (the cells' clock)
 };
 
 }  // namespace caelix

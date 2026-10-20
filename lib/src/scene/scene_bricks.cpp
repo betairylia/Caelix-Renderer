@@ -91,6 +91,7 @@ Scene::Placed Scene::PlaceBrick(CaelixEntityId entity_id, const Location& loc)
         {
             new_slots = slot_tables_.Allocate(kSlotMinRows);
             new_aabbs = aabbs_.Allocate(kSlotMinRows);
+            ReserveLightWords();
             new_reverse = reverse_tables_.Allocate(bricks_per_group_);
             if (free_groups_.empty())
             {
@@ -116,6 +117,7 @@ Scene::Placed Scene::PlaceBrick(CaelixEntityId entity_id, const Location& loc)
             {
                 new_slots = slot_tables_.Allocate(group.slot_rows.rows * 2);
                 new_aabbs = aabbs_.Allocate(group.slot_rows.rows * 2);
+                ReserveLightWords();
             }
         }
     }

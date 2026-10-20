@@ -644,6 +644,27 @@ measurement protocol and results: `docs/GI_EXPERIMENTS.md`. The host flags are
 `--gi` and `--gi-*` (see "Running the host"), the debug UI has a GI section in
 the Render window.
 
+### Light list and light NEE (step 1)
+
+Emissive voxels whose material is a "list light" (luminance of the emission,
+before `emission_scale`, at least `CaelixLightOptions::min_emission`, default
+20) are sampled by next-event estimation (`docs/LIGHT_LIST.md`). The finalize
+kernel writes one light word per AABB row (the luminance sum of the brick's
+alive list-light voxels, a separate buffer), and every flush that finalized
+bricks, freed ids or moved AABB ranges rebuilds the scene's light table
+(`caelix_light_compact` + `caelix_light_scan`: one 128-byte entry per brick
+with list lights, plus a CDF; capacity `max_bricks`, default 65536, bricks
+beyond it are dropped and counted). `caelix_scene_set_light_options` /
+`caelix_scene_get_light_stats` set and read it. With
+`CAELIX_GI_FLAG_LIGHT_NEE` (either GI method) the renderer owns a hash table of
+light cells (world-space ReGIR reservoirs keyed by entity, level and cell
+coordinate; 288 bytes per cell, 65536 by default), refilled by
+`caelix_light_cells` before every trace; every diffuse vertex with a next
+segment samples a brick from its cell (or the global CDF), a voxel face point
+in it, and traces one shadow ray; the segment that leaves such a vertex no
+longer counts the emission of a list light it hits.
+`CaelixGiStats::light_cell_bytes` and `light_fill_ms` report the cells.
+
 ### Render targets and G-buffer mode
 
 `CaelixRenderTargets` has six targets. Each is optional: a target is present
@@ -865,6 +886,15 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   (1/M weights: -3.2 %; unbiased Z weights: -1.0 %, the temporal reuse has no
   visibility ray); after switching back the path tracer image is bit-identical
   with and without `CAELIX_GI_FLAG_DIFFUSE_ONLY` (packed materials are diffuse).
+- `caelix_trace_test`, light list cases (`docs/LIGHT_LIST.md`): the light table
+  of a two-brick scene has one entry (none above every emission, also when the
+  threshold is set before the upload; one dropped with a capacity of one);
+  light NEE in a closed 24^3 box lit by one strength-3 voxel matches the plain
+  path tracer's mean (1024 vs 4096 reference frames, 128x128, 4 bounces: ratio
+  1.0095 against a path tracer noise floor of 1.0060, 16x16 block PSNR
+  45.8 dB); one path tracer frame without the flag is bit-identical on a scene
+  whose table has entries and one whose table is empty; the light cells (1024)
+  are created, filled and timed, and a 1 spp frame is lit; option validation.
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -1015,8 +1045,21 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   (1..8, default 5), `--gi-spatial-passes <N>` (1..2, default 1),
   `--gi-radius <F>` (pixels, default 30), `--gi-depth-threshold <F>`
   (fraction of the view depth, default 0.1). With `--screenshot` the host also
-  prints `timings: trace_ms=... gi_ms=... denoise_ms=... composite_ms=...
-  upscale_ms=...` on stdout when the PNG is written.
+  prints `timings: trace_ms=... gi_ms=... light_ms=... denoise_ms=...
+  composite_ms=... upscale_ms=...` and `light: bricks=... dropped=...
+  table_bytes=... cell_bytes=...` on stdout when the PNG is written.
+- `--gi-light-nee`: both GI methods, next-event estimation on the scene's light
+  list at every diffuse vertex (`CAELIX_GI_FLAG_LIGHT_NEE`, see "Light list
+  and light NEE"). Scene options (set once, before the world loads):
+  `--light-min-emission <F>` (list-light threshold on the emission luminance;
+  0 = the library default 20) and `--light-max-bricks <N>` (light table
+  capacity, 1..1048576, default 65536). Light cell options:
+  `--light-cells <N>` (a power of two, 1024..1048576, default 65536),
+  `--light-candidates <N>` (1..64, default 8) and `--light-footprint <F>`
+  (world units per pixel below which a vertex uses 8-voxel cells, else
+  32-voxel cells; default 0.25). The debug UI's GI section has the same
+  controls and the GPU times show the light fill, the cell memory and the
+  light table's bricks and drops.
 
 ### Test entity and brick edits
 

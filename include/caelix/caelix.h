@@ -72,7 +72,10 @@ extern "C" {
    caelix_jitter_halton) and CaelixUpscalerInfo with caelix_renderer_get_upscaler_info, also without
    a bump. The GI experiment step added CaelixGiMethod, CAELIX_GI_FLAG_*, CaelixGiOptions,
    caelix_renderer_set_gi_options, CaelixGiStats and caelix_renderer_get_gi_stats (no existing struct
-   changed), also without a bump. A host built against an older version-2 header must be rebuilt (the library reads and
+   changed), also without a bump. The light list step (docs/LIGHT_LIST.md) added CaelixLightOptions,
+   caelix_scene_set_light_options, CaelixLightStats, caelix_scene_get_light_stats and
+   CAELIX_GI_FLAG_LIGHT_NEE, and appended the light cell fields to the experimental CaelixGiOptions
+   (32 -> 48 bytes) and CaelixGiStats (16 -> 32 bytes), also without a bump. A host built against an older version-2 header must be rebuilt (the library reads and
    writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -505,6 +508,47 @@ CAELIX_API CaelixResult caelix_scene_set_material_entries(CaelixScene* scene,
    GPU at the next flush. */
 CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint32_t code,
                                                   CaelixMaterial* out);
+
+/* ---------------------------------------------------------------------------
+ * Light list (experimental, docs/LIGHT_LIST.md)
+ *
+ * A material is a "list light" when the luminance of its emission (0.2126 r + 0.7152 g + 0.0722 b,
+ * before CaelixRenderOptions::emission_scale) is >= min_emission. The finalize kernel writes one
+ * light word per brick (the luminance sum of its alive list-light voxels), and every flush that
+ * finalized bricks or freed brick ids rebuilds the scene's light table: one 128-byte entry per brick
+ * with list lights (a voxel mask, region weights, the brick's origin and mean open-face normal) and a
+ * CDF over their weights. Renderers with CAELIX_GI_FLAG_LIGHT_NEE sample it. Bricks beyond max_bricks
+ * are dropped (counted, never an error). */
+typedef struct CaelixLightOptions
+{
+    float min_emission;  /* 0 = 20.0: list light when luminance(material.emission) >= this (packed
+                            encoding: an emissive voxel of strength 2 (64 x albedo) with an albedo
+                            luminance of at least 0.3125, and every bright strength 3 voxel) */
+    uint32_t max_bricks; /* 0 = 65536; 1 .. 1048576: the light table's capacity in bricks */
+    uint32_t reserved[2];
+} CaelixLightOptions;
+
+/* Scene-wide. The light table is built only once this function was called (a host that never calls
+   it, the Unity plugin today, pays nothing beyond the 4-byte light words); pass zeros for the
+   defaults. min_emission applies to bricks finalized after
+   the call and to the next table rebuild; bricks finalized before keep their light word until they
+   are finalized again (call before the uploads). A new max_bricks reallocates the table at the next
+   flush. Validation: min_emission not finite or negative, max_bricks above 1048576 ->
+   CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
+CAELIX_API CaelixResult caelix_scene_set_light_options(CaelixScene* scene, const CaelixLightOptions* options);
+
+typedef struct CaelixLightStats
+{
+    uint32_t bricks;         /* entries of the table after the newest rebuild whose frame is safe
+                                (read back from the GPU; 0 before the first one) */
+    uint32_t bricks_dropped; /* bricks with list lights beyond max_bricks in that rebuild */
+    uint64_t table_bytes;    /* GPU size of the light table (64 + 132 bytes per max_bricks entry) plus
+                                the light words (4 bytes per AABB row) */
+    uint64_t rebuilds;       /* flushes that rebuilt the table so far */
+} CaelixLightStats;
+
+/* Fills *out; a null argument is ignored. */
+CAELIX_API void caelix_scene_get_light_stats(const CaelixScene* scene, CaelixLightStats* out);
 
 /* ---------------------------------------------------------------------------
  * Renderer: traces a scene into the host's images
@@ -1107,12 +1151,20 @@ typedef enum CaelixGiMethod
 #define CAELIX_GI_FLAG_VISIBILITY (1u << 2)   /* a shadow ray per reused neighbour sample (occluded -> weight 0) */
 #define CAELIX_GI_FLAG_UNBIASED (1u << 3)     /* Z-count MIS instead of 1/M (implies VISIBILITY rays per neighbour) */
 #define CAELIX_GI_FLAG_DIFFUSE_ONLY (1u << 4) /* force the Lambert lobe at every vertex */
+#define CAELIX_GI_FLAG_LIGHT_NEE (1u << 5)    /* next-event estimation on the scene's light list at every
+                                                 diffuse vertex (docs/LIGHT_LIST.md); both methods */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
    path, with the path's radiance from there on), then a temporal pass, up to two spatial passes and a
    shade pass write the diffuse radiance that the composite (or NRD) reads. It forces the Lambert lobe
-   at every vertex, ignores sun NEE and the fog on the GI path, and writes no specular radiance. */
+   at every vertex, ignores sun NEE and the fog on the GI path, and writes no specular radiance.
+   CAELIX_GI_FLAG_LIGHT_NEE (either method): every diffuse vertex that has a next segment samples one
+   point on a list light (an emissive voxel face whose material is a list light of the scene, see
+   CaelixLightOptions) through the renderer's light cells (world-space reservoirs keyed by entity,
+   level and cell coordinate, refilled before every trace) and traces a shadow ray; a segment that
+   leaves such a vertex no longer counts the emission of the list light it hits. The light_* fields
+   size the cells. */
 typedef struct CaelixGiOptions
 {
     uint32_t method;          /* CaelixGiMethod */
@@ -1123,6 +1175,12 @@ typedef struct CaelixGiOptions
     float spatial_radius;     /* pixels, 0 = 30 */
     float depth_threshold;    /* 0 = 0.1: |x_v(q) - x_v(r)| must be below threshold * view_z(r) */
     uint32_t reset;           /* 1 = drop the reservoir history with the next render */
+    uint32_t light_cell_capacity; /* 0 = 65536 light cells; else a power of two in 1024 .. 1048576
+                                     (288 bytes per cell) */
+    uint32_t light_candidates;    /* 0 = 8; 1 .. 64 candidates per cell reservoir and frame */
+    float light_level_footprint;  /* 0 = 0.25: a vertex whose pixel footprint (world units per pixel at
+                                     its camera distance) is below this uses 8-voxel cells, else 32 */
+    uint32_t light_reserved;      /* 0 */
 } CaelixGiOptions;
 
 /* Sets the GI options of the renderer; they apply from the next render on and stay until the next
@@ -1132,8 +1190,11 @@ typedef struct CaelixGiOptions
    reservoir history. With CAELIX_GI_PATH_TRACE and without CAELIX_GI_FLAG_DIFFUSE_ONLY the image is
    the path tracer's, bit for bit. The reservoir buffers (4 x 48 bytes per pixel) are allocated at
    the first ReSTIR render and kept until the renderer is destroyed (recreated on a size change).
+   The light cells (light_cell_capacity x 288 bytes) are allocated at the first render with
+   CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity changes.
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
-   floats -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
+   floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,
+   light_candidates > 64 -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);
 
 typedef struct CaelixGiStats
@@ -1141,6 +1202,9 @@ typedef struct CaelixGiStats
     float gi_ms;              /* GPU time of the GI passes (temporal + spatial + shade) of the frame of
                                  CaelixGpuTimings (0 when that frame ran no GI pass) */
     uint64_t reservoir_bytes; /* bytes of the reservoir buffers currently allocated */
+    uint64_t light_cell_bytes; /* bytes of the light cell table currently allocated */
+    float light_fill_ms;       /* GPU time of the light cell fill of the frame of CaelixGpuTimings (0 when
+                                  that frame ran no fill) */
 } CaelixGiStats;
 
 /* Fills *out; a null argument is ignored. */

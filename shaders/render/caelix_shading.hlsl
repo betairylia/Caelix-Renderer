@@ -288,6 +288,7 @@ struct CaelixShadeResult
 {
     float3 albedo;
     float3 emission;
+    float emission_luminance;  // luminance of the material's emission before emission_scale (list-light test)
     float3 bounce_origin;
     float3 bounce_direction;
     bool specular_lobe;  // the bounce sampled the specular lobe (always at a transparent block)
@@ -313,6 +314,7 @@ CaelixShadeResult ShadeVoxelHit(uint block, float3 hit_position, float3 ray_dire
     const CaelixMaterial material = GET_MATERIAL(block);
     CaelixShadeResult shade;
     shade.emission = material.emission * g_emissionScale;
+    shade.emission_luminance = dot(material.emission, float3(0.2126f, 0.7152f, 0.0722f));
     shade.k = 1.0f;
     CAELIX_BRANCH
     if (!IsOpaque(int(block)))

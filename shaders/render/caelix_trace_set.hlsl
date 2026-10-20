@@ -9,7 +9,9 @@
 // (lib/src/render/renderer.h, InternalTargets; fixed formats, so the kernels can read them),
 // binding 19 the sky cubemap (sampled image) and binding 20 its sampler, declared by
 // render/caelix_shading.hlsl through CAELIX_SKY_BINDING_IMAGE / _SAMPLER, which this file
-// defines: include it BEFORE caelix_shading.hlsl. Every binding is PARTIALLY_BOUND. The push
+// defines: include it BEFORE caelix_shading.hlsl. Binding 21 is the renderer's light cell table
+// (render/caelix_light_sample.hlsl, a storage buffer: the cell insertion needs atomics, which need a
+// descriptor with this DXC), written when the light cells exist. Every binding is PARTIALLY_BOUND. The push
 // constant is CaelixTracePush (the device address of the frame constants and the spatial pass
 // index of the GI spatial kernel).
 #ifndef CAELIX_TRACE_SET_HLSL
@@ -41,5 +43,7 @@ CAELIX_BINDING(15, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_diffus
 CAELIX_BINDING(16, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_specular_albedo;
 CAELIX_BINDING(17, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_rr_normal_roughness;
 CAELIX_BINDING(18, 0) CAELIX_FORMAT("r16f") RWTexture2D<float4> g_int_rr_hit_dist;
+// The light cells (render/caelix_light_sample.hlsl); bound when fc.light_cells != 0.
+CAELIX_BINDING(21, 0) RWByteAddressBuffer g_light_cells;
 
 #endif  // CAELIX_TRACE_SET_HLSL

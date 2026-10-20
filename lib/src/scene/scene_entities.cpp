@@ -67,6 +67,7 @@ Scene::Scene(Device& device)
 Scene::~Scene()
 {
     DestroyAccelerationStructures();
+    DestroyLightObjects();
 }
 
 CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
@@ -175,9 +176,12 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
     scene->instances_ =
         GrowableBuffer(allocator, vk_device, kInstancesInitialBytes,
                        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+    // One light word per AABB row (docs/LIGHT_LIST.md).
+    scene->light_words_ = GrowableBuffer(allocator, vk_device, kAabbInitialRows * sizeof(uint32_t));
     const std::vector<uint32_t> finalize_spirv = LoadShader("caelix_finalize");
     scene->finalize_ = ComputePipeline(vk_device, finalize_spirv, sizeof(FinalizePush),
                                        "caelix_finalize");
+    scene->CreateLightObjects();
     scene->flush_timer_ = GpuTimer(device);
     CAELIX_LOGI("scene created: staging %llu bytes, %u records per page (%llu bytes), group %u^3 "
                 "bricks, record %u bytes, %s encoding, build scratch %llu bytes",
@@ -518,9 +522,13 @@ void Scene::ReleaseGroup(uint32_t group_index)
     group.nan_ids.clear();
     group.brick_count = 0;
     group.full_rewrite = false;
-    group.info_dirty = false;
     group.reverse_fill = false;
     group.alive = false;
+    // The next flush restages the GroupInfo row's high water as 0, so the light compact kernel
+    // skips the index (its rows may belong to another group by then), and rebuilds the light table.
+    group.info_dirty = true;
+    ListGroup(group_index);
+    lights_dirty_ = true;
     // The current TLAS refers to the BLAS: it is released after the next TLAS build.
     if (group.blas_handle != VK_NULL_HANDLE)
     {

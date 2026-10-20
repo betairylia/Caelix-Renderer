@@ -5,6 +5,9 @@
 // distance |x_s - x_v| normalized for roughness 1 at the pixel's view z; t_max for a sky sample),
 // so NRD, the composite and the reference accumulation read it unchanged. An invalid reservoir
 // or W = 0 writes 0 (NRD's "no sample").
+// kGiFlagLightNee (docs/LIGHT_LIST.md): the trace kernel left the primary vertex's light NEE in
+// the diffuse target, unpacked; it is added to the reservoir's contribution before the packing (an
+// invalid reservoir then packs the NEE alone with hit distance 0).
 //
 // Descriptors: render/caelix_trace_set.hlsl (internal view z, diffuse radiance).
 #include "common/caelix_platform.hlsl"
@@ -35,7 +38,16 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     // 0 or 2 spatial passes end in gi_temp, one in gi_out.
     const bool spatial_out = fc.gi_spatial_passes == 1u && (fc.gi_flags & kGiFlagSpatial) != 0u;
     const GiReservoir r = LoadGiReservoir(GiReservoirAddress(spatial_out ? fc.gi_out : fc.gi_temp, fc, pixel));
+    const float3 light_nee =
+        (fc.gi_flags & kGiFlagLightNee) != 0u ? g_int_diff[pixel].rgb : float3(0.0f, 0.0f, 0.0f);
     float4 diffuse = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    CAELIX_BRANCH
+    if (any(light_nee > 0.0f))
+    {
+        const float norm_hit_dist =
+            REBLUR_FrontEnd_GetNormHitDist(0.0f, g_int_view_z[pixel].x, fc.hit_dist_params.xyz, 1.0f);
+        diffuse = REBLUR_FrontEnd_PackRadianceAndNormHitDist(SanitizeRadiance(light_nee), norm_hit_dist, true);
+    }
     CAELIX_BRANCH
     if (GiIsValid(r) && r.W > 0.0f)
     {
@@ -48,7 +60,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             hit_distance = length(d);
             w = hit_distance > 0.0f ? d / hit_distance : float3(0.0f, 0.0f, 0.0f);
         }
-        const float3 radiance = r.radiance * (max(0.0f, dot(n_v, w)) * (1.0f / K_PI) * r.W);
+        const float3 radiance = r.radiance * (max(0.0f, dot(n_v, w)) * (1.0f / K_PI) * r.W) + light_nee;
         const float view_z = g_int_view_z[pixel].x;
         const float norm_hit_dist =
             REBLUR_FrontEnd_GetNormHitDist(hit_distance, view_z, fc.hit_dist_params.xyz, 1.0f);

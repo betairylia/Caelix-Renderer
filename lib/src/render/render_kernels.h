@@ -18,11 +18,13 @@ namespace caelix {
 // Trace set: binding 0 the TLAS, bindings 1..6 the host targets, bindings 7..18 the
 // internal targets of the lighting modes (Renderer::Internal order up to
 // kInternalAccum: the NRD G-buffer and radiance, the device depth and the four DLSS RR
-// guides), binding 19 the sky cubemap (sampled image), 20 its sampler.
+// guides), binding 19 the sky cubemap (sampled image), 20 its sampler, binding 21 the light cells
+// (a storage buffer, docs/LIGHT_LIST.md).
 constexpr uint32_t kTargetCount = 6;          // descriptor bindings 1..6
 constexpr uint32_t kTraceInternalCount = 12;  // descriptor bindings 7..18
 constexpr uint32_t kTraceSkyBinding = 1 + kTargetCount + kTraceInternalCount;
-constexpr uint32_t kTraceBindingCount = kTraceSkyBinding + 2;
+constexpr uint32_t kTraceLightCellsBinding = kTraceSkyBinding + 2;
+constexpr uint32_t kTraceBindingCount = kTraceLightCellsBinding + 1;
 // Composite set (also bound by the cross resolve kernel): binding 0 the host colour
 // target, bindings 1..8 internal targets (8 = the resolve image), binding 9 the upscale
 // input (the composite's linear output when an upscaler runs), binding 10 the sky
@@ -77,7 +79,8 @@ struct NrdKernels
 //   encode set, every binding PARTIALLY_BOUND;
 // - the compute pipelines caelix_path_trace, caelix_composite, caelix_cross_resolve,
 //   caelix_sky_sh, caelix_upscale_encode and the ReSTIR GI kernels caelix_restir_gi_temporal,
-//   caelix_restir_gi_spatial and caelix_restir_gi_shade (trace set) (push constant TracePush);
+//   caelix_restir_gi_spatial and caelix_restir_gi_shade and the light cell fill caelix_light_cells
+//   (trace set) (push constant TracePush);
 // - the sky sampler (linear, mipmapped, clamp to edge) and the fallback sky cube (1 x 1
 //   RGBA8), bound in every sky binding when the host gives no cubemap. The first render
 //   call on the device moves the cube from UNDEFINED to GENERAL (TakeFallbackSkyInit);
@@ -141,6 +144,10 @@ public:
     {
         return restir_shade_;
     }
+    const ComputePipeline& light_cells() const
+    {
+        return light_cells_;
+    }
     VkSampler sky_sampler() const
     {
         return sky_sampler_;
@@ -182,6 +189,7 @@ private:
     ComputePipeline restir_temporal_;         // shaders/render/caelix_restir_gi_temporal.hlsl, trace set
     ComputePipeline restir_spatial_;          // shaders/render/caelix_restir_gi_spatial.hlsl, trace set
     ComputePipeline restir_shade_;            // shaders/render/caelix_restir_gi_shade.hlsl, trace set
+    ComputePipeline light_cells_;             // shaders/render/caelix_light_cells.hlsl, trace set
     VkSampler sky_sampler_ = VK_NULL_HANDLE;  // linear, mipmapped, clamp to edge
     GpuImage fallback_sky_;                   // 1 x 1 RGBA8 cube bound without a host cubemap
     bool fallback_sky_needs_init_ = true;     // fallback_sky_ still in VK_IMAGE_LAYOUT_UNDEFINED

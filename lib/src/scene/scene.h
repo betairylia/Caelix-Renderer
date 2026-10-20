@@ -14,6 +14,7 @@
 #include "scene/record_layout.h"
 #include "scene/slot_table_pool.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -134,6 +135,9 @@ public:
     CaelixResult SetGlassPalette(const CaelixMaterial* entries, uint32_t count);
     CaelixResult SetMaterialEntries(const CaelixMaterialEntry* entries, uint32_t count);
     CaelixResult GetMaterial(uint32_t code, CaelixMaterial& out) const;
+    // Light list (scene_lights.cpp, docs/LIGHT_LIST.md).
+    CaelixResult SetLightOptions(const CaelixLightOptions& options);
+    void GetLightStats(CaelixLightStats& out) const;
 
     bool EntityAlive(CaelixEntityId entity) const
     {
@@ -184,6 +188,17 @@ public:
     uint32_t encoding() const
     {
         return encoding_;
+    }
+    // The light table (LightTableHeader, LightEntry rows, CDF) once a flush has rebuilt it; 0
+    // before (and after a reallocation until the next rebuild).
+    VkDeviceAddress light_table_address() const
+    {
+        return light_table_built_ ? light_table_.buffer.address() : 0;
+    }
+    // The list-light threshold (CaelixLightOptions::min_emission after the default).
+    float light_min_emission() const
+    {
+        return light_min_emission_;
     }
     // GPU time of the flush of `frame`, once that frame is safe. False when the
     // flush recorded no work, was not measured, or is not resolved yet.
@@ -245,6 +260,20 @@ private:
         AsBlock block;
         VkAccelerationStructureKHR handle;
     };
+    // The light table buffer and the descriptor set of the light kernels that binds it.
+    struct LightTableGpu
+    {
+        GpuBuffer buffer;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        uint32_t capacity = 0;  // max_bricks of the buffer
+    };
+    struct RetiredLightTable
+    {
+        uint64_t frame;  // destroy when the safe frame is >= this
+        LightTableGpu table;
+    };
+    static constexpr uint32_t kLightReadbackSlots = 8;
 
     explicit Scene(Device& device);
 
@@ -290,7 +319,11 @@ private:
     void StageMaterials();
     // Builds the dispatch list from dirty_. Returns the number of entries staged.
     uint32_t StageDirtyList();
+    // The NaN AABB row and the zero light word of the open flush window in the staging ring.
     bool EnsureNanRow();
+    // Restages the high water of a released group's GroupInfo row as 0 (the light compact kernel
+    // then skips it). Returns false when the ring has no room.
+    bool StageReleasedGroup(uint32_t group_index);
     void RecordCopies(VkCommandBuffer cmd);
 
     // Acceleration structures.
@@ -306,6 +339,20 @@ private:
     bool PlanAccelerationStructures(uint64_t frame, bool& out_of_memory);
     void RecordAccelerationStructureBuilds(VkCommandBuffer cmd);
     void DestroyAccelerationStructures();
+
+    // Light list (scene_lights.cpp).
+    void CreateLightObjects();
+    void DestroyLightObjects();
+    void DestroyLightTable(LightTableGpu& table);
+    // Makes the light words hold one word per AABB row of the pool (after an AABB allocation).
+    void ReserveLightWords();
+    // (Re)allocates the light table when a rebuild is due and the capacity differs; the old
+    // table is retired until `frame` is safe. Throws VulkanError; the scene is unchanged then.
+    void EnsureLightTable(uint64_t frame);
+    // Records the rebuild: header clear, compact, scan, header readback.
+    void RecordLightRebuild(VkCommandBuffer cmd, uint64_t frame);
+    // Reads the newest readback whose frame is safe; frees retired tables.
+    void RecycleLights();
 
     Device& device_;
     RecordLayout layout_;
@@ -389,6 +436,28 @@ private:
     uint64_t uploaded_bricks_total_ = 0;
     uint64_t pending_bricks_ = 0;
     uint64_t finalized_bricks_total_ = 0;
+
+    // Light list (docs/LIGHT_LIST.md).
+    GrowableBuffer light_words_;              // u32 per AABB row: asuint(luminance sum), 0 = no list light
+    std::vector<VkBufferCopy> light_moves_;   // inside light_words_, mirrors aabb_moves_ (4 B rows)
+    VkDeviceSize zero_word_offset_ = 0;       // a zero u32 in the ring next to the NaN row
+    float light_min_emission_ = 0.0f;         // set by Create (the default) and SetLightOptions
+    uint32_t light_max_bricks_ = 0;
+    bool lights_dirty_ = false;               // the next flush rebuilds the table
+    bool lights_enabled_ = false;             // caelix_scene_set_light_options was called: the table is built
+    bool light_table_built_ = false;          // light_table_ holds a rebuild
+    LightTableGpu light_table_;
+    std::vector<RetiredLightTable> retired_light_tables_;
+    VkDescriptorSetLayout light_set_layout_ = VK_NULL_HANDLE;  // binding 0: the table (storage buffer)
+    ComputePipeline light_compact_;
+    ComputePipeline light_scan_;
+    GpuBuffer light_readback_;  // kLightReadbackSlots x 16 B: the header's first 16 bytes per rebuild
+    std::array<uint64_t, kLightReadbackSlots> light_readback_frames_{};  // 0 = unused
+    uint32_t light_readback_next_ = 0;
+    uint64_t light_stats_frame_ = 0;  // the frame of the cached header values
+    uint32_t light_stats_count_ = 0;
+    uint32_t light_stats_dropped_ = 0;
+    uint64_t light_rebuilds_ = 0;
 };
 
 }  // namespace caelix

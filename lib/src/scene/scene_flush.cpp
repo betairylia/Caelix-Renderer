@@ -1,5 +1,5 @@
-// The per-frame flush: staging of the tables, copies, fills and the finalize
-// dispatch.
+// The per-frame flush: staging of the tables, copies, fills, the finalize
+// dispatch and the light table rebuild (scene_lights.cpp).
 #include "scene/scene.h"
 
 #include "core/log.h"
@@ -123,16 +123,23 @@ void Scene::PrepareGroupAabbs(Group& group)
     // The AABB range is new or grew: copy the rows the GPU holds, and make every
     // other row inactive (NaN), so free ids never show up as primitives.
     uint32_t kept = 0;
+    constexpr VkDeviceSize kWord = sizeof(uint32_t);
     if (group.aabb_gpu_rows.valid())
     {
         kept = group.aabb_gpu_rows.rows;
         aabb_moves_.push_back(VkBufferCopy{aabbs_.ByteOffset(group.aabb_gpu_rows.offset),
                                            aabbs_.ByteOffset(group.aabb_rows.offset),
                                            aabbs_.ByteOffset(kept)});
+        // The light words move with their AABB rows.
+        light_moves_.push_back(VkBufferCopy{group.aabb_gpu_rows.offset * kWord, group.aabb_rows.offset * kWord,
+                                            kept * kWord});
     }
     fills_.push_back(PendingFill{aabbs_.buffer(), aabbs_.ByteOffset(group.aabb_rows.offset + kept),
                                  aabbs_.ByteOffset(group.aabb_rows.rows - kept), kQuietNaNBits});
+    fills_.push_back(PendingFill{light_words_.buffer(), (group.aabb_rows.offset + kept) * kWord,
+                                 (group.aabb_rows.rows - kept) * kWord, 0});
     group.aabb_gpu_rows = group.aabb_rows;
+    lights_dirty_ = true;
 }
 
 bool Scene::EnsureNanRow()
@@ -142,15 +149,30 @@ bool Scene::EnsureNanRow()
         return true;
     }
     StagingRing::Span span;
-    if (!staging_.TryAllocate(kAabbRowBytes, 8, StagingRing::Purpose::kRows, span))
+    if (!staging_.TryAllocate(kAabbRowBytes + sizeof(uint32_t), 8, StagingRing::Purpose::kRows, span))
     {
         return false;
     }
-    const uint32_t nan_row[6] = {kQuietNaNBits, kQuietNaNBits, kQuietNaNBits,
-                                 kQuietNaNBits, kQuietNaNBits, kQuietNaNBits};
-    std::memcpy(span.data, nan_row, sizeof(nan_row));
+    // Six NaN floats (an inactive AABB row), then a zero word (a freed id's light word).
+    const uint32_t rows[7] = {kQuietNaNBits, kQuietNaNBits, kQuietNaNBits, kQuietNaNBits,
+                              kQuietNaNBits, kQuietNaNBits, 0u};
+    std::memcpy(span.data, rows, sizeof(rows));
     nan_row_offset_ = span.offset;
+    zero_word_offset_ = span.offset + kAabbRowBytes;
     nan_row_valid_ = true;
+    return true;
+}
+
+bool Scene::StageReleasedGroup(uint32_t group_index)
+{
+    if (!EnsureNanRow())
+    {
+        return false;
+    }
+    pending_.push_back(PendingCopy{zero_word_offset_, group_infos_.buffer(),
+                                   static_cast<VkDeviceSize>(group_index) * sizeof(GroupInfo) +
+                                       offsetof(GroupInfo, high_water),
+                                   sizeof(uint32_t)});
     return true;
 }
 
@@ -236,11 +258,18 @@ bool Scene::StageGroup(uint32_t group_index, Group& group)
                                        cursor - run_begin});
     }
 
-    // NaN rows of freed ids.
+    // NaN rows and zero light words of freed ids.
     for (const uint16_t id : group.nan_ids)
     {
         pending_.push_back(PendingCopy{nan_row_offset_, aabbs_.buffer(),
                                        aabbs_.ByteOffset(group.aabb_rows.offset + id), kAabbRowBytes});
+        pending_.push_back(PendingCopy{zero_word_offset_, light_words_.buffer(),
+                                       (static_cast<VkDeviceSize>(group.aabb_rows.offset) + id) * sizeof(uint32_t),
+                                       sizeof(uint32_t)});
+    }
+    if (!group.nan_ids.empty())
+    {
+        lights_dirty_ = true;
     }
 
     group.full_rewrite = false;
@@ -501,6 +530,7 @@ void Scene::Recycle(uint64_t safe_frame)
     staging_.Recycle(safe_frame_);
     as_pool_.Recycle(safe_frame_);
     flush_timer_.Resolve(safe_frame_);
+    RecycleLights();
     std::erase_if(deferred_buffers_,
                   [this](const DeferredBuffer& deferred) { return deferred.frame <= safe_frame_; });
 }
@@ -524,8 +554,10 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
     const VkCommandBuffer cmd = HandleFromU64<VkCommandBuffer>(desc.command_buffer);
     const uint64_t frame = desc.frame_number;
 
-    // 1. Release what the GPU has finished with.
+    // 1. Release what the GPU has finished with. The light table (re)allocation comes first of the
+    //    allocations of this flush: when it throws, nothing else has changed.
     Recycle(desc.safe_frame_number);
+    EnsureLightTable(frame);
     ++flush_serial_;
     // TODO: VibeReview: Curious Q. Why is this here?
     // Entities staged with prev != cur at the last flush: prev = cur from now on.
@@ -582,6 +614,17 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
             Group& group = groups_[group_index];
             if (!group.alive)
             {
+                // A released group: its GroupInfo row's high water becomes 0.
+                if (group.info_dirty)
+                {
+                    if (ring_full || !StageReleasedGroup(group_index))
+                    {
+                        ring_full = true;
+                        still_dirty.push_back(group_index);
+                        continue;
+                    }
+                    group.info_dirty = false;
+                }
                 group.in_dirty_list = false;
                 continue;
             }
@@ -667,6 +710,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
     take_growth(group_infos_.TakeGrowthSource(), group_infos_.buffer());
     take_growth(entity_infos_.TakeGrowthSource(), entity_infos_.buffer());
     take_growth(page_table_.TakeGrowthSource(), page_table_.buffer());
+    take_growth(light_words_.TakeGrowthSource(), light_words_.buffer());
     // The dirty list and the instance array are rewritten every time they are used
     // and need no copy.
     if (std::optional<GpuBuffer> old = dirty_buffer_.TakeGrowthSource(); old.has_value())
@@ -678,8 +722,16 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
         deferred_buffers_.push_back(DeferredBuffer{frame, std::move(*old)});
     }
 
+    // 4d. The light table is rebuilt after every flush that finalized bricks, freed ids or moved
+    //     AABB ranges, once the tables are consistent (the ring was not full).
+    if (dispatch_count > 0)
+    {
+        lights_dirty_ = true;
+    }
+    const bool rebuild_lights = lights_dirty_ && !ring_full && light_table_.buffer.valid();
+
     if (!pending_.empty() || !growth.empty() || !fills_.empty() || !aabb_moves_.empty() ||
-        dispatch_count > 0 || as_planned)
+        dispatch_count > 0 || as_planned || rebuild_lights)
     {
         staging_.FlushHostWrites();
         flush_timer_.Begin(cmd, frame, safe_frame_);
@@ -714,6 +766,12 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
                 vkCmdCopyBuffer(cmd, aabbs_.buffer(), aabbs_.buffer(), static_cast<uint32_t>(n),
                                 aabb_moves_.data() + i);
             }
+            for (size_t i = 0; i < light_moves_.size(); i += kMaxRegionsPerCopy)
+            {
+                const size_t n = std::min(kMaxRegionsPerCopy, light_moves_.size() - i);
+                vkCmdCopyBuffer(cmd, light_words_.buffer(), light_words_.buffer(), static_cast<uint32_t>(n),
+                                light_moves_.data() + i);
+            }
             for (const PendingFill& fill : fills_)
             {
                 vkCmdFillBuffer(cmd, fill.buffer, fill.offset, fill.size, fill.value);
@@ -742,6 +800,9 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
             push.record_bytes = layout_.record_bytes;
             push.group_shift = group_shift_;
             push.encoding = encoding_;
+            push.light_words = light_words_.address();
+            push.materials = material_buffer_.address();
+            push.min_emission = light_min_emission_;
             for (uint32_t base = 0; base < dispatch_count; base += kMaxDispatchGroups)
             {
                 const uint32_t groups = std::min(kMaxDispatchGroups, dispatch_count - base);
@@ -762,6 +823,16 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
                           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         }
 
+        // 10b. The light table: header clear, compact, scan, header readback; then its writes are
+        //      visible to every later command (the renderers' light cell fill and trace).
+        if (rebuild_lights)
+        {
+            RecordLightRebuild(cmd, frame);
+            MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
+        }
+
         // 11. BLAS builds over the AABB rows, then the TLAS over the instances. The
         //     barrier above makes the copies and the kernel's writes visible to them.
         if (as_planned)
@@ -776,6 +847,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
     pending_.clear();
     fills_.clear();
     aabb_moves_.clear();
+    light_moves_.clear();
     nan_row_valid_ = false;
     pending_bricks_ = 0;
     for (const RangeToFree& item : ranges_to_free_after_flush_)

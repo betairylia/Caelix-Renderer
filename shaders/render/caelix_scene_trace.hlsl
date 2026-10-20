@@ -3,7 +3,8 @@
 // binding 0) and reads the scene's tables (page table, slot rows, group infos,
 // entity infos) through the device addresses in CaelixFrameConstants. The
 // integrator above this file uses only TraceScene, TraceShadow, the entity
-// transform helpers and the block code in TraceResult::attrib; nothing above it
+// transform helpers, BrickVoxelValue (the light list's emitter radiance) and the
+// block code in TraceResult::attrib; nothing above it
 // knows what a record, a slot row or a group is.
 //
 // Instances: instanceCustomIndex (CandidateInstanceID()) is the scene-wide group
@@ -174,6 +175,32 @@ float3 EntityCurWorld(CaelixFrameConstants fc, uint group, float3 p)
     const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + 64));
     const float4 h = float4(p, 1.0f);
     return float3(dot(r0, h), dot(r1, h), dot(r2, h));
+}
+
+// The current object-to-world rows (rotation | position) of entity `entity` (EntityInfo bytes
+// 32..79): world = (dot(r0, p1), dot(r1, p1), dot(r2, p1)) with p1 = (p, 1); column a of the
+// rotation part is the world direction of the entity's local axis a.
+void EntityCurRows(CaelixFrameConstants fc, uint entity, out float4 r0, out float4 r1, out float4 r2)
+{
+    const uint64_t entity_info = fc.entity_infos + uint64_t(entity) * kEntityInfoBytes;
+    r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + 32));
+    r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + 48));
+    r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + 64));
+}
+
+// The raw block value of voxel `voxel` (0..7 per axis) of brick (group, dense id); 0 when the
+// brick is not resident.
+uint BrickVoxelValue(CaelixFrameConstants fc, uint group, uint id, uint3 voxel)
+{
+    const uint slot_row_base = CAELIX_LOAD_U32(fc.group_infos + uint64_t(group) * 32 + 16);
+    const uint4 row = CAELIX_LOAD_U32x4(fc.slot_tables + (uint64_t(slot_row_base) + id) * kSlotRowBytes);
+    if (SlotRowState(row.x) != kSlotStateResident || row.z == kInvalidRecord)
+    {
+        return 0u;
+    }
+    const uint64_t record = RecordAddress(fc, row.z);
+    const uint word = CAELIX_LOAD_U32(record + uint64_t(RecordPayloadWord(voxel.x, voxel.y, voxel.z)) * 4);
+    return (voxel.x & 1u) != 0u ? (word >> 16) : (word & 0xFFFFu);
 }
 
 // The same point under the entity's previous-frame transform (EntityInfo prev

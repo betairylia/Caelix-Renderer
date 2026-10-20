@@ -70,6 +70,13 @@ bool IsUnormFormat(VkFormat format)
     }
 }
 
+// CaelixGiOptions light defaults (docs/LIGHT_LIST.md).
+constexpr uint32_t kDefaultLightCellCapacity = 65536;
+constexpr uint32_t kDefaultLightCandidates = 8;
+constexpr float kDefaultLightLevelFootprint = 0.25f;
+// [numthreads(32, 1, 1)] per cell in caelix_light_cells.hlsl, 1024 cells per dispatch row.
+constexpr uint32_t kLightCellsPerRow = 1024;
+
 // The barriers of one vkCmdPipelineBarrier2: image barriers (any layout -> GENERAL; mip 0,
 // `layer_count` layers) and at most one global memory barrier.
 class Barriers
@@ -348,6 +355,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     denoise_timer_.Resolve(safe);
     upscale_timer_.Resolve(safe);
     gi_timer_.Resolve(safe);
+    light_timer_.Resolve(safe);
     FreeRetired(safe);
 
     // ReSTIR GI: lighting modes with at least one bounce (the initial sample is the first bounce).
@@ -364,6 +372,17 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     {
         EnsureGiBuffers(width, height, frame.frame_number);
     }
+    // Light NEE (lighting modes): the light cells, and the scene's light table (0 before its first
+    // rebuild: no light NEE then).
+    const bool light_nee = lighting && (gi_options_.flags & CAELIX_GI_FLAG_LIGHT_NEE) != 0;
+    const VkDeviceAddress light_table = scene_.light_table_address();
+    if (light_nee)
+    {
+        EnsureLightCells(gi_options_.light_cell_capacity != 0 ? gi_options_.light_cell_capacity
+                                                              : kDefaultLightCellCapacity,
+                         frame.frame_number);
+    }
+    const bool light_fill = light_nee && light_table != 0;
     bool nrd_error = false;
     NrdExecutor* denoiser = nullptr;
     if (options.mode == CAELIX_MODE_PATH_TRACE && options.denoise != 0 && composite && !nrd_failed_ &&
@@ -504,6 +523,18 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     {
         write_sky(slot->sky_set, 0);
     }
+    // The light cells (binding 21), when light NEE runs.
+    const VkDescriptorBufferInfo light_cells_info{light_cells_.buffer(), 0, VK_WHOLE_SIZE};
+    if (light_nee)
+    {
+        VkWriteDescriptorSet& write = writes[write_count++];
+        write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = slot->set;
+        write.dstBinding = kTraceLightCellsBinding;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &light_cells_info;
+    }
     vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
 
     // Frame constants (written to the slot's buffer below, before the submit).
@@ -614,7 +645,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     // history is valid when the previous frame of this renderer ran ReSTIR with the same method and
     // flags on the same buffers and nothing restarted (reset_accumulation, mode change, new targets).
     constants.gi_flags =
-        restir ? gi_options_.flags : (gi_options_.flags & static_cast<uint32_t>(CAELIX_GI_FLAG_DIFFUSE_ONLY));
+        restir ? gi_options_.flags
+               : (gi_options_.flags & static_cast<uint32_t>(CAELIX_GI_FLAG_DIFFUSE_ONLY | CAELIX_GI_FLAG_LIGHT_NEE));
+    if (!lighting)
+    {
+        constants.gi_flags &= ~static_cast<uint32_t>(CAELIX_GI_FLAG_LIGHT_NEE);
+    }
     if (restir)
     {
         constants.gi_method = CAELIX_GI_RESTIR;
@@ -633,6 +669,22 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         constants.gi_depth_threshold =
             gi_options_.depth_threshold != 0.0f ? gi_options_.depth_threshold : kDefaultGiDepthThreshold;
         constants.gi_history_valid = gi_history_valid_ && !restart_accumulation ? 1u : 0u;
+    }
+    // Light NEE (docs/LIGHT_LIST.md). The table address is the scene's in every frame; the cells
+    // only with the flag.
+    ++frame_counter_;
+    constants.frame_counter = frame_counter_;
+    constants.light_table = light_table;
+    constants.light_min_emission = scene_.light_min_emission();
+    if (light_nee)
+    {
+        constants.light_cells = light_cells_.address();
+        constants.light_cell_capacity = light_cell_capacity_;
+        constants.light_candidates =
+            gi_options_.light_candidates != 0 ? gi_options_.light_candidates : kDefaultLightCandidates;
+        constants.light_level_footprint = gi_options_.light_level_footprint != 0.0f
+                                              ? gi_options_.light_level_footprint
+                                              : kDefaultLightLevelFootprint;
     }
     if (sky)
     {
@@ -696,6 +748,42 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
 
     const uint32_t groups_x = (width + kWorkgroupSize - 1) / kWorkgroupSize;
     const uint32_t groups_y = (height + kWorkgroupSize - 1) / kWorkgroupSize;
+    // Light cells: a new buffer is zero-filled (empty keys and reservoirs) before its first use.
+    if (light_nee && light_cells_need_clear_)
+    {
+        vkCmdFillBuffer(cmd, light_cells_.buffer(), 0, VK_WHOLE_SIZE, 0);
+        Barriers cleared;
+        cleared.Memory(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        cleared.Record(cmd);
+        light_cells_need_clear_ = false;
+    }
+    if (light_nee)
+    {
+        light_cells_last_frame_ = frame.frame_number;
+    }
+    // Light cell fill: refills the reservoirs of every live cell from the scene's light table (the
+    // previous frame's trace inserted cells; the "before" barrier ordered its writes before this
+    // dispatch); the barrier after it orders the fill before the trace's reads and inserts.
+    if (light_fill)
+    {
+        const bool timed = light_timer_.Begin(cmd, frame.frame_number, safe);
+        const ComputePipeline& fill = kernels_.light_cells();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fill.pipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fill.layout(), 0, 1, &slot->set, 0, nullptr);
+        vkCmdPushConstants(cmd, fill.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, kLightCellsPerRow, light_cell_capacity_ / kLightCellsPerRow, 1);
+        if (timed)
+        {
+            light_timer_.End(cmd);
+        }
+        Barriers filled;
+        filled.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        filled.Record(cmd);
+    }
     timer_.Begin(cmd, frame.frame_number, safe);
     // Sky SH (host cubemap): one workgroup projects the cubemap into sky_sh_buffer_; the
     // barrier orders that write before the trace's reads. Inside the trace timestamps.

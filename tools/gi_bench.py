@@ -5,8 +5,9 @@
 
 Per scene and run: host command line -> <out>/<scene>/<run>.{png,log}; metrics of every PNG
 against the scene's reference PNG (tools/image_metrics.py); <out>/README.md + results.json.
-The host prints `timings: trace_ms=<f> gi_ms=<f> denoise_ms=<f> composite_ms=<f> upscale_ms=<f>`;
-when absent, the status line `trace X ms | denoise ...` gives trace_ms, else "n/a".
+The host prints `timings: trace_ms=<f> gi_ms=<f> light_ms=<f> denoise_ms=<f> composite_ms=<f>
+upscale_ms=<f>`; when absent, the status line `trace X ms | denoise ...` gives trace_ms, else "n/a".
+A scene's "pose" may be null: the host then starts at the pose stored in the world file (no --pose).
 """
 import argparse
 import json
@@ -28,6 +29,9 @@ RUNS = {
     "restir_unbiased": "--mode pt --no-denoise --warmup 64 --gi restir --gi-unbiased",
     "restir_temporal_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-spatial",
     "restir_spatial_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-temporal",
+    # Light list (docs/LIGHT_LIST.md): next-event estimation on list lights.
+    "pt_nee": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee",
+    "pt_nee_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee",
 }
 
 TIMINGS_RE = re.compile(r"timings:((?:\s+\w+=[-+0-9.eE]+)+)")
@@ -36,8 +40,11 @@ STATUS_RE = re.compile(r"trace\s+([0-9.]+)\s*ms")
 
 def build_command(host, scene, run, size, out_dir):
     png = out_dir / scene["name"] / f"{run}.png"
-    cmd = [str(host), "--world", scene["world"], "--pose", scene["pose"], "--fov", str(scene["fov"]),
-           "--size", size, "--no-input", "--exit-after-screenshot", "--screenshot", str(png)]
+    cmd = [str(host), "--world", scene["world"]]
+    if scene.get("pose") is not None:
+        cmd += ["--pose", scene["pose"]]
+    cmd += ["--fov", str(scene["fov"]), "--size", size, "--no-input", "--exit-after-screenshot",
+            "--screenshot", str(png)]
     cmd += RUNS[run].split()
     cmd += [str(a) for a in scene.get("extra", [])]
     return cmd, png
@@ -125,17 +132,18 @@ def main():
     for scene in scenes:
         extra = " ".join(map(str, scene.get("extra", [])))
         md += [f"## {scene['name']}", "",
-               f"World `{scene['world']}`, pose `{scene['pose']}`, fov {scene['fov']}, extra `{extra}`.", "",
-               "| run | PSNR dB | mean ratio | firefly % | trace ms | gi ms |",
-               "| --- | --- | --- | --- | --- | --- |"]
+               f"World `{scene['world']}`, pose `{scene.get('pose') or 'stored in the file'}`, fov {scene['fov']}, "
+               f"extra `{extra}`.", "",
+               "| run | PSNR dB | mean ratio | firefly % | trace ms | gi ms | light ms |",
+               "| --- | --- | --- | --- | --- | --- | --- |"]
         for run in runs:
             e = results[scene["name"]].get(run, {})
             m, t = e.get("metrics"), e.get("timings", {})
-            md.append("| {} | {} | {} | {} | {} | {} |".format(
+            md.append("| {} | {} | {} | {} | {} | {} | {} |".format(
                 run,
                 fmt(m and m["psnr_db"], ".2f"), fmt(m and m["mean_ratio"], ".4f"),
                 fmt(m and m["firefly_fraction"] * 100, ".3f"),
-                fmt(t.get("trace_ms"), ".2f"), fmt(t.get("gi_ms"), ".2f")))
+                fmt(t.get("trace_ms"), ".2f"), fmt(t.get("gi_ms"), ".2f"), fmt(t.get("light_ms"), ".2f")))
         md += ["", "Command lines:", ""]
         md += [f"- `{run}`: `{line}`" for s, run, line in commands if s == scene["name"]]
         md.append("")

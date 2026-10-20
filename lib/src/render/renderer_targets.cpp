@@ -8,6 +8,7 @@
 #include "scene/scene.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <iterator>
 #include <utility>
@@ -48,6 +49,7 @@ CaelixResult Renderer::Create(Device& device, RenderKernels& kernels, Scene& sce
     renderer->denoise_timer_ = GpuTimer(device);
     renderer->upscale_timer_ = GpuTimer(device);
     renderer->gi_timer_ = GpuTimer(device);
+    renderer->light_timer_ = GpuTimer(device);
     CAELIX_LOGI("renderer created (shared kernels), %u frame slots", kInitialSlots);
     out = std::move(renderer);
     return CAELIX_OK;
@@ -77,17 +79,19 @@ void Renderer::AddSlot()
     auto slot = std::make_unique<FrameSlot>();
     slot->index = static_cast<uint32_t>(slots_.size());
     // Four sets: trace, composite, sky SH (each has one sampled image and one sampler) and the
-    // upscale encode set (storage images only).
-    const VkDescriptorPoolSize sizes[4] = {
+    // upscale encode set (storage images only); the trace set also has the light cells (a storage
+    // buffer).
+    const VkDescriptorPoolSize sizes[5] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
          kTargetCount + kTraceInternalCount + kCompositeStorageCount + kEncodeBindingCount},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 3},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
     };
     VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool_info.maxSets = 4;
-    pool_info.poolSizeCount = 4;
+    pool_info.poolSizeCount = 5;
     pool_info.pPoolSizes = sizes;
     VkResult result = vkCreateDescriptorPool(device, &pool_info, nullptr, &slot->pool);
     if (result != VK_SUCCESS)
@@ -324,11 +328,33 @@ bool Renderer::EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame)
     return true;
 }
 
+void Renderer::EnsureLightCells(uint32_t capacity, uint64_t frame)
+{
+    if (light_cells_.valid() && light_cell_capacity_ == capacity)
+    {
+        return;
+    }
+    // 288 bytes per cell (render/caelix_light_sample.hlsl). On a throw the old buffer stays.
+    constexpr VkDeviceSize kCellBytes = 288;
+    GpuBuffer fresh = GpuBuffer::DeviceLocal(device_.allocator(), device_.device(), kCellBytes * capacity);
+    if (light_cells_.valid())
+    {
+        retired_light_cells_.push_back(RetiredLightCells{light_cells_last_frame_, std::move(light_cells_)});
+    }
+    light_cells_ = std::move(fresh);
+    light_cell_capacity_ = capacity;
+    light_cells_need_clear_ = true;
+    light_cells_last_frame_ = frame;
+    CAELIX_LOGI("renderer: %u light cells created (%.1f MiB)", capacity,
+                static_cast<double>(light_cells_.size()) / (1024.0 * 1024.0));
+}
+
 CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
 {
     constexpr const char* kFunction = "caelix_renderer_set_gi_options";
     constexpr uint32_t kKnownFlags = CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_VISIBILITY |
-                                     CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY;
+                                     CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY |
+                                     CAELIX_GI_FLAG_LIGHT_NEE;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
@@ -361,6 +387,25 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                     static_cast<double>(options.depth_threshold));
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    if (options.light_cell_capacity != 0 &&
+        (!std::has_single_bit(options.light_cell_capacity) || options.light_cell_capacity < (1u << 10) ||
+         options.light_cell_capacity > (1u << 20)))
+    {
+        CAELIX_LOGE("%s: light_cell_capacity %u must be 0 or a power of two in 1024 .. 1048576", kFunction,
+                    options.light_cell_capacity);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (options.light_candidates > 64)
+    {
+        CAELIX_LOGE("%s: light_candidates %u is above the maximum 64", kFunction, options.light_candidates);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (!std::isfinite(options.light_level_footprint) || options.light_level_footprint < 0.0f)
+    {
+        CAELIX_LOGE("%s: light_level_footprint %g must be finite and >= 0", kFunction,
+                    static_cast<double>(options.light_level_footprint));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
     // Reservoirs of another method or other reuse flags are not a valid history.
     if (options.reset != 0 || options.method != gi_options_.method || options.flags != gi_options_.flags)
     {
@@ -382,6 +427,12 @@ void Renderer::GetGiStats(CaelixGiStats& out) const
     {
         out.gi_ms = gi_ms;
     }
+    out.light_cell_bytes = light_cells_.size();
+    float light_ms = 0.0f;
+    if (frame != 0 && light_timer_.MsForFrame(frame, light_ms))
+    {
+        out.light_fill_ms = light_ms;
+    }
 }
 
 void Renderer::FreeRetired(uint64_t safe_frame)
@@ -390,6 +441,9 @@ void Renderer::FreeRetired(uint64_t safe_frame)
         return retired.frame <= safe_frame;
     });
     std::erase_if(retired_gi_, [safe_frame](const RetiredGiBuffers& retired) {
+        return retired.frame <= safe_frame;
+    });
+    std::erase_if(retired_light_cells_, [safe_frame](const RetiredLightCells& retired) {
         return retired.frame <= safe_frame;
     });
     std::erase_if(retired_nrd_, [safe_frame](const RetiredDenoiser& retired) {

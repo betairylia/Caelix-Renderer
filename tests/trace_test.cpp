@@ -10,7 +10,10 @@
 // and the emission scale against closed forms. Two renderers over one flush must
 // agree on the motion of a moving entity, and render once per frame each. ReSTIR GI
 // without reuse must match the path tracer's reference image, and its reuse must keep
-// the mean within a bias bound.
+// the mean within a bias bound. The light list: the scene's light table counts its
+// emissive bricks, next-event estimation on list lights matches the plain path
+// tracer's mean in a closed box lit by one voxel, the path tracer without the flag is
+// the same bits whatever the table holds, and the light cells fill and sample.
 // Uses the public C ABI only.
 #include "test_scenes.h"
 
@@ -3013,7 +3016,7 @@ TEST_CASE("ReSTIR GI: set_gi_options validation")
     };
     CaelixGiOptions bad = GiOptions(2, 0);  // unknown method
     expect_invalid(bad);
-    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 5);  // unknown flag
+    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 6);  // unknown flag
     expect_invalid(bad);
     bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
     bad.spatial_samples = 9;
@@ -3120,6 +3123,367 @@ TEST_CASE("ReSTIR GI: without reuse it matches the path tracer; with reuse its b
     }();
     // Packed scenes have smoothness 0: DIFFUSE_ONLY changes nothing there.
     CHECK(std::memcmp(pt_again.data(), pt_short.data(), pt_again.size() * sizeof(float)) == 0);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+// ---------------------------------------------------------------------------
+// Light list (docs/LIGHT_LIST.md): the scene's light table, next-event estimation on list lights
+// (CAELIX_GI_FLAG_LIGHT_NEE) against the plain path tracer, the path tracer without the flag, and
+// the renderer's light cells.
+
+namespace {
+
+// Packed white emitter of strength 3: emission 512 x albedo 1 (a list light at the default
+// min_emission 20).
+constexpr uint16_t kWhiteEmitter512 = 0x4000u | (15u << 10) | (15u << 6) | (15u << 2) | 3u;
+constexpr uint32_t kBoxSize = 128;  // render size of the light NEE cases
+constexpr int32_t kBoxInterior = 24;
+
+CaelixLightStats LightStats(const CaelixScene* scene)
+{
+    CaelixLightStats stats{};
+    caelix_scene_get_light_stats(scene, &stats);
+    return stats;
+}
+
+// A closed grey box: walls 1 voxel thick around the interior [0, 24)^3, one strength-3 white voxel
+// in the middle of the ceiling (12, 24, 12) as the only light.
+// The light table is opt-in: zero options = the defaults, and the table is built from then on.
+void EnableLights(CaelixScene* scene)
+{
+    const CaelixLightOptions options{};
+    REQUIRE(caelix_scene_set_light_options(scene, &options) == CAELIX_OK);
+}
+
+void UploadLightBox(Rig& rig)
+{
+    EnableLights(rig.scene);
+    World world;
+    const int32_t lo = -1;
+    const int32_t hi = kBoxInterior;
+    FillBox(world, lo, lo, lo, hi, lo, hi, kGreyFloor);  // floor
+    FillBox(world, lo, hi, lo, hi, hi, hi, kGreyFloor);  // ceiling
+    FillBox(world, lo, lo, lo, lo, hi, hi, kGreyFloor);  // -X wall
+    FillBox(world, hi, lo, lo, hi, hi, hi, kGreyFloor);  // +X wall
+    FillBox(world, lo, lo, lo, hi, hi, lo, kGreyFloor);  // -Z wall
+    FillBox(world, lo, lo, hi, hi, hi, hi, kGreyFloor);  // +Z wall
+    FillBox(world, 12, hi, 12, 12, hi, 12, kWhiteEmitter512);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+}
+
+// Inside the box at its centre, looking along +Z: the light is above the view cone (half angle 30
+// degrees), so no pixel sees it directly.
+CaelixCamera LightBoxCamera()
+{
+    const double position[3] = {12.0, 12.0, 2.0};
+    const double forward[3] = {0.0, 0.0, 1.0};
+    return LookAlong(position, forward, std::tan(30.0 * 3.14159265358979323846 / 180.0));
+}
+
+// Reference mode over `frames` frames (seeds seed0 ..), 4 bounces, black sky, no sun; the colour
+// (the running mean) is read back after the last frame.
+std::vector<float> LightReference(Rig& rig, CaelixRenderer* renderer, TargetSet& set, const CaelixCamera& camera,
+                                  uint32_t frames, uint32_t seed0)
+{
+    for (uint32_t i = 0; i < frames; ++i)
+    {
+        CaelixRenderOptions options = GlassOptions(CAELIX_MODE_REFERENCE, 4, 0, seed0 + i);
+        options.reset_accumulation = i == 0 ? 1u : 0u;
+        Render(rig, renderer, set, camera, options, i + 1 == frames);
+    }
+    const Target& color = *set.t[kColor];
+    std::vector<float> image(static_cast<size_t>(color.width) * color.height * 4);
+    std::memcpy(image.data(), color.bytes.data(), image.size() * sizeof(float));
+    return image;
+}
+
+// Mean linear brightness (rgb mean over every pixel) and the PSNR of 16 x 16 block means (both
+// images clamped to [0, 1], peak 1): a 1-voxel light is a rare event for the plain path tracer, so
+// its per-pixel noise at a few thousand frames is far above 30 dB; the block means compare the
+// light distribution.
+struct LightComparison
+{
+    double ref_mean = 0.0;
+    double test_mean = 0.0;
+    double ratio = 0.0;
+    double block_psnr = 0.0;
+};
+
+LightComparison CompareLight(const std::vector<float>& ref, const std::vector<float>& test, uint32_t size)
+{
+    constexpr uint32_t kBlock = 16;
+    LightComparison c;
+    double squared = 0.0;
+    uint32_t blocks = 0;
+    for (uint32_t by = 0; by < size; by += kBlock)
+    {
+        for (uint32_t bx = 0; bx < size; bx += kBlock)
+        {
+            double r_block[3] = {0.0, 0.0, 0.0};
+            double t_block[3] = {0.0, 0.0, 0.0};
+            for (uint32_t y = by; y < by + kBlock; ++y)
+            {
+                for (uint32_t x = bx; x < bx + kBlock; ++x)
+                {
+                    const size_t p = (static_cast<size_t>(y) * size + x) * 4;
+                    for (int ch = 0; ch < 3; ++ch)
+                    {
+                        r_block[ch] += ref[p + ch];
+                        t_block[ch] += test[p + ch];
+                    }
+                }
+            }
+            for (int ch = 0; ch < 3; ++ch)
+            {
+                c.ref_mean += r_block[ch];
+                c.test_mean += t_block[ch];
+                const double d = std::clamp(t_block[ch] / (kBlock * kBlock), 0.0, 1.0) -
+                                 std::clamp(r_block[ch] / (kBlock * kBlock), 0.0, 1.0);
+                squared += d * d;
+            }
+            ++blocks;
+        }
+    }
+    const double values = 3.0 * static_cast<double>(size) * size;
+    c.ref_mean /= values;
+    c.test_mean /= values;
+    c.ratio = c.test_mean / c.ref_mean;
+    const double mse = squared / (3.0 * blocks);
+    c.block_psnr = mse > 0.0 ? 10.0 * std::log10(1.0 / mse) : 99.0;
+    return c;
+}
+
+}  // namespace
+
+TEST_CASE("light table counts one emissive brick")
+{
+    // Brick (0, 0, 0): three strength-3 white voxels and a grey one; brick (1, 0, 0): grey only.
+    World world;
+    FillBox(world, 1, 1, 1, 3, 1, 1, kWhiteEmitter512);
+    FillBox(world, 5, 5, 5, 5, 5, 5, kGreyFloor);
+    FillBox(world, 9, 2, 2, 12, 4, 4, kGreyFloor);
+    REQUIRE(world.bricks.size() == 2);
+
+    // 1. Default options: one entry.
+    {
+        Rig rig;
+        OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+        CHECK(LightStats(rig.scene).rebuilds == 0);
+        EnableLights(rig.scene);
+        Upload(rig, world, KeysOf(world));
+        const CaelixLightStats stats = LightStats(rig.scene);
+        std::printf("light table: %u bricks, %u dropped, %llu bytes, %llu rebuilds\n", stats.bricks,
+                    stats.bricks_dropped, static_cast<unsigned long long>(stats.table_bytes),
+                    static_cast<unsigned long long>(stats.rebuilds));
+        CHECK(stats.bricks == 1);
+        CHECK(stats.bricks_dropped == 0);
+        CHECK(stats.table_bytes > 64ull + 65536ull * 132ull);
+        CHECK(stats.rebuilds >= 1);
+
+        // A threshold above every emission: the next flush rebuilds the table without entries.
+        CaelixLightOptions options{};
+        options.min_emission = 1e6f;
+        REQUIRE(caelix_scene_set_light_options(rig.scene, &options) == CAELIX_OK);
+        FlushFrame(rig.gpu, rig.scene, rig.frames);
+        CHECK(LightStats(rig.scene).bricks == 0);
+        CHECK(LightStats(rig.scene).bricks_dropped == 0);
+
+        // Validation.
+        options.min_emission = -1.0f;
+        ExpectLibraryErrors(1, [&] {
+            REQUIRE(caelix_scene_set_light_options(rig.scene, &options) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        options.min_emission = 0.0f;
+        options.max_bricks = (1u << 20) + 1u;
+        ExpectLibraryErrors(1, [&] {
+            REQUIRE(caelix_scene_set_light_options(rig.scene, &options) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        CloseRig(rig);
+    }
+
+    // 2. The threshold set before the upload: the light words are 0, no entry.
+    {
+        Rig rig;
+        OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+        CaelixLightOptions options{};
+        options.min_emission = 1e6f;
+        REQUIRE(caelix_scene_set_light_options(rig.scene, &options) == CAELIX_OK);
+        Upload(rig, world, KeysOf(world));
+        CHECK(LightStats(rig.scene).bricks == 0);
+        CloseRig(rig);
+    }
+
+    // 3. Two emissive bricks and a capacity of one: one entry, one dropped.
+    {
+        World two = world;
+        FillBox(two, 12, 4, 4, 12, 4, 4, kWhiteEmitter512);  // a corner of the grey block: alive
+        Rig rig;
+        OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+        CaelixLightOptions options{};
+        options.max_bricks = 1;
+        REQUIRE(caelix_scene_set_light_options(rig.scene, &options) == CAELIX_OK);
+        Upload(rig, two, KeysOf(two));
+        const CaelixLightStats stats = LightStats(rig.scene);
+        CHECK(stats.bricks == 1);
+        CHECK(stats.bricks_dropped == 1);
+        CloseRig(rig);
+    }
+}
+
+TEST_CASE("light NEE is unbiased")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadLightBox(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 1);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    // The plain path tracer finds the 1-voxel light rarely: 4096 frames for its mean.
+    CaelixGiOptions gi{};
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> nee = LightReference(rig, renderer, set, camera, 1024, 200000);
+    const LightComparison c = CompareLight(pt, nee, kBoxSize);
+    std::printf("light NEE vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 block PSNR %.2f dB\n", c.test_mean,
+                c.ref_mean, c.ratio, c.block_psnr);
+    // The noise floor of the reference (reported only): the path tracer with other seeds.
+    gi.flags = 0;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const LightComparison floor_c =
+        CompareLight(pt, LightReference(rig, renderer, set, camera, 4096, 300000), kBoxSize);
+    std::printf("path tracer vs path tracer, other seeds: ratio %.4f, 16x16 block PSNR %.2f dB\n", floor_c.ratio,
+                floor_c.block_psnr);
+    CHECK(c.ref_mean > 0.01);
+    CHECK(c.ratio > 0.97);
+    CHECK(c.ratio < 1.03);
+    CHECK(c.block_psnr > 30.0);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("path tracer unchanged without the flag")
+{
+    // The ReSTIR GI room (an emitter of strength 1: luminance 8). Scene A sets min_emission 1, so its
+    // emitter is a list light and its table has entries; scene B keeps the defaults (no list light).
+    // One path tracer frame without CAELIX_GI_FLAG_LIGHT_NEE must be the same bits in both.
+    const CaelixCamera camera = GiRoomCamera();
+    std::vector<uint8_t> images[2];
+    for (int scene = 0; scene < 2; ++scene)
+    {
+        Rig rig;
+        OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+        if (scene == 0)
+        {
+            CaelixLightOptions options{};
+            options.min_emission = 1.0f;
+            REQUIRE(caelix_scene_set_light_options(rig.scene, &options) == CAELIX_OK);
+        }
+        UploadGiRoom(rig);
+        const CaelixLightStats stats = LightStats(rig.scene);
+        std::printf("scene %c: %u light bricks\n", scene == 0 ? 'A' : 'B', stats.bricks);
+        CHECK((scene == 0 ? stats.bricks > 0 : stats.bricks == 0));
+        CaelixRenderer* renderer = nullptr;
+        REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+        Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+        TargetSet set;
+        set.t[kColor] = &color;
+        Render(rig, renderer, set, camera, GlassOptions(CAELIX_MODE_PATH_TRACE, 4, 0, 4242));
+        images[scene] = color.bytes;
+        REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+        caelix_renderer_release_target_views(renderer);
+        caelix_renderer_destroy(renderer);
+        DestroyTarget(rig.gpu, color);
+        CloseRig(rig);
+    }
+    REQUIRE(images[0].size() == images[1].size());
+    CHECK(std::memcmp(images[0].data(), images[1].data(), images[0].size()) == 0);
+}
+
+TEST_CASE("cells fill and sample")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadLightBox(rig);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+
+    CaelixGiOptions bad{};
+    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE;
+    bad.light_cell_capacity = 1000;  // not a power of two
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.light_cell_capacity = 1u << 21;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.light_cell_capacity = 0;
+    bad.light_candidates = 65;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.light_candidates = 0;
+    bad.light_level_footprint = -1.0f;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+
+    CaelixGiOptions gi{};
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
+    gi.light_cell_capacity = 1024;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    CaelixGiStats stats{};
+    caelix_renderer_get_gi_stats(renderer, &stats);
+    CHECK(stats.light_cell_bytes == 0);  // created by the first render
+
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        Render(rig, renderer, set, camera, GlassOptions(CAELIX_MODE_PATH_TRACE, 4, 0, 777 + i), i == 3);
+    }
+    caelix_renderer_get_gi_stats(renderer, &stats);
+    CaelixGpuTimings timings{};
+    caelix_renderer_get_gpu_timings(renderer, &timings);
+    std::printf("light cells: %llu bytes, fill %.4f ms (frame %llu), trace %.4f ms\n",
+                static_cast<unsigned long long>(stats.light_cell_bytes), stats.light_fill_ms,
+                static_cast<unsigned long long>(timings.frame_number), timings.trace_ms);
+    CHECK(stats.light_cell_bytes == 1024ull * 288ull);
+    CHECK(timings.frame_number != 0);
+    CHECK(stats.light_fill_ms > 0.0f);
+
+    // Not black: the last frame's lit pixels (1 spp with light NEE: almost every pixel).
+    const float* pixels = reinterpret_cast<const float*>(color.bytes.data());
+    uint32_t lit = 0;
+    double sum = 0.0;
+    for (size_t p = 0; p < static_cast<size_t>(kBoxSize) * kBoxSize; ++p)
+    {
+        const double v = pixels[p * 4] + pixels[p * 4 + 1] + pixels[p * 4 + 2];
+        sum += v;
+        lit += v > 0.0 ? 1u : 0u;
+    }
+    std::printf("light cells: %u of %u pixels lit, mean %.4f\n", lit, kBoxSize * kBoxSize,
+                sum / (3.0 * kBoxSize * kBoxSize));
+    CHECK(lit > kBoxSize * kBoxSize / 2);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);

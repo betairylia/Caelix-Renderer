@@ -368,5 +368,153 @@ cornell, ashwick, bistro_dark, shroom for `reference`, `pt`, `pt_nee`, `pt_nee_c
 
 ## As built
 
-(The implementer writes this section: what differs from the design and why, sizes, timings,
-open points.)
+Review change (Fable, after the implementation): the light table is opt-in. `Scene::EnsureLightTable`
+builds it only once `caelix_scene_set_light_options` was called (`lights_enabled_`); the Unity plugin
+never calls it and pays only the 4 B light words. The host calls it at scene creation; the tests
+call `EnableLights` (zero options = defaults).
+
+Step 1 as built on 2026-10-21 (branch `gi-experiments`, on top of 03b021c). Files: `shaders/common/
+caelix_light.hlsl` (list-light rule, table layout, entry load, octahedral code),
+`shaders/scene/caelix_finalize.hlsl` (light word), `shaders/scene/caelix_light_compact.hlsl` and
+`caelix_light_scan.hlsl` (table rebuild), `shaders/render/caelix_light_sample.hlsl` (cells,
+CDF search, `SampleLightEntry`, `LightNextEvent`), `shaders/render/caelix_light_cells.hlsl`
+(cell fill), `lib/src/scene/scene_lights.cpp` (options, stats, table allocation, rebuild
+recording), the `Scene::Flush` and `Renderer::Render` hooks, `tests/trace_test.cpp` (four cases),
+host flags and UI, `tools/gi_bench.*`.
+
+### Sizes
+
+| item | size |
+| --- | --- |
+| light word | 4 B per AABB row (`Scene::light_words_`, grows with the AABB pool; 256 KiB at the initial 65536 rows) |
+| light table | 64 B header + 132 B per `max_bricks` entry (128 B entry + 4 B CDF): 8.3 MiB at 65536 |
+| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 |
+| `FinalizePush` | 88 -> 104 B (`light_words`, `materials`, `min_emission` in place of `pad`) |
+| `LightPush` | 72 B (see differences) |
+| `FrameConstants` | 608 -> 672 B, fields as in section 3 (`frame_counter` at 640) |
+| `CaelixGiOptions` | 32 -> 48 B; `CaelixGiStats` 16 -> 32 B |
+| `CaelixLightOptions` | 16 B; `CaelixLightStats` 24 B |
+
+Header word 2 (the design's `pad[0]`) is now `capacity` (= max_bricks, written by the scan): the
+render kernels need it to find the CDF behind the entries.
+
+### Kernels and passes
+
+- `caelix_finalize`: per thread the luminance sum of the row's occupied list-light voxels (one
+  material read per distinct code), 64 floats in groupshared memory, thread 0 sums them and
+  stores `asuint(sum)` (0 when none) at `light_words + (aabb_row_base + id) * 4`.
+- `caelix_light_compact` (scene, 64 threads per group index, split at 65535 groups) and
+  `caelix_light_scan` (scene, one workgroup of 1024, Hillis-Steele in groupshared memory per
+  chunk of 1024 with a carried sum; no subgroup operations). Recorded by
+  `Scene::RecordLightRebuild` after the finalize barrier: fill header[0..16) = 0, barrier,
+  compact, barrier, scan, barrier, copy header[0..16) to a host readback ring (8 slots), barrier
+  to HOST, then a barrier to ALL_COMMANDS reads. Inside the flush timer.
+- `caelix_light_cells` (renderer, trace set + `TracePush`, 32 threads per cell, dispatch
+  1024 x capacity / 1024). Before the sky SH kernel and the trace, with its own `GpuTimer`
+  (`light_timer_` -> `light_fill_ms`) and a compute -> compute barrier after it. A new cell
+  buffer is zero-filled (`vkCmdFillBuffer`) before its first fill.
+- Light NEE in `TracePath` at the sun NEE's vertices, own stream
+  `InitRandom(pixel, frame_seed ^ 0x7F4A7C15)`. ReSTIR mode: the primary NEE goes unpacked into
+  `g_int_diff`, `caelix_restir_gi_shade` adds the reservoir's contribution and packs the sum.
+
+### Differences from the design, and why
+
+1. **`min_emission` default is 20, not 2.0.** The library decodes a packed emitter as
+   `albedo * 8^s` (`material_table.cpp`, `exp2(3 s)`): there is no `* 0.1` (the 0.1 in this
+   document, in `GI_EXPERIMENTS.md` and in the ScenesPlayground notes is not in the native
+   renderer's table). With 2.0, every strength-1 voxel with an albedo luminance >= 0.25 would be
+   a list light, against the decision "strength 0 and 1 keep today's behaviour". 20 = the
+   decision's 2.0 on the library's scale (strength 2 from albedo luminance 0.3125, every bright
+   strength 3). Measured on the shroom forest: 2.0 -> 19769 light bricks, 8 -> 2710, 20 -> 2706
+   (none dropped at 65536). `--light-min-emission` / `CaelixLightOptions::min_emission` change it.
+2. **Atomics go through descriptors.** DXC 1.8 of the Vulkan SDK 1.4.304.1 has no
+   `vk::BufferPointer`, and `vk::RawBufferLoad/Store` have no atomic form. The light table is
+   set 0 binding 0 of the two scene kernels (a `RWByteAddressBuffer`; the scene owns the set
+   layout and one descriptor pool + set per table allocation, retired with the buffer), and the
+   light cells are trace set binding 21 (storage buffer, PARTIALLY_BOUND, written when the flag
+   is on). The render kernels read the table through `fc.light_table` (an address);
+   `fc.light_cells` is the cells' address but serves only as "present" (all cell accesses use the
+   binding). The 64-bit cell key is claimed with a 32-bit compare-and-swap on its low word (64-bit
+   buffer atomics are not a device requirement; the low word is forced non-zero); the high word
+   is stored after the claim. A lookup that sees the low word match before the high word is
+   written probes on and may insert the same key twice (harmless, as for fingerprint collisions).
+3. **Released groups.** The design assumed a freed group's rows read as NaN / 0. They do not:
+   the freed AABB and light-word ranges go back to the row pool and belong to other groups later,
+   while the GPU GroupInfo row of the freed index still points at them, so the compact kernel
+   would create entries with the wrong group. `ReleaseGroup` now marks the group's info dirty and
+   the flush restages its `high_water` as 0 (a 4-byte copy from a zero word in the ring;
+   `Scene::StageReleasedGroup`). Only `high_water` changes, so a stale TLAS instance of the freed
+   group (before the TLAS rebuild) reads the same slot rows as before.
+4. **Light words of new and moved ranges.** A new or grown AABB range gets its light words
+   zero-filled (`[kept, rows)`, next to the NaN fill), so an id that waits for finalization
+   reads 0, not old memory. Range moves copy the light words with the AABB rows
+   (`light_moves_`). Freed ids get their zero word as a 4-byte copy from the ring (a zero word
+   next to the NaN row, `EnsureNanRow`), not a `vkCmdFillBuffer`: copies run after the range
+   moves (as the NaN rows), fills before them, and a fill could race a move into the same row.
+5. **Compact computes before it allocates.** An entry whose recomputed total is 0 (its
+   materials changed since the light word was written, or `min_emission` was raised) is not
+   stored. The scan clamps `count` to the capacity (the compact kernel counts dropped bricks in it
+   too) and writes `capacity` and `total_weight`.
+6. **Hit emission rule.** A list light's emission is skipped only on a segment that leaves a
+   vertex that did light NEE (`segment_light_nee`, like the sun's `segment_sees_sun`), not at
+   every bounce hit: a segment after a specular or transparent vertex (no NEE there) still counts
+   it. The design's rule would lose that light (bias with smooth or glass materials). The
+   primary surface's emission stays deterministic. `CaelixShadeResult` gained
+   `emission_luminance` (the second option of the design: no second table read).
+7. **Cell point.** The cell coordinate uses `object_hit + 0.25 * object face normal` (the air
+   side of the face): the hit point lies on the face plane, and `floor` of it would pick the
+   solid voxel's cell half of the time.
+8. **`LightPush`** is `{group_infos, slot_tables, page_table, light_words, materials,
+   group_base, group_count, max_bricks, records_per_page_shift, record_bytes, group_shift,
+   encoding, min_emission}` (72 B): no `entity_infos` (the compact kernel needs none),
+   `group_base` for the dispatch split, the table is the binding (difference 2).
+9. **Cell insertion does not clear the reservoirs**: a slot whose key is 0 has empty reservoirs
+   (zero at creation, cleared at eviction by the fill pass).
+10. **Table lifetime.** The table is created by the first flush that can rebuild it (dirty
+    bricks, dirty groups or a dirty table) and is rebuilt by every flush that finalized bricks,
+    freed ids, moved AABB ranges, released a group or changed the options, when the ring was not
+    full. `Scene::light_table_address()` is 0 until a rebuild was recorded (and again after a
+    reallocation until the next rebuild): no light NEE then. The table is built whether or not a
+    renderer uses light NEE (the Unity plugin pays 8.3 MiB and the rebuild work per changing
+    flush).
+11. **Stats readback** is built (8 host-visible 16-byte slots; `Recycle` reads the newest slot
+    whose frame is safe), so `CaelixLightStats::bricks` is never the "unknown" marker.
+12. **Tests.** Test 2: the plain path tracer needs 4096 reference frames (light NEE 1024),
+    and the PSNR is taken on 16 x 16 block means: per pixel, the path tracer finds a 1-voxel
+    light only a few times in 4096 samples, so its own per-pixel noise keeps any per-pixel PSNR
+    against it far below 30 dB. The test also
+    prints the path tracer's own noise floor. Test 3 compares the ReSTIR GI room (a strength-1
+    emitter) on a scene with `min_emission` 1 (its table has 4 entries) and a scene with the
+    defaults (no entry). Test 1 also checks the threshold set before the upload and a capacity of
+    one (one entry, one dropped). The existing validation case now uses `1u << 6` as its unknown
+    flag.
+
+### Measurements (RTX 5080, driver 610.88)
+
+- Tests: light table 1 brick, 0 dropped; light NEE vs path tracer mean ratio 1.0095 (path tracer
+  vs path tracer, other seeds: 1.0060), 16 x 16 block PSNR 45.8 dB (noise floor 42.0 dB); path
+  tracer frame bit-identical; cells 294912 bytes, fill 0.0045 ms at 1024 cells, 60 % of the
+  pixels lit at 1 spp (the light is a ceiling voxel: 2 of its 3 candidate faces are covered).
+- Cornell (`--gi pt --no-denoise`, warm-up 32/64): 640 x 360: trace 0.21 ms without the flag,
+  0.35 ms with it, light fill 0.035 ms (65536 cells); 1920 x 1080: trace 1.86 ms -> 3.19 ms, fill
+  0.035 ms; with 1024 cells fill 0.006 ms, trace 3.42 ms (more global-CDF fallbacks and probes).
+  The room is lit at 1 spp with the flag and black without it.
+- Shroom forest (3.24 M bricks, 8457 groups, 1280 x 720): trace 2.98 ms without the flag, 5.9 ms
+  with it (2706 light bricks), fill 0.33 ms; flush mean 0.44 ms with `--test-edits` every frame
+  (finalize + light table rebuild + BLAS builds).
+
+### Open points
+
+- Covered faces: the entry has no per-face data, so a voxel with covered side faces wastes most
+  NEE samples (a light voxel set into a ceiling, as in test 2: 2 of 3). Per-face open bits per entry (6 bits
+  per light voxel, or a face mask per slice) would remove that waste.
+- No MIS: bright emitters close to a vertex keep high variance (speckles in a 256-frame light NEE
+  accumulation of the Cornell box). MIS with the BSDF path is the next step after ReSTIR DI.
+- Material changes do not rewrite light words: a brick whose word is 0 under the old table stays
+  out until it is finalized again (an entry whose lights vanished is dropped by the compact
+  kernel, difference 5).
+- No temporal reuse of the cell reservoirs; the fill touches every live cell every frame.
+- `maxStorageBufferRange`: the table binding at `max_bricks` 2^20 is 138 MB, above the Vulkan
+  minimum of 128 MB (NVIDIA allows 4 GiB).
+- The bench runs (`pt_nee`, `pt_nee_conv`, scene `shroom` with its stored pose) are configured in
+  `tools/gi_bench.json`, not run in this step.

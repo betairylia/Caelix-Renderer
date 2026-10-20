@@ -8,7 +8,10 @@
 //     rewritten (only the words that change) with these face bits.
 //   - occupied = alive && payload value != 0, packed into micro occupancy words,
 //     the coarse byte and the tight bounds of the header,
-//   - the brick's AABB row (entity-local block coordinates; NaN when empty).
+//   - the brick's AABB row (entity-local block coordinates; NaN when empty),
+//   - the brick's light word (docs/LIGHT_LIST.md): asuint of the luminance sum of
+//     its occupied voxels whose material is a list light (luminance of the
+//     emission >= min_emission, common/caelix_light.hlsl), 0 when there is none.
 //
 // Lossless rule: raw(v) = opaque(v) ? v : (v & id_mask) recovers the uploaded
 // value from a finalized one (uploaded transparent values carry no face bits),
@@ -20,6 +23,7 @@
 // voxels change, and raw() masks them off, so every read gives the same raw value.
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_record.hlsl"
+#include "common/caelix_light.hlsl"
 
 struct FinalizePush
 {
@@ -31,12 +35,14 @@ struct FinalizePush
     uint64_t entity_infos;    // EntityInfo[entity_capacity]
     uint64_t group_grids;     // u32 pool base: group index or 0xFFFFFFFF
     uint64_t aabb_pool;       // AABB row pool base
+    uint64_t light_words;     // u32 per AABB row
+    uint64_t materials;       // CaelixMaterial by block code (common/caelix_material.hlsl)
     uint dirty_count;
     uint records_per_page_shift;
     uint record_bytes;
     uint group_shift;
     uint encoding;  // kEncodingPacked or kEncodingBlockId
-    uint pad;
+    float min_emission;
 };
 
 CAELIX_PUSH_CONSTANTS(FinalizePush, g_push);
@@ -54,6 +60,7 @@ groupshared uint gs_payload[256];  // own payload as uploaded/last finalized
 groupshared uint gs_occ[16];       // micro occupancy words
 groupshared int gs_min[3];
 groupshared int gs_max[3];
+groupshared float gs_light[64];   // per thread: luminance sum of the row's list lights
 
 uint64_t RecordAddress(uint record_index)
 {
@@ -161,6 +168,8 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     const uint t = thread_id.x;
     const uint y = t & 7;
     const uint z = t >> 3;
+    g_blockEncoding = g_push.encoding;
+    g_materialTable = g_push.materials;
 
     const bool packed = g_push.encoding == kEncodingPacked;
     const uint opaque_mask = packed ? 0xC000u : 0x8000u;
@@ -227,6 +236,9 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     // 4. Per voxel.
     uint out_words[4] = {0u, 0u, 0u, 0u};
     uint occupied = 0;  // bit x
+    float light = 0.0f;
+    uint last_code = 0xFFFFFFFFu;  // the material code whose luminance is in last_luminance
+    float last_luminance = 0.0f;
     CAELIX_UNROLL
     for (uint x = 0; x < 8; ++x)
     {
@@ -256,6 +268,16 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         if (alive && result != 0)
         {
             occupied |= 1u << x;
+            const uint code = CaelixMaterialCode(result);
+            if (code != last_code)
+            {
+                last_code = code;
+                last_luminance = MaterialEmissionLuminance(code);
+            }
+            if (last_luminance >= g_push.min_emission)
+            {
+                light += last_luminance;
+            }
         }
         out_words[x >> 1] |= (x & 1) != 0 ? (result << 16) : result;
     }
@@ -269,6 +291,8 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
             CAELIX_STORE_U32(row_address + w * 4, out_words[w]);
         }
     }
+
+    gs_light[t] = light;
 
     // 5. Occupancy and bounds. Voxels x 0..3 and 4..7 share one micro word each.
     if (occupied != 0)
@@ -337,5 +361,14 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         CAELIX_STORE_U32x2(aabb, lo.xy);
         CAELIX_STORE_U32x2(aabb + 8, uint2(lo.z, hi.x));
         CAELIX_STORE_U32x2(aabb + 16, hi.yz);
+
+        // The light word (same row index as the AABB row).
+        float light_sum = 0.0f;
+        for (uint i = 0; i < 64; ++i)
+        {
+            light_sum += gs_light[i];
+        }
+        CAELIX_STORE_U32(g_push.light_words + (uint64_t(gs_aabb_base) + gs_id) * 4,
+                         light_sum > 0.0f ? asuint(light_sum) : 0u);
     }
 }

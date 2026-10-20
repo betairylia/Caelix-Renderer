@@ -94,6 +94,27 @@ GpuBuffer GpuBuffer::HostUpload(VmaAllocator allocator, VkDevice device, VkDevic
                      false);
 }
 
+GpuBuffer GpuBuffer::HostReadback(VmaAllocator allocator, VkDevice device, VkDeviceSize size)
+{
+    VmaAllocationCreateInfo allocation_info{};
+    allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
+    allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    return GpuBuffer(allocator, device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, allocation_info, false);
+}
+
+void GpuBuffer::InvalidateHostReads(VkDeviceSize offset, VkDeviceSize size) const
+{
+    if (allocation_ == VK_NULL_HANDLE || size == 0)
+    {
+        return;
+    }
+    const VkResult result = vmaInvalidateAllocation(allocator_, allocation_, offset, size);
+    if (result != VK_SUCCESS)
+    {
+        throw VulkanError("vmaInvalidateAllocation failed", result);
+    }
+}
+
 void GpuBuffer::FlushHostWrites(VkDeviceSize offset, VkDeviceSize size) const
 {
     if (allocation_ == VK_NULL_HANDLE || size == 0)

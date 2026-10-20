@@ -1,6 +1,6 @@
 // Per-frame constants of the trace and composite kernels. Mirrors
 // lib/src/render/frame_constants.h; change both together. The kernel's only push constant is the device address of
-// one CaelixFrameConstants (608 bytes). Every field sits at an offset that is a multiple of its
+// one CaelixFrameConstants (672 bytes). Every field sits at an offset that is a multiple of its
 // size, so std430 and scalar layout rules give the same offsets.
 #ifndef CAELIX_FRAME_HLSL
 #define CAELIX_FRAME_HLSL
@@ -84,7 +84,22 @@ struct CaelixFrameConstants
     float gi_spatial_radius;        // 592  pixels
     uint gi_spatial_passes;         // 596
     uint gi_history_valid;          // 600  1 = gi_prev holds last frame's reservoirs of this renderer
-    float gi_depth_threshold;       // 604  -> 608
+    float gi_depth_threshold;       // 604
+    // Light list (docs/LIGHT_LIST.md, render/caelix_light_sample.hlsl); addresses 0 = none.
+    uint64_t light_table;           // 608  the scene's light table (common/caelix_light.hlsl)
+    uint64_t light_cells;           // 616  the renderer's light cells (also trace set binding 21); 0 without kGiFlagLightNee
+    uint light_cell_capacity;       // 624  cells (a power of two)
+    uint light_candidates;          // 628  K: candidates per cell reservoir
+    float light_level_footprint;    // 632  world units per pixel: below -> level 0 (8-voxel cells), else level 1
+    float light_min_emission;       // 636  the scene's threshold: list light when luminance(emission) >= it
+    uint frame_counter;             // 640  the renderer's render count (1, 2, ...): cell touch and eviction
+    uint light_entity_mask;         // 644  reserved, 0
+    uint pad_648;                   // 648
+    uint pad_652;                   // 652
+    uint pad_656;                   // 656
+    uint pad_660;                   // 660
+    uint pad_664;                   // 664
+    uint pad_668;                   // 668  -> 672
 };
 
 struct CaelixTracePush
@@ -122,6 +137,7 @@ static const uint kGiFlagSpatial = 1u << 1;
 static const uint kGiFlagVisibility = 1u << 2;
 static const uint kGiFlagUnbiased = 1u << 3;
 static const uint kGiFlagDiffuseOnly = 1u << 4;
+static const uint kGiFlagLightNee = 1u << 5;
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

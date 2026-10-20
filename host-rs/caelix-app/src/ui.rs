@@ -45,6 +45,8 @@ pub struct Stats {
     pub upscaler_info: CaelixUpscalerInfo,
     /// The GI passes' time and reservoir memory (`caelix_renderer_get_gi_stats`).
     pub gi: CaelixGiStats,
+    /// The scene's light table (`caelix_scene_get_light_stats`).
+    pub light: CaelixLightStats,
     /// File name of the loaded world (`None` before the first load).
     pub world_name: Option<String>,
     /// The error of the last world load, else empty.
@@ -363,6 +365,10 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
                 ("trace", format!("{:.2} ms", t.trace_ms)),
                 ("gi", format!("{:.2} ms", stats.gi.gi_ms)),
                 ("reservoirs", format!("{:.0} MB", stats.gi.reservoir_bytes as f64 / 1e6)),
+                ("light fill", format!("{:.2} ms", stats.gi.light_fill_ms)),
+                ("light cells", format!("{:.1} MB", stats.gi.light_cell_bytes as f64 / 1e6)),
+                ("light bricks", stats.light.bricks.to_string()),
+                ("light dropped", stats.light.bricks_dropped.to_string()),
                 ("denoise", format!("{:.2} ms", t.denoise_ms)),
                 ("upscale", format!("{:.2} ms", t.upscale_ms)),
                 ("composite", format!("{:.2} ms", t.composite_ms)),
@@ -579,7 +585,28 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             ui.label("depth threshold");
             ui.add_enabled(restir, Slider::new(&mut gi.depth_threshold, 0.01..=1.0).logarithmic(true));
             ui.end_row();
+
+            let light = lighting && gi.light_nee;
+            ui.label("light cells");
+            ui.add_enabled_ui(light, |ui| {
+                ComboBox::from_id_salt("gi_light_cells").selected_text(gi.light_cells.to_string()).show_ui(ui, |ui| {
+                    for shift in 10..=20 {
+                        let cells = 1u32 << shift;
+                        ui.selectable_value(&mut gi.light_cells, cells, cells.to_string());
+                    }
+                });
+            });
+            ui.end_row();
+
+            ui.label("light candidates");
+            ui.add_enabled(light, Slider::new(&mut gi.light_candidates, 1..=64));
+            ui.end_row();
+
+            ui.label("light footprint");
+            ui.add_enabled(light, Slider::new(&mut gi.light_footprint, 0.01..=4.0).logarithmic(true));
+            ui.end_row();
         });
+        ui.add_enabled(lighting, egui::Checkbox::new(&mut gi.light_nee, "light NEE (light list)"));
         ui.add_enabled(
             lighting && gi.method == GiMethod::Pt,
             egui::Checkbox::new(&mut gi.diffuse_only, "diffuse only (path tracer; ReSTIR always)"),
