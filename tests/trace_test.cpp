@@ -3303,7 +3303,7 @@ TEST_CASE("light table counts one emissive brick")
                     static_cast<unsigned long long>(stats.rebuilds));
         CHECK(stats.bricks == 1);
         CHECK(stats.bricks_dropped == 0);
-        CHECK(stats.table_bytes > 64ull + 65536ull * 132ull);
+        CHECK(stats.table_bytes > 64ull + 65536ull * 452ull);  // 448 B entry + 4 B CDF per brick
         CHECK(stats.rebuilds >= 1);
 
         // A threshold above every emission: the next flush rebuilds the table without entries.
@@ -3519,6 +3519,123 @@ TEST_CASE("MIS on a large emitter")
     std::printf("panel: 64-frame RMSE without MIS %.5f, with MIS %.5f (ratio %.3f); ReSTIR DI without MIS %.5f, "
                 "with MIS %.5f (ratio %.3f)\n",
                 rmse[0], rmse[1], rmse[1] / rmse[0], rmse[2], rmse[3], rmse[3] / rmse[2]);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("closed faces are never sampled")
+{
+    // docs/LIGHT_FACES.md section 5: the light box's ceiling voxel has one open face (-Y). Step 1
+    // chose among the 1..3 axis faces that point to the receiver without knowing which were covered,
+    // so two of three samples of a floor receiver hit the ceiling from inside (60 % of the pixels
+    // lit at 1 spp). With the per-face masks the covered faces have no voxel and weight 0, so only
+    // the open face is sampled: every floor and wall pixel (the box is empty, nothing shadows the
+    // light) is lit at 1 spp. Ceiling pixels are not counted: the open face is coplanar with them.
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadLightBox(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 1);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    Target normal = CreateTarget(rig.gpu, VK_FORMAT_R16G16B16A16_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    set.t[kNormal] = &normal;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    Render(rig, renderer, set, camera, GlassOptions(CAELIX_MODE_PATH_TRACE, 4, 0, 4321));
+
+    const float* pixels = reinterpret_cast<const float*>(color.bytes.data());
+    uint32_t counted = 0;
+    uint32_t lit = 0;
+    for (uint32_t y = 0; y < kBoxSize; ++y)
+    {
+        for (uint32_t x = 0; x < kBoxSize; ++x)
+        {
+            if (normal.F16(x, y, 3) != 1.0f || normal.F16(x, y, 1) < -0.5f)
+            {
+                continue;  // no hit, or the ceiling (normal -Y)
+            }
+            const size_t p = static_cast<size_t>(y) * kBoxSize + x;
+            const double v = pixels[p * 4] + pixels[p * 4 + 1] + pixels[p * 4 + 2];
+            ++counted;
+            lit += v > 0.0 ? 1u : 0u;
+        }
+    }
+    const double fraction = counted > 0 ? static_cast<double>(lit) / counted : 0.0;
+    std::printf("closed faces: %u of %u floor and wall pixels lit at 1 spp (%.1f %%; step 1: about 60 %% of "
+                "the pixels)\n",
+                lit, counted, 100.0 * fraction);
+    CHECK(counted > kBoxSize * kBoxSize / 2);
+    CHECK(fraction > 0.95);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, normal);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("faces weigh the brick")
+{
+    // docs/LIGHT_FACES.md section 5: the panel box of "MIS on a large emitter" with a grey slab on
+    // top of the panel (y = 25, the same brick), so the panel's +Y faces are covered: the brick's
+    // weight sits in its -Y face set (64 voxels) and in the side faces of the panel's border rows
+    // (open on the brick border). The light NEE with MIS, whose proxy reads the face weights, must
+    // still match the path tracer.
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    EnableLights(rig.scene);
+    World world = LightBoxWalls();
+    FillBox(world, 8, kBoxInterior, 8, 15, kBoxInterior, 15, kWhiteEmitter512);
+    FillBox(world, 8, kBoxInterior + 1, 8, 15, kBoxInterior + 1, 15, kGreyFloor);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 1);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> nee = LightReference(rig, renderer, set, camera, 1024, 200000);
+    const LightComparison c = CompareLight(pt, nee, kBoxSize);
+    // The panel lights the box far above 1, where CompareLight's clamped block means are all 1 (its
+    // PSNR reads 99 dB): the block PSNR here compares both images scaled to a reference mean of 0.5.
+    const float scale = static_cast<float>(0.5 / c.ref_mean);
+    std::vector<float> pt_scaled = pt;
+    std::vector<float> nee_scaled = nee;
+    for (float& v : pt_scaled)
+    {
+        v *= scale;
+    }
+    for (float& v : nee_scaled)
+    {
+        v *= scale;
+    }
+    const LightComparison scaled = CompareLight(pt_scaled, nee_scaled, kBoxSize);
+    std::printf("covered panel, light NEE + MIS vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 block PSNR "
+                "%.2f dB (images scaled to a reference mean of 0.5)\n",
+                c.test_mean, c.ref_mean, c.ratio, scaled.block_psnr);
+    CHECK(c.ref_mean > 0.01);
+    CHECK(c.ratio > 0.97);
+    CHECK(c.ratio < 1.03);
+    CHECK(scaled.block_psnr > 30.0);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);

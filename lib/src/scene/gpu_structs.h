@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace caelix {
@@ -73,27 +74,31 @@ struct LightTableHeader
 {
     uint32_t count;     // entries (the scan clamps it to max_bricks)
     uint32_t dropped;   // bricks with list lights that did not fit
-    uint32_t capacity;  // max_bricks: the CDF starts at 64 + capacity * 128 (written by the scan)
+    uint32_t capacity;  // max_bricks: the CDF starts at 64 + capacity * 448 (written by the scan)
     uint32_t pad;
     float total_weight;  // cdf[count - 1]; 0 when count is 0
     float pad2[11];
 };
 static_assert(sizeof(LightTableHeader) == 64);
 
-// One brick with list lights. 128 bytes. Voxel v = x | y << 3 | z << 6; word w of the mask is the
-// z = w slice.
+// One brick with list lights (docs/LIGHT_FACES.md). 448 bytes. Voxel v = x | y << 3 | z << 6;
+// face f is +X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5; word z of a face mask is the z slice.
 struct LightEntry
 {
-    uint64_t mask[8];          // bit v of word (v >> 6): voxel v is alive and a list light
-    float region_weight[8];    // luminance sum of the set bits of word w
-    float total_weight;        // sum of region_weight
+    uint64_t face_mask[6][8];  // bit v of word (v >> 6): voxel v is a list light and its face f is
+                               // open (on the brick border, or the neighbour in the brick is empty)
+    float face_weight[6];      // luminance sum of the set bits of face_mask[f]
+    float total_weight;        // luminance sum of the brick's list-light voxels (the CDF weight)
     uint32_t group;            // scene-wide group index
     uint32_t id;               // dense brick id
     uint32_t entity;
     int32_t origin[3];         // entity-local voxel origin of the brick (brick key * 8)
-    uint32_t mean_normal;      // octahedral 2 x 16-bit snorm of the mean open-face direction, 0 = none
+    uint32_t pad[3];
 };
-static_assert(sizeof(LightEntry) == 128);
+static_assert(sizeof(LightEntry) == 448);
+static_assert(offsetof(LightEntry, face_weight) == 384);
+static_assert(offsetof(LightEntry, total_weight) == 408);
+static_assert(offsetof(LightEntry, origin) == 424);
 
 constexpr uint64_t kLightTableHeaderBytes = sizeof(LightTableHeader);
 // Bytes of a light table of `max_bricks` entries.

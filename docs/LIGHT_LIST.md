@@ -56,6 +56,12 @@ groupshared float reduction; thread 0 stores the word. A brick without list ligh
 
 ### 1.2 Light table (scene, `light_table_`)
 
+**Step 4 replaced the entry layout** (`docs/LIGHT_FACES.md`, 2026-10-21): the entry is 448 B with
+six per-face voxel masks and six face weights instead of the one voxel mask, the slice weights and
+`mean_normal` below, and the sampler of section 2.1 picks a face direction by weight before the
+voxel. The text below is the step 1 design and stays as history; the header, the CDF, the kernels'
+dispatch and the entry map are unchanged.
+
 One device-local buffer, rebuilt by two kernels inside `Scene::Flush` after the finalize dispatch
 whenever `lights_dirty_` (set by every flush that dispatched the finalize kernel or recorded a
 zero fill / range move of light words; cleared after the rebuild). Layout, `max_bricks` = N
@@ -440,7 +446,7 @@ host flags and UI, `tools/gi_bench.*`.
 | item | size |
 | --- | --- |
 | light word | 4 B per AABB row (`Scene::light_words_`, grows with the AABB pool; 256 KiB at the initial 65536 rows) |
-| light table | 64 B header + 132 B per `max_bricks` entry (128 B entry + 4 B CDF): 8.3 MiB at 65536 |
+| light table | 64 B header + 132 B per `max_bricks` entry (128 B entry + 4 B CDF): 8.3 MiB at 65536; since step 4 (`LIGHT_FACES.md`) 452 B per entry (448 B entry + 4 B CDF): 28.3 MiB at 65536, 452 MiB at 2^20 |
 | light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md) |
 | `FinalizePush` | 88 -> 104 B (`light_words`, `materials`, `min_emission` in place of `pad`) |
 | `LightPush` | 72 B (see differences); 80 B since step 3 (`light_indices`, docs/LIGHT_MIS.md) |
@@ -558,15 +564,17 @@ render kernels need it to find the CDF behind the entries.
 
 ### Open points
 
-- Covered faces: the entry has no per-face data, so a voxel with covered side faces wastes most
-  NEE samples (a light voxel set into a ceiling, as in test 2: 2 of 3). Per-face open bits per entry (6 bits
-  per light voxel, or a face mask per slice) would remove that waste.
+- Covered faces: done in step 4 (`docs/LIGHT_FACES.md`): the entry has a voxel mask and a weight
+  per face direction, and a face covered inside the brick is never sampled (the light box's floor
+  and walls go from about 60 % to 100 % lit pixels at 1 spp). A face on the brick border that a
+  neighbour brick covers can still be sampled.
 - MIS with the BSDF path and the bias fix for dropped bricks: see docs/LIGHT_MIS.md (step 3).
 - Material changes do not rewrite light words: a brick whose word is 0 under the old table stays
   out until it is finalized again (an entry whose lights vanished is dropped by the compact
   kernel, difference 5).
 - No temporal reuse of the cell reservoirs; the fill touches every live cell every frame.
-- `maxStorageBufferRange`: the table binding at `max_bricks` 2^20 is 138 MB, above the Vulkan
-  minimum of 128 MB (NVIDIA allows 4 GiB).
+- `maxStorageBufferRange`: the table binding at `max_bricks` 2^20 is 474 MB since step 4 (138 MB
+  before), above the Vulkan minimum of 128 MB (NVIDIA allows 4 GiB). Only the compact and scan
+  kernels bind it; the render kernels read it through addresses.
 - The bench runs (`pt_nee`, `pt_nee_conv`, scene `shroom` with its stored pose) are configured in
   `tools/gi_bench.json`, not run in this step.

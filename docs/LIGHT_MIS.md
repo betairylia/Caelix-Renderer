@@ -58,6 +58,14 @@ p_area(y) = orient / max(d2_bc, near_d2) * region_weight[z] / (C_c * n_z * n_fac
 p_area(y) = region_weight[z] / (total * n_z * n_faces)                                (global)
 ```
 
+**Since step 4** (`docs/LIGHT_FACES.md`, per-face masks) the in-brick density comes from the face
+weights: `region_weight[z] / (n_z n_faces)` above is replaced by `total_weight_b * face_weight[f] /
+(W_cand n_f)`, with `f` the point's face, `n_f` the set bits of that face's mask and `W_cand` the sum
+of the weights of the brick's candidate faces seen from the receiver (`LightCandidateWeight`, the
+sampler's rule). The description carries the brick's world origin and axes, the six face weights,
+the face and `1 / n_f` instead of the voxel frame and `pdf_base`, and the mean normal is derived
+from the face weights (`LightBrickNormalLocal`).
+
 Both sides evaluate `p_area` through ONE function, `LightNeeProxyPdf`, from the same inputs: a
 per-vertex context (`LightNeeProxyContext`: whether a cell was found, its world centre, `near_d2`,
 `C_c`, and the table's `total`) built by `LightNeeProxyAt(fc, x_r, group, object_point)` from the
@@ -177,6 +185,11 @@ keeps it in the path-trace method like `LIGHT_CELL_JITTER`. `CaelixGiOptions` is
 behaviour; the four scenes at 1 spp against their references.
 
 ## As built (phase A: sections 1-4, 6-8; 2026-10-21)
+
+Step 4 (`docs/LIGHT_FACES.md`, "As built") changed the proxy's in-brick density to the face weights
+(`LightNeeProxyPdfArea(ctx, d, x_r)`, `LightCandidateWeight` instead of `LightCandidateFaces`, a new
+`LightMisDesc`); the description below is the phase A state, and the measurements of both phases
+were taken before step 4.
 
 Section 5 (ReSTIR DI with MIS) was built in phase B (see "As built (phase B)" below). In phase A
 the DI target, reservoir and shade pass were unchanged, and the primary vertex kept the exclusive

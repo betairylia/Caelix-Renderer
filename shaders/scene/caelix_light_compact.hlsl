@@ -1,16 +1,19 @@
-// Light table compact kernel (docs/LIGHT_LIST.md, section 1.2): turns the light words of every
-// render group into LightEntry rows of the scene's light table (common/caelix_light.hlsl).
+// Light table compact kernel (docs/LIGHT_LIST.md section 1.2, entry layout docs/LIGHT_FACES.md):
+// turns the light words of every render group into the 448-byte entries of the scene's light table
+// (common/caelix_light.hlsl).
 //
 // One workgroup of 64 threads per group index in [group_base, group_base + dispatch size); thread t
 // walks the dense ids t, t + 64, ... below the group's high water. An id whose light word is not 0
 // and whose slot row is resident is read from its record: the micro occupancy gives the occupied
-// voxels, the payload their material code, and every occupied voxel whose material is a list light
-// sets its mask bit, adds its emission luminance to its slice's region weight and the total, and adds
-// the unit directions of its open faces (a face on the brick border, or whose neighbour in the brick
-// is not occupied) to the normal sum. An entry with a total of 0 (the materials changed since the
-// light word was written) is not stored. The entry takes the next index of the header's count
-// (InterlockedAdd); an index at or above the capacity counts in `dropped` instead. The entry's
-// total also goes to cdf[index], which caelix_light_scan turns into the prefix sum.
+// voxels, the payload their material code. Every occupied voxel whose material is a list light adds
+// its emission luminance to the total and, for each of its six faces that is open (on the brick
+// border, or the neighbour voxel inside the brick is not occupied; a neighbour brick is not
+// consulted), to that face's weight; the face masks are the list-light voxels ANDed with the open
+// bits of each face (OpenWord), so a face mask and its weight always cover the same voxels. An
+// entry with a total of 0 (the materials changed since the light word was written) is not stored.
+// The entry takes the next index of the header's count (InterlockedAdd); an index at or above the
+// capacity counts in `dropped` instead. The entry's total also goes to cdf[index], which
+// caelix_light_scan turns into the prefix sum.
 //
 // The brick -> entry map (docs/LIGHT_MIS.md section 2): every dense id below the high water gets
 // light_indices[aabb_row_base + id] = entry index + 1, or 0 when it has no entry (light word 0, not
@@ -57,11 +60,39 @@ uint64_t RecordAddress(uint record_index)
     return page_address + uint64_t(slot) * g_push.record_bytes;
 }
 
-// Whether voxel (x, y, z) (each 0..7) is set in the per-slice masks.
-bool MaskBit(uint2 slices[8], int x, int y, int z)
+// The voxels of slice z whose face `face` (+X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5) is open: the face lies
+// on the brick border or the neighbour voxel in that direction is not occupied. Slice words hold bit
+// x + 8 (y & 3) in the low (y 0..3) or high (y 4..7) half, so a neighbour along x is one bit away
+// (masked at the row ends), along y one byte (carried between the halves), along z one slice.
+uint2 OpenWord(uint2 occupied[8], uint face, uint z)
 {
-    const uint2 s = slices[z];
-    return ((y < 4 ? s.x : s.y) >> (uint(x) + 8u * (uint(y) & 3u)) & 1u) != 0u;
+    const uint2 o = occupied[z];
+    uint2 neighbour;
+    if (face == 0u)
+    {
+        neighbour = (o >> 1) & 0x7F7F7F7Fu;  // x + 1; x = 7 has none
+    }
+    else if (face == 1u)
+    {
+        neighbour = (o << 1) & 0xFEFEFEFEu;  // x - 1; x = 0 has none
+    }
+    else if (face == 2u)
+    {
+        neighbour = uint2((o.x >> 8) | (o.y << 24), o.y >> 8);  // y + 1; y = 7 has none
+    }
+    else if (face == 3u)
+    {
+        neighbour = uint2(o.x << 8, (o.y << 8) | (o.x >> 24));  // y - 1; y = 0 has none
+    }
+    else if (face == 4u)
+    {
+        neighbour = z < 7u ? occupied[z + 1u] : uint2(0u, 0u);
+    }
+    else
+    {
+        neighbour = z > 0u ? occupied[z - 1u] : uint2(0u, 0u);
+    }
+    return ~neighbour;
 }
 
 // Builds and stores the entry of one brick. Returns the entry index + 1, or 0 when the brick got no
@@ -111,18 +142,32 @@ uint CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_ba
         }
     }
 
-    // List lights.
+    // List lights: the voxel mask (ANDed with the open words when the entry is stored), the face
+    // weights and the total.
     uint2 mask[8];
-    float region[8];
+    float face_weight[6];
+    CAELIX_UNROLL
+    for (uint f = 0; f < 6; ++f)
+    {
+        face_weight[f] = 0.0f;
+    }
     float total = 0.0f;
-    float3 normal_sum = float3(0.0f, 0.0f, 0.0f);
     uint last_code = 0xFFFFFFFFu;
     float last_luminance = 0.0f;
     CAELIX_LOOP
     for (uint z = 0; z < 8; ++z)
     {
         mask[z] = uint2(0u, 0u);
-        region[z] = 0.0f;
+        if (all(occupied[z] == 0u))
+        {
+            continue;
+        }
+        uint2 open[6];
+        CAELIX_UNROLL
+        for (uint f2 = 0; f2 < 6; ++f2)
+        {
+            open[f2] = OpenWord(occupied, f2, z);
+        }
         CAELIX_LOOP
         for (uint half_index = 0; half_index < 2; ++half_index)
         {
@@ -153,17 +198,19 @@ uint CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_ba
                 {
                     mask[z].y |= 1u << b;
                 }
-                region[z] += last_luminance;
+                // The total takes every list-light voxel (the light word's rule). A voxel with no
+                // open face cannot exist after the finalize kernel's interior removal; if one did,
+                // it would only weigh the CDF (it is in no face mask).
                 total += last_luminance;
-                const int3 p = int3(x, y, z);
-                const float3 open = float3(
-                    (p.x == 7 || !MaskBit(occupied, p.x + 1, p.y, p.z) ? 1.0f : 0.0f) -
-                        (p.x == 0 || !MaskBit(occupied, p.x - 1, p.y, p.z) ? 1.0f : 0.0f),
-                    (p.y == 7 || !MaskBit(occupied, p.x, p.y + 1, p.z) ? 1.0f : 0.0f) -
-                        (p.y == 0 || !MaskBit(occupied, p.x, p.y - 1, p.z) ? 1.0f : 0.0f),
-                    (p.z == 7 || !MaskBit(occupied, p.x, p.y, p.z + 1) ? 1.0f : 0.0f) -
-                        (p.z == 0 || !MaskBit(occupied, p.x, p.y, p.z - 1) ? 1.0f : 0.0f));
-                normal_sum += open;
+                CAELIX_UNROLL
+                for (uint f3 = 0; f3 < 6; ++f3)
+                {
+                    const uint open_half = half_index == 0 ? open[f3].x : open[f3].y;
+                    if (((open_half >> b) & 1u) != 0u)
+                    {
+                        face_weight[f3] += last_luminance;
+                    }
+                }
             }
         }
     }
@@ -185,19 +232,27 @@ uint CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_ba
     const uint pos = SlotRowPos(row.x);
     const int3 brick = int3(pos & pos_mask, (pos >> shift) & pos_mask, (pos >> (2 * shift)) & pos_mask);
     const int3 origin = (coord * int(1u << shift) + brick) * 8;
-    const float normal_length = length(normal_sum);
-    const uint mean_normal = normal_length > 1e-6f ? EncodeOctahedral(normal_sum / normal_length) : 0u;
 
+    // 24 x 16 B of face masks (face-major, two slices per store), then the 64 bytes of the header
+    // part: the six weights, total, group, id, entity, origin and the pad.
     const uint address = kLightHeaderBytes + index * kLightEntryBytes;
-    CAELIX_UNROLL
-    for (uint w = 0; w < 4; ++w)
+    CAELIX_LOOP
+    for (uint f4 = 0; f4 < 6; ++f4)
     {
-        g_table.Store4(address + w * 16, uint4(mask[2 * w], mask[2 * w + 1]));
+        CAELIX_UNROLL
+        for (uint w = 0; w < 4; ++w)
+        {
+            const uint2 lo = mask[2 * w] & OpenWord(occupied, f4, 2 * w);
+            const uint2 hi = mask[2 * w + 1] & OpenWord(occupied, f4, 2 * w + 1);
+            g_table.Store4(address + f4 * kLightEntryFaceMaskBytes + w * 16, uint4(lo, hi));
+        }
     }
-    g_table.Store4(address + 64, asuint(float4(region[0], region[1], region[2], region[3])));
-    g_table.Store4(address + 80, asuint(float4(region[4], region[5], region[6], region[7])));
-    g_table.Store4(address + 96, uint4(asuint(total), group, id, entity));
-    g_table.Store4(address + 112, uint4(asuint(origin), mean_normal));
+    g_table.Store4(address + kLightEntryWeightsOffset,
+                   asuint(float4(face_weight[0], face_weight[1], face_weight[2], face_weight[3])));
+    g_table.Store4(address + kLightEntryWeightsOffset + 16,
+                   uint4(asuint(face_weight[4]), asuint(face_weight[5]), asuint(total), group));
+    g_table.Store4(address + kLightEntryTotalOffset + 8, uint4(id, entity, asuint(origin.x), asuint(origin.y)));
+    g_table.Store4(address + kLightEntryOriginOffset + 8, uint4(asuint(origin.z), 0u, 0u, 0u));
     g_table.Store(kLightHeaderBytes + g_push.max_bricks * kLightEntryBytes + index * 4, asuint(total));
     return index + 1u;
 }

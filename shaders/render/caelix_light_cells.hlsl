@@ -9,7 +9,8 @@
 // target p_hat_i = total_i * G_i:
 //   G_i = orient / max(|centre_i - cell centre|^2, (cell half size + 4)^2),
 //   orient = max(0.1, dot(mean normal_i, direction from the brick centre to the cell centre)),
-//            1 without a mean normal,
+//            1 without a mean normal (the normal comes from the entry's face weights,
+//            LightBrickNormalLocal: the luminance-weighted open-face direction, docs/LIGHT_FACES.md),
 // all in world space (entity transforms of the brick and of the cell). The reservoir stores the
 // entry index and W = (w_sum / K) / p_hat(selected), w_i = p_hat_i / p_i: an unbiased contribution
 // weight of the brick for every point of the cell, since p_hat_i > 0 for every entry. No temporal
@@ -102,10 +103,8 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     for (uint k = 0; k < candidates; ++k)
     {
         const uint i = LightCdfSearch(table, capacity, count, RandomFloat01(rng) * total);
-        const uint64_t entry = LightEntryAddress(table, i);
-        const uint4 a = CAELIX_LOAD_U32x4(entry + 96);   // total, group, id, entity
-        const uint4 b = CAELIX_LOAD_U32x4(entry + 112);  // origin, mean normal
-        const float entry_total = asfloat(a.x);
+        const LightEntryHeader entry = LoadLightEntryHeader(LightEntryAddress(table, i));
+        const float entry_total = entry.total_weight;
         const float u_select = RandomFloat01(rng);
         if (!(entry_total > 0.0f))
         {
@@ -114,14 +113,15 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         float4 e0;
         float4 e1;
         float4 e2;
-        EntityCurRows(fc, a.w, e0, e1, e2);
-        const float3 centre = RowsTransform(e0, e1, e2, float3(int3(b.xyz)) + 4.0f);
+        EntityCurRows(fc, entry.entity, e0, e1, e2);
+        const float3 centre = RowsTransform(e0, e1, e2, float3(entry.origin) + 4.0f);
         const float3 to_cell = cell_centre - centre;
         const float distance2 = dot(to_cell, to_cell);
         float orient = 1.0f;
-        if (b.w != 0u && distance2 > 1e-12f)
+        const float3 n_local = LightBrickNormalLocal(entry);
+        if (any(n_local != 0.0f) && distance2 > 1e-12f)
         {
-            const float3 n = RowsRotate(e0, e1, e2, DecodeOctahedral(b.w));
+            const float3 n = RowsRotate(e0, e1, e2, n_local);
             orient = max(0.1f, dot(n, to_cell * rsqrt(distance2)));
         }
         const float G = orient / max(distance2, near_d2);

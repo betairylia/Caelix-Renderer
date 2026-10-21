@@ -64,7 +64,7 @@
 //                   diffuse vertex with a next segment also samples the scene's light list
 //                   (LightNextEvent) and the segment that leaves it does not count the emission
 //                   of a list light it hits when the NEE can sample that point (the brick has a
-//                   table entry and the voxel's mask bit is set, LightListCanSample); in ReSTIR
+//                   table entry and the hit face's mask bit is set, LightListCanSample); in ReSTIR
 //                   mode the primary vertex's light NEE goes to the diffuse target unpacked (the
 //                   shade pass adds the reservoir to it).
 //                   kGiFlagLightMis (docs/LIGHT_MIS.md, with kGiFlagLightNee): instead of that
@@ -310,9 +310,10 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // random stream; the segment that leaves such a vertex skips the emission of a list light it
 // hits (luminance of the emission >= fc.light_min_emission, at least the near-field distance
 // away) when the NEE can sample that point (LightListCanSample: the brick has a table entry and
-// the voxel's mask bit is set), so NEE replaces exactly that emission. A point the NEE cannot
-// sample (a brick dropped beyond the table's capacity, a voxel whose material changed) keeps its
-// emission: before step 3 (docs/LIGHT_MIS.md) such light was lost. A segment that leaves a vertex
+// the voxel's bit is set in the mask of the hit face, docs/LIGHT_FACES.md), so NEE replaces exactly
+// that emission. A point the NEE cannot sample (a brick dropped beyond the table's capacity, a voxel
+// whose material changed, a face the entry counts as covered) keeps its emission: before step 3
+// (docs/LIGHT_MIS.md) such light was lost. A segment that leaves a vertex
 // without light NEE (a specular lobe) still counts every emission.
 // Light MIS (kGiFlagLightMis with light NEE): the vertex's NEE is multiplied by the balance
 // heuristic weight w_nee and a list-light hit of the segment that leaves it (one the NEE can
@@ -492,15 +493,17 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         if (segment_light_nee && shade.emission_luminance >= fc.light_min_emission &&
             hit.T >= g_lightNeeMinDistance)
         {
-            LightEntry light_entry;
+            LightEntryHeader light_entry;
+            uint64_t light_address;
             uint3 light_voxel;
             uint light_face;
-            if (LightListCanSample(fc, hit, light_entry, light_voxel, light_face))
+            if (LightListCanSample(fc, hit, light_entry, light_address, light_voxel, light_face))
             {
                 emission_weight = 0.0f;
                 if (segment_mis)
                 {
-                    const LightMisDesc desc = LightMisDescOf(fc, light_entry, light_voxel);
+                    const LightMisDesc desc =
+                        LightMisDescOf(fc, light_entry, light_address, light_voxel, light_face);
                     const float cos_l = -dot(hit.normal, bounce.Direction);
                     emission_weight = LightNeeMisWeight(segment_ctx, desc, segment_x_r, segment_n_r,
                                                         bounce.Direction, hit.T, cos_l, false);

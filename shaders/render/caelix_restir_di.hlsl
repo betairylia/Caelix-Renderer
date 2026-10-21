@@ -202,7 +202,7 @@ DiLight DiInvalidLight()
 
 // Invalid without a sample or with an entry index beyond the table's count (the table changed:
 // the renderer drops the history then, this is the guard). The MIS description is built only with
-// DiMisEnabled (it costs one more load of the entity rows).
+// DiMisEnabled (it costs one more load of the entity rows and of the face's mask).
 DiLight DiResolve(CaelixFrameConstants fc, DiReservoir r)
 {
     if (!DiHasSample(r) || fc.light_table == 0u)
@@ -214,10 +214,12 @@ DiLight DiResolve(CaelixFrameConstants fc, DiReservoir r)
     {
         return DiInvalidLight();
     }
-    const LightEntry entry = LoadLightEntry(LightEntryAddress(fc.light_table, r.light));
+    const uint64_t address = LightEntryAddress(fc.light_table, r.light);
+    const LightEntryHeader entry = LoadLightEntryHeader(address);
     const float2 uv = float2(LightUvDequantize(r.uv & 0xFFFFu), LightUvDequantize(r.uv >> 16));
     const uint v = r.voxel_face & kDiVoxelMask;
-    const LightPoint p = LightPointAt(fc, entry, v, (r.voxel_face >> kDiFaceShift) & kDiFaceMask, uv);
+    const uint face = (r.voxel_face >> kDiFaceShift) & kDiFaceMask;
+    const LightPoint p = LightPointAt(fc, entry, v, face, uv);
     DiLight l;
     l.valid = true;
     l.position = p.position;
@@ -227,7 +229,7 @@ DiLight DiResolve(CaelixFrameConstants fc, DiReservoir r)
     l.mis = LightMisDescZero();
     if (DiMisEnabled(fc))
     {
-        l.mis = LightMisDescOf(fc, entry, uint3(v & 7u, (v >> 3) & 7u, (v >> 6) & 7u));
+        l.mis = LightMisDescOf(fc, entry, address, uint3(v & 7u, (v >> 3) & 7u, (v >> 6) & 7u), face);
     }
     return l;
 }
@@ -458,18 +460,18 @@ DiReservoir DiInitialReservoir(CaelixFrameConstants fc, uint2 pixel, float3 x_v,
                 W_brick = asfloat(reservoir.y);
             }
         }
-        LightEntry entry;
-        if (light == kNoLight)
+        const bool from_cdf = light == kNoLight;
+        if (from_cdf)
         {
             light = LightCdfSearch(table, capacity, count, u_global * total);
-            entry = LoadLightEntry(LightEntryAddress(table, light));
+        }
+        const uint64_t address = LightEntryAddress(table, light);
+        const LightEntryHeader entry = LoadLightEntryHeader(address);
+        if (from_cdf)
+        {
             W_brick = entry.total_weight > 0.0f ? total / entry.total_weight : 0.0f;
         }
-        else
-        {
-            entry = LoadLightEntry(LightEntryAddress(table, light));
-        }
-        const LightSample s = SampleLightEntryWith(fc, entry, x_v, true, rng);
+        const LightSample s = SampleLightEntryWith(fc, entry, address, x_v, true, rng);
         const float u_select = RandomFloat01(rng);
         if (!s.valid || !(W_brick > 0.0f))
         {

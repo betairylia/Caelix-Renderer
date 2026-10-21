@@ -118,3 +118,100 @@ reservoir's face. The cell fill reads the header and derives the mean normal fro
 `pt_nee`, `pt_nee_nomis`, `di`, `di_unbiased` (+ `_conv`) on the four scenes against the step 3
 references (`Artifacts/gi-experiments-20261020/light-mis/`), lit-pixel fraction and PSNR at 1 spp;
 the expected gain is in the lit fraction and in the DI's 1-spp PSNR.
+
+## As built (sections 1-5; 2026-10-21)
+
+The bench of section 6 was not run in this step.
+
+### Sizes
+
+| item | size |
+| --- | --- |
+| light table entry | 448 B (was 128 B), layout as in section 1; C++ `LightEntry` with `static_assert`s on the size and on the offsets 384 / 408 / 424 |
+| light table | 64 B header + 452 B per `max_bricks` entry (448 B entry + 4 B CDF): 28.3 MiB at 65536 (`CaelixLightStats::table_bytes` 30146624 with the 2 x 256 KiB of light words and entry map), 452 MiB at 2^20 |
+| `LightMisDesc` | 27 values (was 20): brick origin, 3 axes, 6 face weights, face, `inv_n_face`, `brick_total`, brick centre, brick normal |
+| ABI | none; comments in `caelix.h` (entry size, `table_bytes`) updated |
+
+### Kernels and code touched
+
+- `common/caelix_light.hlsl`: `LightEntryHeader`, `LoadLightEntryHeader` (4 x 16 B from byte 384),
+  `LoadLightFaceMask`, `LightFaceMaskBit` (one 8 B load), `LightBrickNormalLocal` (the mean normal
+  from the weights), offset constants; `LightEntry`, `LoadLightEntry` and the octahedral code are
+  gone (nothing else used them).
+- `scene/caelix_light_compact.hlsl`: `OpenWord(occupied, face, z)` computes the open bits of one
+  slice for one face with word operations (x: one bit, masked at the row ends; y: one byte, carried
+  between the two halves; z: the next slice). Pass 1 adds each list-light voxel's luminance to the
+  total and to the weight of every face whose open bit is set; after the index is allocated, pass 2
+  stores `mask[z] & OpenWord(...)` per face (24 x 16 B), then 4 x 16 B of weights, total, group, id,
+  entity, origin and pad. `MaskBit` and the normal sum are gone.
+- `render/caelix_light_cells.hlsl`: the fill loads the header; `orient` uses
+  `LightBrickNormalLocal` rotated by the entity rows (1 when it is 0).
+- `render/caelix_light_sample.hlsl`: `LightBrickFrame` (+ `LightBrickFrameOf`),
+  `LightCandidateFaceMask`, `LightCandidateWeightSum`, `LightVoxelFrameIn`, the new `LightMisDesc`
+  (+ `LightMisDescWith`, `LightMisDescOf(fc, header, address, voxel, face)`), `LightFaceCount`,
+  `LightCandidateWeight`; `SampleLightEntryWith(fc, header, address, x_r, quantize_uv, rng)`,
+  `LightPointAt(fc, header, ...)`, `LightNeeProxyPdfArea(ctx, d, x_r)`; `LightListCanSample` returns
+  the header and the entry address and tests the hit face's mask bit. `LightCandidateFaces` is gone.
+- `render/caelix_restir_di.hlsl`: `DiInitialReservoir` and `DiResolve` load the header and pass the
+  entry address; `DiResolve` builds the description for the reservoir's face.
+- `render/caelix_path_trace.hlsl`: the BSDF-side call site and two comments.
+- `lib/src/scene/gpu_structs.h`: the 448 B `LightEntry`, the `LightTableHeader` comment.
+
+### Differences from the design, and why
+
+1. **The proxy keeps the entry's weight.** Section 4 says `face_weight[face] * inv_n_face /
+   W_cand` replaces `pdf_base / n_faces`. These two are not the same quantity: step 1's
+   `pdf_base / n_faces = region_weight[z] / (n_z n_faces)` is the entry's total weight times the
+   in-brick density (the total cancelled against `p_brick`), while the new expression is the
+   in-brick density alone. `LightNeeProxyPdfArea` therefore uses `brick_total * face_weight[face] *
+   inv_n_face / W_cand` in that place: with a cell `G * brick_total * in_brick / C_c`, without one
+   `brick_total * in_brick / total`. Without the factor the proxy would be off by the brick's
+   luminance (any scale keeps MIS unbiased, but the weights would be wrong).
+2. **One candidate function for both sides.** `LightCandidateFaceMask(origin, axes, x_r)` and
+   `LightCandidateWeightSum(weights, mask)` (face order) are called by the sampler and by
+   `LightCandidateWeight` of the proxy, so `W_cand` is the same number on both sides.
+3. **The brick frame.** The sampler needs the brick's world origin before it knows the voxel, so
+   the frame functions start from the brick (`LightBrickFrameOf`: origin corner + axes from the
+   entity rows) and derive the voxel frame from it (`LightVoxelFrameIn`); the description's brick
+   centre is `origin + 4 (a0 + a1 + a2)`. Step 3 went the other way (voxel frame first). The NEE
+   side, the BSDF side and `LightPointAt` all use the same functions, so the numbers agree.
+4. **The mean normal threshold.** `LightBrickNormalLocal` returns 0 when the length of
+   `(w0 - w1, w2 - w3, w4 - w5)` is at most `1e-6 * total_weight` (a relative test: the weights are
+   luminance sums, and two equal sums in different order need not subtract to exactly 0).
+5. **`LightMisDescOf` keeps a `voxel` argument** (as the brief's signature), but the description
+   does not depend on it: every point of one face set has the same in-brick density.
+6. **Candidate t in voxel units assumes unit axes.** `t_a = dot(axis_a, x_r - origin)` is in voxel
+   units only for an entity transform without scale, as the rest of the light sampling assumes (the
+   face area is taken as 1).
+7. **Test "faces weigh the brick"**: the panel lights the box far above 1, so `CompareLight`'s
+   block PSNR (block means clamped to [0, 1]) reads 99 dB for every panel case (also in "MIS on a
+   large emitter"); the new case computes the block PSNR on both images scaled to a reference mean
+   of 0.5. Its slab covers the panel's +Y faces, which the floor camera's receivers never have as a
+   candidate (they are below the brick); the case checks the proxy's face weights and the side faces
+   on the brick border (open, covered by the neighbour bricks' ceiling: wasted samples, no bias).
+
+### Measurements (`tests/trace_test.cpp`, RTX 5080, 128 x 128, 4 bounces)
+
+All 29 trace test cases pass.
+
+| test | step 3 | step 4 |
+| --- | --- | --- |
+| closed faces are never sampled (floor and wall pixels lit at 1 spp, light NEE) | about 60 % of all pixels | 15880 of 15884 (100.0 %) |
+| cells fill and sample (all pixels lit at 1 spp) | 60 % | 16380 of 16384 |
+| faces weigh the brick (covered panel, light NEE + MIS, 1024 vs 4096-frame PT) | - | ratio 1.0009, scaled block PSNR 51.40 dB |
+| light NEE is unbiased (1 voxel) | ratio 1.0095, block PSNR 45.78 dB | ratio 1.0062, 45.92 dB (PT vs PT other seeds: 1.0060, 42.04 dB) |
+| light NEE with MIS is unbiased | 1.0095, 45.78 dB | 1.0062, 45.92 dB |
+| MIS on a large emitter, 64-frame RMSE: light NEE / + MIS | 1.4757 / 1.4578 | 0.96447 / 0.97848 (ratio 1.015) |
+| same, ReSTIR DI / + MIS | 2.5797 / 2.3871 | 1.19243 / 1.16880 (ratio 0.980) |
+| same, converged ratios (NEE, NEE + MIS, DI, DI + MIS) | 1.0035, 1.0032, 1.0076, 1.0074 | 1.0009, 1.0009, 0.9993, 1.0001 |
+| dropped bricks keep their emission (NEE, NEE + MIS) | 1.0032, 39.55 dB | 1.0023, 39.53 dB |
+| ReSTIR DI unbiased vs light NEE (without / with MIS) | 0.9943 / 0.9998, pixel PSNR 38.78 / 38.71 dB | 0.9998 / 0.9999, pixel PSNR 54.98 / 54.98 dB (NEE vs NEE other seeds 55.04 dB) |
+| single frame RMSE after 64 warm-up frames (NEE, DI `TS`, DI `TSU`, DI `TSU` + MIS) | 0.15678, 0.15367, 0.15484, 0.15430 | 0.04017, 0.04002, 0.04002, 0.04012 |
+
+The single-voxel box: the NEE now samples only the open face, so the 1-spp error of the light NEE
+drops by 3.9x, and the pixel PSNR between two 1024-frame accumulations (DI vs NEE) rises from
+38.8 to 55.0 dB. ReSTIR DI gains almost nothing over the NEE in this box any more: with one
+light voxel and no wasted candidates there is nothing for the reuse to choose between. The panel:
+the side faces of the inner panel voxels are covered inside the brick and no longer sampled, so the
+64-frame RMSE drops by 1.5x (NEE) and 2.2x (DI). MIS on the panel is now neutral to slightly worse
+for the NEE (1.015x) and still helps the DI (0.980x).

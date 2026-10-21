@@ -518,9 +518,9 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
  * A material is a "list light" when the luminance of its emission (0.2126 r + 0.7152 g + 0.0722 b,
  * before CaelixRenderOptions::emission_scale) is >= min_emission. The finalize kernel writes one
  * light word per brick (the luminance sum of its alive list-light voxels), and every flush that
- * finalized bricks or freed brick ids rebuilds the scene's light table: one 128-byte entry per brick
- * with list lights (a voxel mask, region weights, the brick's origin and mean open-face normal) and a
- * CDF over their weights. Renderers with CAELIX_GI_FLAG_LIGHT_NEE sample it. Bricks beyond max_bricks
+ * finalized bricks or freed brick ids rebuilds the scene's light table: one 448-byte entry per brick
+ * with list lights (per face direction a mask of the voxels whose face is open and its weight, the
+ * brick's origin; docs/LIGHT_FACES.md) and a CDF over their weights. Renderers with CAELIX_GI_FLAG_LIGHT_NEE sample it. Bricks beyond max_bricks
  * are dropped (counted, never an error). */
 typedef struct CaelixLightOptions
 {
@@ -550,7 +550,7 @@ typedef struct CaelixLightStats
     uint32_t bricks;         /* entries of the table after the newest rebuild whose frame is safe
                                 (read back from the GPU; 0 before the first one) */
     uint32_t bricks_dropped; /* bricks with list lights beyond max_bricks in that rebuild */
-    uint64_t table_bytes;    /* GPU size of the light table (64 + 132 bytes per max_bricks entry) plus
+    uint64_t table_bytes;    /* GPU size of the light table (64 + 452 bytes per max_bricks entry) plus
                                 the light words (4 bytes per AABB row) */
     uint64_t rebuilds;       /* flushes that rebuilt the table so far */
 } CaelixLightStats;
