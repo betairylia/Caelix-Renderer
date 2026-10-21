@@ -366,16 +366,16 @@ bool Renderer::EnsureDiBuffers(uint32_t width, uint32_t height, uint64_t frame)
     return true;
 }
 
-void Renderer::EnsureLightCells(uint32_t capacity, uint64_t frame)
+void Renderer::EnsureLightCells(uint32_t capacity, uint32_t reservoirs, uint64_t frame)
 {
-    if (light_cells_.valid() && light_cell_capacity_ == capacity)
+    if (light_cells_.valid() && light_cell_capacity_ == capacity && light_cell_reservoirs_ == reservoirs)
     {
         return;
     }
-    // 256 bytes per cell and the 32 bytes of usage counters at the tail (render/caelix_light_sample.hlsl),
-    // and the counters' readback ring. On a throw the old buffers stay.
+    // LightCellBytes(reservoirs) per cell and the 32 bytes of usage counters at the tail
+    // (render/caelix_light_sample.hlsl), and the counters' readback ring. On a throw the old buffers stay.
     GpuBuffer fresh = GpuBuffer::DeviceLocal(device_.allocator(), device_.device(),
-                                             kLightCellBytes * capacity + kLightCellCounterBytes);
+                                             LightCellBytes(reservoirs) * capacity + kLightCellCounterBytes);
     GpuBuffer fresh_readback = GpuBuffer::HostReadback(device_.allocator(), device_.device(),
                                                        kLightCellCounterBytes * kLightCounterSlots);
     if (light_cells_.valid())
@@ -387,9 +387,10 @@ void Renderer::EnsureLightCells(uint32_t capacity, uint64_t frame)
     light_counter_readback_ = std::move(fresh_readback);
     light_counter_frames_.fill(0);
     light_cell_capacity_ = capacity;
+    light_cell_reservoirs_ = reservoirs;
     light_cells_need_clear_ = true;
     light_cells_last_frame_ = frame;
-    CAELIX_LOGI("renderer: %u light cells created (%.1f MiB)", capacity,
+    CAELIX_LOGI("renderer: %u light cells of %u reservoirs created (%.1f MiB)", capacity, reservoirs,
                 static_cast<double>(light_cells_.size()) / (1024.0 * 1024.0));
 }
 
@@ -479,6 +480,13 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
     if (options.light_nee_candidates > 32)
     {
         CAELIX_LOGE("%s: light_nee_candidates %u is above the maximum 32", kFunction, options.light_nee_candidates);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (options.light_cell_reservoirs != 0 &&
+        (!std::has_single_bit(options.light_cell_reservoirs) || options.light_cell_reservoirs > 64))
+    {
+        CAELIX_LOGE("%s: light_cell_reservoirs %u must be 0 or a power of two in 1 .. 64", kFunction,
+                    options.light_cell_reservoirs);
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     // The push ring stores a brick-level contribution weight over the cell's receiver union; the

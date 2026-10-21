@@ -173,7 +173,7 @@ DiReceiver DiReceiverOf(CaelixFrameConstants fc, DiReservoir r)
     if (v.ctx.cell)
     {
         const uint level = (r.visible_flags_m & kDiCellLevel) != 0u ? 1u : 0u;
-        const float cell_size = float(8u << (2u * level));
+        const float cell_size = LightCellSize(level);
         v.ctx.cell_centre = r.cell_centre;
         // The trace kernel looked the cell up with this face (LightCellFaceOf of the same normal).
         v.ctx.cell_normal = (fc.gi_flags & kGiFlagLightCellOriented) != 0u
@@ -466,9 +466,10 @@ DiReservoir DiInitialReservoir(CaelixFrameConstants fc, uint2 pixel, float3 x_v,
         uint cell_face = kLightCellFaceBrick;
         if (slot >= 0)
         {
-            const uint cell_r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));
-            const uint2 reservoir =
-                g_light_cells.Load2(uint(slot) * kLightCellBytes + kLightCellReservoirOffset + cell_r * 8u);
+            const uint cell_r =
+                min(fc.light_cell_reservoirs - 1u, uint(u_reservoir * float(fc.light_cell_reservoirs)));
+            const uint2 reservoir = g_light_cells.Load2(uint(slot) * LightCellBytes(fc) + kLightCellReservoirOffset +
+                                                        cell_r * kLightCellReservoirBytes);
             uint entry_index;
             uint voxel;
             uint face;

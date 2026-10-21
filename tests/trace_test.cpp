@@ -3608,7 +3608,10 @@ TEST_CASE("light NEE with cell push-back is unbiased")
     CHECK(c.ref_mean > 0.01);
     CHECK(c.ratio > 0.97);
     CHECK(c.ratio < 1.03);
-    CHECK(c.block_psnr > 30.0);
+    // 28 dB since the 32-voxel cells (docs/LIGHT_LIST.md section 2.8): the box fits in one cell, so 8
+    // live cells replace 42 and ~30 pushes per frame land instead of ~239 (block PSNR 32 .. 34 dB,
+    // once 29.5, against 35 .. 37 before); the ratio check above is the unbiasedness test.
+    CHECK(c.block_psnr > 28.0);
     CHECK(stats.light_cell_pushes > 0);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
@@ -3680,7 +3683,8 @@ TEST_CASE("light NEE with oriented cells is unbiased")
     // the receiver's face, and the fill's target and the MIS proxy's cell form carry the receiver
     // orientation term (floor 0.1). The ceiling's receivers face down while the lights sit in the
     // ceiling plane, so their cells weigh every light near the floor. With and without the jittered
-    // lookup (a jittered receiver reads a cell of its own face but another position).
+    // lookup (a jittered receiver reads a cell of its own face but another position). The last mode
+    // runs unoriented jittered cells with 2 reservoirs per cell (docs/LIGHT_LIST.md section 2.8).
     Rig rig;
     OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
     EnableLights(rig.scene);
@@ -3704,14 +3708,18 @@ TEST_CASE("light NEE with oriented cells is unbiased")
     const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
     constexpr uint32_t kFlags = CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED | CAELIX_GI_FLAG_LIGHT_NEE |
                                 CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
-    const uint32_t modes[3] = {kFlags, kFlags | CAELIX_GI_FLAG_LIGHT_CELL_JITTER,
-                               kFlags & ~static_cast<uint32_t>(CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED)};
-    const char* names[3] = {"oriented cells", "oriented cells + jitter", "unoriented cells"};
-    std::vector<float> images[3];
-    for (int m = 0; m < 3; ++m)
+    constexpr uint32_t kUnoriented = kFlags & ~static_cast<uint32_t>(CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED);
+    const uint32_t modes[4] = {kFlags, kFlags | CAELIX_GI_FLAG_LIGHT_CELL_JITTER, kUnoriented,
+                               kUnoriented | CAELIX_GI_FLAG_LIGHT_CELL_JITTER};
+    const uint32_t reservoirs[4] = {0, 0, 0, 2};  // 0 = 8
+    const char* names[4] = {"oriented cells", "oriented cells + jitter", "unoriented cells",
+                            "unoriented cells + jitter, 2 reservoirs"};
+    std::vector<float> images[4];
+    for (int m = 0; m < 4; ++m)
     {
         gi.flags = modes[m];
         gi.light_nee_candidates = 1;
+        gi.light_cell_reservoirs = reservoirs[m];
         // The validation accepts the flag (with every light NEE flag it combines with here).
         REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
         images[m] = LightReference(rig, renderer, set, camera, 1024, 200000);
@@ -3722,7 +3730,9 @@ TEST_CASE("light NEE with oriented cells is unbiased")
                     "16x16 block PSNR %.2f dB, pixel PSNR %.2f dB (live cells %u)\n",
                     names[m], c.test_mean, c.ref_mean, c.ratio, c.block_psnr, PixelPsnr(pt, images[m], kBoxSize),
                     stats.light_cells_live);
-        CHECK(stats.light_cell_bytes == 65536ull * 256ull + 32ull);  // the cells and the usage counters
+        // The cells (64 + 24 R bytes each) and the usage counters.
+        const uint64_t r = reservoirs[m] != 0 ? reservoirs[m] : 8;
+        CHECK(stats.light_cell_bytes == 65536ull * (64ull + 24ull * r) + 32ull);
         CHECK(c.ref_mean > 0.01);
         CHECK(c.ratio > 0.97);
         CHECK(c.ratio < 1.03);
@@ -4096,6 +4106,17 @@ TEST_CASE("cells fill and sample")
     });
     bad.light_temporal_frames = 0;
     bad.flags = CAELIX_GI_FLAG_LIGHT_NEE;
+    // Reservoirs per cell (docs/LIGHT_LIST.md section 2.8): 0 (= 8) or a power of two in 1 .. 64.
+    bad.light_cell_reservoirs = 3;  // not a power of two
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.light_cell_reservoirs = 128;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.light_cell_reservoirs = 0;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
 
     CaelixGiOptions gi{};
     gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;

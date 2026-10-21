@@ -4,29 +4,31 @@
 // MIS with the BSDF path (docs/LIGHT_MIS.md: the density proxy, LightNeeMisWeight, LightListCanSample).
 //
 // Light cells: a hash table of fc.light_cell_capacity cells in g_light_cells (trace set binding
-// 21), 256 bytes each (288 before step 3 of the light list, 296 before the temporal cell reuse, 304
-// before the push-back of shadow ray results, 832 with 32 reservoirs and 32 push entries before the
-// oriented cells, docs/LIGHT_LIST.md section 2.7):
+// 21), 64 + 24 R bytes each (R = fc.light_cell_reservoirs reservoirs and push entries, 1 .. 64,
+// default 8; 256 B at R 8; LightCellBytes). Before 2026-10-22 R was the constant 8; 288 bytes before
+// step 3 of the light list, 296 before the temporal cell reuse, 304 before the push-back of shadow ray
+// results, 832 with 32 reservoirs and 32 push entries before the oriented cells, docs/LIGHT_LIST.md
+// sections 2.7 and 2.8:
 //   0    uint key_lo, key_hi    the 64-bit fingerprint of (entity, level, coordinate, face); key_lo 0 = empty
 //   8    uint touched_frame     fc.frame_counter of the newest lookup
 //   12   uint entity
-//   16   int3 coord             the cell coordinate at `level`: floor(p) >> (3 + 2 level), p entity-local
-//   28   uint level             0: 8-voxel cells, 1: 32-voxel cells
+//   16   int3 coord             the cell coordinate at `level`: floor(p) >> (5 + 2 level), p entity-local
+//   28   uint level             0: 32-voxel cells, 1: 128-voxel cells (8 / 32 before 2026-10-22)
 //   32   float C_prev           the cell normalisation C_c of the fill before the latest one (the MIS
 //                               proxy reads this one; 0 = none yet: the global proxy)
-//   36   float C_cur            C_c of the latest fill: the mean of w_sum / K over the 8 reservoirs
+//   36   float C_cur            C_c of the latest fill: the mean of w_sum / K over the R reservoirs
 //                               (kGiFlagLightCellTemporal: the running mean of dedicated draws)
 //   40   float M                kGiFlagLightCellTemporal: the candidate count behind every reservoir of
-//                               the cell (uniform over the 8: all threads merge the same way); 0 = no history
+//                               the cell (uniform over the R: all threads merge the same way); 0 = no history
 //   44   float C_n              kGiFlagLightCellTemporal: the draw count behind C_cur; 0 = none
-//   48   uint push_count        kGiFlagLightCellPush: pushes claimed since the latest fill (may exceed 8)
+//   48   uint push_count        kGiFlagLightCellPush: pushes claimed since the latest fill (may exceed R)
 //   52   uint face              the receiver face of the key (kGiFlagLightCellOriented: 0..5 = +X -X +Y
 //                               -Y +Z -Z of the receivers' world normal, GiFaceIndex), else
 //                               kLightCellFaceNone (6); written by the insert, read by the fill
 //   56   8 bytes of padding
-//   64   8 x { uint light; float W }   the reservoirs: light = a light sample word (below), W = its
+//   64   R x { uint light; float W }   the reservoirs: light = a light sample word (below), W = its
 //                               unbiased contribution weight (0 = empty)
-//   128  8 x { uint word; float W; float visible; uint pad }   kGiFlagLightCellPush: the push ring,
+//   64 + 8 R   R x { uint word; float W; float visible; uint pad }   kGiFlagLightCellPush: the push ring,
 //                               the light samples that the trace's vertices drew from this cell
 //                               (LightCellClaimPush, LightCellStorePush); the fill merges entry r
 //                               into reservoir r
@@ -36,7 +38,7 @@
 // voxel, area 1), 6 = kLightCellFaceBrick a brick-level sample (the vertex samples a point inside the
 // brick; voxel bits 0), 7 only in kNoLight (empty). The fill's fresh candidates are brick-level;
 // voxel-face samples enter the cells only through the push ring.
-// After the last cell (byte fc.light_cell_capacity x 256, LightCellCounterBase) the buffer holds 32
+// After the last cell (byte fc.light_cell_capacity x LightCellBytes, LightCellCounterBase) the buffer holds 32
 // bytes of usage counters, zeroed by the renderer before every fill and copied to the host after the
 // trace (CaelixGiStats):
 //   0    uint live              cells with a key after this frame's eviction (fill, thread 0)
@@ -44,7 +46,7 @@
 //   8    uint inserted          cells inserted by this frame's lookups (LightCellLookup)
 //   12   uint failed            lookups that found neither the key nor a free slot in 8 probes
 //   16   uint pushed            pushes of the previous frame's trace that got a ring slot (fill, thread 0)
-//   20   uint push_dropped      pushes of the previous frame's trace beyond the 8 slots (fill, thread 0)
+//   20   uint push_dropped      pushes of the previous frame's trace beyond the R slots (fill, thread 0)
 //   24   8 bytes of padding
 // The trace kernel looks cells up and inserts missing ones (LightCellLookup); caelix_light_cells.hlsl
 // fills the reservoirs of every live cell before the next trace and evicts cells untouched for 64
@@ -68,8 +70,10 @@
 #include "render/caelix_shading.hlsl"
 #include "render/caelix_restir_gi.hlsl"
 
-static const uint kLightCellBytes = 256;
-static const uint kLightCellReservoirs = 8;
+// The cell edge at level 0 is 1 << kLightCellBaseShift voxels (32); each level is 4x larger.
+static const uint kLightCellBaseShift = 5u;
+static const uint kLightCellHeaderBytes = 64;
+static const uint kLightCellReservoirBytes = 8;
 static const uint kLightCellCPrevOffset = 32;
 static const uint kLightCellCCurOffset = 36;
 static const uint kLightCellMOffset = 40;
@@ -77,8 +81,6 @@ static const uint kLightCellCNOffset = 44;
 static const uint kLightCellPushCountOffset = 48;
 static const uint kLightCellReservoirOffset = 64;
 static const uint kLightCellFaceOffset = 52;
-static const uint kLightCellPushOffset = 128;
-static const uint kLightCellPushSlots = 8;
 static const uint kLightCellPushBytes = 16;
 // The header face of an unoriented cell (kGiFlagLightCellOriented off): no receiver face in the key.
 static const uint kLightCellFaceNone = 6u;
@@ -153,10 +155,29 @@ uint2 LightCellKey(uint entity, uint level, int3 coord, uint face)
     return uint2(lo != 0u ? lo : 1u, uint(h >> 32));
 }
 
+// The reservoirs per cell R (fc.light_cell_reservoirs, a power of two in 1 .. 64); the push ring has
+// R entries as well. A cell is 64 + 24 R bytes: the header, R x 8 B reservoirs, R x 16 B push entries.
+uint LightCellBytes(CaelixFrameConstants fc)
+{
+    return kLightCellHeaderBytes + (kLightCellReservoirBytes + kLightCellPushBytes) * fc.light_cell_reservoirs;
+}
+
+// The byte offset of the push ring inside a cell (after the reservoirs).
+uint LightCellPushOffset(CaelixFrameConstants fc)
+{
+    return kLightCellReservoirOffset + kLightCellReservoirBytes * fc.light_cell_reservoirs;
+}
+
+// The edge of a cell at `level` in voxels (entity-local units).
+float LightCellSize(uint level)
+{
+    return float(1u << (kLightCellBaseShift + 2u * level));
+}
+
 // The byte offset of the usage counters in g_light_cells (after the last cell).
 uint LightCellCounterBase(CaelixFrameConstants fc)
 {
-    return fc.light_cell_capacity * kLightCellBytes;
+    return fc.light_cell_capacity * LightCellBytes(fc);
 }
 
 // The level of a path vertex at world position `x` (its pixel footprint at its camera distance).
@@ -169,7 +190,7 @@ uint LightCellLevel(CaelixFrameConstants fc, float3 x)
 // The cell coordinate of the entity-local point `p` at `level`.
 int3 LightCellCoord(float3 p, uint level)
 {
-    return int3(floor(p)) >> int(3u + 2u * level);
+    return int3(floor(p)) >> int(kLightCellBaseShift + 2u * level);
 }
 
 // The receiver face of the cell key of a vertex with world normal `n_r` (docs/LIGHT_LIST.md section
@@ -218,7 +239,7 @@ int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord
     for (uint probe = 0; probe < kLightCellProbes; ++probe)
     {
         const uint slot = (key.x + probe) & mask;
-        const uint base = slot * kLightCellBytes;
+        const uint base = slot * LightCellBytes(fc);
         uint key_lo = g_light_cells.Load(base);
         if (key_lo == 0u)
         {
@@ -584,12 +605,12 @@ LightNeeProxyContext LightNeeProxyOfSlot(CaelixFrameConstants fc, int slot, uint
     {
         return ctx;
     }
-    const float c_prev = asfloat(g_light_cells.Load(uint(slot) * kLightCellBytes + kLightCellCPrevOffset));
+    const float c_prev = asfloat(g_light_cells.Load(uint(slot) * LightCellBytes(fc) + kLightCellCPrevOffset));
     if (!(c_prev > 0.0f))
     {
         return ctx;
     }
-    const float cell_size = float(8u << (2u * level));
+    const float cell_size = LightCellSize(level);
     float4 r0;
     float4 r1;
     float4 r2;
@@ -918,7 +939,7 @@ LightSample LightSampleFaceOf(CaelixFrameConstants fc, LightEntryHeader header, 
 // cell_size + 1 along the entity's axes. Every receiver that reads the cell lies in it.
 uint LightCellRegionFaceMask(CaelixFrameConstants fc, uint entity, uint level, int3 coord, LightEntryHeader header)
 {
-    const float cell_size = float(8u << (2u * level));
+    const float cell_size = LightCellSize(level);
     float4 c0;
     float4 c1;
     float4 c2;
@@ -931,24 +952,25 @@ uint LightCellRegionFaceMask(CaelixFrameConstants fc, uint entity, uint level, i
                                             float3(c0.y, c1.y, c2.y) * h, float3(c0.z, c1.z, c2.z) * h);
 }
 
-// Claims a push of cell `slot` (kGiFlagLightCellPush) and returns its index: the first 8 claims of
-// a frame get a ring entry, later ones are dropped (the fill counts both from push_count). A vertex
-// claims BEFORE it draws its light sample: which vertices win the 8 entries then depends on the
-// paths' timing up to the claim, never on the sample (a claim after the shadow ray lets the vertices
-// without a ray win, a sample-dependent choice: 0.36 % dark in the 4-light box).
-uint LightCellClaimPush(uint slot)
+// Claims a push of cell `slot` (kGiFlagLightCellPush) and returns its index: the first R claims of
+// a frame get a ring entry (R = fc.light_cell_reservoirs), later ones are dropped (the fill counts
+// both from push_count). A vertex claims BEFORE it draws its light sample: which vertices win the R
+// entries then depends on the paths' timing up to the claim, never on the sample (a claim after the
+// shadow ray lets the vertices without a ray win, a sample-dependent choice: 0.36 % dark in the
+// 4-light box).
+uint LightCellClaimPush(CaelixFrameConstants fc, uint slot)
 {
     uint index;
-    g_light_cells.InterlockedAdd(slot * kLightCellBytes + kLightCellPushCountOffset, 1u, index);
+    g_light_cells.InterlockedAdd(slot * LightCellBytes(fc) + kLightCellPushCountOffset, 1u, index);
     return index;
 }
 
-// Writes the claimed push `index` of cell `slot` (no-op beyond the 8 ring entries).
-void LightCellStorePush(uint slot, uint index, uint word, float W, bool visible)
+// Writes the claimed push `index` of cell `slot` (no-op beyond the R ring entries).
+void LightCellStorePush(CaelixFrameConstants fc, uint slot, uint index, uint word, float W, bool visible)
 {
-    if (index < kLightCellPushSlots)
+    if (index < fc.light_cell_reservoirs)
     {
-        g_light_cells.Store4(slot * kLightCellBytes + kLightCellPushOffset + index * kLightCellPushBytes,
+        g_light_cells.Store4(slot * LightCellBytes(fc) + LightCellPushOffset(fc) + index * kLightCellPushBytes,
                              uint4(word, asuint(W), asuint(visible ? 1.0f : 0.0f), 0u));
     }
 }
@@ -1017,9 +1039,10 @@ float3 LightNextEventResampled(CaelixFrameConstants fc, float3 x_r, float3 n_r, 
         uint cell_face = kLightCellFaceBrick;
         if (slot >= 0)
         {
-            const uint cell_r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));
-            const uint2 reservoir =
-                g_light_cells.Load2(uint(slot) * kLightCellBytes + kLightCellReservoirOffset + cell_r * 8u);
+            const uint cell_r =
+                min(fc.light_cell_reservoirs - 1u, uint(u_reservoir * float(fc.light_cell_reservoirs)));
+            const uint2 reservoir = g_light_cells.Load2(uint(slot) * LightCellBytes(fc) + kLightCellReservoirOffset +
+                                                        cell_r * kLightCellReservoirBytes);
             uint entry_index;
             uint voxel;
             uint face;
@@ -1206,7 +1229,7 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
         if (jitter)
         {
             const float3 u_jitter = float3(RandomFloat01(rng), RandomFloat01(rng), RandomFloat01(rng));
-            const float3 cell_point = object_point + (u_jitter - 0.5f) * float(8u << (2u * level));
+            const float3 cell_point = object_point + (u_jitter - 0.5f) * LightCellSize(level);
             sample_coord = LightCellCoord(cell_point, level);
             slot = LightCellLookup(fc, entity, level, sample_coord, face);
         }
@@ -1228,11 +1251,11 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     {
         if ((fc.gi_flags & kGiFlagLightCellPush) != 0u)
         {
-            push_index = LightCellClaimPush(uint(slot));
+            push_index = LightCellClaimPush(fc, uint(slot));
         }
-        const uint r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));
-        const uint2 reservoir =
-            g_light_cells.Load2(uint(slot) * kLightCellBytes + kLightCellReservoirOffset + r * 8u);
+        const uint r = min(fc.light_cell_reservoirs - 1u, uint(u_reservoir * float(fc.light_cell_reservoirs)));
+        const uint2 reservoir = g_light_cells.Load2(uint(slot) * LightCellBytes(fc) + kLightCellReservoirOffset +
+                                                    r * kLightCellReservoirBytes);
         uint entry_index;
         uint voxel;
         uint face;
@@ -1313,7 +1336,7 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     }
 
     CAELIX_BRANCH
-    if (push_index < kLightCellPushSlots)
+    if (push_index < fc.light_cell_reservoirs)
     {
         uint word = kNoLight;
         float W_push = 0.0f;
@@ -1336,7 +1359,7 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
                 W_push = W_brick;
             }
         }
-        LightCellStorePush(uint(slot), push_index, word, W_push, !occluded);
+        LightCellStorePush(fc, uint(slot), push_index, word, W_push, !occluded);
     }
     return contribution;
 }

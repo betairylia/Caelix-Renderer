@@ -1,11 +1,12 @@
-// Light cell fill kernel (docs/LIGHT_LIST.md, section 2.2): refills the 8 reservoirs of every
-// live light cell (render/caelix_light_sample.hlsl) from the scene's light table before the trace.
+// Light cell fill kernel (docs/LIGHT_LIST.md, sections 2.2 and 2.8): refills the R reservoirs
+// (R = fc.light_cell_reservoirs, a power of two in 1 .. 64) of every live light cell
+// (render/caelix_light_sample.hlsl) from the scene's light table before the trace.
 //
-// Four cells per workgroup of 32 threads, 8 threads per cell (dispatch min(1024, G) x max(1, G / 1024)
-// with G = capacity / 4 workgroups: slot = (y * 1024 + x) * 4 + thread / 8); thread r = thread % 8
-// owns reservoir r of its cell. An empty slot (key_lo 0) is skipped. A cell not looked up for 64
-// frames is evicted (key 0, reservoirs empty). Without a light table or with an empty one the
-// reservoirs are emptied. The four cells of a workgroup are independent: a skipped, evicted or
+// 64 / R cells per workgroup of 64 threads, R threads per cell (dispatch min(1024, G) x max(1, G / 1024)
+// with G = capacity x R / 64 workgroups: slot = (y * 1024 + x) * (64 / R) + thread / R); thread
+// r = thread % R owns reservoir r of its cell. An empty slot (key_lo 0) is skipped. A cell not looked
+// up for 64 frames is evicted (key 0, reservoirs empty). Without a light table or with an empty one the
+// reservoirs are emptied. The cells of a workgroup are independent: a skipped, evicted or
 // emptied cell only clears its threads' `active`, so that every thread of the workgroup reaches both
 // barriers (barriers in uniform control flow only). Thread r = 0 of every cell that stays counts it
 // in the usage counters after the last cell (live; active when the previous frame's trace looked it
@@ -46,7 +47,7 @@
 // thread merges the reservoir it wrote in the previous fill as one more candidate with the weight
 // p_hat(y_old) * W_old * M_old, where M_old is the cell header's confidence sum clamped to
 // fc.light_temporal_frames x K (0 drops the history: the renderer sets 0 after a light table
-// rebuild or a reset). The header stores the mean over the 8 threads of their M_new. E[p_hat(y_old)
+// rebuild or a reset). The header stores the mean over the R threads of their M_new. E[p_hat(y_old)
 // W_old] = C, so w_old has expectation M_old C; every entry with total > 0 is reachable from the
 // fresh draws, so W stays an unbiased contribution weight. The history candidate's random number is
 // drawn whenever the flag is on (also with an empty history), so the stream never depends on the
@@ -56,7 +57,7 @@
 // Push-back of shadow ray results (kGiFlagLightCellPush): the trace's vertices that sampled this
 // cell pushed their light samples (LightNextEvent, LightCellClaimPush, LightCellStorePush): word, W
 // and visible (0 = the shadow ray was traced and hit). Thread r merges ring entry r when
-// r < min(push_count, 8), with the constant confidence c_p = fc.light_push_confidence (M += c_p
+// r < min(push_count, R), with the constant confidence c_p = fc.light_push_confidence (M += c_p
 // also for an empty entry) and the weight c_p * p_hat_p * W_p, p_hat_p = LightCellTargetOf(word)
 // times kLightOccludedTarget when the entry is occluded. The old sample's target gets the same factor
 // when an entry of this frame's ring holds its word occluded (several entries: occluded wins). The
@@ -67,7 +68,7 @@
 // constants (do not depend on the inputs' values) and that each W_i is a contribution weight over
 // the cell's receivers (E[f(y_i) W_i] = the integral for every receiver). The per-candidate target
 // cancels (W divides by the selected candidate's own target), so it may be any positive function,
-// visibility included. Hence the rules: (1) a ring entry's presence is its claim order (the first 8
+// visibility included. Hence the rules: (1) a ring entry's presence is its claim order (the first R
 // claims), and a vertex claims before it draws its sample, so neither the presence nor the vertex
 // that fills an entry depends on the sample; every vertex that used the cell pushes once, whatever
 // its ray found (a claim after the shadow ray let the vertices without a ray win the entries); a
@@ -84,14 +85,14 @@
 //
 // The cell normalisation (docs/LIGHT_MIS.md section 3): without temporal reuse, w_sum / K over the K
 // fresh candidates of every reservoir is an unbiased estimate of C_c = sum over the table of p_hat_i;
-// thread r = 0 moves the header's C_cur to C_prev and stores the mean over the 8 threads of the cell
+// thread r = 0 moves the header's C_cur to C_prev and stores the mean over the R threads of the cell
 // as the new C_cur. The trace reads C_prev only (the MIS proxy), so it never divides by an estimate
 // made from the reservoirs it samples. With temporal reuse that is no longer enough: the previous
 // fill's candidates ARE part of this frame's reservoirs, so an estimate made from the candidates
 // (even one frame delayed through C_prev) is correlated with the reservoirs the trace samples. Each
 // thread then makes one dedicated draw from the CDF (w_c = p_hat_j / p_j, independent of every
-// reservoir) and thread r = 0 folds the mean of the 8 into C_cur as a running mean over at most
-// fc.light_temporal_frames x 8 draws (draw count in the header's C_n). The pushes do not enter C_c
+// reservoir) and thread r = 0 folds the mean of the R into C_cur as a running mean over at most
+// fc.light_temporal_frames x R draws (draw count in the header's C_n). The pushes do not enter C_c
 // (it stays the brick-level normalisation of the MIS proxy). An evicted cell and a cell filled
 // without a usable table get C_prev = C_cur = M = C_n = push_count = 0 (the global proxy, no
 // history).
@@ -108,17 +109,17 @@
 #include "render/caelix_shading.hlsl"
 #include "render/caelix_light_sample.hlsl"
 
-// Workgroups per dispatch row (the dispatch is min(1024, G) x max(1, G / 1024), G = capacity / 4).
+// Workgroups per dispatch row (the dispatch is min(1024, G) x max(1, G / 1024), G = capacity x R / 64).
 static const uint kLightCellGroupsPerRow = 1024;
-// Cells per workgroup: 32 threads = 4 cells x kLightCellReservoirs (8) threads.
-static const uint kLightCellsPerGroup = 4;
-static const uint kLightCellGroupThreads = 32;
+// Threads per workgroup: 64 / R cells x R threads (R = fc.light_cell_reservoirs, a power of two in
+// 1 .. 64, so the cells fill the workgroup exactly).
+static const uint kLightCellGroupThreads = 64;
 
 // Per thread: w_sum / K of its fresh candidates, or its dedicated draw w_c with temporal reuse; 0 for
-// a thread whose cell is not filled. Thread r = 0 of each cell averages the cell's 8 into C_cur.
+// a thread whose cell is not filled. Thread r = 0 of each cell averages the cell's R into C_cur.
 groupshared float gs_c[kLightCellGroupThreads];
-// The push rings of this frame (kGiFlagLightCellPush), 8 entries per cell: entry r of the cell, or
-// { kNoLight, 0, 1, 0 } for r >= min(push_count, 8), without the flag and for a cell not filled.
+// The push rings of this frame (kGiFlagLightCellPush), R entries per cell: entry r of the cell, or
+// { kNoLight, 0, 1, 0 } for r >= min(push_count, R), without the flag and for a cell not filled.
 groupshared uint4 gs_push[kLightCellGroupThreads];
 
 // The geometry term G of the brick-level target p_hat = entry.total_weight * G for the cell centre
@@ -189,18 +190,20 @@ float LightCellTargetOf(CaelixFrameConstants fc, uint64_t table, uint count, uin
     return luminance * orient * orient_r / max(distance2, near_d2);
 }
 
-[numthreads(32, 1, 1)]
+[numthreads(64, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
 {
     const CaelixFrameConstants fc = CAELIX_LOAD_STRUCT(CaelixFrameConstants, g_push.frame_constants, 16);
     g_materialTable = fc.materials;
     // This thread's cell of the workgroup, its reservoir r and the cell's first entry in groupshared.
-    const uint cell_in_group = thread_id.x / kLightCellReservoirs;
-    const uint r = thread_id.x % kLightCellReservoirs;
-    const uint gs_cell = cell_in_group * kLightCellReservoirs;
-    const uint slot = (group_id.y * kLightCellGroupsPerRow + group_id.x) * kLightCellsPerGroup + cell_in_group;
-    const uint base = slot * kLightCellBytes;
-    const uint reservoir = base + kLightCellReservoirOffset + r * 8u;
+    const uint R = fc.light_cell_reservoirs;
+    const uint cells_per_group = kLightCellGroupThreads / R;
+    const uint cell_in_group = thread_id.x / R;
+    const uint r = thread_id.x % R;
+    const uint gs_cell = cell_in_group * R;
+    const uint slot = (group_id.y * kLightCellGroupsPerRow + group_id.x) * cells_per_group + cell_in_group;
+    const uint base = slot * LightCellBytes(fc);
+    const uint reservoir = base + kLightCellReservoirOffset + r * kLightCellReservoirBytes;
 
     // `active`: this thread's cell is filled below. Every thread reaches both barriers: a slot beyond
     // the capacity, an empty slot, an evicted cell and a fill without a usable table only clear it.
@@ -245,7 +248,7 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
             }
             if (push_count != 0u)
             {
-                const uint pushed = min(push_count, kLightCellPushSlots);
+                const uint pushed = min(push_count, R);
                 g_light_cells.InterlockedAdd(counters + kLightCellCounterPushed, pushed);
                 if (push_count > pushed)
                 {
@@ -272,9 +275,9 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     const bool push = (fc.gi_flags & kGiFlagLightCellPush) != 0u;
 
     // The push ring into groupshared memory, then the count is reset for this frame's trace.
-    const uint push_entries = (active && push) ? min(push_count, kLightCellPushSlots) : 0u;
+    const uint push_entries = (active && push) ? min(push_count, R) : 0u;
     gs_push[thread_id.x] = r < push_entries
-                               ? g_light_cells.Load4(base + kLightCellPushOffset + r * kLightCellPushBytes)
+                               ? g_light_cells.Load4(base + LightCellPushOffset(fc) + r * kLightCellPushBytes)
                                : uint4(kNoLight, 0u, asuint(1.0f), 0u);
     GroupMemoryBarrierWithGroupSync();
     if (active && r == 0u)
@@ -296,7 +299,7 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         const int3 coord = int3(g_light_cells.Load3(base + 16));
         const uint level = g_light_cells.Load(base + 28);
         const float3 n_cell = LightCellFaceNormal(g_light_cells.Load(base + kLightCellFaceOffset));
-        const float cell_size = float(8u << (2u * level));
+        const float cell_size = LightCellSize(level);
         float4 c0;
         float4 c1;
         float4 c2;
@@ -357,8 +360,8 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
                 // A receiver of this cell saw the old sample occluded in the previous frame: its target
                 // (not its confidence) takes the occluded factor.
                 bool occluded = false;
-                CAELIX_UNROLL
-                for (uint t = 0; t < kLightCellPushSlots; ++t)
+                CAELIX_LOOP
+                for (uint t = 0; t < R; ++t)
                 {
                     const uint4 entry_t = gs_push[gs_cell + t];
                     occluded = occluded || (entry_t.x == old.x && asfloat(entry_t.z) == 0.0f);
@@ -430,18 +433,18 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     if (active && r == 0u)
     {
         float c_sum = 0.0f;
-        CAELIX_UNROLL
-        for (uint t = 0; t < kLightCellReservoirs; ++t)
+        CAELIX_LOOP
+        for (uint t = 0; t < R; ++t)
         {
             c_sum += gs_c[gs_cell + t];
         }
-        const float threads = float(kLightCellReservoirs);
+        const float threads = float(R);
         const float c_prev = asfloat(g_light_cells.Load(base + kLightCellCCurOffset));
         if (temporal)
         {
-            // Running mean of the dedicated draws over at most light_temporal_frames x 8 of them.
-            // M: the mean of the 8 threads' confidence sums (they differ by c_p where the ring has
-            // fewer than 8 entries); any constant is a valid confidence for the next merge.
+            // Running mean of the dedicated draws over at most light_temporal_frames x R of them.
+            // M: the mean of the R threads' confidence sums (they differ by c_p where the ring has
+            // fewer than R entries); any constant is a valid confidence for the next merge.
             const float m_header = m_old + float(candidates) +
                                    (push ? fc.light_push_confidence * float(push_entries) / threads : 0.0f);
             const float n_old =

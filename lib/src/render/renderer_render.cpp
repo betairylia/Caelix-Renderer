@@ -82,9 +82,11 @@ constexpr uint32_t kDefaultLightTemporalFrames = 20;
 constexpr float kDefaultLightPushConfidence = 8.0f;
 // CaelixGiOptions::light_nee_candidates default (docs/LIGHT_LIST.md section 2.6).
 constexpr uint32_t kDefaultLightNeeCandidates = 1;
-// [numthreads(32, 1, 1)] per four cells in caelix_light_cells.hlsl (8 threads per cell), at most 1024
-// workgroups per dispatch row.
-constexpr uint32_t kLightCellsPerGroup = 4;
+// CaelixGiOptions::light_cell_reservoirs default (docs/LIGHT_LIST.md section 1.3).
+constexpr uint32_t kDefaultLightCellReservoirs = 8;
+// [numthreads(64, 1, 1)] in caelix_light_cells.hlsl: 64 / R cells per workgroup, R threads per cell
+// (R = the reservoirs per cell), at most 1024 workgroups per dispatch row.
+constexpr uint32_t kLightCellGroupThreads = 64;
 constexpr uint32_t kLightCellGroupsPerRow = 1024;
 
 // The barriers of one vkCmdPipelineBarrier2: image barriers (any layout -> GENERAL; mip 0,
@@ -390,6 +392,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     {
         EnsureLightCells(gi_options_.light_cell_capacity != 0 ? gi_options_.light_cell_capacity
                                                               : kDefaultLightCellCapacity,
+                         gi_options_.light_cell_reservoirs != 0 ? gi_options_.light_cell_reservoirs
+                                                                : kDefaultLightCellReservoirs,
                          frame.frame_number);
     }
     const bool light_fill = light_nee && light_table != 0;
@@ -730,6 +734,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     {
         constants.light_cells = light_cells_.address();
         constants.light_cell_capacity = light_cell_capacity_;
+        constants.light_cell_reservoirs = light_cell_reservoirs_;
         constants.light_candidates =
             gi_options_.light_candidates != 0 ? gi_options_.light_candidates : kDefaultLightCandidates;
         constants.light_level_footprint = gi_options_.light_level_footprint != 0.0f
@@ -836,8 +841,9 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         }
         else
         {
-            vkCmdFillBuffer(cmd, light_cells_.buffer(), kLightCellBytes * light_cell_capacity_,
-                            kLightCellCounterBytes, 0);
+            vkCmdFillBuffer(cmd, light_cells_.buffer(),
+                            LightCellBytes(light_cell_reservoirs_) * light_cell_capacity_, kLightCellCounterBytes,
+                            0);
         }
         Barriers cleared;
         cleared.Memory(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -859,9 +865,9 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fill.pipeline());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fill.layout(), 0, 1, &slot->set, 0, nullptr);
         vkCmdPushConstants(cmd, fill.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        // capacity / 4 workgroups (the capacity is a power of two >= 1024): one row of 256 or 512 for
-        // the two smallest capacities, else rows of 1024.
-        const uint32_t groups = light_cell_capacity_ / kLightCellsPerGroup;
+        // capacity x R / 64 workgroups (the capacity is a power of two >= 1024 and R a power of two
+        // in 1 .. 64, so at least 16 and exact): one row when there are at most 1024, else rows of 1024.
+        const uint32_t groups = light_cell_capacity_ * light_cell_reservoirs_ / kLightCellGroupThreads;
         const uint32_t groups_x = std::min(groups, kLightCellGroupsPerRow);
         vkCmdDispatch(cmd, groups_x, groups / groups_x, 1);
         if (timed)
@@ -911,7 +917,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                       VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
         traced.Record(cmd);
         const uint32_t counter_slot = static_cast<uint32_t>(frame.frame_number % kLightCounterSlots);
-        const VkBufferCopy region{kLightCellBytes * light_cell_capacity_,
+        const VkBufferCopy region{LightCellBytes(light_cell_reservoirs_) * light_cell_capacity_,
                                   static_cast<VkDeviceSize>(counter_slot) * kLightCellCounterBytes,
                                   kLightCellCounterBytes};
         vkCmdCopyBuffer(cmd, light_cells_.buffer(), light_counter_readback_.buffer(), 1, &region);

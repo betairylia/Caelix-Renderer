@@ -1057,9 +1057,11 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   near-field split in world units, 0 = the library default 8: light points
   closer than this are left to the BSDF path). Light cell options:
   `--light-cells <N>` (a power of two, 1024..1048576, default 65536),
+  `--light-cell-reservoirs <N>` (a power of two, 1..64, default 8;
+  reservoirs and push entries per cell, 64 + 24 x N bytes per cell),
   `--light-candidates <N>` (1..64, default 8) and `--light-footprint <F>`
-  (world units per pixel below which a vertex uses 8-voxel cells, else
-  32-voxel cells; default 0.25). The debug UI's GI section has the same
+  (world units per pixel below which a vertex uses 32-voxel cells, else
+  128-voxel cells; default 0.25). The debug UI's GI section has the same
   controls and the GPU times show the light fill, the cell memory and the
   light table's bricks and drops.
 - `--gi-restir-di`: needs `--gi-light-nee`; both GI methods, per-pixel ReSTIR

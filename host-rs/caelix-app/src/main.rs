@@ -426,9 +426,14 @@ struct Args {
     /// points closer than this are left to the BSDF path.
     #[arg(long, value_name = "F", default_value_t = 0.0)]
     light_nee_distance: f32,
-    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 256 bytes each).
+    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 64 + 24 x
+    /// --light-cell-reservoirs bytes each).
     #[arg(long, value_name = "N", default_value_t = 65536)]
     light_cells: u32,
+    /// Light NEE: reservoirs (and push ring entries) per light cell (a power of two, 1..64; a cell
+    /// is 64 + 24 x N bytes, 256 at 8).
+    #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64))]
+    light_cell_reservoirs: u32,
     /// Light NEE: candidates per cell reservoir and frame (1..64).
     #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64))]
     light_candidates: u32,
@@ -469,8 +474,8 @@ struct Args {
     /// receiver's own geometry term over the cell's normalisation; docs/LIGHT_MIS.md "Vertex proxy").
     #[arg(long)]
     light_proxy_vertex: bool,
-    /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 8-voxel
-    /// cells, else 32-voxel cells.
+    /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 32-voxel
+    /// cells, else 128-voxel cells.
     #[arg(long, value_name = "F", default_value_t = 0.25)]
     light_footprint: f32,
     /// Both GI methods, with --gi-light-nee: per-pixel ReSTIR DI on the light list at the primary
@@ -2113,6 +2118,7 @@ fn main() -> anyhow::Result<()> {
             depth_threshold: args.gi_depth_threshold,
             light_nee: args.gi_light_nee,
             light_cells: args.light_cells,
+            light_cell_reservoirs: args.light_cell_reservoirs,
             light_cell_jitter: !args.light_no_cell_jitter,
             light_cell_oriented: args.light_cell_oriented,
             light_mis: !args.light_no_mis,
@@ -2133,6 +2139,9 @@ fn main() -> anyhow::Result<()> {
     }
     if !args.light_cells.is_power_of_two() || !(1024..=1048576).contains(&args.light_cells) {
         bail!("--light-cells {} must be a power of two in 1024..1048576", args.light_cells);
+    }
+    if !args.light_cell_reservoirs.is_power_of_two() {
+        bail!("--light-cell-reservoirs {} must be a power of two in 1..64", args.light_cell_reservoirs);
     }
     if let Some(candidates) = args.light_nee_candidates {
         if args.light_cell_push && candidates >= 2 {

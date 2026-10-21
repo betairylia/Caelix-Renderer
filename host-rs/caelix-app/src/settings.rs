@@ -269,6 +269,9 @@ pub struct GiSettings {
     pub light_nee: bool,
     /// Light cells (a power of two, 1024..1048576).
     pub light_cells: u32,
+    /// Light NEE: reservoirs (and push ring entries) per light cell (a power of two, 1..64; a cell is
+    /// 64 + 24 x this bytes).
+    pub light_cell_reservoirs: u32,
     /// Light NEE: look the cell up at a point jittered by up to half a cell per vertex
     /// (`CAELIX_GI_FLAG_LIGHT_CELL_JITTER`): the per-cell flicker becomes per-pixel noise.
     pub light_cell_jitter: bool,
@@ -300,7 +303,7 @@ pub struct GiSettings {
     pub light_proxy_vertex: bool,
     /// Candidates per cell reservoir and frame (1..64).
     pub light_candidates: u32,
-    /// World units per pixel below which a vertex uses 8-voxel cells (else 32-voxel cells).
+    /// World units per pixel below which a vertex uses 32-voxel cells (else 128-voxel cells).
     pub light_footprint: f32,
     /// Both methods, with `light_nee`: per-pixel ReSTIR DI on the light list at the primary surface
     /// (`CAELIX_GI_FLAG_RESTIR_DI`, docs/RESTIR_DI.md); it uses the reuse settings above.
@@ -325,6 +328,7 @@ impl Default for GiSettings {
             depth_threshold: 0.1,
             light_nee: false,
             light_cells: 65536,
+            light_cell_reservoirs: 8,
             light_cell_jitter: true,
             light_cell_oriented: false,
             light_mis: true,
@@ -407,6 +411,7 @@ impl GiSettings {
             light_temporal_frames: self.light_temporal_frames,
             light_push_confidence: self.light_push_confidence,
             light_nee_candidates: self.light_nee_candidates,
+            light_cell_reservoirs: self.light_cell_reservoirs,
         }
     }
 }

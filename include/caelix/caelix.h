@@ -86,7 +86,9 @@ extern "C" {
    (48 -> 56 bytes). The per-vertex resampling of the light NEE appended light_nee_candidates to
    CaelixGiOptions (56 -> 60 bytes) and added CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX. The oriented light cells
    added CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED and shrank a light cell to 256 bytes (8 reservoirs,
-   CaelixGiStats::light_cell_bytes changes accordingly). A host built against
+   CaelixGiStats::light_cell_bytes changes accordingly). The light cell size step (2026-10-22) made a
+   level 0 cell 32 voxels (128 at level 1) and appended light_cell_reservoirs to CaelixGiOptions
+   (60 -> 64 bytes; the cell is 64 + 24 x reservoirs bytes). A host built against
    an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1247,10 +1249,11 @@ typedef struct CaelixGiOptions
     float depth_threshold;    /* 0 = 0.1: |x_v(q) - x_v(r)| must be below threshold * view_z(r) */
     uint32_t reset;           /* 1 = drop the reservoir history with the next render */
     uint32_t light_cell_capacity; /* 0 = 65536 light cells; else a power of two in 1024 .. 1048576
-                                     (256 bytes per cell) */
+                                     (64 + 24 x light_cell_reservoirs bytes per cell) */
     uint32_t light_candidates;    /* 0 = 8; 1 .. 64 candidates per cell reservoir and frame */
     float light_level_footprint;  /* 0 = 0.25: a vertex whose pixel footprint (world units per pixel at
-                                     its camera distance) is below this uses 8-voxel cells, else 32 */
+                                     its camera distance) is below this uses 32-voxel cells, else
+                                     128-voxel cells */
     uint32_t di_candidates;       /* 0 = 4; 1 .. 32 initial light candidates per pixel (RESTIR_DI) */
     uint32_t light_temporal_frames; /* 0 = 20; LIGHT_CELL_TEMPORAL: the history behind a cell reservoir is
                                        clamped to this many frames (x light_candidates candidates) before
@@ -1261,6 +1264,9 @@ typedef struct CaelixGiOptions
                                       the exact target at the vertex before the one shadow ray
                                       (docs/LIGHT_LIST.md section 2.6); 1 = no resampling (one
                                       sample, the earlier NEE); 1 .. 32. LIGHT_CELL_PUSH needs 1 */
+    uint32_t light_cell_reservoirs; /* 0 = 8; LIGHT_NEE: reservoirs per light cell (the push ring has as many
+                                       entries); a power of two in 1 .. 64. A cell is 64 + 24 x this bytes
+                                       (256 at 8); a change recreates the cell table (history dropped) */
 } CaelixGiOptions;
 
 /* Sets the GI options of the renderer; they apply from the next render on and stay until the next
@@ -1273,14 +1279,16 @@ typedef struct CaelixGiOptions
    the DI reservoir buffers (4 x 48 bytes per pixel) likewise at the first render with
    CAELIX_GI_FLAG_RESTIR_DI. The DI history is also dropped when the scene's light table was rebuilt
    since the renderer's previous render.
-   The light cells (light_cell_capacity x 256 bytes + 32) are allocated at the first render with
-   CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity changes.
+   The light cells (light_cell_capacity x (64 + 24 x light_cell_reservoirs) bytes + 32) are allocated
+   at the first render with CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity or the reservoir
+   count changes.
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,
    light_candidates > 64, CAELIX_GI_FLAG_RESTIR_DI without CAELIX_GI_FLAG_LIGHT_NEE, di_candidates > 32,
    light_temporal_frames > 1024, a light_push_confidence that is not finite or not in 0 .. 1024,
    light_nee_candidates > 32, CAELIX_GI_FLAG_LIGHT_CELL_PUSH with an effective light_nee_candidates
-   >= 2 -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
+   >= 2, a light_cell_reservoirs that is not 0 or a power of two in 1 .. 64
+   -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);
 
 typedef struct CaelixGiStats
@@ -1301,7 +1309,7 @@ typedef struct CaelixGiStats
     uint32_t light_cell_pushes;         /* LIGHT_CELL_PUSH: pushes of the previous frame's trace that got a
                                            ring entry (counted by this frame's fill) */
     uint32_t light_cell_pushes_dropped; /* LIGHT_CELL_PUSH: pushes of the previous frame's trace beyond the
-                                           32 ring entries of their cell */
+                                           light_cell_reservoirs ring entries of their cell */
 } CaelixGiStats;
 
 /* Fills *out; a null argument is ignored. */

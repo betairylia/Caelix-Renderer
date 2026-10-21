@@ -21,10 +21,16 @@ namespace caelix {
 class Scene;
 class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 
-// The light cell layout (render/caelix_light_sample.hlsl): kLightCellBytes per cell, then the
-// usage counters (live, active, inserted, failed, pushed, push_dropped: six uints and 8 bytes of
-// padding) at the buffer's tail.
-constexpr VkDeviceSize kLightCellBytes = 256;
+// The light cell layout (render/caelix_light_sample.hlsl): LightCellBytes(reservoirs) per cell (a 64-byte
+// header, `reservoirs` x 8 B reservoirs and as many 16 B push entries), then the usage counters (live,
+// active, inserted, failed, pushed, push_dropped: six uints and 8 bytes of padding) at the buffer's tail.
+constexpr VkDeviceSize kLightCellHeaderBytes = 64;
+constexpr VkDeviceSize kLightCellReservoirBytes = 8;
+constexpr VkDeviceSize kLightCellPushBytes = 16;
+constexpr VkDeviceSize LightCellBytes(uint32_t reservoirs)
+{
+    return kLightCellHeaderBytes + (kLightCellReservoirBytes + kLightCellPushBytes) * reservoirs;
+}
 constexpr VkDeviceSize kLightCellCounterBytes = 32;
 // Readback slots of the light cell counters (slot = frame_number % kLightCounterSlots).
 constexpr uint32_t kLightCounterSlots = 8;
@@ -265,10 +271,10 @@ private:
     bool EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame);
     // The same for the ReSTIR DI reservoir buffers (48 bytes per pixel).
     bool EnsureDiBuffers(uint32_t width, uint32_t height, uint64_t frame);
-    // Creates the light cells when they are missing or of another capacity; the old buffer is
-    // retired until `frame` is safe. A new buffer is zero-filled by the next render
+    // Creates the light cells when they are missing or of another capacity or reservoir count; the
+    // old buffer is retired until `frame` is safe. A new buffer is zero-filled by the next render
     // (light_cells_need_clear_).
-    void EnsureLightCells(uint32_t capacity, uint64_t frame);
+    void EnsureLightCells(uint32_t capacity, uint32_t reservoirs, uint64_t frame);
     // The device address of reservoir buffer `which` (GiBuffer) under the current rotation.
     uint64_t GiAddress(GiBuffer which) const
     {
@@ -372,9 +378,10 @@ private:
     uint64_t di_light_rebuilds_ = 0;     // CaelixLightStats::rebuilds at the previous ReSTIR DI render
     std::vector<RetiredGiBuffers> retired_di_;
     // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE).
-    GpuBuffer light_cells_;                  // capacity x 256 bytes + 32 bytes of usage counters
-                                             // (render/caelix_light_sample.hlsl)
+    GpuBuffer light_cells_;                  // capacity x LightCellBytes(reservoirs) + 32 bytes of usage
+                                             // counters (render/caelix_light_sample.hlsl)
     uint32_t light_cell_capacity_ = 0;       // cells of light_cells_
+    uint32_t light_cell_reservoirs_ = 0;     // reservoirs per cell of light_cells_
     // The usage counters of the light cells, copied after the trace of each light NEE frame into
     // slot frame_number % kLightCounterSlots (32 bytes each; persistently mapped), and the frame of
     // each slot (0 = none). Created and retired with light_cells_.

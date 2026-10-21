@@ -126,32 +126,36 @@ rebuild's presence in the flush time (no separate timer).
 
 A hash table of cells owned by the renderer (like the GI reservoir buffers: created at the first
 render that needs it, recreated when the capacity option changes, retired safely). Capacity C =
-`CaelixGiOptions::light_cell_capacity` (0 = 65536, power of two, 2^10 .. 2^20). R = 8 reservoirs
-per cell (`kLightCellReservoirs`, a shader constant; 32 before the oriented cells, section 2.7).
+`CaelixGiOptions::light_cell_capacity` (0 = 65536, power of two, 2^10 .. 2^20). R =
+`CaelixGiOptions::light_cell_reservoirs` reservoirs per cell (0 = 8; a power of two, 1 .. 64; a
+shader constant of 8 before 2026-10-22, 32 before the oriented cells, section 2.7). A cell is
+64 + 24 R bytes (section 2.8).
 
 ```
-Cell (256 B since the oriented cells, section 2.7: 8 reservoirs and 8 push entries; 832 B with 32
+Cell (64 + 24 R B, 256 at R 8, since 2026-10-22, section 2.8; 256 B since the oriented cells,
+section 2.7: 8 reservoirs and 8 push entries; 832 B with 32
 and 32 since the push-back of shadow ray results, section 2.2; 304 B since the temporal cell
 reuse; 296 B since step 3, docs/LIGHT_MIS.md; 288 B before, without C_prev and C_cur)
   uint64_t key;          //   0  0 = empty; else the fingerprint of (entity, level, cell coordinate,
                          //      receiver face with LIGHT_CELL_ORIENTED)
   uint touched_frame;    //   8  fc.frame_counter (section 3) of the last lookup
   uint entity;           //  12
-  int3 coord;            //  16  cell coordinate at `level`
+  int3 coord;            //  16  cell coordinate at `level`: level 0 = 32-voxel cells, level 1 =
+                         //      128-voxel cells (8 / 32 before 2026-10-22)
   uint level;            //  28
   float C_prev;          //  32  cell normalisation of the fill before the latest one (MIS proxy)
   float C_cur;           //  36  cell normalisation of the latest fill (mean of w_sum / K; with
                          //      LIGHT_CELL_TEMPORAL the running mean of dedicated draws)
   float M;               //  40  LIGHT_CELL_TEMPORAL: the confidence sum behind the cell's
-                         //      reservoirs (the mean over the 8 threads; they differ by the push
-                         //      confidence where the push ring has fewer than 8 entries); 0 = no history
+                         //      reservoirs (the mean over the R threads; they differ by the push
+                         //      confidence where the push ring has fewer than R entries); 0 = no history
   float C_n;             //  44  LIGHT_CELL_TEMPORAL: the draw count behind C_cur; 0 = none
-  uint push_count;       //  48  LIGHT_CELL_PUSH: pushes claimed since the latest fill (may exceed 8)
+  uint push_count;       //  48  LIGHT_CELL_PUSH: pushes claimed since the latest fill (may exceed R)
   uint face;             //  52  the receiver face of the key: 0..5 (+X -X +Y -Y +Z -Z of the world
                          //      normal) with LIGHT_CELL_ORIENTED, else 6 (kLightCellFaceNone); section 2.7
   uint pad[2];           //  56
-  LightCellReservoir r[8];   // 64 .. 128
-  LightCellPush push[8];     // 128 .. 256  LIGHT_CELL_PUSH: the push ring
+  LightCellReservoir r[R];   // 64 .. 64 + 8 R
+  LightCellPush push[R];     // 64 + 8 R .. 64 + 24 R  LIGHT_CELL_PUSH: the push ring
 LightCellReservoir (8 B)
   uint light;            // a light sample word (below), 0xFFFFFFFF = empty
   float W;               // unbiased contribution weight of that sample (0 = empty)
@@ -171,8 +175,9 @@ enter the cells only through the push ring (section 2.2).
 An unfilled cell has empty reservoirs (all `W` 0); the sampling then falls back to the global
 table (section 2.3).
 
-Cell coordinate of an entity-local point p (voxel units) at level L: `floor(p) >> (3 + 2 L)`
-(level 0 = one brick = 8 voxels, level 1 = 32 voxels). Level by footprint: with `d` = the world
+Cell coordinate of an entity-local point p (voxel units) at level L: `floor(p) >> (5 + 2 L)`
+(level 0 = 32 voxels, level 1 = 128 voxels; before 2026-10-22 `floor(p) >> (3 + 2 L)`: one brick =
+8 voxels and 32 voxels). Level by footprint: with `d` = the world
 distance from the camera position to the vertex, `footprint = 2 d tan_half_fov_y / size.y`
 (world units per pixel); level 0 when `footprint < light_level_footprint` (option, 0 = 0.25),
 else level 1. Every vertex of a path uses its own camera distance.
@@ -654,6 +659,44 @@ unoriented for comparison).
 | `CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED` | new, `1u << 12` |
 | `CaelixGiStats::light_cell_bytes` | `capacity x 256 + 32` |
 
+### 2.8 Cell size 32 / 128 and tunable reservoirs (2026-10-22)
+
+Owner's request, two parts. (A) A level 0 cell is 32 voxels on an edge and a level 1 cell 128
+voxels (before: 8 and 32). The coordinate shift is `kLightCellBaseShift + 2 level` with
+`kLightCellBaseShift` = 5 (`LightCellCoord`), and every cell edge in the kernels comes from
+`LightCellSize(level)` = `1 << (5 + 2 level)`: the cell centre of the fill's target and of the MIS
+proxy, the near distance `(cell half size + 4)^2`, the jitter of the lookup (section 2.5, +- half a
+cell) and the receiver region of the push (`LightCellRegionFaceMask`). (B) The number of reservoirs
+per cell R is a runtime option, `CaelixGiOptions::light_cell_reservoirs` (0 = 8; a power of two in
+1 .. 64), passed to the kernels in `FrameConstants::light_cell_reservoirs`. The push ring has R
+entries as well. A cell is `64 + 24 R` bytes (`LightCellBytes`): the 64-byte header, R x 8 B
+reservoirs from byte 64, R x 16 B push entries from byte `64 + 8 R` (`LightCellPushOffset`). At
+R = 8 the layout is byte-identical to section 2.7 (256 B). A change of R recreates the cell table
+(like a capacity change: the cells and their history are dropped).
+
+Fill dispatch: workgroups of 64 threads, 64 / R cells per workgroup, R threads per cell (thread
+`r = thread % R` owns reservoir r; slot = `(y * 1024 + x) * (64 / R) + thread / R`), dispatch
+`min(1024, G) x max(1, G / 1024)` with `G = capacity x R / 64` workgroups (at least 16, exact: the
+capacity and R are powers of two). `gs_c` and `gs_push` hold 64 entries. The loops over the push
+ring and over the reservoirs of a cell run to R (no longer unrolled).
+
+| item | change |
+| --- | --- |
+| cell edge | level 0: 8 -> 32 voxels; level 1: 32 -> 128 (`kLightCellBaseShift` 5, `LightCellSize`, `LightCellCoord`) |
+| `CaelixGiOptions::light_cell_reservoirs` | new (60 -> 64 B); 0 = 8, power of two in 1 .. 64 |
+| `FrameConstants::light_cell_reservoirs` | at 708 (former pad); size stays 720 |
+| light cell | 64 + 24 R bytes (`LightCellBytes`), push ring at 64 + 8 R, R push entries |
+| fill kernel | `[numthreads(64, 1, 1)]`, 64 / R cells per group |
+| host | `--light-cell-reservoirs <N>` (default 8), GI panel "light reservoirs" combo |
+
+No measurement yet (the owner measures).
+
+Test box effect (2026-10-22, "light NEE with cell push-back is unbiased", 5 runs each): the 24-voxel
+box fits in one 32-voxel cell, so 8 live cells replace 42 and ~30 pushes per frame land instead of ~239
+(8 push slots per cell); the ratio stays within 1.02 but the 16x16 block PSNR drops from 35 .. 37 dB to
+32 .. 34 dB (one run at 29.5), so that test's noise guard is 28 dB now. The oriented-cells test also has
+fewer live cells (8 .. 174). The cost or gain on real scenes is not measured.
+
 ## 3. Frame constants and push constants
 
 `FrameConstants` grows from 608 to 672 B (CPU + HLSL + static_asserts):
@@ -675,7 +718,8 @@ uint32_t pad_648[6];         // 648 .. 671
 the push-back uses offset 700: `float light_push_confidence` = the confidence of a pushed sample,
 0 without `LIGHT_CELL_PUSH`. The per-vertex resampling (section 2.6) grew it to 720 B:
 `uint32_t light_nee_candidates` at 704 = the effective candidates per vertex, 1 .. 32, 0 without
-`LIGHT_NEE`, then three pad words.)
+`LIGHT_NEE`, then three pad words. The cell size step (section 2.8) uses offset 708:
+`uint32_t light_cell_reservoirs` = R, 1 .. 64.)
 
 `TracePush` is unchanged. Scene kernels use `LightPush` (section 1.2, `gpu_structs.h`):
 `{ uint64_t group_infos, slot_tables, page_table, light_words, light_table, materials,
@@ -810,7 +854,7 @@ host flags and UI, `tools/gi_bench.*`.
 | --- | --- |
 | light word | 4 B per AABB row (`Scene::light_words_`, grows with the AABB pool; 256 KiB at the initial 65536 rows) |
 | light table | 64 B header + 132 B per `max_bricks` entry (128 B entry + 4 B CDF): 8.3 MiB at 65536; since step 4 (`LIGHT_FACES.md`) 452 B per entry (448 B entry + 4 B CDF): 28.3 MiB at 65536, 452 MiB at 2^20 |
-| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md; 304 B since the temporal cell reuse: 19 MiB at 65536; 832 B since the push-back of shadow ray results: 52 MiB at 65536; 256 B since the oriented cells, section 2.7: 16 MiB at 65536, 256 MiB at 2^20) |
+| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md; 304 B since the temporal cell reuse: 19 MiB at 65536; 832 B since the push-back of shadow ray results: 52 MiB at 65536; 256 B since the oriented cells, section 2.7: 16 MiB at 65536, 256 MiB at 2^20; 64 + 24 R B since section 2.8) |
 | `FinalizePush` | 88 -> 104 B (`light_words`, `materials`, `min_emission` in place of `pad`) |
 | `LightPush` | 72 B (see differences); 80 B since step 3 (`light_indices`, docs/LIGHT_MIS.md) |
 | `FrameConstants` | 608 -> 672 B, fields as in section 3 (`frame_counter` at 640); 720 B since section 2.6 (`light_nee_candidates` at 704) |
@@ -833,7 +877,8 @@ render kernels need it to find the CDF behind the entries.
   to HOST, then a barrier to ALL_COMMANDS reads. Inside the flush timer.
 - `caelix_light_cells` (renderer, trace set + `TracePush`, 32 threads per cell, dispatch
   1024 x capacity / 1024; since section 2.7: 8 threads per cell, 4 cells per workgroup, dispatch
-  min(1024, capacity / 4) x max(1, capacity / 4096)). Before the sky SH kernel and the trace, with its own `GpuTimer`
+  min(1024, capacity / 4) x max(1, capacity / 4096); since section 2.8: 64 threads per workgroup,
+  64 / R cells, G = capacity x R / 64 workgroups in rows of 1024). Before the sky SH kernel and the trace, with its own `GpuTimer`
   (`light_timer_` -> `light_fill_ms`) and a compute -> compute barrier after it. A new cell
   buffer is zero-filled (`vkCmdFillBuffer`) before its first fill.
 - Light NEE in `TracePath` at the sun NEE's vertices, own stream

@@ -107,7 +107,7 @@ struct FrameConstants
     uint32_t light_temporal_frames;     // 696  LIGHT_CELL_TEMPORAL: frames of history the fill keeps (0 = none this frame)
     float light_push_confidence;        // 700  LIGHT_CELL_PUSH: the confidence (M) of a pushed sample in the cell fill; 0 without the flag
     uint32_t light_nee_candidates;      // 704  LIGHT_NEE: candidates per diffuse vertex (1 .. 32; 1 = no resampling)
-    uint32_t pad_708;                   // 708
+    uint32_t light_cell_reservoirs;     // 708  LIGHT_NEE: reservoirs (and push entries) per light cell (a power of two in 1 .. 64)
     uint32_t pad_712;                   // 712
     uint32_t pad_716;                   // 716
 };
@@ -164,6 +164,7 @@ static_assert(offsetof(FrameConstants, light_indices) == 688);
 static_assert(offsetof(FrameConstants, light_temporal_frames) == 696);
 static_assert(offsetof(FrameConstants, light_push_confidence) == 700);
 static_assert(offsetof(FrameConstants, light_nee_candidates) == 704);
+static_assert(offsetof(FrameConstants, light_cell_reservoirs) == 708);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

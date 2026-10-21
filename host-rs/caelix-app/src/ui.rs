@@ -614,6 +614,24 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             });
             ui.end_row();
 
+            ui.label("light reservoirs");
+            ui.add_enabled_ui(light, |ui| {
+                ComboBox::from_id_salt("gi_light_cell_reservoirs")
+                    .selected_text(gi.light_cell_reservoirs.to_string())
+                    .show_ui(ui, |ui| {
+                        for shift in 0..=6 {
+                            let reservoirs = 1u32 << shift;
+                            ui.selectable_value(&mut gi.light_cell_reservoirs, reservoirs, reservoirs.to_string());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Reservoirs and push ring entries per light cell; a cell is 64 + 24 x this bytes. A change \
+                         recreates the cell table",
+                    );
+            });
+            ui.end_row();
+
             ui.label("light candidates");
             ui.add_enabled(light, Slider::new(&mut gi.light_candidates, 1..=64));
             ui.end_row();

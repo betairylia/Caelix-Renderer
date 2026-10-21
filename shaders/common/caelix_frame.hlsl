@@ -105,7 +105,7 @@ struct CaelixFrameConstants
     uint light_temporal_frames;     // 696  kGiFlagLightCellTemporal: frames of history the cell fill keeps (0 = none this frame)
     float light_push_confidence;    // 700  kGiFlagLightCellPush: the confidence (M) of a pushed sample in the cell fill; 0 without
     uint light_nee_candidates;      // 704  kGiFlagLightNee: light candidates per diffuse vertex (1 .. 32; 1 = no resampling)
-    uint pad_708;                   // 708
+    uint light_cell_reservoirs;     // 708  kGiFlagLightNee: reservoirs (and push entries) per light cell, a power of two in 1 .. 64
     uint pad_712;                   // 712
     uint pad_716;                   // 716  -> 720
 };
