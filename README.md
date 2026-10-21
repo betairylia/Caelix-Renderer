@@ -1041,7 +1041,12 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   (`CAELIX_GI_FLAG_DIFFUSE_ONLY`) for a comparison on one BSDF. ReSTIR GI options:
   `--gi-no-temporal`, `--gi-no-spatial`, `--gi-visibility` (a shadow ray per
   spatial neighbour), `--gi-unbiased` (Z-count MIS weights, with the shadow
-  rays), `--gi-m-cap <N>` (1..64, default 20), `--gi-spatial-samples <N>`
+  rays), `--gi-no-pairwise` (1/M or Z-count weights instead of the pairwise
+  MIS; by default `--gi restir` uses the pairwise MIS of
+  `CAELIX_GI_FLAG_PAIRWISE_MIS`, the balance heuristic with visibility in the
+  weights and two shadow rays per spatial neighbour, which ignores
+  `--gi-visibility` and `--gi-unbiased`; docs/GI_EXPERIMENTS.md "Pairwise
+  MIS"), `--gi-m-cap <N>` (1..64, default 20), `--gi-spatial-samples <N>`
   (1..8, default 5), `--gi-spatial-passes <N>` (1..2, default 1),
   `--gi-radius <F>` (pixels, default 30), `--gi-depth-threshold <F>`
   (fraction of the view depth, default 0.1). With `--screenshot` the host also

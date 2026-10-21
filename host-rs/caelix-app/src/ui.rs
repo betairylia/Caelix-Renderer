@@ -726,6 +726,8 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         );
         ui.add_enabled(restir, egui::Checkbox::new(&mut gi.temporal, "temporal reuse"));
         ui.add_enabled(restir, egui::Checkbox::new(&mut gi.spatial, "spatial reuse"));
+        ui.add_enabled(restir, egui::Checkbox::new(&mut gi.pairwise_mis, "pairwise MIS (2 rays per neighbour)"))
+            .on_hover_text("Balance heuristic per neighbour with visibility in the weights; replaces 1/M, visibility rays and Z weights");
         ui.add_enabled(restir && gi.spatial, egui::Checkbox::new(&mut gi.visibility, "visibility rays"));
         ui.add_enabled(restir && gi.spatial, egui::Checkbox::new(&mut gi.unbiased, "unbiased (Z weights)"));
         if ui

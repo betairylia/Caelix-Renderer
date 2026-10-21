@@ -3016,7 +3016,7 @@ TEST_CASE("ReSTIR GI: set_gi_options validation")
     };
     CaelixGiOptions bad = GiOptions(2, 0);  // unknown method
     expect_invalid(bad);
-    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 31);  // unknown flag (bits 0 .. 8 are defined)
+    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 31);  // unknown flag (bits 0 .. 9 are defined)
     expect_invalid(bad);
     bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
     bad.spatial_samples = 9;
@@ -3041,6 +3041,9 @@ TEST_CASE("ReSTIR GI: set_gi_options validation")
     good.depth_threshold = 0.05f;
     good.reset = 1;
     CHECK(caelix_renderer_set_gi_options(renderer, &good) == CAELIX_OK);
+    const CaelixGiOptions pairwise =
+        GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_PAIRWISE_MIS);
+    CHECK(caelix_renderer_set_gi_options(renderer, &pairwise) == CAELIX_OK);
     const CaelixGiOptions zero{};
     CHECK(caelix_renderer_set_gi_options(renderer, &zero) == CAELIX_OK);
     // No ReSTIR render yet: no reservoir buffer.
@@ -3099,7 +3102,7 @@ TEST_CASE("ReSTIR GI: without reuse it matches the path tracer; with reuse its b
 
     // 3. Temporal + spatial reuse (1/M weights, no visibility rays): biased; the mean must stay
     //    within 10 percent of the path tracer's. Then with visibility rays and the unbiased
-    //    combination (reported, same bound).
+    //    combination, and with the pairwise MIS (reported, same bound).
     gi = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_DIFFUSE_ONLY | CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL);
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
     const GiComparison reuse = CompareGi(pt, GiReference(rig, renderer, set, camera, kFrames, 17000));
@@ -3111,6 +3114,13 @@ TEST_CASE("ReSTIR GI: without reuse it matches the path tracer; with reuse its b
     const GiComparison reuse_unbiased = CompareGi(pt, GiReference(rig, renderer, set, camera, kFrames, 21000));
     PrintGi("ReSTIR GI temporal + spatial (unbiased) vs path tracer", reuse_unbiased);
     CHECK(reuse_unbiased.max_ratio_error < 0.10);
+
+    gi = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_DIFFUSE_ONLY | CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL |
+                                         CAELIX_GI_FLAG_PAIRWISE_MIS);
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const GiComparison reuse_pairwise = CompareGi(pt, GiReference(rig, renderer, set, camera, kFrames, 25000));
+    PrintGi("ReSTIR GI temporal + spatial (pairwise MIS) vs path tracer", reuse_pairwise);
+    CHECK(reuse_pairwise.max_ratio_error < 0.10);
 
     // 4. Back to the path tracer: the image is the path tracer's again, bit for bit (same seeds).
     gi = GiOptions(CAELIX_GI_PATH_TRACE, CAELIX_GI_FLAG_DIFFUSE_ONLY);

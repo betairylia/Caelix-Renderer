@@ -153,6 +153,7 @@ static const uint kGiFlagLightCellTemporal = 1u << 9;
 static const uint kGiFlagLightCellPush = 1u << 10;
 static const uint kGiFlagLightProxyVertex = 1u << 11;
 static const uint kGiFlagLightCellOriented = 1u << 12;
+static const uint kGiFlagPairwiseMis = 1u << 13;
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

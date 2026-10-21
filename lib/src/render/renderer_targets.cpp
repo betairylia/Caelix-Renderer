@@ -402,7 +402,8 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                                      CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI |
                                      CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_MIS |
                                      CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL | CAELIX_GI_FLAG_LIGHT_CELL_PUSH |
-                                     CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX | CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED;
+                                     CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX | CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED |
+                                     CAELIX_GI_FLAG_PAIRWISE_MIS;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);

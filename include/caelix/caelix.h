@@ -88,7 +88,8 @@ extern "C" {
    added CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED and shrank a light cell to 256 bytes (8 reservoirs,
    CaelixGiStats::light_cell_bytes changes accordingly). The light cell size step (2026-10-22) made a
    level 0 cell 32 voxels (128 at level 1) and appended light_cell_reservoirs to CaelixGiOptions
-   (60 -> 64 bytes; the cell is 64 + 24 x reservoirs bytes). A host built against
+   (60 -> 64 bytes; the cell is 64 + 24 x reservoirs bytes). The pairwise MIS step added
+   CAELIX_GI_FLAG_PAIRWISE_MIS (no struct changed). A host built against
    an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1215,12 +1216,22 @@ typedef enum CaelixGiMethod
                                                  fill's target and the MIS proxy's cell form get the
                                                  receiver orientation term (floor 0.1, never 0)
                                                  (docs/LIGHT_LIST.md section 2.7). Unbiased */
+#define CAELIX_GI_FLAG_PAIRWISE_MIS (1u << 13) /* ReSTIR GI: pairwise MIS (balance heuristic between each spatial
+                                                 neighbour and the pixel's own sample, with visibility in both
+                                                 densities: two shadow rays per accepted neighbour) in the
+                                                 spatial pass and the balance heuristic in the temporal pass,
+                                                 instead of 1/M or the Z-count (VISIBILITY and UNBIASED are then
+                                                 ignored by ReSTIR GI; ReSTIR DI ignores this flag). Bounds the
+                                                 reconnection Jacobian's outliers (docs/GI_EXPERIMENTS.md,
+                                                 "Pairwise MIS") */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
    path, with the path's radiance from there on), then a temporal pass, up to two spatial passes and a
    shade pass write the diffuse radiance that the composite (or NRD) reads. It forces the Lambert lobe
    at every vertex, ignores sun NEE and the fog on the GI path, and writes no specular radiance.
+   CAELIX_GI_FLAG_PAIRWISE_MIS weights its temporal and spatial reuse with the balance heuristic
+   (pairwise MIS with two shadow rays per spatial neighbour) instead of 1/M or the Z-count.
    CAELIX_GI_FLAG_LIGHT_NEE (either method): every diffuse vertex that has a next segment samples one
    point on a list light (an emissive voxel face whose material is a list light of the scene, see
    CaelixLightOptions) through the renderer's light cells (world-space reservoirs keyed by entity,

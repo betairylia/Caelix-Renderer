@@ -1,7 +1,8 @@
 // Screen-space ReSTIR GI (Ouyang et al. 2021), diffuse only: the reservoir, its storage in the
 // reservoir buffers of CaelixFrameConstants (gi_initial, gi_prev, gi_temp, gi_out), the target
 // function, the Jacobian of the reconnection shift, the geometric similarity test, the merge
-// (resampled importance sampling with 1/M or Z-count weights) and the visibility ray.
+// (resampled importance sampling with 1/M or Z-count weights, or with explicit MIS weights per
+// candidate for the pairwise MIS of kGiFlagPairwiseMis) and the visibility ray.
 // docs/GI_EXPERIMENTS.md is the design.
 //
 // One reservoir per pixel holds one sample: the first bounce of a path from the visible point
@@ -254,6 +255,52 @@ GiReservoir GiMergeFinishWithCount(GiMerge s, float3 x_v_r, uint face_r, uint co
 GiReservoir GiMergeFinish(GiMerge s, float3 x_v_r, uint face_r)
 {
     return GiMergeFinishWithCount(s, x_v_r, face_r, s.m);
+}
+
+// Pairwise MIS (kGiFlagPairwiseMis; docs/GI_EXPERIMENTS.md "Pairwise MIS"). The confidence-weighted
+// density of a candidate technique with visible point x_t and confidence m_t for the sample s that the
+// receiver at x_v_r holds, expressed in the receiver's domain: m_t * p_hat_t(s) * J(s; r -> t). Both
+// share the receiver's face normal n (GiSimilar requires the same face). No visibility.
+float GiTechniqueDensity(GiReservoir s, float3 x_v_r, float3 x_v_t, float3 n, uint m_t)
+{
+    return float(m_t) * GiTargetPdf(s, x_v_t, n) * GiJacobian(s, x_v_r, x_v_t);
+}
+
+// Adds candidate `c` with an explicit resampling weight `w` (its MIS weight times the receiver's
+// target times W times the Jacobian) and confidence `m`. Returns true when `c` was selected.
+bool GiMergeWeighted(inout GiMerge s, GiReservoir c, float p_hat_at_r, float w, uint m, inout uint rng)
+{
+    s.m += m;
+    if (!(w > 0.0f))
+    {
+        return false;
+    }
+    s.w_sum += w;
+    if (RandomFloat01(rng) * s.w_sum < w)
+    {
+        s.selected = c;
+        s.p_hat_selected = p_hat_at_r;
+        return true;
+    }
+    return false;
+}
+
+// An empty merge for explicit MIS weights: the receiver's own reservoir is added afterwards through
+// GiMergeWeighted like every other candidate.
+GiMerge GiMergeInitWeighted(GiReservoir own, float p_hat_own)
+{
+    GiMerge s;
+    s.selected = own;
+    s.w_sum = 0.0f;
+    s.m = 0u;
+    s.p_hat_selected = p_hat_own;
+    return s;
+}
+
+// The merged reservoir when the candidates carried explicit MIS weights: W = w_sum / p_hat(selected).
+GiReservoir GiMergeFinishMis(GiMerge s, float3 x_v_r, uint face_r)
+{
+    return GiMergeFinishWithCount(s, x_v_r, face_r, 1u);
 }
 
 // Whether sample `r` is visible from x_v (already pushed off its surface): a shadow ray toward

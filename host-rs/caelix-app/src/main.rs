@@ -394,6 +394,9 @@ struct Args {
     /// ReSTIR GI: Z-count MIS weights instead of 1/M (implies the shadow rays of --gi-visibility).
     #[arg(long)]
     gi_unbiased: bool,
+    /// ReSTIR GI: 1/M or Z-count weights instead of the pairwise MIS (which is the default).
+    #[arg(long)]
+    gi_no_pairwise: bool,
     /// ReSTIR GI: the previous frame's M is clamped to N before the temporal merge (1..64).
     #[arg(long, value_name = "N", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=64))]
     gi_m_cap: u32,
@@ -2111,6 +2114,7 @@ fn main() -> anyhow::Result<()> {
             spatial: !args.gi_no_spatial,
             visibility: args.gi_visibility,
             unbiased: args.gi_unbiased,
+            pairwise_mis: !args.gi_no_pairwise,
             temporal_m_cap: args.gi_m_cap,
             spatial_samples: args.gi_spatial_samples,
             spatial_passes: args.gi_spatial_passes,

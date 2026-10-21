@@ -4,11 +4,21 @@
 //
 // gi_spatial_samples neighbours, uniform in a disk of gi_spatial_radius pixels around the pixel
 // (the pixel itself and pixels outside the image are skipped), each accepted by GiSimilar, shifted
-// to this pixel's visible point with the reconnection Jacobian and merged with its full M.
-// kGiFlagVisibility or kGiFlagUnbiased: a shadow ray from this pixel's visible point to each
-// neighbour's sample (occluded: weight 0, still counted in M). kGiFlagUnbiased: after the
-// selection of Y, the MIS denominator is Z = the sum of M over this pixel and the accepted
-// neighbours at which Y has a nonzero target function and is visible, instead of M (1/M weights).
+// to this pixel's visible point with the reconnection Jacobian. The accepted neighbours are
+// gathered first, then merged with one of three weighting schemes:
+// - 1/M (default): each candidate is weighted with its full M; W = w_sum / (M * p_hat(Y)).
+//   kGiFlagVisibility: a shadow ray from this pixel's visible point to each neighbour's sample
+//   (occluded: weight 0, still counted in M).
+// - Z-count (kGiFlagUnbiased): as 1/M with the visibility rays, but after the selection of Y the
+//   MIS denominator is Z = the sum of M over this pixel and the accepted neighbours at which Y has
+//   a nonzero target function and is visible.
+// - Pairwise MIS (kGiFlagPairwiseMis; overrides the two above): the balance heuristic between each
+//   neighbour i and the pixel's own technique c over confidence-weighted densities in this pixel's
+//   domain, p_t(s) = M_t * p_hat_t(s) * J(s; r -> t), with visibility in p_c(X_i) and p_i(Y_c) (two
+//   shadow rays per accepted neighbour). m_i = p_i(X_i) / (k p_i(X_i) + p_c(X_i)),
+//   m_c = (1/k) sum_i p_c(Y_c) / (k p_i(Y_c) + p_c(Y_c)); w = m * p_hat_r * W * J (no factor M);
+//   W = w_sum / p_hat_r(Y). The weights are bounded, so the reconnection Jacobian's outliers are
+//   damped (docs/GI_EXPERIMENTS.md "Pairwise MIS").
 //
 // Descriptors: render/caelix_trace_set.hlsl (TLAS for the shadow rays, internal view z).
 #include "common/caelix_platform.hlsl"
@@ -51,18 +61,12 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     const float view_z = g_int_view_z[pixel].x;
     uint rng = InitRandom(pixel, fc.frame_seed ^ (0x2C9B7A15u + g_push.gi_pass * 0x9E3779B9u));
 
-    const bool unbiased = (fc.gi_flags & kGiFlagUnbiased) != 0u;
-    const bool trace_visibility = (fc.gi_flags & (kGiFlagVisibility | kGiFlagUnbiased)) != 0u;
-    // The accepted neighbours (counted in M): their visible points and face + M words, for Z.
-    float3 accepted_pos[kGiMaxSpatialSamples];
-    uint accepted_face_m[kGiMaxSpatialSamples];
-    uint accepted_count = 0u;
-    int selected = -1;  // the accepted neighbour whose sample was selected; -1 = the pixel's own
-
-    GiMerge merge = GiMergeInit(own, GiTargetPdf(own, x_v, n_v));
+    // Gather the accepted neighbours (each is counted in M whatever its weight).
+    GiReservoir cand[kGiMaxSpatialSamples];
+    uint count = 0u;
     const uint samples = min(fc.gi_spatial_samples, kGiMaxSpatialSamples);
     CAELIX_LOOP
-    for (uint i = 0u; i < samples; ++i)
+    for (uint s = 0u; s < samples; ++s)
     {
         const float radius = fc.gi_spatial_radius * sqrt(RandomFloat01(rng));
         const float angle = K_TWO_PI * RandomFloat01(rng);
@@ -76,55 +80,114 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         {
             continue;
         }
-        const float p_hat = GiTargetPdf(c, x_v, n_v);
-        const float jacobian = GiJacobian(c, c.visible_pos, x_v);
-        float visibility = 1.0f;
-        CAELIX_BRANCH
-        if (trace_visibility && p_hat > 0.0f && jacobian > 0.0f)
-        {
-            visibility = GiVisible(fc, x_v, c) ? 1.0f : 0.0f;
-        }
-        if (GiMergeCandidate(merge, c, p_hat, jacobian, GiM(c), visibility, rng))
-        {
-            selected = int(accepted_count);
-        }
-        accepted_pos[accepted_count] = c.visible_pos;
-        accepted_face_m[accepted_count] = c.visible_flags_m;
-        ++accepted_count;
+        cand[count] = c;
+        ++count;
     }
 
     GiReservoir result;
     CAELIX_BRANCH
-    if (unbiased)
+    if ((fc.gi_flags & kGiFlagPairwiseMis) != 0u)
     {
-        const GiReservoir y = merge.selected;
-        uint z = 0u;
-        // This pixel: its own sample was traced from here; a neighbour's sample could only be
-        // selected with a nonzero weight, which needed the visibility ray from here (UNBIASED
-        // traces it for every neighbour with a nonzero target function) to pass.
-        if (GiTargetPdf(y, x_v, n_v) > 0.0f)
+        // Pairwise MIS: m_i = p_i(X_i) / (k p_i(X_i) + p_c(X_i)) for a neighbour's sample,
+        // m_c = (1/k) sum_i p_c(Y_c) / (k p_i(Y_c) + p_c(Y_c)) for the pixel's own, with visibility in
+        // p_c(X_i) (ray from x_v to X_i) and p_i(Y_c) (ray from the neighbour's visible point to Y_c).
+        const float k = float(count);
+        const uint m_c = GiM(own);
+        const float p_hat_own = GiTargetPdf(own, x_v, n_v);
+        const float p_c_own = float(m_c) * p_hat_own;
+        float mis_own = 1.0f;
+        CAELIX_BRANCH
+        if (count > 0u && p_c_own > 0.0f && own.W > 0.0f)
         {
-            z += GiM(own);
+            mis_own = 0.0f;
+            CAELIX_LOOP
+            for (uint i = 0u; i < count; ++i)
+            {
+                float p_i = GiTechniqueDensity(own, x_v, cand[i].visible_pos, n_v, GiM(cand[i]));
+                if (p_i > 0.0f && !GiVisible(fc, cand[i].visible_pos, own))
+                {
+                    p_i = 0.0f;
+                }
+                mis_own += p_c_own / (k * p_i + p_c_own);
+            }
+            mis_own /= k;
         }
+        GiMerge merge = GiMergeInitWeighted(own, p_hat_own);
+        GiMergeWeighted(merge, own, p_hat_own, (p_c_own > 0.0f) ? mis_own * p_hat_own * own.W : 0.0f, m_c, rng);
         CAELIX_LOOP
-        for (uint k = 0u; k < accepted_count; ++k)
+        for (uint i = 0u; i < count; ++i)
         {
-            const float3 n_k = GiFaceNormal(accepted_face_m[k] & kGiVisibleFaceMask);
-            if (!(GiTargetPdf(y, accepted_pos[k], n_k) > 0.0f))
+            const GiReservoir c = cand[i];
+            const float p_hat_r = GiTargetPdf(c, x_v, n_v);
+            const float jacobian = GiJacobian(c, c.visible_pos, x_v);
+            float w = 0.0f;
+            CAELIX_BRANCH
+            if (p_hat_r > 0.0f && jacobian > 0.0f && c.W > 0.0f && GiVisible(fc, x_v, c))
             {
-                continue;
+                const float p_i = GiTechniqueDensity(c, x_v, c.visible_pos, n_v, GiM(c));
+                const float p_c = float(m_c) * p_hat_r;
+                w = (p_i / (k * p_i + p_c)) * p_hat_r * c.W * jacobian;
             }
-            // The neighbour that owned Y sees it by construction.
-            if (int(k) == selected || GiVisible(fc, accepted_pos[k], y))
-            {
-                z += accepted_face_m[k] >> kGiMShift;
-            }
+            GiMergeWeighted(merge, c, p_hat_r, w, GiM(c), rng);
         }
-        result = GiMergeFinishWithCount(merge, x_v, face, z);
+        result = GiMergeFinishMis(merge, x_v, face);
     }
     else
     {
-        result = GiMergeFinish(merge, x_v, face);
+        const bool unbiased = (fc.gi_flags & kGiFlagUnbiased) != 0u;
+        const bool trace_visibility = (fc.gi_flags & (kGiFlagVisibility | kGiFlagUnbiased)) != 0u;
+        int selected = -1;  // the accepted neighbour whose sample was selected; -1 = the pixel's own
+        GiMerge merge = GiMergeInit(own, GiTargetPdf(own, x_v, n_v));
+        CAELIX_LOOP
+        for (uint i = 0u; i < count; ++i)
+        {
+            const GiReservoir c = cand[i];
+            const float p_hat = GiTargetPdf(c, x_v, n_v);
+            const float jacobian = GiJacobian(c, c.visible_pos, x_v);
+            float visibility = 1.0f;
+            CAELIX_BRANCH
+            if (trace_visibility && p_hat > 0.0f && jacobian > 0.0f)
+            {
+                visibility = GiVisible(fc, x_v, c) ? 1.0f : 0.0f;
+            }
+            if (GiMergeCandidate(merge, c, p_hat, jacobian, GiM(c), visibility, rng))
+            {
+                selected = int(i);
+            }
+        }
+
+        CAELIX_BRANCH
+        if (unbiased)
+        {
+            const GiReservoir y = merge.selected;
+            uint z = 0u;
+            // This pixel: its own sample was traced from here; a neighbour's sample could only be
+            // selected with a nonzero weight, which needed the visibility ray from here (UNBIASED
+            // traces it for every neighbour with a nonzero target function) to pass.
+            if (GiTargetPdf(y, x_v, n_v) > 0.0f)
+            {
+                z += GiM(own);
+            }
+            CAELIX_LOOP
+            for (uint j = 0u; j < count; ++j)
+            {
+                const float3 n_j = GiFaceNormal(GiVisibleFace(cand[j]));
+                if (!(GiTargetPdf(y, cand[j].visible_pos, n_j) > 0.0f))
+                {
+                    continue;
+                }
+                // The neighbour that owned Y sees it by construction.
+                if (int(j) == selected || GiVisible(fc, cand[j].visible_pos, y))
+                {
+                    z += GiM(cand[j]);
+                }
+            }
+            result = GiMergeFinishWithCount(merge, x_v, face, z);
+        }
+        else
+        {
+            result = GiMergeFinish(merge, x_v, face);
+        }
     }
     StoreGiReservoir(output, result);
 }

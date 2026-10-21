@@ -257,6 +257,10 @@ pub struct GiSettings {
     pub visibility: bool,
     /// ReSTIR: Z-count MIS weights (with the shadow rays) instead of 1/M.
     pub unbiased: bool,
+    /// ReSTIR GI: pairwise MIS weights with visibility in the densities (`CAELIX_GI_FLAG_PAIRWISE_MIS`,
+    /// two shadow rays per spatial neighbour) instead of 1/M or the Z-count; bounds the reconnection
+    /// Jacobian's fireflies.
+    pub pairwise_mis: bool,
     pub temporal_m_cap: u32,
     pub spatial_samples: u32,
     pub spatial_passes: u32,
@@ -321,6 +325,7 @@ impl Default for GiSettings {
             spatial: true,
             visibility: false,
             unbiased: false,
+            pairwise_mis: true,
             temporal_m_cap: 20,
             spatial_samples: 5,
             spatial_passes: 1,
@@ -364,6 +369,9 @@ impl GiSettings {
         }
         if self.unbiased {
             flags |= CAELIX_GI_FLAG_UNBIASED;
+        }
+        if self.pairwise_mis && self.method == GiMethod::Restir {
+            flags |= CAELIX_GI_FLAG_PAIRWISE_MIS;
         }
         if self.light_nee {
             flags |= CAELIX_GI_FLAG_LIGHT_NEE;

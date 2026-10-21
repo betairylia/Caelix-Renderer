@@ -26,11 +26,16 @@ RUNS = {
     "reference": "--mode ref --accumulate 2048 --gi pt",
     "restir_converged": "--mode ref --accumulate 512 --gi restir",
     "pt": "--mode pt --no-denoise --warmup 64 --gi pt",
+    # Since the pairwise MIS step `--gi restir` uses the pairwise MIS by default, so "restir" and
+    # "restir_converged" measure it; the *_nopairwise runs and the variants below keep the 1/M or
+    # Z-count weights they measured before (--gi-no-pairwise).
     "restir": "--mode pt --no-denoise --warmup 64 --gi restir",
-    "restir_visibility": "--mode pt --no-denoise --warmup 64 --gi restir --gi-visibility",
-    "restir_unbiased": "--mode pt --no-denoise --warmup 64 --gi restir --gi-unbiased",
-    "restir_temporal_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-spatial",
-    "restir_spatial_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-temporal",
+    "restir_nopairwise": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-pairwise",
+    "restir_nopairwise_converged": "--mode ref --accumulate 512 --gi restir --gi-no-pairwise",
+    "restir_visibility": "--mode pt --no-denoise --warmup 64 --gi restir --gi-visibility --gi-no-pairwise",
+    "restir_unbiased": "--mode pt --no-denoise --warmup 64 --gi restir --gi-unbiased --gi-no-pairwise",
+    "restir_temporal_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-spatial --gi-no-pairwise",
+    "restir_spatial_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-temporal --gi-no-pairwise",
     # Light list (docs/LIGHT_LIST.md): next-event estimation on list lights.
     "pt_nee": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee",
     "pt_nee_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee",

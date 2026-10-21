@@ -318,6 +318,92 @@ bias) or pairwise MIS; (b) visibility reuse on the selected sample; (c) raise or
 Jacobian clamp near emitters and measure the light pools again; (d) a converged run of the
 unbiased mode is now part of the protocol (`restir_unbiased_converged`).
 
+### Pairwise MIS (2026-10-21)
+
+Problem: converged ReSTIR GI images keep fireflies that accumulate on concave edges, more with a
+higher M cap (`Artifacts/gi-experiments-20261020/fireflies/README.md`). They come from the
+reconnection shift: a neighbour's sample moved to this pixel's visible point carries the geometry
+ratio (cos_r / cos_q) * J, which is large where the sample point lies close to a concave edge. The
+1/M and Z-count weights do not depend on that ratio, so they do not bound it. A balance-heuristic
+MIS does (a generalized balance heuristic without visibility removed the sparkles in the variant
+tests), but the weights must carry visibility consistently: without visibility the light leaks
+into occluded corners, with visibility on one side only the image is too dark there. Pairwise MIS
+(Bitterli, PhD thesis 2022; Lin et al. 2022, GRIS section 7) with visibility in both densities is the fix.
+
+Flag `CAELIX_GI_FLAG_PAIRWISE_MIS` (bit 9, ReSTIR GI only; it overrides `VISIBILITY` and
+`UNBIASED` for ReSTIR GI, ReSTIR DI ignores it). Host default for `--gi restir`: on
+(`--gi-no-pairwise` and the debug UI checkbox "pairwise MIS (2 rays per neighbour)" turn it off).
+
+Notation: receiver r = this pixel with visible point x_v, face normal n_v, own sample Y_c with
+confidence M_c = M(own) and weight W_c. Accepted spatial neighbours i = 1..k (GiSimilar passed, so
+they share n_v) with sample X_i, confidence M_i, weight W_i and visible point x_i. The
+confidence-weighted density of technique t for a sample s, in the receiver's domain:
+
+    p_t(s) = M_t * p_hat_t(s) * J(s; x_v -> x_t)     (GiTechniqueDensity)
+    p_c(s) = M_c * p_hat_r(s)                        (the receiver itself, Jacobian 1)
+
+Visibility enters the densities: p_c(X_i) is multiplied by V(x_v -> X_i) (shadow ray 1) and
+p_i(Y_c) by V(x_i -> Y_c) (shadow ray 2). p_i(X_i) and p_c(Y_c) are visible by construction.
+Two shadow rays per accepted neighbour (ray 2 is skipped when p_i(Y_c) is already 0 or the own
+sample has no weight; ray 1 when the neighbour's sample has no weight at r).
+
+Spatial pass, pairwise MIS weights (they sum to 1 over the techniques for every sample in the
+receiver's support):
+
+    m_i = p_i(X_i) / (k p_i(X_i) + p_c(X_i))
+    m_c = (1/k) sum_i p_c(Y_c) / (k p_i(Y_c) + p_c(Y_c))     (m_c = 1 when k = 0)
+
+Resampling weights, without a factor M (the confidence sits in m):
+
+    w_i = m_i * p_hat_r(X_i) * W_i * J(X_i; x_i -> x_v)
+    w_c = m_c * p_hat_r(Y_c) * W_c
+
+Weighted reservoir selection over {own, neighbours}; W = w_sum / p_hat_r(Y) (0 when either is 0),
+M = M_c + sum_i M_i, visible point and face of the receiver. A neighbour with W_i = 0,
+p_hat_r(X_i) = 0, J = 0 or a failed ray 1 gets weight 0 and still counts in M.
+
+Temporal pass (k = 1, no rays): the reprojected previous reservoir (after GiSimilar) with
+confidence m = min(M(prev), gi_temporal_m_cap) and visible point x_p; the receiver's own initial
+sample with M_c = 1:
+
+    p_p(s) = m * p_hat_p(s) * J(s; x_v -> x_p)
+    w_prev = [p_p(X_p) / (p_p(X_p) + p_c(X_p))] * p_hat_r(X_p) * W_p * J(X_p; x_p -> x_v)
+    w_own  = [p_c(Y_c) / (p_c(Y_c) + p_p(Y_c))] * p_hat_r(Y_c) * W_c
+    W = w_sum / p_hat_r(Y),  M = M_c + m
+
+With a static camera (x_p = x_v, J = 1) the weights equal the 1/M weights. Without an accepted
+previous reservoir the output is the initial reservoir as before.
+
+Code: `GiTechniqueDensity`, `GiMergeWeighted`, `GiMergeInitWeighted`, `GiMergeFinishMis` in
+`shaders/render/caelix_restir_gi.hlsl`; the spatial pass gathers the accepted neighbours first and
+then merges them with the 1/M, Z-count or pairwise scheme.
+
+Results (2026-10-21, `Artifacts/gi-experiments-20261020/fireflies/PAIRWISE.md` and `pairwise-bench/`):
+
+Converged runs (512 frames, 1280x720, M cap 20, 4 neighbours, radius 100 px) against the 2048-frame
+path tracer reference; "local" = ratio of 9x9 box means (fireflies show as a high local maximum):
+
+| scene | weights | mean ratio | >2x pixels | local max / p99 / p1 |
+| --- | --- | --- | --- | --- |
+| concave | Z-count | 0.999 | 0.06 % | 1.60 / 1.03 / 0.93 |
+| concave | 1/M | 1.005 | 0.06 % | 1.40 / 1.14 / 0.95 |
+| concave | GBH, no visibility (variant) | 1.007 | 0.00 % | 1.28 / 1.15 / 0.95 |
+| concave | pairwise MIS | 1.000 | 0.00 % | 1.06 / 1.01 / 0.99 |
+| fennick | Z-count | 0.998 | 0.25 % | 4.50 / 1.13 / 0.95 |
+| fennick | GBH, no visibility (variant) | 1.000 | 3.62 % | 15.3 / 2.15 / 0.74 |
+| fennick | pairwise MIS | 1.000 | 0.06 % | 1.91 / 1.03 / 0.97 |
+
+The pairwise images have no sparkles on the concave edges or the fennick roofs and no light leaks
+into the trees and corners (the leaks were the GBH variant's defect); the fennick local maximum of
+1.91 sits on a black pixel. Single frames (200 warm-up frames): relative RMSE concave 0.245
+(Z-count 0.288), fennick 0.200 (Z-count 0.247). Bench at 1920x1080 (5 neighbours, radius 30):
+ashwick converged 34.3 dB / mean 1.015 (1/M 31.8 dB / 0.980), one frame 29.4 dB (1/M 29.2 dB);
+cornell unchanged (its mean ratio of 1.16 is the sRGB artefact of the noisy reference noted above).
+Fixture test (`caelix_trace_test`, 256 frames): max ratio error 0.0066 (noise floor 0.0060; 1/M
+0.033, Z-count 0.011). Cost: gi_ms 2.4 ms cornell / 6.0 ms ashwick at 1080p, the same as the
+Z-count (2.1 / 5.7 ms) and 2 to 5x the 1/M weights (1.3 / 1.2 ms): two shadow rays per accepted
+neighbour. The temporal balance heuristic is untested under camera motion (equal to 1/M at rest).
+
 ## Phase 2 (planned): brick-keyed world-space reservoirs
 
 Sketch, to be designed after phase 1 numbers exist: hash cells keyed by (entity id, level,
