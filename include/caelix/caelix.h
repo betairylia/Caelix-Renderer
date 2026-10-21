@@ -81,7 +81,9 @@ extern "C" {
    (docs/LIGHT_MIS.md) added CAELIX_GI_FLAG_LIGHT_MIS (no struct changed). The light cell temporal reuse
    added CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL and appended light_temporal_frames to CaelixGiOptions
    (48 -> 52 bytes). The light cell usage counters appended four uint32 fields to CaelixGiStats
-   (32 -> 48 bytes). A host built against
+   (32 -> 48 bytes). The light cell push-back added CAELIX_GI_FLAG_LIGHT_CELL_PUSH, appended
+   light_push_confidence to CaelixGiOptions (52 -> 56 bytes) and two uint32 fields to CaelixGiStats
+   (48 -> 56 bytes). A host built against
    an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1168,7 +1170,9 @@ typedef enum CaelixGiMethod
                                                  horizon, near-field split) */
 #define CAELIX_GI_FLAG_DIFFUSE_ONLY (1u << 4) /* force the Lambert lobe at every vertex */
 #define CAELIX_GI_FLAG_LIGHT_NEE (1u << 5)    /* next-event estimation on the scene's light list at every
-                                                 diffuse vertex (docs/LIGHT_LIST.md); both methods */
+                                                 diffuse vertex (docs/LIGHT_LIST.md): world-space reservoirs
+                                                 (light cells) of light samples, brick-level or (with
+                                                 LIGHT_CELL_PUSH) voxel-face; both methods */
 #define CAELIX_GI_FLAG_RESTIR_DI (1u << 6)    /* per-pixel ReSTIR DI on the light list at the primary
                                                  surface (docs/RESTIR_DI.md); needs LIGHT_NEE; both methods */
 #define CAELIX_GI_FLAG_LIGHT_CELL_JITTER (1u << 7) /* light NEE: each vertex looks its light cell up at a point
@@ -1187,6 +1191,12 @@ typedef enum CaelixGiMethod
                                                  (docs/LIGHT_LIST.md section 2.2). Assumes a static scene (no
                                                  scene edits, no entity motion); the history is dropped when
                                                  the light table was rebuilt or reset is set */
+#define CAELIX_GI_FLAG_LIGHT_CELL_PUSH (1u << 10) /* with LIGHT_NEE: every vertex that sampled a light cell
+                                                 pushes its light sample and its shadow ray result into
+                                                 the cell; the next fill merges the pushes (confidence
+                                                 light_push_confidence, an occluded sample with a lower
+                                                 target), so voxel-face samples enter the cells
+                                                 (docs/LIGHT_LIST.md section 2.2). Unbiased */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
@@ -1221,7 +1231,7 @@ typedef struct CaelixGiOptions
     float depth_threshold;    /* 0 = 0.1: |x_v(q) - x_v(r)| must be below threshold * view_z(r) */
     uint32_t reset;           /* 1 = drop the reservoir history with the next render */
     uint32_t light_cell_capacity; /* 0 = 65536 light cells; else a power of two in 1024 .. 1048576
-                                     (304 bytes per cell) */
+                                     (832 bytes per cell) */
     uint32_t light_candidates;    /* 0 = 8; 1 .. 64 candidates per cell reservoir and frame */
     float light_level_footprint;  /* 0 = 0.25: a vertex whose pixel footprint (world units per pixel at
                                      its camera distance) is below this uses 8-voxel cells, else 32 */
@@ -1229,6 +1239,8 @@ typedef struct CaelixGiOptions
     uint32_t light_temporal_frames; /* 0 = 20; LIGHT_CELL_TEMPORAL: the history behind a cell reservoir is
                                        clamped to this many frames (x light_candidates candidates) before
                                        the merge; 1 .. 1024 */
+    float light_push_confidence; /* 0 = 8; LIGHT_CELL_PUSH: the confidence (M) of a pushed sample in the
+                                    cell fill; finite, 0 .. 1024 */
 } CaelixGiOptions;
 
 /* Sets the GI options of the renderer; they apply from the next render on and stay until the next
@@ -1241,12 +1253,13 @@ typedef struct CaelixGiOptions
    the DI reservoir buffers (4 x 48 bytes per pixel) likewise at the first render with
    CAELIX_GI_FLAG_RESTIR_DI. The DI history is also dropped when the scene's light table was rebuilt
    since the renderer's previous render.
-   The light cells (light_cell_capacity x 304 bytes) are allocated at the first render with
+   The light cells (light_cell_capacity x 832 bytes + 32) are allocated at the first render with
    CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity changes.
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,
    light_candidates > 64, CAELIX_GI_FLAG_RESTIR_DI without CAELIX_GI_FLAG_LIGHT_NEE, di_candidates > 32,
-   light_temporal_frames > 1024 -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
+   light_temporal_frames > 1024, a light_push_confidence that is not finite or not in 0 .. 1024
+   -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);
 
 typedef struct CaelixGiStats
@@ -1258,12 +1271,16 @@ typedef struct CaelixGiStats
     float light_fill_ms;       /* GPU time of the light cell fill of the frame of CaelixGpuTimings (0 when
                                   that frame ran no fill) */
     /* The light cell usage counters of the frame of CaelixGpuTimings (all 0 when that frame ran no
-       light NEE). light_cell_bytes includes their 16 bytes at the tail of the cell table. */
+       light NEE). light_cell_bytes includes their 32 bytes at the tail of the cell table. */
     uint32_t light_cells_live;          /* cells with a key after this frame's eviction */
     uint32_t light_cells_active;        /* of those, looked up by the previous frame's trace */
     uint32_t light_cells_inserted;      /* cells inserted by this frame's lookups */
     uint32_t light_cell_lookups_failed; /* lookups that found neither the key nor a free slot in 8 probes
                                            (the table is full around there) */
+    uint32_t light_cell_pushes;         /* LIGHT_CELL_PUSH: pushes of the previous frame's trace that got a
+                                           ring entry (counted by this frame's fill) */
+    uint32_t light_cell_pushes_dropped; /* LIGHT_CELL_PUSH: pushes of the previous frame's trace beyond the
+                                           32 ring entries of their cell */
 } CaelixGiStats;
 
 /* Fills *out; a null argument is ignored. */

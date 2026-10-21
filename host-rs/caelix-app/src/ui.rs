@@ -380,6 +380,8 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, light_cells: u32, demo: bool) 
                 ("light cells active", stats.gi.light_cells_active.to_string()),
                 ("light cell inserts", stats.gi.light_cells_inserted.to_string()),
                 ("light cell misses", stats.gi.light_cell_lookups_failed.to_string()),
+                ("light cell pushes", stats.gi.light_cell_pushes.to_string()),
+                ("light cell pushes dropped", stats.gi.light_cell_pushes_dropped.to_string()),
                 ("light bricks", stats.light.bricks.to_string()),
                 ("light dropped", stats.light.bricks_dropped.to_string()),
                 ("denoise", format!("{:.2} ms", t.denoise_ms)),
@@ -627,6 +629,13 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             );
             ui.end_row();
 
+            ui.label("light push confidence");
+            ui.add_enabled(
+                light && gi.light_cell_push,
+                Slider::new(&mut gi.light_push_confidence, 0.5..=256.0).logarithmic(true),
+            );
+            ui.end_row();
+
             ui.label("DI candidates");
             ui.add_enabled(light && gi.restir_di, Slider::new(&mut gi.di_candidates, 1..=32));
             ui.end_row();
@@ -644,6 +653,14 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         .on_hover_text(
             "Each cell reservoir merges its previous frame's reservoir (history capped by the light temporal frames); \
              assumes a static scene",
+        );
+        ui.add_enabled(
+            lighting && gi.light_nee,
+            egui::Checkbox::new(&mut gi.light_cell_push, "push shadow ray results into light cells"),
+        )
+        .on_hover_text(
+            "Every vertex that sampled a light cell pushes its light sample and its shadow ray result into the \
+             cell; the next fill merges them (an occluded sample with a lower target)",
         );
         ui.add_enabled(
             lighting && gi.light_nee,

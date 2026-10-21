@@ -3509,7 +3509,7 @@ TEST_CASE("light NEE with temporal cell reuse is unbiased")
     const std::vector<float> temporal = LightReference(rig, renderer, set, camera, 1024, 200000);
     CaelixGiStats stats{};
     caelix_renderer_get_gi_stats(renderer, &stats);
-    CHECK(stats.light_cell_bytes == 65536ull * 304ull + 16ull);  // the cells and the usage counters
+    CHECK(stats.light_cell_bytes == 65536ull * 832ull + 32ull);  // the cells and the usage counters
     const LightComparison c = CompareLight(pt, temporal, kBoxSize);
     std::printf("4 lights, light NEE + MIS + temporal cells vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 "
                 "block PSNR %.2f dB\n",
@@ -3527,6 +3527,70 @@ TEST_CASE("light NEE with temporal cell reuse is unbiased")
     CHECK(c.ratio < 1.03);
     CHECK(c.block_psnr > 30.0);
     CHECK(temporal != fresh);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("light NEE with cell push-back is unbiased")
+{
+    // The four lights of the temporal test, with the vertices' light samples and shadow ray results
+    // pushed back into the cells (CAELIX_GI_FLAG_LIGHT_CELL_PUSH). The box has little partial
+    // occlusion of a light, so the bias of the rejected variants (merge only visible pushes, halve the
+    // history's confidence on an occluded observation; docs/LIGHT_LIST.md section 2.2) would hardly
+    // show here; the bench on bistro and shroom is the real check.
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    EnableLights(rig.scene);
+    World world = LightBoxWalls();
+    FillBox(world, 4, kBoxInterior, 4, 4, kBoxInterior, 4, kWhiteEmitter512);
+    FillBox(world, 20, kBoxInterior, 20, 20, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 4, kBoxInterior, 20, 4, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 12, kBoxInterior, 12, 12, kBoxInterior, 12, kWhiteEmitter512);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 4);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions bad{};
+    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_PUSH;
+    bad.light_push_confidence = 1025.0f;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.light_push_confidence = -1.0f;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+
+    CaelixGiOptions gi{};
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    // The default capacity, history (20 frames) and push confidence (8).
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
+               CAELIX_GI_FLAG_LIGHT_CELL_PUSH;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pushed = LightReference(rig, renderer, set, camera, 1024, 200000);
+    CaelixGiStats stats{};
+    caelix_renderer_get_gi_stats(renderer, &stats);
+    const LightComparison c = CompareLight(pt, pushed, kBoxSize);
+    std::printf("4 lights, light NEE + MIS + temporal cells + push-back vs path tracer: mean %.5f vs %.5f, ratio "
+                "%.4f, 16x16 block PSNR %.2f dB (pushes %u, dropped %u, live cells %u)\n",
+                c.test_mean, c.ref_mean, c.ratio, c.block_psnr, stats.light_cell_pushes,
+                stats.light_cell_pushes_dropped, stats.light_cells_live);
+    CHECK(c.ref_mean > 0.01);
+    CHECK(c.ratio > 0.97);
+    CHECK(c.ratio < 1.03);
+    CHECK(c.block_psnr > 30.0);
+    CHECK(stats.light_cell_pushes > 0);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);
@@ -3916,12 +3980,13 @@ TEST_CASE("cells fill and sample")
     std::printf("light cells: %llu bytes, fill %.4f ms (frame %llu), trace %.4f ms\n",
                 static_cast<unsigned long long>(stats.light_cell_bytes), stats.light_fill_ms,
                 static_cast<unsigned long long>(timings.frame_number), timings.trace_ms);
-    CHECK(stats.light_cell_bytes == 1024ull * 304ull + 16ull);  // the cells and the usage counters
+    CHECK(stats.light_cell_bytes == 1024ull * 832ull + 32ull);  // the cells and the usage counters
     CHECK(timings.frame_number != 0);
     CHECK(stats.light_fill_ms > 0.0f);
     // The usage counters of the same frame: some cells live, never more than the capacity.
-    std::printf("light cells: live %u, active %u, inserted %u, lookups failed %u\n", stats.light_cells_live,
-                stats.light_cells_active, stats.light_cells_inserted, stats.light_cell_lookups_failed);
+    std::printf("light cells: live %u, active %u, inserted %u, lookups failed %u, pushes %u, pushes dropped %u\n",
+                stats.light_cells_live, stats.light_cells_active, stats.light_cells_inserted,
+                stats.light_cell_lookups_failed, stats.light_cell_pushes, stats.light_cell_pushes_dropped);
     CHECK(stats.light_cells_live > 0);
     CHECK(stats.light_cells_live <= 1024);
 

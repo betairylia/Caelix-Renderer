@@ -78,6 +78,8 @@ constexpr float kDefaultLightLevelFootprint = 0.25f;
 constexpr uint32_t kDefaultDiCandidates = 4;
 // CaelixGiOptions::light_temporal_frames default (docs/LIGHT_LIST.md section 2.2).
 constexpr uint32_t kDefaultLightTemporalFrames = 20;
+// CaelixGiOptions::light_push_confidence default (docs/LIGHT_LIST.md section 2.2).
+constexpr float kDefaultLightPushConfidence = 8.0f;
 // [numthreads(32, 1, 1)] per cell in caelix_light_cells.hlsl, 1024 cells per dispatch row.
 constexpr uint32_t kLightCellsPerRow = 1024;
 
@@ -667,7 +669,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                : (gi_options_.flags & (static_cast<uint32_t>(CAELIX_GI_FLAG_DIFFUSE_ONLY | CAELIX_GI_FLAG_LIGHT_NEE |
                                                              CAELIX_GI_FLAG_LIGHT_CELL_JITTER |
                                                              CAELIX_GI_FLAG_LIGHT_MIS |
-                                                             CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL) |
+                                                             CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
+                                                             CAELIX_GI_FLAG_LIGHT_CELL_PUSH) |
                                        (restir_di ? (kReuseFlags | CAELIX_GI_FLAG_RESTIR_DI) : 0u)));
     if (!lighting)
     {
@@ -735,6 +738,13 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
             constants.light_temporal_frames = gi_options_.light_temporal_frames != 0
                                                   ? gi_options_.light_temporal_frames
                                                   : kDefaultLightTemporalFrames;
+        }
+        // Push-back of shadow ray results: the confidence of a pushed sample in the fill.
+        if ((constants.gi_flags & CAELIX_GI_FLAG_LIGHT_CELL_PUSH) != 0)
+        {
+            constants.light_push_confidence = gi_options_.light_push_confidence != 0.0f
+                                                  ? gi_options_.light_push_confidence
+                                                  : kDefaultLightPushConfidence;
         }
     }
     if (sky)

@@ -60,7 +60,10 @@ diffuse target expects).
    pdf_area`. Streaming RIS; the result `W = w_sum / (M0 * p_hat_sel)` (0 when w_sum = 0), M = 1
    (the candidates are one initial sample; M counts reservoir merges as in the GI code: the
    initial reservoir has M = 1). Written to `di_initial`. No shadow ray here. The primary
-   vertex's one-sample NEE of step 1 is skipped in this mode.
+   vertex's one-sample NEE of step 1 is skipped in this mode. With
+   `CAELIX_GI_FLAG_LIGHT_CELL_PUSH` (2026-10-21, docs/LIGHT_LIST.md section 2.2) a cell reservoir
+   can hold a voxel-face sample: then the point is uniform on that face (`LightSampleFaceOf`,
+   `pdf_area` 1, W = the reservoir's W). The DI candidates push nothing into the cells.
 2. `caelix_restir_di_temporal`: as the GI temporal pass (reprojection by the internal motion,
    `GiSimilar`-style test on `visible_pos` and face, M clamped to the cap), merge weight
    `p_hat_r(y_prev) * W_prev * M_prev` with `p_hat_r` recomputed at this pixel; no Jacobian.

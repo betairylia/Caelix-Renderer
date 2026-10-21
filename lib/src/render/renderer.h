@@ -22,9 +22,10 @@ class Scene;
 class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 
 // The light cell layout (render/caelix_light_sample.hlsl): kLightCellBytes per cell, then the
-// usage counters (live, active, inserted, failed: four uints) at the buffer's tail.
-constexpr VkDeviceSize kLightCellBytes = 304;
-constexpr VkDeviceSize kLightCellCounterBytes = 16;
+// usage counters (live, active, inserted, failed, pushed, push_dropped: six uints and 8 bytes of
+// padding) at the buffer's tail.
+constexpr VkDeviceSize kLightCellBytes = 832;
+constexpr VkDeviceSize kLightCellCounterBytes = 32;
 // Readback slots of the light cell counters (slot = frame_number % kLightCounterSlots).
 constexpr uint32_t kLightCounterSlots = 8;
 
@@ -85,7 +86,7 @@ constexpr uint32_t kLightCounterSlots = 8;
 // until safe) when the render size changes, kept while another method runs.
 //
 // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE, lighting modes; docs/LIGHT_LIST.md): the renderer owns the
-// light cells (CaelixGiOptions::light_cell_capacity x 304 bytes + 16 bytes of usage counters, trace
+// light cells (CaelixGiOptions::light_cell_capacity x 832 bytes + 32 bytes of usage counters, trace
 // set binding 21; the counters are reset before the fill and read back after the trace), created and
 // zero-filled at the first render with the flag, recreated (the old buffer retired until safe) when
 // the capacity changes, kept while the flag is off. When the scene has a light table, the light cell
@@ -371,11 +372,11 @@ private:
     uint64_t di_light_rebuilds_ = 0;     // CaelixLightStats::rebuilds at the previous ReSTIR DI render
     std::vector<RetiredGiBuffers> retired_di_;
     // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE).
-    GpuBuffer light_cells_;                  // capacity x 304 bytes + 16 bytes of usage counters
+    GpuBuffer light_cells_;                  // capacity x 832 bytes + 32 bytes of usage counters
                                              // (render/caelix_light_sample.hlsl)
     uint32_t light_cell_capacity_ = 0;       // cells of light_cells_
     // The usage counters of the light cells, copied after the trace of each light NEE frame into
-    // slot frame_number % kLightCounterSlots (16 bytes each; persistently mapped), and the frame of
+    // slot frame_number % kLightCounterSlots (32 bytes each; persistently mapped), and the frame of
     // each slot (0 = none). Created and retired with light_cells_.
     GpuBuffer light_counter_readback_;
     std::array<uint64_t, kLightCounterSlots> light_counter_frames_{};

@@ -426,7 +426,7 @@ struct Args {
     /// points closer than this are left to the BSDF path.
     #[arg(long, value_name = "F", default_value_t = 0.0)]
     light_nee_distance: f32,
-    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 304 bytes each).
+    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 832 bytes each).
     #[arg(long, value_name = "N", default_value_t = 65536)]
     light_cells: u32,
     /// Light NEE: candidates per cell reservoir and frame (1..64).
@@ -448,6 +448,13 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = 20,
           value_parser = clap::value_parser!(u32).range(1..=1024))]
     light_temporal_frames: u32,
+    /// Light NEE: every vertex that sampled a light cell pushes its light sample and its shadow ray
+    /// result into the cell; the next fill merges the pushes (voxel-face samples enter the cells).
+    #[arg(long)]
+    light_cell_push: bool,
+    /// Light NEE with --light-cell-push: the confidence (M) of a pushed sample in the cell fill.
+    #[arg(long, value_name = "F", default_value_t = 8.0)]
+    light_push_confidence: f32,
     /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 8-voxel
     /// cells, else 32-voxel cells.
     #[arg(long, value_name = "F", default_value_t = 0.25)]
@@ -1218,7 +1225,7 @@ impl App {
                         let light = light_stats(state.scene);
                         println!(
                             "light: bricks={} dropped={} table_bytes={} cell_bytes={} \
-                             cells live/active/inserted/failed={}/{}/{}/{}",
+                             cells live/active/inserted/failed={}/{}/{}/{} pushes/dropped={}/{}",
                             light.bricks,
                             light.bricks_dropped,
                             light.table_bytes,
@@ -1226,7 +1233,9 @@ impl App {
                             gi.light_cells_live,
                             gi.light_cells_active,
                             gi.light_cells_inserted,
-                            gi.light_cell_lookups_failed
+                            gi.light_cell_lookups_failed,
+                            gi.light_cell_pushes,
+                            gi.light_cell_pushes_dropped
                         );
                         self.screenshot = Screenshot::Done;
                         if self.args.exit_after_screenshot {
@@ -2094,6 +2103,8 @@ fn main() -> anyhow::Result<()> {
             light_mis: !args.light_no_mis,
             light_cell_temporal: args.light_cell_temporal,
             light_temporal_frames: args.light_temporal_frames,
+            light_cell_push: args.light_cell_push,
+            light_push_confidence: args.light_push_confidence,
             light_candidates: args.light_candidates,
             light_footprint: args.light_footprint,
             restir_di: args.gi_restir_di,
@@ -2105,6 +2116,9 @@ fn main() -> anyhow::Result<()> {
     }
     if !args.light_cells.is_power_of_two() || !(1024..=1048576).contains(&args.light_cells) {
         bail!("--light-cells {} must be a power of two in 1024..1048576", args.light_cells);
+    }
+    if !(0.0..=1024.0).contains(&args.light_push_confidence) {
+        bail!("--light-push-confidence {} must be in 0..1024", args.light_push_confidence);
     }
     if !args.light_footprint.is_finite() || args.light_footprint < 0.0 {
         bail!("--light-footprint {} must be a finite value >= 0", args.light_footprint);

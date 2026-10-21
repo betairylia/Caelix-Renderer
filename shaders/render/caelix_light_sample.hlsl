@@ -4,7 +4,8 @@
 // MIS with the BSDF path (docs/LIGHT_MIS.md: the density proxy, LightNeeMisWeight, LightListCanSample).
 //
 // Light cells: a hash table of fc.light_cell_capacity cells in g_light_cells (trace set binding
-// 21), 304 bytes each (288 before step 3 of the light list, 296 before the temporal cell reuse):
+// 21), 832 bytes each (288 before step 3 of the light list, 296 before the temporal cell reuse, 304
+// before the push-back of shadow ray results):
 //   0    uint key_lo, key_hi    the 64-bit fingerprint of (entity, level, coordinate); key_lo 0 = empty
 //   8    uint touched_frame     fc.frame_counter of the newest lookup
 //   12   uint entity
@@ -17,20 +18,37 @@
 //   40   float M                kGiFlagLightCellTemporal: the candidate count behind every reservoir of
 //                               the cell (uniform over the 32: all threads merge the same way); 0 = no history
 //   44   float C_n              kGiFlagLightCellTemporal: the draw count behind C_cur; 0 = none
-//   48   32 x { uint light; float W }   light = entry index of the table, W = the RIS weight (0 = empty)
-// After the last cell (byte fc.light_cell_capacity x 304, LightCellCounterBase) the buffer holds 16
+//   48   uint push_count        kGiFlagLightCellPush: pushes claimed since the latest fill (may exceed 32)
+//   52   12 bytes of padding
+//   64   32 x { uint light; float W }   the reservoirs: light = a light sample word (below), W = its
+//                               unbiased contribution weight (0 = empty)
+//   320  32 x { uint word; float W; float visible; uint pad }   kGiFlagLightCellPush: the push ring,
+//                               the light samples that the trace's vertices drew from this cell
+//                               (LightCellClaimPush, LightCellStorePush); the fill merges entry r
+//                               into reservoir r
+// A light sample word (LightCellWord, LightCellDecode): bits 0..19 the entry index in the light table
+// (the table holds at most 2^20 entries), bits 20..28 the voxel v = x | y << 3 | z << 6 inside the
+// entry's brick, bits 29..31 the face: 0..5 a voxel-face sample (a point uniform on that face of that
+// voxel, area 1), 6 = kLightCellFaceBrick a brick-level sample (the vertex samples a point inside the
+// brick; voxel bits 0), 7 only in kNoLight (empty). The fill's fresh candidates are brick-level;
+// voxel-face samples enter the cells only through the push ring.
+// After the last cell (byte fc.light_cell_capacity x 832, LightCellCounterBase) the buffer holds 32
 // bytes of usage counters, zeroed by the renderer before every fill and copied to the host after the
 // trace (CaelixGiStats):
 //   0    uint live              cells with a key after this frame's eviction (fill, thread 0)
 //   4    uint active            of those, looked up by the previous frame's trace (fill, thread 0)
 //   8    uint inserted          cells inserted by this frame's lookups (LightCellLookup)
 //   12   uint failed            lookups that found neither the key nor a free slot in 8 probes
+//   16   uint pushed            pushes of the previous frame's trace that got a ring slot (fill, thread 0)
+//   20   uint push_dropped      pushes of the previous frame's trace beyond the 32 slots (fill, thread 0)
+//   24   8 bytes of padding
 // The trace kernel looks cells up and inserts missing ones (LightCellLookup); caelix_light_cells.hlsl
 // fills the reservoirs of every live cell before the next trace and evicts cells untouched for 64
 // frames. The fingerprint is claimed with a 32-bit compare-and-swap on key_lo (64-bit buffer atomics
 // are not a device requirement); key_hi is stored after the claim. A lookup that sees key_lo match
-// but key_hi not yet written probes on and may insert the same key twice: harmless, every
-// reservoir carries its own W. A trace never reads the C_c computed from the reservoirs it samples
+// and key_hi still 0 (not yet written) takes that cell: before 2026-10-21 it probed on and inserted
+// the same key again, up to 8 times (the shroom forest had twice as many live cells as used ones and
+// a full table). A trace never reads the C_c computed from the reservoirs it samples
 // (the fill moves C_cur to C_prev before writing C_cur): a ratio of two estimates from the same
 // reservoirs would be biased.
 //
@@ -45,13 +63,26 @@
 #include "render/caelix_scene_trace.hlsl"
 #include "render/caelix_shading.hlsl"
 
-static const uint kLightCellBytes = 304;
+static const uint kLightCellBytes = 832;
 static const uint kLightCellReservoirs = 32;
 static const uint kLightCellCPrevOffset = 32;
 static const uint kLightCellCCurOffset = 36;
 static const uint kLightCellMOffset = 40;
 static const uint kLightCellCNOffset = 44;
-static const uint kLightCellReservoirOffset = 48;
+static const uint kLightCellPushCountOffset = 48;
+static const uint kLightCellReservoirOffset = 64;
+static const uint kLightCellPushOffset = 320;
+static const uint kLightCellPushSlots = 32;
+static const uint kLightCellPushBytes = 16;
+// The light sample word of a cell reservoir or push entry (see above).
+static const uint kLightCellEntryMask = 0xFFFFFu;
+static const uint kLightCellVoxelShift = 20u;
+static const uint kLightCellFaceShift = 29u;
+static const uint kLightCellFaceBrick = 6u;
+// The fill's target factor of a voxel-face sample that a push of this frame saw occluded
+// (caelix_light_cells.hlsl): a floor, not 0, so that the support stays full. A sample occluded
+// from one receiver but visible from another gets a W up to 10x larger there: noise, not bias.
+static const float kLightOccludedTarget = 0.1f;
 static const uint kLightCellProbes = 8;
 // A cell not looked up for this many frames is evicted by the fill pass.
 static const uint kLightCellMaxAge = 64;
@@ -61,6 +92,8 @@ static const uint kLightCellCounterLive = 0;
 static const uint kLightCellCounterActive = 4;
 static const uint kLightCellCounterInserted = 8;
 static const uint kLightCellCounterFailed = 12;
+static const uint kLightCellCounterPushed = 16;
+static const uint kLightCellCounterPushDropped = 20;
 // Light points closer than this (world units) to the receiver belong to the BSDF path, not to the
 // light NEE: TracePath keeps the emission of a list light that a segment hits closer than this,
 // and ReSTIR DI gives such points a zero target. Area sampling with a 1/d^2 term and a brick
@@ -142,20 +175,27 @@ int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord
             {
                 // Inserted. A slot with key 0 has empty reservoirs (zero at creation, cleared on
                 // eviction), so the cell samples the global table until the next fill. C_prev,
-                // C_cur, M and C_n start at 0 (the MIS proxy is the global one until the second
-                // fill; no temporal history).
+                // C_cur, M, C_n and push_count start at 0 (the MIS proxy is the global one until the
+                // second fill; no temporal history; a push of this trace that claimed a slot before
+                // this store is lost, which does not depend on the sample it carried).
                 g_light_cells.Store(base + 4, key.y);
                 g_light_cells.Store(base + 8, fc.frame_counter);
                 g_light_cells.Store(base + 12, entity);
                 g_light_cells.Store3(base + 16, asuint(coord));
                 g_light_cells.Store(base + 28, level);
                 g_light_cells.Store4(base + kLightCellCPrevOffset, uint4(0u, 0u, 0u, 0u));
+                g_light_cells.Store(base + kLightCellPushCountOffset, 0u);
                 g_light_cells.InterlockedAdd(LightCellCounterBase(fc) + kLightCellCounterInserted, 1u);
                 return int(slot);
             }
             key_lo = original;
         }
-        if (key_lo == key.x && g_light_cells.Load(base + 4) == key.y)
+        // A high word of 0 is a pending insert (key_hi is stored after the claim) and counts as a
+        // match: it stops a thread that lost the CAS from inserting a duplicate further on. A low-word
+        // collision with a different high word while the insert is pending merges two cells
+        // (harmless: every reservoir carries its own W).
+        const uint key_hi = key_lo == key.x ? g_light_cells.Load(base + 4) : 0u;
+        if (key_lo == key.x && (key_hi == key.y || key_hi == 0u))
         {
             if (g_light_cells.Load(base + 8) != fc.frame_counter)
             {
@@ -166,6 +206,28 @@ int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord
     }
     g_light_cells.InterlockedAdd(LightCellCounterBase(fc) + kLightCellCounterFailed, 1u);
     return -1;
+}
+
+// The light sample word of (entry, voxel v = x | y << 3 | z << 6, face 0..5 or kLightCellFaceBrick).
+uint LightCellWord(uint entry, uint voxel, uint face)
+{
+    return (entry & kLightCellEntryMask) | ((voxel & 511u) << kLightCellVoxelShift) | (face << kLightCellFaceShift);
+}
+
+// Decodes a light sample word of a table with `count` entries: false for kNoLight (face 7) and for an
+// entry index beyond the table.
+bool LightCellDecode(uint word, uint count, out uint entry, out uint voxel, out uint face)
+{
+    entry = word & kLightCellEntryMask;
+    voxel = (word >> kLightCellVoxelShift) & 511u;
+    face = word >> kLightCellFaceShift;
+    return word != kNoLight && face <= kLightCellFaceBrick && entry < count;
+}
+
+// The voxel (0..7 per axis) of v = x | y << 3 | z << 6.
+uint3 LightVoxel3(uint v)
+{
+    return uint3(v & 7u, (v >> 3) & 7u, (v >> 6) & 7u);
 }
 
 // The smallest index i in [0, count) of the light table's CDF with cdf[i] > target.
@@ -256,6 +318,33 @@ uint LightCandidateFaceMask(float3 origin, float3 axis0, float3 axis1, float3 ax
     return mask;
 }
 
+// The union of LightCandidateFaceMask over every receiver in a box (centre `centre`, world half axes
+// half0..half2): the same plane tests with t_a replaced by its maximum (+a) or minimum (-a) over the
+// box, t_a(centre) +- sum_k |dot(axis_a, half_k)| (exact for a box under any rotation). The push-back
+// of a vertex's light sample (LightNextEvent) compares the vertex's own mask with this one over the
+// cell's receiver region.
+uint LightCandidateFaceMaskOverRegion(float3 origin, float3 axis0, float3 axis1, float3 axis2, uint extent0,
+                                      uint extent1, float3 centre, float3 half0, float3 half1, float3 half2)
+{
+    const float3 d = centre - origin;
+    float3 axes[3];
+    axes[0] = axis0;
+    axes[1] = axis1;
+    axes[2] = axis2;
+    uint mask = 0u;
+    CAELIX_UNROLL
+    for (uint a = 0; a < 3; ++a)
+    {
+        const float t = dot(axes[a], d);
+        const float reach = abs(dot(axes[a], half0)) + abs(dot(axes[a], half1)) + abs(dot(axes[a], half2));
+        const uint lowest = LightFaceExtent(extent0, extent1, 2u * a);        // lowest +a face row
+        const uint highest = LightFaceExtent(extent0, extent1, 2u * a + 1u);  // highest -a face row
+        mask |= (lowest != 0xFFu && t + reach > float(lowest) + 1.0f) ? 1u << (2u * a) : 0u;
+        mask |= (highest != 0xFFu && t - reach < float(highest)) ? 2u << (2u * a) : 0u;
+    }
+    return mask;
+}
+
 // The sum of the face weights over the candidate faces of `mask` (in face order, so that the sampler
 // and the proxy add the same numbers in the same order).
 float LightCandidateWeightSum(float face_weight[6], uint mask)
@@ -323,6 +412,7 @@ struct LightSample
     uint face;        // +X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5 (entity-local axes)
     float2 uv;        // the point on the face in (-0.5, 0.5)^2 along (e1, e2) of LightFaceBasis
     LightMisDesc mis; // the point's MIS description (LightMisDescOf of the entry, the voxel and the face)
+    uint face_mask;   // SampleLightEntryWith: the candidate faces it chose from; LightSampleFaceOf: 0
 };
 
 // The world frame of one voxel of a brick: the voxel centre and the three entity axes.
@@ -583,6 +673,7 @@ LightSample SampleLightEntryWith(CaelixFrameConstants fc, LightEntryHeader heade
     s.face = 0u;
     s.uv = float2(0.0f, 0.0f);
     s.mis = LightMisDescZero();
+    s.face_mask = 0u;
     const float u_face = RandomFloat01(rng);
     const float u_voxel = RandomFloat01(rng);
     const float u_s = RandomFloat01(rng);
@@ -596,6 +687,7 @@ LightSample SampleLightEntryWith(CaelixFrameConstants fc, LightEntryHeader heade
     const LightBrickFrame brick = LightBrickFrameOf(fc, header);
     const uint candidates = LightCandidateFaceMask(brick.origin, brick.axes[0], brick.axes[1], brick.axes[2],
                                                    header.face_extent[0], header.face_extent[1], x_r);
+    s.face_mask = candidates;
     const float w_cand = LightCandidateWeightSum(header.face_weight, candidates);
     if (!(w_cand > 0.0f))
     {
@@ -698,6 +790,83 @@ LightSample SampleLightEntry(CaelixFrameConstants fc, LightEntryHeader header, u
     return SampleLightEntryWith(fc, header, address, x_r, false, rng);
 }
 
+// The point of a voxel-face sample (a cell reservoir word with face 0..5): voxel v = x | y << 3 |
+// z << 6 of the entry's brick, face `face`, a point uniform on that face (pdf_area 1: the word's W is
+// already the contribution weight per unit area). The same frame, basis, point and uv quantization as
+// SampleLightEntryWith; the MIS description is the brick-level one of that face. Valid iff the
+// voxel's bit is set in the face's mask. Four random numbers, as SampleLightEntryWith (the first two
+// unused), so that the stream does not depend on the word.
+LightSample LightSampleFaceOf(CaelixFrameConstants fc, LightEntryHeader header, uint64_t address, uint voxel_index,
+                              uint face, bool quantize_uv, inout uint rng)
+{
+    RandomFloat01(rng);
+    RandomFloat01(rng);
+    const float u_s = RandomFloat01(rng);
+    const float u_t = RandomFloat01(rng);
+    const uint3 voxel = LightVoxel3(voxel_index);
+    const uint f = min(face, 5u);
+    const LightBrickFrame brick = LightBrickFrameOf(fc, header);
+    const LightVoxelFrame frame = LightVoxelFrameIn(brick, voxel);
+    float3 face_normal;
+    float3 e1;
+    float3 e2;
+    LightFaceBasis(frame, f, face_normal, e1, e2);
+    LightSample s;
+    s.uv = quantize_uv ? float2(LightUvDequantize(LightUvQuantize(u_s)), LightUvDequantize(LightUvQuantize(u_t)))
+                       : float2(u_s - 0.5f, u_t - 0.5f);
+    s.position = LightFacePoint(frame, face_normal, e1, e2, s.uv);
+    s.normal = face_normal;
+    s.radiance = GET_MATERIAL(BrickVoxelValue(fc, header.group, header.id, voxel)).emission * g_emissionScale;
+    s.pdf_area = 1.0f;
+    s.voxel = voxel_index & 511u;
+    s.face = f;
+    s.mis = LightMisDescWith(header, brick, f, LightFaceCount(address, f));
+    s.face_mask = 0u;
+    s.valid = LightFaceMaskBit(address, f, voxel);
+    return s;
+}
+
+// The candidate faces of `header`'s brick over the receiver region of the cell (entity, level,
+// coord): the cell box grown by half a cell (the jittered lookup, section 2.5) and one voxel (the
+// object offset of the lookup point and the push-off) on every side, i.e. world half axes of
+// cell_size + 1 along the entity's axes. Every receiver that reads the cell lies in it.
+uint LightCellRegionFaceMask(CaelixFrameConstants fc, uint entity, uint level, int3 coord, LightEntryHeader header)
+{
+    const float cell_size = float(8u << (2u * level));
+    float4 c0;
+    float4 c1;
+    float4 c2;
+    EntityCurRows(fc, entity, c0, c1, c2);
+    const float3 centre = RowsTransform(c0, c1, c2, (float3(coord) + 0.5f) * cell_size);
+    const float h = cell_size + 1.0f;
+    const LightBrickFrame b = LightBrickFrameOf(fc, header);
+    return LightCandidateFaceMaskOverRegion(b.origin, b.axes[0], b.axes[1], b.axes[2], header.face_extent[0],
+                                            header.face_extent[1], centre, float3(c0.x, c1.x, c2.x) * h,
+                                            float3(c0.y, c1.y, c2.y) * h, float3(c0.z, c1.z, c2.z) * h);
+}
+
+// Claims a push of cell `slot` (kGiFlagLightCellPush) and returns its index: the first 32 claims of
+// a frame get a ring entry, later ones are dropped (the fill counts both from push_count). A vertex
+// claims BEFORE it draws its light sample: which vertices win the 32 entries then depends on the
+// paths' timing up to the claim, never on the sample (a claim after the shadow ray lets the vertices
+// without a ray win, a sample-dependent choice: 0.36 % dark in the 4-light box).
+uint LightCellClaimPush(uint slot)
+{
+    uint index;
+    g_light_cells.InterlockedAdd(slot * kLightCellBytes + kLightCellPushCountOffset, 1u, index);
+    return index;
+}
+
+// Writes the claimed push `index` of cell `slot` (no-op beyond the 32 ring entries).
+void LightCellStorePush(uint slot, uint index, uint word, float W, bool visible)
+{
+    if (index < kLightCellPushSlots)
+    {
+        g_light_cells.Store4(slot * kLightCellBytes + kLightCellPushOffset + index * kLightCellPushBytes,
+                             uint4(word, asuint(W), asuint(visible ? 1.0f : 0.0f), 0u));
+    }
+}
+
 // A light point rebuilt from the indices that a LightSample named (ReSTIR DI, docs/RESTIR_DI.md):
 // voxel v (x | y << 3 | z << 6) of the entry's brick, its face and the uv on it, under the entity's
 // current transform. The same frame, basis and point expressions as SampleLightEntryWith.
@@ -725,10 +894,12 @@ LightPoint LightPointAt(CaelixFrameConstants fc, LightEntryHeader header, uint v
 // Next-event estimation on the light list at a diffuse path vertex (section 2.3): the receiver
 // x_r (the pushed-off vertex position) with world normal n_r, on brick group `group`, entity-local
 // position `object_point` (the hit point moved a little into the air, for the cell coordinate).
-// The brick comes from one of the 32 reservoirs of the vertex's light cell when it holds one, else
-// from the global CDF; the point from SampleLightEntry; one shadow ray. Returns the demodulated
-// incident radiance of the Lambert lobe (the albedo is in the caller's throughput, as for the sun
-// NEE), 0 without a usable sample.
+// The light sample comes from one of the 32 reservoirs of the vertex's light cell when it holds a
+// valid one, else from the global CDF: a brick-level sample (a brick, then a point by
+// SampleLightEntry, W = W_brick / pdf_area) or a voxel-face sample (a point uniform on that face by
+// LightSampleFaceOf, W = the reservoir's W, pdf_area 1; a word whose voxel bit is clear counts as no
+// sample from the cell). One shadow ray. Returns the demodulated incident radiance of the Lambert lobe
+// (the albedo is in the caller's throughput, as for the sun NEE), 0 without a usable sample.
 // With kGiFlagLightCellJitter (section 2.5) the cell is looked up at `object_point` moved by a
 // uniform random offset in (-0.5, 0.5) cells per axis: the pixels of one brick then read up to 8
 // cells instead of the same one, so the variance of the cell contents (one refill of 32 reservoirs
@@ -739,6 +910,15 @@ LightPoint LightPointAt(CaelixFrameConstants fc, LightEntryHeader header, uint v
 // (the unjittered cell, LightNeeProxyAt's lookup; with the jitter on, the sampling cell is a second
 // lookup) for the BSDF segment that leaves the vertex. Without `mis`, `ctx` is the global context
 // and the lookups and random numbers are the same as before step 3. The MIS draws no random number.
+// Push-back (kGiFlagLightCellPush, docs/LIGHT_LIST.md section 2.2): when the sampling cell exists,
+// the vertex claims a push (LightCellClaimPush) before it draws its sample and writes it once,
+// whatever happened to the sample (so that neither the presence of a ring entry nor the vertex that
+// fills it depends on the sample): a voxel-face reservoir sample its own word and W;
+// a brick-level sample (reservoir or global CDF) its voxel-face word with W_brick / pdf_area when the
+// vertex's candidate faces equal their union over the cell's receiver region
+// (LightCellRegionFaceMask: then the point's density covers every face any receiver of the cell can
+// see), else its brick-level word with W_brick; nothing usable (no brick weight) an empty entry.
+// visible = 0 only when the shadow ray was traced and hit.
 float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint group, float3 object_point, bool mis,
                       inout uint rng, out LightNeeProxyContext ctx)
 {
@@ -755,89 +935,153 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     const uint capacity = CAELIX_LOAD_U32(table + kLightHeaderCapacity);
 
     uint light = kNoLight;
-    float W_brick = 0.0f;
+    float W_cell = 0.0f;
+    uint cell_voxel = 0u;
+    uint cell_face = kLightCellFaceBrick;
+    int slot = -1;
+    uint entity = 0u;
+    uint level = 0u;
+    int3 sample_coord = int3(0, 0, 0);
+    uint push_index = kNoLight;  // kGiFlagLightCellPush: the claimed push of the sampling cell
     CAELIX_BRANCH
     if (fc.light_cells != 0u)
     {
-        const uint level = LightCellLevel(fc, x_r);
-        const uint entity = GroupEntity(fc, group);
+        level = LightCellLevel(fc, x_r);
+        entity = GroupEntity(fc, group);
         const bool jitter = (fc.gi_flags & kGiFlagLightCellJitter) != 0u;
-        int slot = -1;
         // The proxy's cell is the unjittered one; without the jitter it is also the sampling cell.
         if (mis || !jitter)
         {
-            const int3 coord = LightCellCoord(object_point, level);
-            slot = LightCellLookup(fc, entity, level, coord);
+            sample_coord = LightCellCoord(object_point, level);
+            slot = LightCellLookup(fc, entity, level, sample_coord);
             if (mis)
             {
-                ctx = LightNeeProxyOfSlot(fc, slot, entity, level, coord, total);
+                ctx = LightNeeProxyOfSlot(fc, slot, entity, level, sample_coord, total);
             }
         }
         if (jitter)
         {
             const float3 u_jitter = float3(RandomFloat01(rng), RandomFloat01(rng), RandomFloat01(rng));
             const float3 cell_point = object_point + (u_jitter - 0.5f) * float(8u << (2u * level));
-            slot = LightCellLookup(fc, entity, level, LightCellCoord(cell_point, level));
+            sample_coord = LightCellCoord(cell_point, level);
+            slot = LightCellLookup(fc, entity, level, sample_coord);
         }
         if (slot >= 0)
         {
+            if ((fc.gi_flags & kGiFlagLightCellPush) != 0u)
+            {
+                push_index = LightCellClaimPush(uint(slot));
+            }
             const uint r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));
             const uint2 reservoir =
                 g_light_cells.Load2(uint(slot) * kLightCellBytes + kLightCellReservoirOffset + r * 8u);
-            if (asfloat(reservoir.y) > 0.0f && reservoir.x < count)
+            uint entry_index;
+            uint voxel;
+            uint face;
+            if (asfloat(reservoir.y) > 0.0f && LightCellDecode(reservoir.x, count, entry_index, voxel, face))
             {
-                light = reservoir.x;
-                W_brick = asfloat(reservoir.y);
+                light = entry_index;
+                W_cell = asfloat(reservoir.y);
+                cell_voxel = voxel;
+                cell_face = face;
             }
         }
     }
-    const bool from_cdf = light == kNoLight;
-    if (from_cdf)
+    uint64_t address = 0u;
+    LightEntryHeader entry = (LightEntryHeader)0;
+    if (light != kNoLight)
     {
-        light = LightCdfSearch(table, capacity, count, u_global * total);
+        address = LightEntryAddress(table, light);
+        entry = LoadLightEntryHeader(address);
+        // A voxel-face word whose voxel is no longer a list light with that face open (the scene
+        // changed): no sample from the cell.
+        if (cell_face < kLightCellFaceBrick && !LightFaceMaskBit(address, cell_face, LightVoxel3(cell_voxel)))
+        {
+            light = kNoLight;
+        }
     }
-    const uint64_t address = LightEntryAddress(table, light);
-    const LightEntryHeader entry = LoadLightEntryHeader(address);
-    if (from_cdf)
+    float W_brick = W_cell;
+    if (light == kNoLight)
     {
         // The global CDF: the brick's probability is total_b / total.
+        cell_face = kLightCellFaceBrick;
+        light = LightCdfSearch(table, capacity, count, u_global * total);
+        address = LightEntryAddress(table, light);
+        entry = LoadLightEntryHeader(address);
         W_brick = entry.total_weight > 0.0f ? total / entry.total_weight : 0.0f;
     }
-    const LightSample s = SampleLightEntry(fc, entry, address, x_r, rng);
-    if (!s.valid || !(W_brick > 0.0f))
+    const bool face_sample = cell_face < kLightCellFaceBrick;
+    LightSample s;
+    if (face_sample)
     {
-        return float3(0.0f, 0.0f, 0.0f);
+        s = LightSampleFaceOf(fc, entry, address, cell_voxel, cell_face, false, rng);
     }
-    const float3 d = s.position - x_r;
-    const float d2 = dot(d, d);
-    if (!(d2 > 0.0f))
+    else
     {
-        return float3(0.0f, 0.0f, 0.0f);
+        s = SampleLightEntry(fc, entry, address, x_r, rng);
     }
-    const float distance = sqrt(d2);
-    if (distance < g_lightNeeMinDistance)
+
+    float3 contribution = float3(0.0f, 0.0f, 0.0f);
+    bool occluded = false;
+    if (s.valid && W_brick > 0.0f)
     {
-        return float3(0.0f, 0.0f, 0.0f);
+        const float3 d = s.position - x_r;
+        const float d2 = dot(d, d);
+        const float distance = sqrt(d2);
+        if (d2 > 0.0f && distance >= g_lightNeeMinDistance)
+        {
+            const float3 w = d / distance;
+            const float cos_r = dot(n_r, w);
+            const float cos_l = -dot(s.normal, w);
+            if (cos_r > 0.0f && cos_l > 0.0f)
+            {
+                // The point lies on a voxel face: the ray stops 2 push-offs short of it (as GiVisible).
+                RayDesc shadow;
+                shadow.Origin = x_r;
+                shadow.Direction = w;
+                shadow.TMin = 0.0f;
+                shadow.TMax = distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
+                occluded = shadow.TMax > 0.0f && TraceShadow(fc, shadow);
+                if (!occluded)
+                {
+                    contribution =
+                        s.radiance * ((cos_r * (1.0f / K_PI)) * (cos_l / d2) / s.pdf_area * W_brick);
+                    if (mis)
+                    {
+                        contribution *= LightNeeMisWeight(ctx, s.mis, x_r, n_r, w, distance, cos_l, true);
+                    }
+                }
+            }
+        }
     }
-    const float3 w = d / distance;
-    const float cos_r = dot(n_r, w);
-    const float cos_l = -dot(s.normal, w);
-    if (!(cos_r > 0.0f) || !(cos_l > 0.0f))
+
+    CAELIX_BRANCH
+    if (push_index < kLightCellPushSlots)
     {
-        return float3(0.0f, 0.0f, 0.0f);
+        uint word = kNoLight;
+        float W_push = 0.0f;
+        if (face_sample)
+        {
+            word = LightCellWord(light, cell_voxel, cell_face);
+            W_push = W_brick;
+        }
+        else if (W_brick > 0.0f)
+        {
+            const uint region = LightCellRegionFaceMask(fc, entity, level, sample_coord, entry);
+            if (s.valid && s.face_mask == region)
+            {
+                word = LightCellWord(light, s.voxel, s.face);
+                W_push = W_brick / s.pdf_area;
+            }
+            else
+            {
+                word = LightCellWord(light, 0u, kLightCellFaceBrick);
+                W_push = W_brick;
+            }
+        }
+        LightCellStorePush(uint(slot), push_index, word, W_push, !occluded);
     }
-    // The point lies on a voxel face: the ray stops 2 push-offs short of it (as GiVisible).
-    RayDesc shadow;
-    shadow.Origin = x_r;
-    shadow.Direction = w;
-    shadow.TMin = 0.0f;
-    shadow.TMax = distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
-    if (shadow.TMax > 0.0f && TraceShadow(fc, shadow))
-    {
-        return float3(0.0f, 0.0f, 0.0f);
-    }
-    const float3 contribution = s.radiance * ((cos_r * (1.0f / K_PI)) * (cos_l / d2) / s.pdf_area * W_brick);
-    return mis ? contribution * LightNeeMisWeight(ctx, s.mis, x_r, n_r, w, distance, cos_l, true) : contribution;
+    return contribution;
 }
 
 // Whether the light NEE can produce the point that the ray of `hit` found on a list light

@@ -281,6 +281,12 @@ pub struct GiSettings {
     pub light_cell_temporal: bool,
     /// Light NEE with `light_cell_temporal`: frames of history behind a cell reservoir (1..1024).
     pub light_temporal_frames: u32,
+    /// Light NEE: every vertex that sampled a light cell pushes its light sample and its shadow ray
+    /// result into the cell; the next fill merges the pushes (`CAELIX_GI_FLAG_LIGHT_CELL_PUSH`,
+    /// docs/LIGHT_LIST.md section 2.2).
+    pub light_cell_push: bool,
+    /// Light NEE with `light_cell_push`: the confidence (M) of a pushed sample in the fill.
+    pub light_push_confidence: f32,
     /// Candidates per cell reservoir and frame (1..64).
     pub light_candidates: u32,
     /// World units per pixel below which a vertex uses 8-voxel cells (else 32-voxel cells).
@@ -312,6 +318,8 @@ impl Default for GiSettings {
             light_mis: true,
             light_cell_temporal: false,
             light_temporal_frames: 20,
+            light_cell_push: false,
+            light_push_confidence: 8.0,
             light_candidates: 8,
             light_footprint: 0.25,
             restir_di: false,
@@ -350,6 +358,9 @@ impl GiSettings {
             if self.light_cell_temporal {
                 flags |= CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
             }
+            if self.light_cell_push {
+                flags |= CAELIX_GI_FLAG_LIGHT_CELL_PUSH;
+            }
             // RESTIR_DI needs LIGHT_NEE (the library rejects it alone).
             if self.restir_di {
                 flags |= CAELIX_GI_FLAG_RESTIR_DI;
@@ -374,6 +385,7 @@ impl GiSettings {
             light_level_footprint: self.light_footprint,
             di_candidates: self.di_candidates,
             light_temporal_frames: self.light_temporal_frames,
+            light_push_confidence: self.light_push_confidence,
         }
     }
 }

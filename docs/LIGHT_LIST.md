@@ -130,8 +130,8 @@ render that needs it, recreated when the capacity option changes, retired safely
 per cell (`kLightCellReservoirs`, a shader constant).
 
 ```
-Cell (304 B since the temporal cell reuse, section 2.2; 296 B since step 3, docs/LIGHT_MIS.md;
-288 B before, without C_prev and C_cur)
+Cell (832 B since the push-back of shadow ray results, section 2.2; 304 B since the temporal cell
+reuse; 296 B since step 3, docs/LIGHT_MIS.md; 288 B before, without C_prev and C_cur)
   uint64_t key;          //   0  0 = empty; else the fingerprint of (entity, level, cell coordinate)
   uint touched_frame;    //   8  fc.frame_counter (section 3) of the last lookup
   uint entity;           //  12
@@ -140,15 +140,30 @@ Cell (304 B since the temporal cell reuse, section 2.2; 296 B since step 3, docs
   float C_prev;          //  32  cell normalisation of the fill before the latest one (MIS proxy)
   float C_cur;           //  36  cell normalisation of the latest fill (mean of w_sum / K; with
                          //      LIGHT_CELL_TEMPORAL the running mean of dedicated draws)
-  float M;               //  40  LIGHT_CELL_TEMPORAL: the candidate count behind every reservoir of
-                         //      the cell (uniform over the 32: all threads merge the same way);
-                         //      0 = no history
+  float M;               //  40  LIGHT_CELL_TEMPORAL: the confidence sum behind the cell's
+                         //      reservoirs (the mean over the 32 threads; they differ by the push
+                         //      confidence where the push ring has fewer than 32 entries); 0 = no history
   float C_n;             //  44  LIGHT_CELL_TEMPORAL: the draw count behind C_cur; 0 = none
-  LightCellReservoir r[32];  // 48 .. 304
+  uint push_count;       //  48  LIGHT_CELL_PUSH: pushes claimed since the latest fill (may exceed 32)
+  uint pad[3];           //  52
+  LightCellReservoir r[32];  // 64 .. 320
+  LightCellPush push[32];    // 320 .. 832  LIGHT_CELL_PUSH: the push ring
 LightCellReservoir (8 B)
-  uint light;            // entry index in the light table, 0xFFFFFFFF = empty
-  float W;               // unbiased contribution weight of the brick-level target (0 = empty)
+  uint light;            // a light sample word (below), 0xFFFFFFFF = empty
+  float W;               // unbiased contribution weight of that sample (0 = empty)
+LightCellPush (16 B)
+  uint word;             // the light sample word that a vertex drew from this cell, 0xFFFFFFFF = empty
+  float W;               // its contribution weight as the vertex used it (0 = empty)
+  float visible;         // 0 = the vertex's shadow ray was traced and hit; 1 otherwise
+  uint pad;
 ```
+Light sample word (`LightCellWord`, `LightCellDecode`): bits 0..19 the entry index (the table holds
+at most 2^20 entries, `kMaxLightMaxBricks`), bits 20..28 the voxel v = x | y << 3 | z << 6 inside
+the entry's brick, bits 29..31 the face: 0..5 = a voxel-face sample (a point uniform on that face
+of that voxel, area 1: W is the contribution weight per unit area), 6 = `kLightCellFaceBrick` a
+brick-level sample (the vertex samples a point in the brick, section 2.1; voxel bits 0), 7 only in
+`kNoLight` = 0xFFFFFFFF (empty). The fill's fresh candidates are brick-level; voxel-face samples
+enter the cells only through the push ring (section 2.2).
 An unfilled cell has empty reservoirs (all `W` 0); the sampling then falls back to the global
 table (section 2.3).
 
@@ -168,29 +183,45 @@ Lookup from the trace kernel (`LightCellLookup`): probe; a matching key -> write
 `InterlockedCompareExchange(key, 0, fingerprint)`; success or another thread's success with the
 same key -> that cell (touched, reservoirs empty until the next fill); 8 probes without a
 match -> no cell (the vertex samples the global table, section 2.3). The inserting thread also
-writes entity, coord and level and clears the 32 reservoirs (plain stores after the CAS; a
-concurrent reader of the same new cell may see partly cleared reservoirs and reads either an
-empty one or a stale `W` 0 slot, both harmless).
+writes entity, coord and level, zeroes the header from C_prev to push_count and clears the 32
+reservoirs (plain stores after the CAS; a concurrent reader of the same new cell may see partly
+cleared reservoirs and reads either an empty one or a stale `W` 0 slot, both harmless). A key_lo
+match counts as a match when key_hi equals the fingerprint's high word or is still 0 (2026-10-21):
+key_hi is stored after the claim, and before this rule a thread that lost the CAS to the same key
+probed on and inserted the same cell again, up to 8 times (the 4-light box had 202 live cells for
+38 used ones). A low-word collision with another high word while an insert is pending merges two
+cells, which is harmless (every reservoir carries its own W).
 
 Eviction: the fill pass clears a cell (key = 0, reservoirs empty) when `touched_frame + 64 <
 fc.frame_counter`. Hash-table removal under linear probing leaves tombstone-free holes, which
 is fine here: a later lookup of a displaced key simply inserts again in an earlier slot and the
 displaced old cell ages out.
 
-Usage counters (2026-10-21): the buffer is `C x 304 + 16` bytes; the 16 bytes after the last cell
-(`LightCellCounterBase` = `fc.light_cell_capacity x 304`) hold four uints: `live` (offset 0),
-`active` (4), `inserted` (8) and `failed` (12). The renderer resets them with a 16-byte
-`vkCmdFillBuffer` before the fill of every light NEE frame (a new buffer is zero-filled whole). The
-fill's thread 0 adds 1 to `live` for every cell that stays after the eviction check (also without a
-light table) and 1 to `active` when that cell's `touched_frame == fc.frame_counter - 1` (looked up
-by the previous frame's trace). `LightCellLookup` adds 1 to `inserted` on a successful insert and 1
-to `failed` when 8 probes found neither the key nor a free slot. After the trace dispatch (every
-lookup of the frame, the ReSTIR DI initial reservoirs included, is in the trace kernel) the renderer
-copies the 16 bytes into slot `frame_number % 8` of a persistently mapped readback ring (created
-and retired with the cells). `caelix_renderer_get_gi_stats` reports the slot of the frame of
-`CaelixGpuTimings` as `CaelixGiStats::light_cells_live`, `light_cells_active`,
-`light_cells_inserted` and `light_cell_lookups_failed` (0 when that frame ran no light NEE).
-`CaelixGiStats::light_cell_bytes` is the whole buffer, the 16-byte tail included.
+Usage counters (2026-10-21): the buffer is `C x 832 + 32` bytes; the 32 bytes after the last cell
+(`LightCellCounterBase` = `fc.light_cell_capacity x 832`) hold six uints and 8 bytes of padding:
+`live` (offset 0), `active` (4), `inserted` (8), `failed` (12), `pushed` (16) and `push_dropped`
+(20). The renderer resets them with a 32-byte `vkCmdFillBuffer` before the fill of every light NEE
+frame (a new buffer is zero-filled whole). The fill's thread 0 adds 1 to `live` for every cell that
+stays after the eviction check (also without a light table), 1 to `active` when that cell's
+`touched_frame == fc.frame_counter - 1` (looked up by the previous frame's trace), and the cell's
+`push_count` split into `min(push_count, 32)` (`pushed`) and the rest (`push_dropped`): the pushes
+of the previous frame's trace, counted once per cell in the fill instead of once per push in the
+trace (one counter address for every vertex would serialise the trace's atomics; wave-aggregated
+atomics would need subgroup ballot, which is not a device requirement). `LightCellLookup` adds 1 to
+`inserted` on a successful insert and 1 to `failed` when 8 probes found neither the key nor a free
+slot. After the trace dispatch (every lookup of the frame, the ReSTIR DI initial reservoirs
+included, is in the trace kernel) the renderer copies the 32 bytes into slot `frame_number % 8` of a
+persistently mapped readback ring (created and retired with the cells). `caelix_renderer_get_gi_stats`
+reports the slot of the frame of `CaelixGpuTimings` as `CaelixGiStats::light_cells_live`,
+`light_cells_active`, `light_cells_inserted`, `light_cell_lookups_failed`, `light_cell_pushes` and
+`light_cell_pushes_dropped` (0 when that frame ran no light NEE). `CaelixGiStats::light_cell_bytes`
+is the whole buffer, the 32-byte tail included.
+
+Measured with the counters (shroom forest, 960x540, `--gi pt --gi-light-nee`, jitter and MIS on,
+32 warm-up frames): about 74000 cells are looked up per frame and about 200000 are live (the union
+over the 64-frame retention). The default capacity 65536 is full there (about 1 million failed
+lookups per frame, which fall back to the global CDF); 262144 or 524288 cells leave almost no
+failed lookups and make the trace faster (5.3 -> 4.2 ms), at 1.6 - 2.6 ms of fill.
 
 ## 2. Sampling
 
@@ -294,16 +325,112 @@ reuse in light cell fill" and slider "light temporal frames". Bench runs `pt_nee
 `pt_nee_temporal_conv`, `di_temporal`. Test: "light NEE with temporal cell reuse is unbiased" (four
 single-voxel lights in four ceiling bricks: with one brick the merge cannot change W).
 
+Push-back of shadow ray results (`CAELIX_GI_FLAG_LIGHT_CELL_PUSH`, 2026-10-21). The owner's intent:
+the shadow ray that a vertex traces to its light sample feeds back into the cell, so that the pool
+gets better samples over time. The fill keeps its brick-level fresh candidates; voxel-face samples
+enter the cells only through the pushes.
+
+Vertex (`LightNextEvent`). When the vertex's sampling cell exists (the jittered one with
+`LIGHT_CELL_JITTER`), it claims a push (`InterlockedAdd` on `push_count`, `LightCellClaimPush`)
+BEFORE it draws its light sample, and writes the claimed entry once at the end
+(`LightCellStorePush`; claims beyond 32 are dropped), whatever happened to the sample:
+
+- a voxel-face reservoir sample: its own word and the reservoir's W (already a contribution weight
+  for every receiver of the cell);
+- a brick-level sample (cell reservoir or global CDF): the voxel-face word of the sampled point with
+  `W_brick / pdf_area` when the vertex's candidate face mask (`LightCandidateFaceMask(x_r)`) equals
+  the union of the candidate masks over the cell's receiver region
+  (`LightCellRegionFaceMask`: the cell box grown by half a cell for the jittered lookup and 1 voxel
+  for the object offset and the push-off, i.e. half axes of `cell_size + 1` along the cell entity's
+  axes; per axis the plane tests use the maximum or minimum of t_a over the box, t_a(centre) +-
+  sum_k |dot(axis_a, half_k)|, exact for a box under any rotation), else the brick-level word with
+  `W_brick`;
+- no usable sample (no brick weight): an empty entry (`kNoLight`, W 0).
+
+`visible` = 0 only when the shadow ray was traced and hit, 1 otherwise (visible, or no ray: invalid
+sample, near field, cos_r <= 0 or cos_l <= 0). The ReSTIR DI candidates of the trace push nothing
+(not done: the DI shade pass would need the cell slot of the pixel).
+
+Fill. All 32 threads load the ring into groupshared memory (entry r for r < min(push_count, 32),
+else an empty entry), then thread 0 resets `push_count`. Per thread, after the fresh candidates and
+the temporal history, with one more random number `u_push` (always drawn with the flag, after the
+history's and before the dedicated C draw):
+
+```
+present  = r < min(push_count, 32)
+c_p      = light_push_confidence                          // CaelixGiOptions, 0 = 8
+p_hat_p  = LightCellTargetOf(word) * (visible ? 1 : kLightOccludedTarget)   // 0.1
+if present: M_new += c_p                                  // also for an empty entry
+            if W_p > 0 and p_hat_p > 0: w_p = c_p * p_hat_p * W_p; w_sum += w_p; select with u_push
+old sample: p_hat_old *= kLightOccludedTarget when a ring entry holds its word with visible 0
+W        = (w_sum / M_new) / p_hat_selected
+```
+
+`LightCellTargetOf` decodes a word: a brick-level word `total * G` (as above), a voxel-face word
+`L_v * G_face` with `L_v` = the luminance of the voxel's emission (material table, before
+`emission_scale`) and `G_face = max(0.1, dot(n, to_cell) / |to_cell|) / max(|to_cell|^2, near_d2)`,
+`to_cell` = cell centre - face centre (voxel centre + 0.5 n, world); 0 for an invalid word or a
+voxel-face word whose voxel bit is clear (the scene changed). The header's M is the mean of the 32
+threads' confidence sums (`M_old + K + c_p * entries / 32`); any constant is a valid confidence for
+the next merge. C_c (the MIS proxy's normalisation) stays brick-level: the pushes do not enter it.
+
+Why it is unbiased. Streaming RIS with confidences gives, for every receiver f of the cell,
+`E[f(y) W] = (1 / M) sum_i c_i E[f(y_i) W_i]`, provided that every input's presence and confidence
+c_i are constants (they do not depend on the inputs' values) and that each W_i is a contribution
+weight over the cell's receivers (`E[f(y_i) W_i]` = the integral for every receiver). The
+per-candidate target cancels (W divides by the selected candidate's own target), so it may be any
+positive function: visibility may shape the target freely, but never the presence or the
+confidence. The rules follow from three failure modes found in the review of the first design:
+
+1. Merging only visible pushes makes the presence depend on visibility, which correlates with f:
+   biased bright. A lamp with two open voxels, one hidden from every receiver: the visible pushes
+   always hold the visible voxel with W = 2, so `E[f W | merged] = 2 I`.
+2. Halving `M_old` when its sample was seen occluded makes the history's weight smaller exactly when
+   its f is small: `Cov(c_old / M, f W_old) > 0`, biased bright.
+3. A pushed point drawn from the vertex's own candidate faces does not cover a face that another
+   receiver of the cell sees (a near brick whose face planes lie inside the receiver region):
+   biased dark. Hence the voxel-face word only when the vertex's mask equals the region's union;
+   both branches have the right expectation per brick.
+
+A fourth one appeared in the implementation: claiming the ring entry after the shadow ray let the
+vertices without a ray (back-facing or near-field samples, which arrive first) win the 32 entries,
+a sample-dependent choice (the 4-light box: ratio 0.9964); claiming before the sample is drawn
+makes the winners depend only on the paths' timing up to the claim (two runs: ratio 0.9976 and
+1.0003, block PSNR 38.17 and 37.71 dB, vs 1.0011 and 37.52 dB with temporal reuse alone; the
+ratio varies by about 0.3 % between runs because the atomics' order varies). The floor `kLightOccludedTarget` = 0.1 keeps the
+support full: a sample occluded from one receiver but visible from another gets a W up to 10x larger
+there, which is noise, not bias.
+
+Cost: the cell grows from 304 to 832 bytes (65536 cells: 19 -> 52 MiB); one atomic and one 16-byte
+store per vertex in the trace; the fill loads the ring and evaluates up to two more targets per
+thread. Shroom forest, 960 x 540, 262144 cells, temporal reuse, one frame's timings: trace 4.56 ->
+4.69 ms, fill 2.60 -> 2.41 ms (noise); 360000 pushes landed and 764000 were dropped per frame.
+
+Host: `--light-cell-push`, `--light-push-confidence F` (default 8), UI checkbox "push shadow ray
+results into light cells" and slider "light push confidence". Bench runs `pt_nee_push`,
+`pt_nee_push_conv`, `di_push`, `di_push_conv`. Test: "light NEE with cell push-back is unbiased"
+(the four lights of the temporal test; the box has little partial occlusion, so the bench on bistro
+and shroom is the real check).
+
 ### 2.3 At a path vertex (`SampleLightAtVertex`)
 
 ```
 cell = LightCellLookup(entity, level, coordinate)      // touches / inserts
-if (cell && reservoir r = cell.r[floor(u * 32)] has W > 0)  -> entry = light table[r.light], W_brick = r.W
-else                                                    -> CDF sample from the global table (binary
-                                                           search), W_brick = total_weight / entry.total_weight
-sample = SampleLightEntry(entry, x_r, rng)
-contribution as in 2.1, times W_brick
+if (cell && reservoir r = cell.r[floor(u * 32)] has W > 0 and a valid word)
+    -> entry = light table[word.entry], W = r.W
+       face 0..5 and the voxel's bit set: a voxel-face sample (LightSampleFaceOf: a point uniform
+       on that face, pdf_area 1)
+       face 6: a brick-level sample (W_brick = W)
+else (also a voxel-face word whose bit is clear)
+    -> CDF sample from the global table (binary search), W_brick = total_weight / entry.total_weight
+brick-level: sample = SampleLightEntry(entry, x_r, rng)
+contribution as in 2.1, times W (pdf_area 1 for a voxel-face sample)
 ```
+
+`LightSampleFaceOf` draws four random numbers like `SampleLightEntry` (the first two unused), so the
+stream does not depend on the word. ReSTIR DI's initial candidates (docs/RESTIR_DI.md) read the
+cell words the same way (uv quantized). The MIS proxy (docs/LIGHT_MIS.md) stays brick-level for
+both kinds of sample.
 
 The uniform choice of one of the 32 reservoirs needs no factor: each reservoir is an unbiased
 estimator of the same integral.
@@ -383,7 +510,8 @@ uint32_t pad_648[6];         // 648 .. 671
 
 (Later steps filled the padding and grew the struct to 704 B; the temporal cell reuse uses offset
 696: `uint32_t light_temporal_frames` = the frames of history the fill keeps, 0 = none this frame;
-`pad_700` follows.)
+the push-back uses offset 700: `float light_push_confidence` = the confidence of a pushed sample,
+0 without `LIGHT_CELL_PUSH`.)
 
 `TracePush` is unchanged. Scene kernels use `LightPush` (section 1.2, `gpu_structs.h`):
 `{ uint64_t group_infos, slot_tables, page_table, light_words, light_table, materials,
@@ -518,7 +646,7 @@ host flags and UI, `tools/gi_bench.*`.
 | --- | --- |
 | light word | 4 B per AABB row (`Scene::light_words_`, grows with the AABB pool; 256 KiB at the initial 65536 rows) |
 | light table | 64 B header + 132 B per `max_bricks` entry (128 B entry + 4 B CDF): 8.3 MiB at 65536; since step 4 (`LIGHT_FACES.md`) 452 B per entry (448 B entry + 4 B CDF): 28.3 MiB at 65536, 452 MiB at 2^20 |
-| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md; 304 B since the temporal cell reuse: 19 MiB at 65536) |
+| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md; 304 B since the temporal cell reuse: 19 MiB at 65536; 832 B since the push-back of shadow ray results: 52 MiB at 65536) |
 | `FinalizePush` | 88 -> 104 B (`light_words`, `materials`, `min_emission` in place of `pad`) |
 | `LightPush` | 72 B (see differences); 80 B since step 3 (`light_indices`, docs/LIGHT_MIS.md) |
 | `FrameConstants` | 608 -> 672 B, fields as in section 3 (`frame_counter` at 640) |

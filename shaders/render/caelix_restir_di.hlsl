@@ -391,10 +391,12 @@ DiReservoir DiMergeFinishWithCount(DiMerge s, DiReservoir own, uint count)
 
 // The initial reservoir of a pixel (trace kernel): `candidates` light points by streaming RIS at the
 // visible point x_v (the pushed-off primary point) with the face index `face` of its normal. Each
-// candidate: one of the 32 reservoirs of the pixel's light cell (looked up once; entry index and
-// W_brick), or the global CDF when the cell or that reservoir is empty, then SampleLightEntryWith
-// (uv quantized to the reservoir's 16 bits) -> point with pdf_area; candidate weight
-// p_hat * W_brick / pdf_area. W = w_sum / (candidates * p_hat(selected)), M = 1. No shadow ray.
+// candidate: one of the 32 reservoirs of the pixel's light cell (looked up once; a light sample
+// word and its W), or the global CDF when the cell or that reservoir is empty, then
+// SampleLightEntryWith for a brick-level sample or LightSampleFaceOf for a voxel-face one (uv
+// quantized to the reservoir's 16 bits) -> point with pdf_area (1 for a voxel-face sample);
+// candidate weight p_hat * W / pdf_area. W = w_sum / (candidates * p_hat(selected)), M = 1. No
+// shadow ray. The DI candidates push nothing into the cells (kGiFlagLightCellPush: not done).
 // `group` and `object_point` locate the cell as in LightNextEvent. Own random stream.
 // With DiMisEnabled the same (unjittered) cell lookup gives the receiver's proxy context
 // (LightNeeProxyOfSlot; TracePath's LightNeeProxyAt finds the same slot and C_prev for the first
@@ -449,29 +451,55 @@ DiReservoir DiInitialReservoir(CaelixFrameConstants fc, uint2 pixel, float3 x_v,
         const float u_global = RandomFloat01(rng);
         uint light = kNoLight;
         float W_brick = 0.0f;
+        uint cell_voxel = 0u;
+        uint cell_face = kLightCellFaceBrick;
         if (slot >= 0)
         {
             const uint cell_r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));
             const uint2 reservoir =
                 g_light_cells.Load2(uint(slot) * kLightCellBytes + kLightCellReservoirOffset + cell_r * 8u);
-            if (asfloat(reservoir.y) > 0.0f && reservoir.x < count)
+            uint entry_index;
+            uint voxel;
+            uint face;
+            if (asfloat(reservoir.y) > 0.0f && LightCellDecode(reservoir.x, count, entry_index, voxel, face))
             {
-                light = reservoir.x;
+                light = entry_index;
                 W_brick = asfloat(reservoir.y);
+                cell_voxel = voxel;
+                cell_face = face;
             }
         }
-        const bool from_cdf = light == kNoLight;
-        if (from_cdf)
+        uint64_t address = 0u;
+        LightEntryHeader entry = (LightEntryHeader)0;
+        if (light != kNoLight)
         {
-            light = LightCdfSearch(table, capacity, count, u_global * total);
+            address = LightEntryAddress(table, light);
+            entry = LoadLightEntryHeader(address);
+            // A voxel-face word whose voxel bit is clear (the scene changed): no sample from the cell.
+            if (cell_face < kLightCellFaceBrick && !LightFaceMaskBit(address, cell_face, LightVoxel3(cell_voxel)))
+            {
+                light = kNoLight;
+            }
         }
-        const uint64_t address = LightEntryAddress(table, light);
-        const LightEntryHeader entry = LoadLightEntryHeader(address);
-        if (from_cdf)
+        if (light == kNoLight)
         {
+            cell_face = kLightCellFaceBrick;
+            light = LightCdfSearch(table, capacity, count, u_global * total);
+            address = LightEntryAddress(table, light);
+            entry = LoadLightEntryHeader(address);
             W_brick = entry.total_weight > 0.0f ? total / entry.total_weight : 0.0f;
         }
-        const LightSample s = SampleLightEntryWith(fc, entry, address, x_v, true, rng);
+        // A voxel-face word: a point uniform on its face (pdf_area 1, W the reservoir's); else a point
+        // of the brick (W_brick / pdf_area).
+        LightSample s;
+        if (cell_face < kLightCellFaceBrick)
+        {
+            s = LightSampleFaceOf(fc, entry, address, cell_voxel, cell_face, true, rng);
+        }
+        else
+        {
+            s = SampleLightEntryWith(fc, entry, address, x_v, true, rng);
+        }
         const float u_select = RandomFloat01(rng);
         if (!s.valid || !(W_brick > 0.0f))
         {

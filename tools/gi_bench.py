@@ -42,6 +42,13 @@ RUNS = {
     "pt_nee_temporal": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal",
     "pt_nee_temporal_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal",
     "di_temporal": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di --light-cell-temporal",
+    # Push-back of shadow ray results into the light cells (docs/LIGHT_LIST.md section 2.2).
+    "pt_nee_push": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal --light-cell-push",
+    "pt_nee_push_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal --light-cell-push",
+    "di_push": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di --light-cell-temporal "
+    "--light-cell-push",
+    "di_push_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --gi-restir-di --light-cell-temporal "
+    "--light-cell-push",
 }
 
 TIMINGS_RE = re.compile(r"timings:((?:\s+\w+=[-+0-9.eE]+)+)")

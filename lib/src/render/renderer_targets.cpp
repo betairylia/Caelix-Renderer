@@ -372,7 +372,7 @@ void Renderer::EnsureLightCells(uint32_t capacity, uint64_t frame)
     {
         return;
     }
-    // 304 bytes per cell and the 16 bytes of usage counters at the tail (render/caelix_light_sample.hlsl),
+    // 832 bytes per cell and the 32 bytes of usage counters at the tail (render/caelix_light_sample.hlsl),
     // and the counters' readback ring. On a throw the old buffers stay.
     GpuBuffer fresh = GpuBuffer::DeviceLocal(device_.allocator(), device_.device(),
                                              kLightCellBytes * capacity + kLightCellCounterBytes);
@@ -400,7 +400,7 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                                      CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY |
                                      CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI |
                                      CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_MIS |
-                                     CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
+                                     CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL | CAELIX_GI_FLAG_LIGHT_CELL_PUSH;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
@@ -468,6 +468,13 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                     options.light_temporal_frames);
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    if (!std::isfinite(options.light_push_confidence) || options.light_push_confidence < 0.0f ||
+        options.light_push_confidence > 1024.0f)
+    {
+        CAELIX_LOGE("%s: light_push_confidence %g must be finite and in 0 .. 1024", kFunction,
+                    static_cast<double>(options.light_push_confidence));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
     // Reservoirs of another method or other reuse flags are not a valid history (GI and DI).
     if (options.reset != 0 || options.method != gi_options_.method || options.flags != gi_options_.flags)
     {
@@ -509,12 +516,15 @@ void Renderer::GetGiStats(CaelixGiStats& out) const
     {
         const VkDeviceSize offset = static_cast<VkDeviceSize>(slot) * kLightCellCounterBytes;
         light_counter_readback_.InvalidateHostReads(offset, kLightCellCounterBytes);
-        uint32_t counters[4];
+        uint32_t counters[6];
+        static_assert(sizeof(counters) <= kLightCellCounterBytes);
         std::memcpy(counters, light_counter_readback_.mapped() + offset, sizeof(counters));
         out.light_cells_live = counters[0];
         out.light_cells_active = counters[1];
         out.light_cells_inserted = counters[2];
         out.light_cell_lookups_failed = counters[3];
+        out.light_cell_pushes = counters[4];
+        out.light_cell_pushes_dropped = counters[5];
     }
 }
 
