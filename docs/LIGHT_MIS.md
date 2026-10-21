@@ -1,0 +1,176 @@
+# MIS between the light NEE and the BSDF path (step 3)
+
+Design (Fable, 2026-10-21). Follows `LIGHT_LIST.md` (step 1) and `RESTIR_DI.md` (step 2). The
+"As built" section at the end is the truth once the step is implemented.
+
+## Why
+
+Step 1 made the list lights NEE-only: a segment that leaves a vertex with light NEE skips the
+emission of a list light it hits, except in the near field (`nee_min_distance`, 8 units), which
+is the BSDF path's. Two problems remain:
+
+- Bright emitters just outside the near field keep a high variance: the NEE reaches them through a
+  brick choice that ignores their size on the receiver's hemisphere, while a cosine-sampled bounce
+  hits a large close emitter often and with a bounded weight. Speckles in the 256-frame light NEE
+  accumulation of the Cornell box; the near-field split only moved the problem to 8 units.
+- A latent bias: a list-light brick that the table dropped (beyond `max_bricks`), or a voxel whose
+  entry mask bit is clear (materials changed after the light word was written), is never sampled by
+  the NEE, but the BSDF path still skips its emission. That light is lost.
+
+Multiple importance sampling (Veach 1997, balance heuristic) combines the two strategies: at every
+diffuse vertex the NEE contribution is weighted by `w_nee(y) = p_nee(y) / (p_nee(y) + p_bsdf(y))`
+and a list-light hit of the next segment by `w_bsdf(y) = p_bsdf(y) / (p_nee(y) + p_bsdf(y))`. The
+weights sum to 1 at every light point, so the sum of the two estimators is unbiased for any
+densities as long as (a) both sides evaluate the SAME functions `p_nee` and `p_bsdf` of the vertex
+and the point, and (b) `w_nee(y) = 0` wherever the NEE of this frame cannot produce `y`. Neither
+density has to be the true density of the strategy: a proxy keeps the unbiasedness and only
+changes the variance (Veach 1997, section 9.2.2).
+
+## 1. The densities
+
+`p_bsdf` is the solid-angle density of the cosine-weighted diffuse direction at the vertex,
+`cos_r / pi` with `cos_r = dot(n_r, w)`. It is the exact density of `ShadeVoxelHit`'s diffuse
+lobe (`normalize(N + unit vector)`). The specular lobe is not combined: a segment that leaves a
+specular-lobe vertex counts every emission in full, as before (no NEE ran there).
+
+`p_nee` is a PROXY for the area density of the light NEE at the vertex, in the area measure at the
+light point, converted to solid angle by `d^2 / cos_l`. The true density of the NEE is not
+evaluable (the brick comes from one of 32 ReGIR reservoirs whose contents are random, the cell is
+jittered, empty reservoirs fall back to the global CDF). The proxy mirrors the cell fill's target
+instead:
+
+```
+p_area(y) = p_brick(b) * (region_weight[z] / total_weight_b) * (1 / n_z) * (1 / n_faces)
+p_brick(b) = p_hat_c(b) / C_c           with a cell c (section 3), or
+           = total_weight_b / total     without one (the global CDF)
+p_hat_c(b) = total_weight_b * orient / max(|centre_b - centre_c|^2, near_d2(level))
+```
+
+`region_weight[z]`, `total_weight_b`, `n_z` (the set bits of the slice mask), `centre_b` (brick
+origin + 4, world) and `orient` (the mean-normal term of `caelix_light_cells.hlsl`, 1 without a
+mean normal) come from the light table entry of the brick; `n_faces` is the number of axis faces
+of the voxel whose outward normal points to the receiver's side of the voxel centre (1..3, exactly
+as `SampleLightEntryWith` counts them); `C_c` is the cell's normalisation of section 3. The entry's
+`total_weight_b` cancels inside the cell term:
+
+```
+p_area(y) = orient / max(d2_bc, near_d2) * region_weight[z] / (C_c * n_z * n_faces)   (cell)
+p_area(y) = region_weight[z] / (total * n_z * n_faces)                                (global)
+```
+
+Both sides evaluate `p_area` through ONE function, `LightNeeProxyPdf`, from the same inputs: a
+per-vertex context (`LightNeeProxyContext`: whether a cell was found, its world centre, `near_d2`,
+`C_c`, and the table's `total`) built by `LightNeeProxyAt(fc, x_r, group, object_point)` from the
+UNJITTERED cell of the vertex (the jitter of section 2.5 of `LIGHT_LIST.md` only moves the cell
+the NEE samples from; the proxy is a deterministic function of the vertex), and a per-light
+description (`LightMisDesc`: the voxel frame = world centre + the three entity axes, `pdf_base =
+region_weight[z] / n_z`, `brick_centre`, `brick_normal` (world, length 0 without a mean normal),
+`total_weight_b`).
+
+`w_nee = 0` where the NEE cannot sample (condition (b)): points closer than `nee_min_distance` (the
+NEE returns 0 there; the BSDF side keeps `w_bsdf = 1`, as today), bricks without a table entry
+(section 2), voxels whose mask bit is clear, and materials below `min_emission` (not list lights:
+their emission is counted in full, as today). Where the NEE CAN sample but this frame's cell
+happens not to hold the brick, `w_nee > 0` is still correct: every reservoir's `W` is an unbiased
+weight of every brick, so the NEE estimator of `f * w_nee` is unbiased in expectation over the
+fill (the same argument as step 1).
+
+The balance heuristic: `w_nee = p_sa / (p_sa + p_bsdf)` with `p_sa = p_area * d^2 / cos_l`. No
+power heuristic (the densities are proxies; the balance heuristic is the one that is provably never
+much worse than either strategy alone).
+
+## 2. Brick -> entry index map (scene, `light_indices_`)
+
+The BSDF side needs the light table entry of the brick a segment hit. A new growable buffer of
+`u32` per AABB row, next to `light_words_` and managed exactly like it (reserved by
+`ReserveLightWords`, moved by the same `light_moves_` copies, zero-filled for new rows and freed
+ids by the same fills and pending copies), holds `entry index + 1` (0 = no entry). The compact
+kernel writes it for EVERY dense id below the group's high water (0 for a light word of 0, for a
+dropped entry and for a zero total), so a rebuild leaves no stale value behind; rows above the
+high water are never hit. `LightPush` grows by one address (80 bytes). `CaelixFrameConstants`
+carries the buffer address at offset 688 (`light_indices`, 0 without a table), and
+`CaelixScene` exposes it like `light_table_address()`.
+
+Section 2's map also fixes the latent bias in the non-MIS path: a list-light hit is skipped only
+when the map has an entry for the brick AND the voxel's mask bit is set (the NEE can sample it).
+
+## 3. Cell normalisation `C_c` (renderer, light cells)
+
+The cell fill's RIS gives every reservoir `W = (w_sum / K) / p_hat(selected)`, and `w_sum / K`
+is an unbiased estimate of `C_c = sum over the table of p_hat_c(b)`. The fill kernel averages
+`w_sum / K` over its 32 threads (groupshared, thread 0 sums) and stores it in the cell header. The
+trace of the same frame must not read the value computed from the reservoirs it samples (a ratio
+estimator bias), so the header keeps two values: `C_prev` (the fill before the latest one; the
+trace reads this one) and `C_cur` (written by the latest fill). The fill moves `C_cur` into
+`C_prev` before writing. A cell inserted by a lookup starts with both at 0; an evicted cell gets
+both 0; `C_prev = 0` selects the global proxy (the first frame of a cell).
+
+Cell layout (296 bytes, was 288): `0 key_lo, 4 key_hi, 8 touched_frame, 12 entity, 16 coord (3),
+28 level, 32 C_prev, 36 C_cur, 40 reservoirs (32 x 8)`. `kLightCellBytes`, `kLightCellReservoirOffset`
+and the renderer's `kCellBytes` change together; the ABI comments that say "288 bytes per cell"
+say 296.
+
+## 4. Path tracer (`TracePath`, flag `CAELIX_GI_FLAG_LIGHT_MIS`)
+
+At a vertex with light NEE (diffuse lobe, next segment exists), `LightNextEvent` takes `mis` and
+returns its contribution times `w_nee` (the proxy context is built from the unjittered cell; with
+the jitter on, the sampling cell is a second lookup). The vertex remembers `x_r`, `n_r` and its
+proxy context for the segment that leaves it.
+
+When that segment hits a list light (`emission_luminance >= light_min_emission`) at `T >=
+nee_min_distance`:
+
+```
+index = light_indices[aabb_row_base(group) + id]        (0 -> w_bsdf = 1)
+entry = LoadLightEntry(index - 1)
+voxel = floor(object_hit - 0.25 * object normal) - entry.origin   (outside 0..7 or mask bit clear -> w_bsdf = 1)
+face  = the hit face (from the object normal); n_faces counted from x_r as SampleLightEntryWith does
+p_sa  = LightNeeProxyPdf(context, desc, voxel slice, n_faces) * T^2 / cos_l
+w_bsdf = p_bsdf / (p_bsdf + p_sa),  p_bsdf = dot(n_r, direction) / pi
+radiance += emission * throughput * w_bsdf
+```
+
+Without the flag (or without MIS at this vertex): `w_bsdf = 0` when the NEE can sample the point
+(entry found and mask bit set), else 1. That is step 1's rule with the bias fix of section 2.
+
+Vertices that keep step 1's exclusive rule even with the flag (their BSDF sample is reused by
+other pixels, so a pixel-dependent weight would bias the reuse): the primary vertex in ReSTIR GI
+mode (`restir`), and in ReSTIR DI mode (`restir_di`) until section 5 is built.
+
+## 5. ReSTIR DI (second commit)
+
+The primary vertex's NEE is the DI reservoir. Its sample is reused by other pixels, so the
+receiver's proxy context must travel with the reservoir: `DiReservoir` grows to 48 bytes
+(`float3 cell_centre`, `float cell_C` (0 = global proxy or no cell), level in flag bit 4), filled
+by `DiInitialReservoir` from the primary vertex's cell lookup (no jitter there, as today) and kept
+as "own" fields by every merge (like `visible_pos`). The target function becomes `p_hat(y) =
+luminance(L_e) * G * w_nee(y; receiver)` (the integrand of the NEE strategy; the Z counts of the
+spatial pass evaluate it at the neighbours' receivers from their stored context), the shade pass
+contributes `L_e * G * V * W * w_nee`, and the first segment of a diffuse primary vertex in DI mode
+uses `w_bsdf` from the same context as section 4. `DiLight` carries the `LightMisDesc` of its entry
+(resolved by `DiResolve` together with the point). ReSTIR GI keeps the exclusive rule at the
+primary vertex (its sample radiance `L_o(x_s)` is pixel-independent by construction).
+
+## 6. ABI
+
+Flags only: `CAELIX_GI_FLAG_LIGHT_MIS (1u << 8)` ("with LIGHT_NEE: MIS between the light NEE and
+the diffuse bounce; without it a list-light hit after a light NEE vertex is skipped"). The renderer
+keeps it in the path-trace method like `LIGHT_CELL_JITTER`. `CaelixGiOptions` is unchanged. Host:
+`--light-no-mis` (the flag is on by default with `--gi-light-nee`); bench runs `pt_nee_nomis`.
+
+## 7. Tests (`tests/trace_test.cpp`)
+
+- "light NEE with MIS is unbiased": the light box of step 1 with `LIGHT_NEE | LIGHT_MIS`, 1024
+  reference frames against the 4096-frame path tracer: ratio in 0.97..1.03, block PSNR > 30 dB.
+- "MIS on a large emitter": the same box with an 8 x 8 emissive panel (one brick, strength 3) in
+  the ceiling at distance > 8 from the floor, so that both strategies carry weight: with and
+  without the flag against the path tracer, ratio in 0.97..1.03 both; the per-pixel RMSE of a
+  64-frame accumulation is printed for both (expected: lower with MIS).
+- "dropped bricks keep their emission": `max_bricks 1` with two light bricks: without MIS the
+  dropped brick's emission is still counted (ratio against the path tracer in 0.97..1.03).
+- The step 1 cases keep passing (the cell layout changed: "cells fill and sample" reads the cells).
+
+## 8. Bench
+
+`tools/gi_bench.py`: `pt_nee` gains the flag by default (host default), `pt_nee_nomis` is the old
+behaviour; the four scenes at 1 spp against their references.
