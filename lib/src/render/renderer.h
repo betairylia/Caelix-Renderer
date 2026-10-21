@@ -91,7 +91,7 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // caelix_restir_di_temporal, up to two caelix_restir_di_spatial passes and caelix_restir_di_shade run
 // after the ReSTIR GI passes (when those run) and before NRD / the composite; the shade pass adds
 // the direct light of the list lights to the diffuse radiance target. Four DI reservoir buffers
-// (32 bytes per pixel each), rotated, created, retired and resized as the GI buffers (di_*). The DI
+// (48 bytes per pixel each), rotated, created, retired and resized as the GI buffers (di_*). The DI
 // history is also dropped when the scene's light table was rebuilt since this renderer's previous
 // render (CaelixLightStats::rebuilds changed: entry indices may have moved). gi_timer_ brackets
 // the GI and the DI passes.
@@ -250,7 +250,7 @@ private:
     // ones are retired until `frame` is safe and the history is dropped. Returns true when it
     // created them.
     bool EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame);
-    // The same for the ReSTIR DI reservoir buffers (32 bytes per pixel).
+    // The same for the ReSTIR DI reservoir buffers (48 bytes per pixel).
     bool EnsureDiBuffers(uint32_t width, uint32_t height, uint64_t frame);
     // Creates the light cells when they are missing or of another capacity; the old buffer is
     // retired until `frame` is safe. A new buffer is zero-filled by the next render
@@ -348,7 +348,7 @@ private:
     uint64_t gi_last_frame_ = 0;         // the last frame that used gi_buffers_
     std::vector<RetiredGiBuffers> retired_gi_;
     GpuTimer gi_timer_;                  // temporal + spatial + shade dispatches (GI and DI)
-    // ReSTIR DI (CAELIX_GI_FLAG_RESTIR_DI): the same roles as the GI buffers, 32 bytes per pixel.
+    // ReSTIR DI (CAELIX_GI_FLAG_RESTIR_DI): the same roles as the GI buffers, 48 bytes per pixel.
     bool di_history_valid_ = false;      // the buffer at di_index_[kGiPrev] holds the previous frame's DI reservoirs
     GiBuffers di_buffers_;               // created at the first ReSTIR DI render
     std::array<uint32_t, kGiBufferCount> di_index_{kGiInitial, kGiPrev, kGiTemp, kGiOut};

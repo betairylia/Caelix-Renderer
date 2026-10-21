@@ -15,6 +15,10 @@
 // counts this pixel's M (1/M or Z by target support) for samples it can no longer hold (occluded
 // here, visible there), which lost 33 % of the direct light on bistro. Variance is the price: a
 // light voxel set into a wall keeps occluded side-face samples in the history for some frames.
+// With DiMisEnabled (kGiFlagLightMis, docs/LIGHT_MIS.md section 5) the contribution is multiplied by
+// the NEE weight w_nee of the light point at this pixel's receiver (the proxy context stored in the
+// reservoir): this pass contributes the NEE strategy's share of the list lights' direct light, the
+// trace kernel's first segment after the diffuse primary vertex the BSDF's (w_bsdf, same context).
 //
 // Descriptors: render/caelix_trace_set.hlsl (TLAS, internal view z, diffuse radiance).
 #include "common/caelix_platform.hlsl"
@@ -58,15 +62,22 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     {
         return;
     }
-    const float3 x_v = r.visible_pos;
-    const float3 n_v = GiFaceNormal(DiVisibleFace(r));
+    const DiReceiver receiver = DiReceiverOf(fc, r);
+    const float3 x_v = receiver.x_v;
+    const float3 n_v = receiver.n_v;
     float distance;
-    const float geometry = DiGeometry(light.position, light.normal, x_v, n_v, distance);
+    float3 w;
+    float cos_l;
+    const float geometry = DiGeometry(light.position, light.normal, x_v, n_v, distance, w, cos_l);
     if (!(geometry > 0.0f) || !DiVisible(fc, x_v, light))
     {
         return;  // occluded: nothing this frame, the history is not pruned (see the header)
     }
-    const float3 contribution = light.radiance * (geometry * r.W);
+    float3 contribution = light.radiance * (geometry * r.W);
+    if (DiMisEnabled(fc))
+    {
+        contribution *= LightNeeMisWeight(receiver.ctx, light.mis, x_v, n_v, w, distance, cos_l, true);
+    }
     const float4 stored = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_int_diff[pixel]);
     const float3 existing = max(stored.rgb, float3(0.0f, 0.0f, 0.0f));
     float norm_hit_dist = stored.a;

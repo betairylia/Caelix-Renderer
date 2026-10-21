@@ -14,7 +14,9 @@
 // times too large; the history keeps that W, the next frames select it again, and a second such
 // event multiplies it again, up to inf (the pixel then stays black: measured as a 40 % loss on
 // bistro with temporal + spatial reuse). The spatial pass keeps its Z (no feedback there). A pixel
-// without a surface (M 0) stores an empty reservoir.
+// without a surface (M 0) stores an empty reservoir. With DiMisEnabled the target function includes
+// the NEE weight w_nee at this pixel's receiver (its proxy context from the initial reservoir), and
+// the merged reservoir keeps that receiver (DiMergeFinishWithCount with the own reservoir).
 //
 // Descriptors: render/caelix_trace_set.hlsl (internal motion and view z, light table reads).
 #include "common/caelix_platform.hlsl"
@@ -53,12 +55,13 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     }
     const float3 x_v = own.visible_pos;
     const uint face = DiVisibleFace(own);
-    const float3 n_v = GiFaceNormal(face);
     const float view_z = g_int_view_z[pixel].x;
     uint rng = InitRandom(pixel, fc.frame_seed ^ 0x6C8E9CF5u);
+    const bool mis = DiMisEnabled(fc);
+    const DiReceiver receiver = DiReceiverOf(fc, own);
 
     const DiLight own_light = DiResolve(fc, own);
-    DiMerge merge = DiMergeInit(own, own_light, DiTargetPdf(own_light, x_v, n_v));
+    DiMerge merge = DiMergeInit(own, own_light, DiTargetPdf(own_light, receiver, mis));
     bool has_prev = false;
     DiReservoir prev = DiEmptyReservoir();
     uint m_prev = 0u;
@@ -75,10 +78,11 @@ void main(uint3 thread_id : SV_DispatchThreadID)
                 has_prev = true;
                 m_prev = min(DiM(prev), fc.gi_temporal_m_cap);
                 const DiLight prev_light = DiResolve(fc, prev);
-                DiMergeCandidate(merge, prev, prev_light, DiTargetPdf(prev_light, x_v, n_v), m_prev, 1.0f, rng);
+                DiMergeCandidate(merge, prev, prev_light, DiTargetPdf(prev_light, receiver, mis), m_prev, 1.0f,
+                                 rng);
             }
         }
     }
     // 1/M in every mode (see the header: a Z count feeds back through the history).
-    StoreDiReservoir(output, DiMergeFinishWithCount(merge, x_v, own.visible_flags_m, merge.m));
+    StoreDiReservoir(output, DiMergeFinishWithCount(merge, own, merge.m));
 }

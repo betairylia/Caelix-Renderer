@@ -3491,10 +3491,16 @@ TEST_CASE("MIS on a large emitter")
     CaelixGiOptions gi{};
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
     const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
-    const uint32_t modes[2] = {CAELIX_GI_FLAG_LIGHT_NEE, CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS};
-    const char* names[2] = {"light NEE", "light NEE + MIS"};
-    double rmse[2] = {0.0, 0.0};
-    for (int m = 0; m < 2; ++m)
+    // Modes 3 and 4: ReSTIR DI (unbiased reuse) without and with MIS; with it the DI is the NEE
+    // strategy at the primary vertex (docs/LIGHT_MIS.md section 5), and the panel gives both
+    // strategies weight there.
+    constexpr uint32_t kDi = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL |
+                             CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED;
+    const uint32_t modes[4] = {CAELIX_GI_FLAG_LIGHT_NEE, CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS, kDi,
+                               kDi | CAELIX_GI_FLAG_LIGHT_MIS};
+    const char* names[4] = {"light NEE", "light NEE + MIS", "ReSTIR DI", "ReSTIR DI + MIS"};
+    double rmse[4] = {0.0, 0.0, 0.0, 0.0};
+    for (int m = 0; m < 4; ++m)
     {
         gi.flags = modes[m];
         REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
@@ -3510,8 +3516,9 @@ TEST_CASE("MIS on a large emitter")
         CHECK(c.ratio > 0.97);
         CHECK(c.ratio < 1.03);
     }
-    std::printf("panel: 64-frame RMSE without MIS %.5f, with MIS %.5f (ratio %.3f)\n", rmse[0], rmse[1],
-                rmse[1] / rmse[0]);
+    std::printf("panel: 64-frame RMSE without MIS %.5f, with MIS %.5f (ratio %.3f); ReSTIR DI without MIS %.5f, "
+                "with MIS %.5f (ratio %.3f)\n",
+                rmse[0], rmse[1], rmse[1] / rmse[0], rmse[2], rmse[3], rmse[3] / rmse[2]);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);
@@ -3708,9 +3715,14 @@ TEST_CASE("ReSTIR DI unbiased")
                CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED;
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
     const std::vector<float> di = LightReference(rig, renderer, set, camera, 1024, 400000);
-
     CaelixGiStats stats{};
     caelix_renderer_get_gi_stats(renderer, &stats);
+    // The same with the MIS of docs/LIGHT_MIS.md section 5 (the DI is the NEE strategy at the
+    // primary vertex, the first bounce segment the BSDF strategy).
+    gi.flags |= CAELIX_GI_FLAG_LIGHT_MIS;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> di_mis = LightReference(rig, renderer, set, camera, 1024, 900000);
+
     const LightComparison c = CompareLight(nee, di, kBoxSize);
     const double psnr = PixelPsnr(nee, di, kBoxSize);
     const double floor_psnr = PixelPsnr(nee, nee2, kBoxSize);
@@ -3720,11 +3732,20 @@ TEST_CASE("ReSTIR DI unbiased")
                 "%.2f dB; reservoir bytes %llu, gi %.4f ms\n",
                 c.test_mean, c.ref_mean, c.ratio, c.block_psnr, psnr, floor_c.ratio, floor_psnr,
                 static_cast<unsigned long long>(stats.reservoir_bytes), stats.gi_ms);
-    CHECK(stats.reservoir_bytes == 4ull * 32ull * kBoxSize * kBoxSize);
+    CHECK(stats.reservoir_bytes == 4ull * 48ull * kBoxSize * kBoxSize);
     CHECK(c.ref_mean > 0.01);
     CHECK(c.ratio > 0.97);
     CHECK(c.ratio < 1.03);
     CHECK(psnr > 30.0);
+
+    const LightComparison c_mis = CompareLight(nee, di_mis, kBoxSize);
+    const double psnr_mis = PixelPsnr(nee, di_mis, kBoxSize);
+    std::printf("ReSTIR DI + MIS (unbiased) vs light NEE, 1024 frames each: mean %.5f vs %.5f, ratio %.4f, "
+                "16x16 block PSNR %.2f dB, pixel PSNR %.2f dB\n",
+                c_mis.test_mean, c_mis.ref_mean, c_mis.ratio, c_mis.block_psnr, psnr_mis);
+    CHECK(c_mis.ratio > 0.97);
+    CHECK(c_mis.ratio < 1.03);
+    CHECK(psnr_mis > 30.0);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);
@@ -3768,9 +3789,12 @@ TEST_CASE("ReSTIR DI lowers the error")
     const double di_unbiased =
         single_frame_rmse(CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL |
                           CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED);
+    const double di_mis =
+        single_frame_rmse(CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL |
+                          CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_LIGHT_MIS);
     std::printf("single frame RMSE against the 1024-frame light NEE reference: light NEE %.5f, ReSTIR DI %.5f "
-                "(%.3fx), ReSTIR DI unbiased %.5f (%.3fx)\n",
-                nee, di, di / nee, di_unbiased, di_unbiased / nee);
+                "(%.3fx), ReSTIR DI unbiased %.5f (%.3fx), ReSTIR DI unbiased + MIS %.5f (%.3fx)\n",
+                nee, di, di / nee, di_unbiased, di_unbiased / nee, di_mis, di_mis / nee);
     CHECK(di < nee);
     CHECK(di_unbiased < nee);
 

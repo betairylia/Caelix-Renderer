@@ -11,7 +11,9 @@
 // neighbours at which the selected sample has a nonzero target function, instead of M. Unlike the
 // GI pass, Z traces no visibility ray: the DI targets have no visibility (the initial candidates
 // are not shadow-tested), so a reservoir can hold an occluded sample and its support does not
-// depend on visibility.
+// depend on visibility. With DiMisEnabled the target function includes the NEE weight w_nee: the
+// merge weights evaluate it at this pixel's receiver, the Z counts at each accepted neighbour's own
+// receiver (DiReceiverOf of its reservoir: the support of the NEE strategy at that neighbour).
 //
 // Descriptors: render/caelix_trace_set.hlsl (TLAS for the shadow rays, internal view z).
 #include "common/caelix_platform.hlsl"
@@ -52,7 +54,6 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     }
     const float3 x_v = own.visible_pos;
     const uint face = DiVisibleFace(own);
-    const float3 n_v = GiFaceNormal(face);
     const float view_z = g_int_view_z[pixel].x;
     uint rng = InitRandom(pixel, fc.frame_seed ^ (0x3B5A9D27u + g_push.gi_pass * 0x9E3779B9u));
 
@@ -64,14 +65,16 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     // (too bright: the pixel's own weight has no visibility test, so the techniques are not
     // consistent) at 11 ms; not worth fixing while the shade ray gives an unbiased result.
     const bool trace_visibility = false;
+    const bool mis = DiMisEnabled(fc);
+    const DiReceiver receiver = DiReceiverOf(fc, own);
     int selected = -1;  // the accepted neighbour whose sample was selected; -1 = the pixel's own
-    // The accepted neighbours (counted in M): their visible points and face + M words, for Z.
-    float3 accepted_pos[kGiMaxSpatialSamples];
-    uint accepted_face_m[kGiMaxSpatialSamples];
+    // The accepted neighbours (counted in M), whole: their receivers (visible point, face, proxy
+    // context) and M, for Z.
+    DiReservoir accepted[kGiMaxSpatialSamples];
     uint accepted_count = 0u;
 
     const DiLight own_light = DiResolve(fc, own);
-    DiMerge merge = DiMergeInit(own, own_light, DiTargetPdf(own_light, x_v, n_v));
+    DiMerge merge = DiMergeInit(own, own_light, DiTargetPdf(own_light, receiver, mis));
     const uint samples = min(fc.gi_spatial_samples, kGiMaxSpatialSamples);
     CAELIX_LOOP
     for (uint i = 0u; i < samples; ++i)
@@ -89,7 +92,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             continue;
         }
         const DiLight light = DiResolve(fc, c);
-        const float p_hat = DiTargetPdf(light, x_v, n_v);
+        const float p_hat = DiTargetPdf(light, receiver, mis);
         float visibility = 1.0f;
         CAELIX_BRANCH
         if (trace_visibility && p_hat > 0.0f && c.W > 0.0f)
@@ -100,8 +103,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         {
             selected = int(accepted_count);
         }
-        accepted_pos[accepted_count] = c.visible_pos;
-        accepted_face_m[accepted_count] = c.visible_flags_m;
+        accepted[accepted_count] = c;
         ++accepted_count;
     }
 
@@ -111,24 +113,24 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     {
         const DiLight y = merge.selected_light;
         count = 0u;
-        if (DiTargetPdf(y, x_v, n_v) > 0.0f)
+        if (DiTargetPdf(y, receiver, mis) > 0.0f)
         {
             count += DiM(own);
         }
         CAELIX_LOOP
         for (uint k = 0u; k < accepted_count; ++k)
         {
-            const float3 n_k = GiFaceNormal(accepted_face_m[k] & kGiVisibleFaceMask);
-            if (!(DiTargetPdf(y, accepted_pos[k], n_k) > 0.0f))
+            const DiReceiver receiver_k = DiReceiverOf(fc, accepted[k]);
+            if (!(DiTargetPdf(y, receiver_k, mis) > 0.0f))
             {
                 continue;
             }
             // The neighbour that owned Y sees it by construction (its weight passed the ray).
-            if (!trace_visibility || int(k) == selected || DiVisible(fc, accepted_pos[k], y))
+            if (!trace_visibility || int(k) == selected || DiVisible(fc, receiver_k.x_v, y))
             {
-                count += accepted_face_m[k] >> kDiMShift;
+                count += DiM(accepted[k]);
             }
         }
     }
-    StoreDiReservoir(output, DiMergeFinishWithCount(merge, x_v, own.visible_flags_m, count));
+    StoreDiReservoir(output, DiMergeFinishWithCount(merge, own, count));
 }

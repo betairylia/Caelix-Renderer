@@ -71,14 +71,18 @@
 //                   exclusive rule, the NEE and such a list-light hit are weighted by the balance
 //                   heuristic over a density proxy of the NEE and the cosine density of the
 //                   diffuse bounce (LightNeeMisWeight); the primary vertex keeps the exclusive
-//                   rule in ReSTIR GI and ReSTIR DI mode (other pixels reuse its sample).
+//                   rule in ReSTIR GI mode (other pixels reuse its BSDF sample).
 //                   kGiFlagRestirDi (docs/RESTIR_DI.md, render/caelix_restir_di.hlsl; with
 //                   kGiFlagLightNee): the primary vertex's light NEE is replaced by the pixel's
 //                   initial DI reservoir (fc.di_initial, di_candidates candidates, no shadow ray),
 //                   written for every opaque primary surface (the diffuse-lobe bit tells the DI
 //                   shade pass whether to add its contribution); the first segment after a
 //                   diffuse primary vertex still skips list-light emission that the NEE can
-//                   sample. The bounce vertices keep their light NEE.
+//                   sample, or with kGiFlagLightMis (not in ReSTIR GI mode) counts it with the
+//                   BSDF's balance heuristic weight from the proxy context of the primary
+//                   vertex's unjittered light cell, the context that DiInitialReservoir stores
+//                   in the reservoir and the DI passes weight their NEE share with
+//                   (docs/LIGHT_MIS.md section 5). The bounce vertices keep their light NEE.
 //
 // Inputs: the push constant is the device address of the frame constants; the
 // scene's tables (page table, slot rows, group infos, entity infos) are read by
@@ -315,13 +319,20 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // sample, beyond the near field) counts its emission times w_bsdf = 1 - w_nee of that point; both
 // weights come from LightNeeMisWeight with the vertex's proxy context (kept in segment_ctx with
 // segment_x_r and segment_n_r), so the two strategies sum to the full emission at every point. The
-// primary vertex keeps the exclusive rule (segment_mis false) with `restir` and `restir_di`: its
-// BSDF sample is reused by other pixels, so a pixel-dependent weight would bias the reuse.
+// primary vertex keeps the exclusive rule (segment_mis false) with `restir` (ReSTIR GI): its BSDF
+// sample is reused by other pixels, so a pixel-dependent weight would bias the reuse.
 // `primary_light` receives the primary vertex's light NEE; with `restir` it is not in the
 // returned radiance (the caller writes it to the diffuse target, the shade pass adds it).
 // `restir_di` (ReSTIR DI): the primary vertex draws no light NEE (primary_light stays 0, the DI
 // passes add the direct light of the list lights there), but its first segment still skips the
 // emission of a list light it hits (one the NEE can sample) when the vertex took the diffuse lobe.
+// With light MIS (and without `restir`) that segment counts such a hit with w_bsdf instead: the
+// DI is the NEE strategy there (docs/LIGHT_MIS.md section 5). Its proxy context comes from
+// LightNeeProxyAt at the unjittered cell of the vertex; DiInitialReservoir (in main, later in the
+// same dispatch) looks the same cell up, gets the same slot and C_prev and stores that context in
+// the reservoir, so both strategies use one context. segment_n_r is then the axis normal of the
+// visible face (GiFaceNormal), the n_v of the DI passes, so that both sides also evaluate p_bsdf
+// with the same normal (it differs from surface.normal only on rotated entities).
 struct GiInitialSample
 {
     bool valid;            // the path had a first segment (bounce_count >= 1)
@@ -404,9 +415,16 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
                 radiance += primary_light;
             }
         }
+        else if (light_mis && !restir)
+        {
+            // The DI's receiver: the pushed-off primary point, its face's axis normal and the
+            // unjittered cell's context (DiInitialReservoir stores the same one).
+            segment_mis = true;
+            segment_ctx = LightNeeProxyAt(fc, primary_shade.bounce_origin, surface.group, LightCellPoint(surface));
+        }
         segment_light_nee = true;
         segment_x_r = primary_shade.bounce_origin;
-        segment_n_r = surface.normal;
+        segment_n_r = segment_mis && restir_di ? GiFaceNormal(GiFaceIndex(surface.normal)) : surface.normal;
     }
 
     RayDesc bounce;

@@ -342,9 +342,9 @@ bool Renderer::EnsureDiBuffers(uint32_t width, uint32_t height, uint64_t frame)
         retired_di_.push_back(std::move(retired));
         di_reservoir_bytes_ = 0;
     }
-    // 32 bytes per pixel (DiReservoir, shaders/render/caelix_restir_di.hlsl). On a throw the
+    // 48 bytes per pixel (DiReservoir, shaders/render/caelix_restir_di.hlsl). On a throw the
     // buffers created so far are destroyed with `fresh`, and the next ReSTIR DI render tries again.
-    constexpr VkDeviceSize kReservoirBytes = 32;
+    constexpr VkDeviceSize kReservoirBytes = 48;
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * kReservoirBytes;
     GiBuffers fresh;
     for (GpuBuffer& buffer : fresh)

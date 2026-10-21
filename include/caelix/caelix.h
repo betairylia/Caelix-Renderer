@@ -1174,7 +1174,9 @@ typedef enum CaelixGiMethod
                                                  docs/LIGHT_LIST.md section 2.5). Unbiased. */
 #define CAELIX_GI_FLAG_LIGHT_MIS (1u << 8)    /* with LIGHT_NEE: MIS (balance heuristic) between the light NEE and
                                                  the diffuse bounce (docs/LIGHT_MIS.md); without it a list-light
-                                                 hit after a light NEE vertex is skipped */
+                                                 hit after a light NEE vertex is skipped. With RESTIR_DI the DI
+                                                 at the primary surface takes part as the NEE strategy (not with
+                                                 CAELIX_GI_RESTIR) */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
@@ -1189,12 +1191,15 @@ typedef enum CaelixGiMethod
    sample that point (a brick the table dropped keeps its emission). With CAELIX_GI_FLAG_LIGHT_MIS
    the NEE and such a hit are combined by multiple importance sampling instead (balance heuristic
    over a proxy of the NEE density and the cosine density of the diffuse bounce); the primary
-   vertex keeps the exclusive rule with ReSTIR GI and ReSTIR DI. The light_* fields size the cells.
+   vertex keeps the exclusive rule with ReSTIR GI. The light_* fields size the cells.
    CAELIX_GI_FLAG_RESTIR_DI (with LIGHT_NEE, either method, bounce_count >= 1): the primary vertex's
    one-sample light NEE is replaced by per-pixel ReSTIR DI: di_candidates initial light points per
    pixel, then temporal and spatial reuse with the TEMPORAL, SPATIAL, VISIBILITY and UNBIASED flags
    and the reuse fields above, and one shadow ray per pixel; the result is added to the diffuse
-   radiance (after ReSTIR GI's). The bounce vertices keep the one-sample light NEE. */
+   radiance (after ReSTIR GI's). The bounce vertices keep the one-sample light NEE. With
+   CAELIX_GI_FLAG_LIGHT_MIS and CAELIX_GI_PATH_TRACE the DI takes part in the MIS: its target and its
+   contribution carry the NEE's balance heuristic weight at the pixel's primary surface, and the
+   first bounce segment counts a list-light hit with the bounce's weight. */
 typedef struct CaelixGiOptions
 {
     uint32_t method;          /* CaelixGiMethod */
@@ -1220,7 +1225,7 @@ typedef struct CaelixGiOptions
    reservoir history. With CAELIX_GI_PATH_TRACE and without CAELIX_GI_FLAG_DIFFUSE_ONLY the image is
    the path tracer's, bit for bit. The reservoir buffers (4 x 48 bytes per pixel) are allocated at
    the first ReSTIR render and kept until the renderer is destroyed (recreated on a size change);
-   the DI reservoir buffers (4 x 32 bytes per pixel) likewise at the first render with
+   the DI reservoir buffers (4 x 48 bytes per pixel) likewise at the first render with
    CAELIX_GI_FLAG_RESTIR_DI. The DI history is also dropped when the scene's light table was rebuilt
    since the renderer's previous render.
    The light cells (light_cell_capacity x 296 bytes) are allocated at the first render with

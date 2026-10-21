@@ -135,7 +135,8 @@ Without the flag (or without MIS at this vertex): `w_bsdf = 0` when the NEE can 
 
 Vertices that keep step 1's exclusive rule even with the flag (their BSDF sample is reused by
 other pixels, so a pixel-dependent weight would bias the reuse): the primary vertex in ReSTIR GI
-mode (`restir`), and in ReSTIR DI mode (`restir_di`) until section 5 is built.
+mode (`restir`). In ReSTIR DI mode (`restir_di`) the primary vertex takes part since section 5
+(phase B).
 
 ## 5. ReSTIR DI (second commit)
 
@@ -177,8 +178,9 @@ behaviour; the four scenes at 1 spp against their references.
 
 ## As built (phase A: sections 1-4, 6-8; 2026-10-21)
 
-Section 5 (ReSTIR DI with MIS) is not built: the DI target, reservoir and shade pass are unchanged,
-and the primary vertex keeps the exclusive rule in ReSTIR DI mode (with the bias fix of section 2).
+Section 5 (ReSTIR DI with MIS) was built in phase B (see "As built (phase B)" below). In phase A
+the DI target, reservoir and shade pass were unchanged, and the primary vertex kept the exclusive
+rule in ReSTIR DI mode (with the bias fix of section 2).
 
 ### Sizes
 
@@ -222,7 +224,7 @@ and the primary vertex keeps the exclusive rule in ReSTIR DI mode (with the bias
    lookup serves both. The MIS draws no random number.
 2. The function the design calls `LightNeeProxyPdf` is `LightNeeProxyPdfArea`; the shared cell part
    is `LightNeeProxyOfSlot`, so that `LightNextEvent` and `LightNeeProxyAt` build the context from
-   the same code. `LightNeeProxyAt` is not called yet (phase B, ReSTIR DI, needs it).
+   the same code. `LightNeeProxyAt` was not called in phase A (phase B calls it in `TracePath`).
 3. `LightMisDesc` computes the brick centre and the world mean normal from the voxel frame's axes
    (`centre_b = voxel centre + R (3.5 - voxel)`) instead of a second load of the entity rows. The NEE
    side (`SampleLightEntryWith`) and the BSDF side (`LightMisDescOf`) both go through
@@ -257,3 +259,65 @@ covered side faces of the panel voxels). MIS helps where an emitter just beyond 
 covers a large part of the hemisphere; the bench scenes (`pt_nee` vs `pt_nee_nomis`) are the real
 measure and were not run in this step. The dropped-bricks case before this step lost the dropped
 light (the BSDF path skipped it and the NEE could not sample it); its ratio is now 1.003.
+
+## As built (phase B: section 5, ReSTIR DI with MIS; 2026-10-21)
+
+### What changed
+
+- `caelix_restir_di.hlsl`: `DiReservoir` is 48 bytes; the third word is the receiver's proxy
+  context (`float3 cell_centre`, `float cell_C`; 0 = global proxy), the cell level is own flag bit 4
+  (`kDiCellLevel`). `DiMisEnabled(fc)` = the MIS flag and not ReSTIR GI. `DiReceiver` +
+  `DiReceiverOf(fc, r)` rebuild the receiver (x_v, the face's axis normal, the context with
+  `near_d2` from the level and the table's `total`). `DiLight::mis` (`LightMisDescOf` in
+  `DiResolve`). `DiGeometry` has an overload that also returns `w` and `cos_l`. `DiTargetPdf(l,
+  receiver, mis)` multiplies by `LightNeeMisWeight(..., nee_side = true)`.
+  `DiMergeFinishWithCount(s, own, count)` copies `visible_pos`, the own flags and the context from
+  the receiver's own reservoir. `DiInitialReservoir` builds the context from its unjittered cell
+  lookup (`LightNeeProxyOfSlot`) and weights each candidate's `p_hat` by `w_nee` (`s.mis`).
+- Temporal / spatial passes: the receiver from `DiReceiverOf(own)`; the spatial pass keeps whole
+  copies of the accepted neighbours and evaluates the Z counts at `DiReceiverOf(accepted[k])`.
+- Shade pass: the contribution times `w_nee` at the receiver.
+- `TracePath`: in ReSTIR DI mode with MIS (and without ReSTIR GI) the primary vertex sets
+  `segment_mis`, `segment_ctx = LightNeeProxyAt(fc, bounce_origin, surface.group,
+  LightCellPoint(surface))` and `segment_n_r = GiFaceNormal(GiFaceIndex(surface.normal))`.
+- C++: DI reservoir buffers 48 bytes per pixel (`renderer_targets.cpp`), comments in `renderer.h`
+  and `caelix.h`. No ABI struct changed.
+
+### Differences from the design, and why
+
+1. **Not with ReSTIR GI.** `DiMisEnabled` is false when `gi_method` is ReSTIR GI: the first segment
+   of the primary vertex keeps the exclusive rule there (ReSTIR GI reuses it), so the DI must keep
+   its full weight, or the two strategies would not sum to 1 and the direct light of the list
+   lights would be too dark. With ReSTIR GI the DI behaves as in step 2 (zero context fields).
+2. **The BSDF side uses the axis normal.** The DI's receiver normal is the axis normal of the
+   visible face (`GiFaceNormal`, as in all DI passes); `TracePath` uses the same normal for
+   `p_bsdf` at the primary vertex in DI mode (only in the MIS weight; the bounce direction and its
+   cosine are unchanged), so that `w_nee + w_bsdf = 1` holds exactly also on rotated entities.
+   Elsewhere `segment_n_r` stays `surface.normal`.
+3. **The context and the MIS descriptions are built only with `DiMisEnabled`.** Without the flag
+   the initial reservoir stores zeros in the third word and `DiResolve` does not load the voxel
+   frame a second time; the images without the flag are the same as before (the DI test cases give
+   identical numbers with the phase A shaders loaded through `CAELIX_SHADER_DIR`).
+4. **Both lookups are the same lookup.** `LightNeeProxyAt` in `TracePath` runs before
+   `DiInitialReservoir` in the same thread and inserts the cell when it is missing; the DI lookup
+   then finds that slot. `C_prev` is written only by the fill kernel, so both read the same value.
+5. **Tests**: the DI+MIS unbiasedness check compares against the 1024-frame light NEE reference,
+   as the existing DI case does (light NEE itself matches the path tracer, "light NEE is unbiased");
+   the comparison against the path tracer is in "MIS on a large emitter", which got two more
+   modes (ReSTIR DI and ReSTIR DI + MIS, both `TEMPORAL | SPATIAL | UNBIASED`).
+
+### Measurements (`tests/trace_test.cpp`, RTX 5080, 128 x 128, 4 bounces)
+
+| test | result |
+| --- | --- |
+| ReSTIR DI unbiased vs light NEE (1024 frames each), without MIS | ratio 0.9943, block PSNR 54.88 dB, pixel PSNR 38.78 dB (unchanged from phase A) |
+| ReSTIR DI unbiased + MIS vs light NEE | ratio 0.9998, block PSNR 55.55 dB, pixel PSNR 38.71 dB |
+| single frame RMSE after 64 warm-up frames (vs 1024-frame light NEE) | light NEE 0.15678, DI `TS` 0.15367, DI `TSU` 0.15484, DI `TSU` + MIS 0.15430 |
+| panel (8 x 8 emitter) vs 4096-frame path tracer, ReSTIR DI | ratio 1.0076, 64-frame RMSE 2.5797 |
+| panel, ReSTIR DI + MIS | ratio 1.0074, 64-frame RMSE 2.3871 (0.925x) |
+
+All 27 trace test cases pass. The single-voxel light box gives `w_nee` near 1 (see phase A), so
+the DI with and without MIS are almost the same image there; the panel shows the gain. The 64-frame
+RMSE of the DI runs is above the one-sample light NEE (1.46-1.48) because the temporal reuse
+correlates the frames of a short accumulation; it is not a per-frame comparison. The bench scenes
+were not run in this step.

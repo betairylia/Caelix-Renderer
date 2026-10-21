@@ -21,7 +21,7 @@ for ReSTIR GI: `TEMPORAL`, `SPATIAL`, `VISIBILITY` (a shadow ray per reused neig
 `spatial_passes`, `spatial_radius`, `depth_threshold`. `CaelixGiOptions::light_reserved` becomes
 `di_candidates` (0 = 4; 1 .. 32): initial candidates per pixel.
 
-## Reservoir (32 B, four buffers per pixel like ReSTIR GI: initial, prev, temp, out)
+## Reservoir (48 B since step 3, was 32 B; four buffers per pixel like ReSTIR GI: initial, prev, temp, out)
 
 ```
 DiReservoir
@@ -30,8 +30,15 @@ DiReservoir
   uint uv;                //  8  2 x f16: point on the face in (-0.5, 0.5)^2 (e1, e2 of GiFace basis)
   float W;                // 12  unbiased contribution weight (area measure at the light point)
   float3 visible_pos;     // 16  x_v (the pushed-off primary point)
-  uint visible_flags_m;   // 28  bits 0..2 face of n_v, bits 8..31 M  (as GiReservoir)
+  uint visible_flags_m;   // 28  bits 0..2 face of n_v, bit 3 diffuse lobe, bit 4 cell level (step 3), bits 8..31 M
+  float3 cell_centre;     // 32  step 3 (MIS): world centre of the receiver's unjittered light cell
+  float cell_C;           // 44  step 3 (MIS): that cell's C_prev; 0 = the global proxy (no cell / no normalisation)
 ```
+
+The second and third words describe the receiver (the pixel that owns the reservoir); every merge
+copies them from the receiver's own reservoir (the low byte of `visible_flags_m` holds the own
+flags: face, lobe and cell level). The third word and bit 4 are written only with
+`CAELIX_GI_FLAG_LIGHT_MIS` (zeros otherwise); see `docs/LIGHT_MIS.md` section 5.
 
 The light point `y`, its normal `n_y` and radiance `L_e` are recomputed from (light, voxel,
 face, uv) through the light table entry and the entity's CURRENT transform every time they are
@@ -266,6 +273,20 @@ noise of the bounces; the direct light alone (`--bounces 1`, reference 2048 fram
 walls and not darker or brighter. With ReSTIR GI (`--gi restir --gi-light-nee`): 19.83 dB ->
 21.81 dB with DI, gi_ms 0.31 -> 0.63. With NRD (64 frames): 24.21 dB vs 24.11 dB, denoise 0.50 vs
 0.65 ms.
+
+### Step 3: MIS (2026-10-21)
+
+`docs/LIGHT_MIS.md` section 5 and its "As built (phase B)". With `CAELIX_GI_FLAG_LIGHT_MIS` (path
+trace method only; with ReSTIR GI the primary vertex keeps the exclusive rule and the DI its full
+weight, `DiMisEnabled`) the DI is the NEE strategy of the balance heuristic at the primary vertex:
+the reservoir carries the receiver's proxy context (the 48-byte layout above), the target becomes
+`p_hat(y) = luminance(L_e) * G * w_nee(y; receiver)` (`DiTargetPdf(light, DiReceiverOf(fc, r),
+mis)`; the spatial Z counts evaluate it at each neighbour's own receiver), the shade pass adds `L_e
+* G * V * W * w_nee`, and the trace kernel's first segment after a diffuse primary vertex counts a
+list-light hit with `w_bsdf` from the same context. Without the flag the DI gives the same images
+as before (checked: the DI test numbers with the step 2 shaders and with the new ones are
+identical). Light box: DI + MIS against light NEE ratio 0.9998; the 8 x 8 panel: the 64-frame
+RMSE of DI drops from 2.580 to 2.387 (0.925x) with MIS.
 
 ### Open points
 
