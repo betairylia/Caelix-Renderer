@@ -113,10 +113,17 @@ trace reads this one) and `C_cur` (written by the latest fill). The fill moves `
 `C_prev` before writing. A cell inserted by a lookup starts with both at 0; an evicted cell gets
 both 0; `C_prev = 0` selects the global proxy (the first frame of a cell).
 
-Cell layout (296 bytes, was 288): `0 key_lo, 4 key_hi, 8 touched_frame, 12 entity, 16 coord (3),
-28 level, 32 C_prev, 36 C_cur, 40 reservoirs (32 x 8)`. `kLightCellBytes`, `kLightCellReservoirOffset`
-and the renderer's `kCellBytes` change together; the ABI comments that say "288 bytes per cell"
-say 296.
+Cell layout (304 bytes since the temporal cell reuse; 296 in step 3, 288 before):
+`0 key_lo, 4 key_hi, 8 touched_frame, 12 entity, 16 coord (3), 28 level, 32 C_prev, 36 C_cur,
+40 M, 44 C_n, 48 reservoirs (32 x 8)`. `kLightCellBytes`, `kLightCellReservoirOffset` and the
+renderer's `kCellBytes` change together; the ABI comments say "304 bytes per cell".
+
+With `CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL` (docs/LIGHT_LIST.md section 2.2) the normalisation comes
+from dedicated draws: each fill thread draws one more entry from the CDF only for the estimate,
+and C_cur is the running mean of those draws over at most `light_temporal_frames` x 32 draws
+(count in C_n). The reason: with temporal reuse the previous fill's candidates are part of this
+frame's reservoirs, so `w_sum / K` (even one frame delayed through C_prev) would be correlated
+with the reservoirs that the trace samples. The trace still reads C_prev.
 
 ## 4. Path tracer (`TracePath`, flag `CAELIX_GI_FLAG_LIGHT_MIS`)
 

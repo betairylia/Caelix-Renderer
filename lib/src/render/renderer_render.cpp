@@ -76,6 +76,8 @@ constexpr uint32_t kDefaultLightCandidates = 8;
 constexpr float kDefaultLightLevelFootprint = 0.25f;
 // CaelixGiOptions::di_candidates default (docs/RESTIR_DI.md).
 constexpr uint32_t kDefaultDiCandidates = 4;
+// CaelixGiOptions::light_temporal_frames default (docs/LIGHT_LIST.md section 2.2).
+constexpr uint32_t kDefaultLightTemporalFrames = 20;
 // [numthreads(32, 1, 1)] per cell in caelix_light_cells.hlsl, 1024 cells per dispatch row.
 constexpr uint32_t kLightCellsPerRow = 1024;
 
@@ -664,7 +666,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         restir ? gi_options_.flags
                : (gi_options_.flags & (static_cast<uint32_t>(CAELIX_GI_FLAG_DIFFUSE_ONLY | CAELIX_GI_FLAG_LIGHT_NEE |
                                                              CAELIX_GI_FLAG_LIGHT_CELL_JITTER |
-                                                             CAELIX_GI_FLAG_LIGHT_MIS) |
+                                                             CAELIX_GI_FLAG_LIGHT_MIS |
+                                                             CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL) |
                                        (restir_di ? (kReuseFlags | CAELIX_GI_FLAG_RESTIR_DI) : 0u)));
     if (!lighting)
     {
@@ -723,6 +726,16 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         constants.light_level_footprint = gi_options_.light_level_footprint != 0.0f
                                               ? gi_options_.light_level_footprint
                                               : kDefaultLightLevelFootprint;
+        // Temporal cell reuse (static scene): the history is valid unless the scene rebuilt its light
+        // table since the previous fill (entry indices may have moved) or a reset was requested; 0
+        // makes the fill drop it for this frame.
+        const bool cell_history = !light_cell_reset_ && light_stats.rebuilds == light_cell_rebuilds_;
+        if ((constants.gi_flags & CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL) != 0 && cell_history)
+        {
+            constants.light_temporal_frames = gi_options_.light_temporal_frames != 0
+                                                  ? gi_options_.light_temporal_frames
+                                                  : kDefaultLightTemporalFrames;
+        }
     }
     if (sky)
     {
@@ -816,6 +829,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         {
             light_timer_.End(cmd);
         }
+        light_cell_reset_ = false;
+        light_cell_rebuilds_ = light_stats.rebuilds;
         Barriers filled;
         filled.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,

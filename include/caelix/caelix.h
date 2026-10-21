@@ -78,7 +78,9 @@ extern "C" {
    (32 -> 48 bytes) and CaelixGiStats (16 -> 32 bytes), also without a bump. The ReSTIR DI step
    (docs/RESTIR_DI.md) added CAELIX_GI_FLAG_RESTIR_DI and renamed CaelixGiOptions::light_reserved to
    di_candidates (same size). The light cell jitter added CAELIX_GI_FLAG_LIGHT_CELL_JITTER. The light MIS step
-   (docs/LIGHT_MIS.md) added CAELIX_GI_FLAG_LIGHT_MIS (no struct changed). A host built against
+   (docs/LIGHT_MIS.md) added CAELIX_GI_FLAG_LIGHT_MIS (no struct changed). The light cell temporal reuse
+   added CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL and appended light_temporal_frames to CaelixGiOptions
+   (48 -> 52 bytes). A host built against
    an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1177,6 +1179,13 @@ typedef enum CaelixGiMethod
                                                  hit after a light NEE vertex is skipped. With RESTIR_DI the DI
                                                  at the primary surface takes part as the NEE strategy (not with
                                                  CAELIX_GI_RESTIR) */
+#define CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL (1u << 9) /* with LIGHT_NEE: the cell fill merges each reservoir's
+                                                 previous frame reservoir as temporal history (M-capped by
+                                                 light_temporal_frames) and estimates the cell normalisation
+                                                 from dedicated draws accumulated over frames
+                                                 (docs/LIGHT_LIST.md section 2.2). Assumes a static scene (no
+                                                 scene edits, no entity motion); the history is dropped when
+                                                 the light table was rebuilt or reset is set */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
@@ -1211,11 +1220,14 @@ typedef struct CaelixGiOptions
     float depth_threshold;    /* 0 = 0.1: |x_v(q) - x_v(r)| must be below threshold * view_z(r) */
     uint32_t reset;           /* 1 = drop the reservoir history with the next render */
     uint32_t light_cell_capacity; /* 0 = 65536 light cells; else a power of two in 1024 .. 1048576
-                                     (296 bytes per cell) */
+                                     (304 bytes per cell) */
     uint32_t light_candidates;    /* 0 = 8; 1 .. 64 candidates per cell reservoir and frame */
     float light_level_footprint;  /* 0 = 0.25: a vertex whose pixel footprint (world units per pixel at
                                      its camera distance) is below this uses 8-voxel cells, else 32 */
     uint32_t di_candidates;       /* 0 = 4; 1 .. 32 initial light candidates per pixel (RESTIR_DI) */
+    uint32_t light_temporal_frames; /* 0 = 20; LIGHT_CELL_TEMPORAL: the history behind a cell reservoir is
+                                       clamped to this many frames (x light_candidates candidates) before
+                                       the merge; 1 .. 1024 */
 } CaelixGiOptions;
 
 /* Sets the GI options of the renderer; they apply from the next render on and stay until the next
@@ -1228,12 +1240,12 @@ typedef struct CaelixGiOptions
    the DI reservoir buffers (4 x 48 bytes per pixel) likewise at the first render with
    CAELIX_GI_FLAG_RESTIR_DI. The DI history is also dropped when the scene's light table was rebuilt
    since the renderer's previous render.
-   The light cells (light_cell_capacity x 296 bytes) are allocated at the first render with
+   The light cells (light_cell_capacity x 304 bytes) are allocated at the first render with
    CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity changes.
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,
-   light_candidates > 64, CAELIX_GI_FLAG_RESTIR_DI without CAELIX_GI_FLAG_LIGHT_NEE, di_candidates > 32
-   -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
+   light_candidates > 64, CAELIX_GI_FLAG_RESTIR_DI without CAELIX_GI_FLAG_LIGHT_NEE, di_candidates > 32,
+   light_temporal_frames > 1024 -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);
 
 typedef struct CaelixGiStats

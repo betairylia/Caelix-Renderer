@@ -104,7 +104,8 @@ struct FrameConstants
     uint32_t di_candidates;             // 680  initial candidates per pixel (1 .. 32)
     uint32_t di_history_valid;          // 684  1 = di_prev holds last frame's DI reservoirs of this renderer
     uint64_t light_indices;             // 688  Scene::light_indices_address(): brick -> light entry map, 0 = none
-    uint32_t pad_696[2];                // 696 .. 703
+    uint32_t light_temporal_frames;     // 696  LIGHT_CELL_TEMPORAL: frames of history the fill keeps (0 = none this frame)
+    uint32_t pad_700;                   // 700 .. 703
 };
 static_assert(sizeof(FrameConstants) == 704);
 static_assert(offsetof(FrameConstants, size) == 64);
@@ -156,6 +157,7 @@ static_assert(offsetof(FrameConstants, di_out) == 672);
 static_assert(offsetof(FrameConstants, di_candidates) == 680);
 static_assert(offsetof(FrameConstants, di_history_valid) == 684);
 static_assert(offsetof(FrameConstants, light_indices) == 688);
+static_assert(offsetof(FrameConstants, light_temporal_frames) == 696);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

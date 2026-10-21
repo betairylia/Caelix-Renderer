@@ -371,8 +371,8 @@ void Renderer::EnsureLightCells(uint32_t capacity, uint64_t frame)
     {
         return;
     }
-    // 296 bytes per cell (render/caelix_light_sample.hlsl). On a throw the old buffer stays.
-    constexpr VkDeviceSize kCellBytes = 296;
+    // 304 bytes per cell (render/caelix_light_sample.hlsl). On a throw the old buffer stays.
+    constexpr VkDeviceSize kCellBytes = 304;
     GpuBuffer fresh = GpuBuffer::DeviceLocal(device_.allocator(), device_.device(), kCellBytes * capacity);
     if (light_cells_.valid())
     {
@@ -392,7 +392,8 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
     constexpr uint32_t kKnownFlags = CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_VISIBILITY |
                                      CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY |
                                      CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI |
-                                     CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_MIS;
+                                     CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_MIS |
+                                     CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
@@ -454,11 +455,23 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
         CAELIX_LOGE("%s: di_candidates %u is above the maximum 32", kFunction, options.di_candidates);
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    if (options.light_temporal_frames > 1024)
+    {
+        CAELIX_LOGE("%s: light_temporal_frames %u is above the maximum 1024", kFunction,
+                    options.light_temporal_frames);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
     // Reservoirs of another method or other reuse flags are not a valid history (GI and DI).
     if (options.reset != 0 || options.method != gi_options_.method || options.flags != gi_options_.flags)
     {
         gi_history_valid_ = false;
         di_history_valid_ = false;
+    }
+    // The light cell history (CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL) is dropped by reset only: the cell
+    // targets do not depend on the method or the other flags, and a fill without the flag stores M 0.
+    if (options.reset != 0)
+    {
+        light_cell_reset_ = true;
     }
     gi_options_ = options;
     gi_options_.reset = 0;

@@ -38,6 +38,10 @@ RUNS = {
     "di": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di",
     "di_unbiased": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di --gi-unbiased",
     "di_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --gi-restir-di",
+    # Temporal reuse in the light cell fill (docs/LIGHT_LIST.md section 2.2; static scenes).
+    "pt_nee_temporal": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal",
+    "pt_nee_temporal_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal",
+    "di_temporal": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di --light-cell-temporal",
 }
 
 TIMINGS_RE = re.compile(r"timings:((?:\s+\w+=[-+0-9.eE]+)+)")

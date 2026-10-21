@@ -275,6 +275,12 @@ pub struct GiSettings {
     /// Light NEE: MIS between the light NEE and the diffuse bounce (`CAELIX_GI_FLAG_LIGHT_MIS`,
     /// docs/LIGHT_MIS.md); off: a list-light hit after a light NEE vertex is skipped.
     pub light_mis: bool,
+    /// Light NEE: temporal reuse in the light cell fill (`CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL`,
+    /// docs/LIGHT_LIST.md section 2.2): each cell reservoir merges its previous frame's reservoir;
+    /// assumes a static scene.
+    pub light_cell_temporal: bool,
+    /// Light NEE with `light_cell_temporal`: frames of history behind a cell reservoir (1..1024).
+    pub light_temporal_frames: u32,
     /// Candidates per cell reservoir and frame (1..64).
     pub light_candidates: u32,
     /// World units per pixel below which a vertex uses 8-voxel cells (else 32-voxel cells).
@@ -304,6 +310,8 @@ impl Default for GiSettings {
             light_cells: 65536,
             light_cell_jitter: true,
             light_mis: true,
+            light_cell_temporal: false,
+            light_temporal_frames: 20,
             light_candidates: 8,
             light_footprint: 0.25,
             restir_di: false,
@@ -339,6 +347,9 @@ impl GiSettings {
             if self.light_mis {
                 flags |= CAELIX_GI_FLAG_LIGHT_MIS;
             }
+            if self.light_cell_temporal {
+                flags |= CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
+            }
             // RESTIR_DI needs LIGHT_NEE (the library rejects it alone).
             if self.restir_di {
                 flags |= CAELIX_GI_FLAG_RESTIR_DI;
@@ -362,6 +373,7 @@ impl GiSettings {
             light_candidates: self.light_candidates,
             light_level_footprint: self.light_footprint,
             di_candidates: self.di_candidates,
+            light_temporal_frames: self.light_temporal_frames,
         }
     }
 }

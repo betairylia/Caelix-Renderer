@@ -426,7 +426,7 @@ struct Args {
     /// points closer than this are left to the BSDF path.
     #[arg(long, value_name = "F", default_value_t = 0.0)]
     light_nee_distance: f32,
-    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 296 bytes each).
+    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 304 bytes each).
     #[arg(long, value_name = "N", default_value_t = 65536)]
     light_cells: u32,
     /// Light NEE: candidates per cell reservoir and frame (1..64).
@@ -440,6 +440,14 @@ struct Args {
     /// list-light hit after a light NEE vertex is skipped instead (the step 1 rule).
     #[arg(long)]
     light_no_mis: bool,
+    /// Light NEE: temporal reuse in the light cell fill (each cell reservoir merges its previous
+    /// frame's reservoir, history capped by --light-temporal-frames); assumes a static scene.
+    #[arg(long)]
+    light_cell_temporal: bool,
+    /// Light NEE with --light-cell-temporal: frames of history behind a cell reservoir (1..1024).
+    #[arg(long, value_name = "N", default_value_t = 20,
+          value_parser = clap::value_parser!(u32).range(1..=1024))]
+    light_temporal_frames: u32,
     /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 8-voxel
     /// cells, else 32-voxel cells.
     #[arg(long, value_name = "F", default_value_t = 0.25)]
@@ -2076,6 +2084,8 @@ fn main() -> anyhow::Result<()> {
             light_cells: args.light_cells,
             light_cell_jitter: !args.light_no_cell_jitter,
             light_mis: !args.light_no_mis,
+            light_cell_temporal: args.light_cell_temporal,
+            light_temporal_frames: args.light_temporal_frames,
             light_candidates: args.light_candidates,
             light_footprint: args.light_footprint,
             restir_di: args.gi_restir_di,

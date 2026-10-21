@@ -607,6 +607,13 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             ui.add_enabled(light, Slider::new(&mut gi.light_footprint, 0.01..=4.0).logarithmic(true));
             ui.end_row();
 
+            ui.label("light temporal frames");
+            ui.add_enabled(
+                light && gi.light_cell_temporal,
+                Slider::new(&mut gi.light_temporal_frames, 1..=1024).logarithmic(true),
+            );
+            ui.end_row();
+
             ui.label("DI candidates");
             ui.add_enabled(light && gi.restir_di, Slider::new(&mut gi.di_candidates, 1..=32));
             ui.end_row();
@@ -617,6 +624,14 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             egui::Checkbox::new(&mut gi.light_cell_jitter, "jitter light cell lookup"),
         )
         .on_hover_text("Each vertex reads one of up to 8 cells around its hit point: per-cell flicker becomes per-pixel noise");
+        ui.add_enabled(
+            lighting && gi.light_nee,
+            egui::Checkbox::new(&mut gi.light_cell_temporal, "temporal reuse in light cell fill"),
+        )
+        .on_hover_text(
+            "Each cell reservoir merges its previous frame's reservoir (history capped by the light temporal frames); \
+             assumes a static scene",
+        );
         ui.add_enabled(
             lighting && gi.light_nee,
             egui::Checkbox::new(&mut gi.light_mis, "MIS light NEE / diffuse bounce"),

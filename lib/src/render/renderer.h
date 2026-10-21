@@ -78,13 +78,16 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // until safe) when the render size changes, kept while another method runs.
 //
 // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE, lighting modes; docs/LIGHT_LIST.md): the renderer owns the
-// light cells (CaelixGiOptions::light_cell_capacity x 296 bytes, trace set binding 21), created and
+// light cells (CaelixGiOptions::light_cell_capacity x 304 bytes, trace set binding 21), created and
 // zero-filled at the first render with the flag, recreated (the old buffer retired until safe) when
 // the capacity changes, kept while the flag is off. When the scene has a light table, the light cell
 // fill (caelix_light_cells, trace set, TracePush) runs before the sky SH kernel and the trace, with
 // its own timer (CaelixGiStats::light_fill_ms); a compute -> compute barrier orders its writes before
 // the trace, which reads the reservoirs and inserts new cells. frame_counter_ (the render count) is
-// the cells' clock.
+// the cells' clock. With CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL the fill merges each reservoir's previous
+// fill (FrameConstants::light_temporal_frames > 0); the history is dropped (0 for one fill) when the
+// scene rebuilt its light table since the previous fill (light_cell_rebuilds_) or after a reset
+// (light_cell_reset_).
 //
 // ReSTIR DI (CAELIX_GI_FLAG_RESTIR_DI with LIGHT_NEE, lighting modes with bounces and a light
 // table; docs/RESTIR_DI.md): the trace kernel stores one initial DI reservoir per pixel, then
@@ -359,10 +362,12 @@ private:
     uint64_t di_light_rebuilds_ = 0;     // CaelixLightStats::rebuilds at the previous ReSTIR DI render
     std::vector<RetiredGiBuffers> retired_di_;
     // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE).
-    GpuBuffer light_cells_;                  // capacity x 296 bytes (render/caelix_light_sample.hlsl)
+    GpuBuffer light_cells_;                  // capacity x 304 bytes (render/caelix_light_sample.hlsl)
     uint32_t light_cell_capacity_ = 0;       // cells of light_cells_
     bool light_cells_need_clear_ = false;    // light_cells_ is new: the next render zero-fills it
     uint64_t light_cells_last_frame_ = 0;    // the last frame that used light_cells_
+    bool light_cell_reset_ = false;          // CaelixGiOptions::reset: the next fill drops the cell history
+    uint64_t light_cell_rebuilds_ = 0;       // CaelixLightStats::rebuilds at the previous light cell fill
     std::vector<RetiredLightCells> retired_light_cells_;
     GpuTimer light_timer_;                   // the light cell fill
     uint32_t frame_counter_ = 0;             // render calls of this renderer (the cells' clock)

@@ -130,15 +130,21 @@ render that needs it, recreated when the capacity option changes, retired safely
 per cell (`kLightCellReservoirs`, a shader constant).
 
 ```
-Cell (296 B since step 3, docs/LIGHT_MIS.md; 288 B before, without C_prev and C_cur)
+Cell (304 B since the temporal cell reuse, section 2.2; 296 B since step 3, docs/LIGHT_MIS.md;
+288 B before, without C_prev and C_cur)
   uint64_t key;          //   0  0 = empty; else the fingerprint of (entity, level, cell coordinate)
   uint touched_frame;    //   8  fc.frame_counter (section 3) of the last lookup
   uint entity;           //  12
   int3 coord;            //  16  cell coordinate at `level`
   uint level;            //  28
   float C_prev;          //  32  cell normalisation of the fill before the latest one (MIS proxy)
-  float C_cur;           //  36  cell normalisation of the latest fill (mean of w_sum / K)
-  LightCellReservoir r[32];  // 40 .. 296
+  float C_cur;           //  36  cell normalisation of the latest fill (mean of w_sum / K; with
+                         //      LIGHT_CELL_TEMPORAL the running mean of dedicated draws)
+  float M;               //  40  LIGHT_CELL_TEMPORAL: the candidate count behind every reservoir of
+                         //      the cell (uniform over the 32: all threads merge the same way);
+                         //      0 = no history
+  float C_n;             //  44  LIGHT_CELL_TEMPORAL: the draw count behind C_cur; 0 = none
+  LightCellReservoir r[32];  // 48 .. 304
 LightCellReservoir (8 B)
   uint light;            // entry index in the light table, 0xFFFFFFFF = empty
   float W;               // unbiased contribution weight of the brick-level target (0 = empty)
@@ -227,6 +233,52 @@ Streaming RIS over the K candidates with weight `p_hat_i / p_i`; the result rese
 `light = selected i, W = (w_sum / K) / p_hat_selected` (0 when w_sum = 0). Unbiased for the
 brick-level target. No temporal reuse of cell reservoirs in step 1.
 
+Temporal reuse (`CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL`, 2026-10-21). Test feature: it assumes a
+static scene (no scene edits, no entity motion), because the merge evaluates the old sample with
+this frame's target. After the K fresh candidates (same draws in the same order as without the
+flag) each thread merges the reservoir it wrote in the previous fill as one more candidate:
+
+```
+m_cap  = light_temporal_frames * K          // FrameConstants::light_temporal_frames, 0 = drop
+M_old  = min(cell.M, m_cap)
+old    = this thread's reservoir (light, W_old)
+u_old  = RandomFloat01(rng)                 // always drawn with the flag: the stream does not
+                                            // depend on the data
+if M_old > 0 and old.light valid (< count) and W_old > 0 and p_hat_old = total_old * G_old > 0:
+    w_old = p_hat_old * W_old * M_old;  w_sum += w_old;  select old with probability w_old / w_sum
+M_new  = M_old + K
+W      = (w_sum / M_new) / p_hat_selected
+```
+
+Thread 0 stores `M = M_new` in the header (uniform for the cell: every thread merges the same
+way). `CaelixGiOptions::light_temporal_frames` (0 = 20, 1 .. 1024; host `--light-temporal-frames`)
+sets the cap. The renderer passes `light_temporal_frames = 0` (the fill drops the history for one
+frame) when the scene rebuilt its light table since the previous fill (`CaelixLightStats::rebuilds`
+changed: entry indices may have moved) or after `CaelixGiOptions::reset`. A new cell (insert,
+eviction, a fill without a usable table) has M = 0; a fill without the flag stores M = 0, so a
+later switch to the flag starts clean.
+
+Unbiased: `E[p_hat(y_old) W_old] = C` (the cell normalisation), so `w_old` has expectation
+`M_old C` and `w_sum / M_new` estimates C; the merge weights (`M_old / M_new` for the history,
+`1 / M_new` per fresh candidate) sum to 1, every entry with total > 0 is reachable from the fresh
+draws, and the target is the same every frame (static scene), so W stays an unbiased contribution
+weight.
+
+Cell normalisation with the flag: the previous fill's candidates are part of this frame's
+reservoirs, so a C estimate made from the candidates (even one frame delayed through `C_prev`) is
+correlated with the reservoirs the trace samples, and the MIS proxy (docs/LIGHT_MIS.md section 3)
+must stay independent of them. Each thread therefore makes one dedicated draw from the CDF
+(`w_c = G_j * total`, an unbiased estimate of C), and thread 0 folds the mean of the 32 into
+`C_cur` as a running mean: `n_old = min(C_n, light_temporal_frames * 32)`,
+`C_cur = (C_cur_old * n_old + sum of w_c) / (n_old + 32)`, `C_n = n_old + 32`; `C_prev = C_cur_old`
+as before. Cost: one more CDF search, entry load and G per thread (the shroom forest at 960 x 540:
+fill 0.6 -> 0.75 ms in one frame's timings, not a careful measurement).
+
+Host: `--light-cell-temporal`, `--light-temporal-frames N` (default 20), UI checkbox "temporal
+reuse in light cell fill" and slider "light temporal frames". Bench runs `pt_nee_temporal`,
+`pt_nee_temporal_conv`, `di_temporal`. Test: "light NEE with temporal cell reuse is unbiased" (four
+single-voxel lights in four ceiling bricks: with one brick the merge cannot change W).
+
 ### 2.3 At a path vertex (`SampleLightAtVertex`)
 
 ```
@@ -294,9 +346,9 @@ is per vertex, every bounce, path trace and ReSTIR GI methods; ReSTIR DI's initi
 flag the random stream and the lookup are unchanged. Host: on by default with `light NEE`,
 `--light-no-cell-jitter` / the "jitter light cell lookup" checkbox turn it off.
 
-Not built (variance, not pattern): temporal reuse of the cell reservoirs in the fill (thread r
-merges its old reservoir, M-capped, as one more candidate), and several reservoirs per vertex
-resampled with the exact point target.
+Built since (variance, not pattern): temporal reuse of the cell reservoirs in the fill (thread r
+merges its old reservoir, M-capped, as one more candidate; `CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL`,
+section 2.2). Not built: several reservoirs per vertex resampled with the exact point target.
 
 ## 3. Frame constants and push constants
 
@@ -313,6 +365,10 @@ uint32_t frame_counter;      // 640  renderer render count (1, 2, ...), for touc
 uint32_t light_entity_mask;  // 644  reserved 0
 uint32_t pad_648[6];         // 648 .. 671
 ```
+
+(Later steps filled the padding and grew the struct to 704 B; the temporal cell reuse uses offset
+696: `uint32_t light_temporal_frames` = the frames of history the fill keeps, 0 = none this frame;
+`pad_700` follows.)
 
 `TracePush` is unchanged. Scene kernels use `LightPush` (section 1.2, `gpu_structs.h`):
 `{ uint64_t group_infos, slot_tables, page_table, light_words, light_table, materials,
@@ -447,11 +503,11 @@ host flags and UI, `tools/gi_bench.*`.
 | --- | --- |
 | light word | 4 B per AABB row (`Scene::light_words_`, grows with the AABB pool; 256 KiB at the initial 65536 rows) |
 | light table | 64 B header + 132 B per `max_bricks` entry (128 B entry + 4 B CDF): 8.3 MiB at 65536; since step 4 (`LIGHT_FACES.md`) 452 B per entry (448 B entry + 4 B CDF): 28.3 MiB at 65536, 452 MiB at 2^20 |
-| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md) |
+| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md; 304 B since the temporal cell reuse: 19 MiB at 65536) |
 | `FinalizePush` | 88 -> 104 B (`light_words`, `materials`, `min_emission` in place of `pad`) |
 | `LightPush` | 72 B (see differences); 80 B since step 3 (`light_indices`, docs/LIGHT_MIS.md) |
 | `FrameConstants` | 608 -> 672 B, fields as in section 3 (`frame_counter` at 640) |
-| `CaelixGiOptions` | 32 -> 48 B; `CaelixGiStats` 16 -> 32 B |
+| `CaelixGiOptions` | 32 -> 48 B (52 B since the temporal cell reuse: `light_temporal_frames`); `CaelixGiStats` 16 -> 32 B |
 | `CaelixLightOptions` | 16 B; `CaelixLightStats` 24 B |
 
 Header word 2 (the design's `pad[0]`) is now `capacity` (= max_bricks, written by the scan): the
@@ -572,7 +628,9 @@ render kernels need it to find the CDF behind the entries.
 - Material changes do not rewrite light words: a brick whose word is 0 under the old table stays
   out until it is finalized again (an entry whose lights vanished is dropped by the compact
   kernel, difference 5).
-- No temporal reuse of the cell reservoirs; the fill touches every live cell every frame.
+- Temporal reuse of the cell reservoirs is built behind `CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL`
+  (section 2.2) for static scenes only; it has no motion or edit handling beyond dropping the
+  history after a light table rebuild. The fill touches every live cell every frame.
 - `maxStorageBufferRange`: the table binding at `max_bricks` 2^20 is 474 MB since step 4 (138 MB
   before), above the Vulkan minimum of 128 MB (NVIDIA allows 4 GiB). Only the compact and scan
   kernels bind it; the render kernels read it through addresses.

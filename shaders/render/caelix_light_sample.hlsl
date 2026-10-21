@@ -4,7 +4,7 @@
 // MIS with the BSDF path (docs/LIGHT_MIS.md: the density proxy, LightNeeMisWeight, LightListCanSample).
 //
 // Light cells: a hash table of fc.light_cell_capacity cells in g_light_cells (trace set binding
-// 21), 296 bytes each (288 before step 3 of the light list):
+// 21), 304 bytes each (288 before step 3 of the light list, 296 before the temporal cell reuse):
 //   0    uint key_lo, key_hi    the 64-bit fingerprint of (entity, level, coordinate); key_lo 0 = empty
 //   8    uint touched_frame     fc.frame_counter of the newest lookup
 //   12   uint entity
@@ -13,7 +13,11 @@
 //   32   float C_prev           the cell normalisation C_c of the fill before the latest one (the MIS
 //                               proxy reads this one; 0 = none yet: the global proxy)
 //   36   float C_cur            C_c of the latest fill: the mean of w_sum / K over the 32 reservoirs
-//   40   32 x { uint light; float W }   light = entry index of the table, W = the RIS weight (0 = empty)
+//                               (kGiFlagLightCellTemporal: the running mean of dedicated draws)
+//   40   float M                kGiFlagLightCellTemporal: the candidate count behind every reservoir of
+//                               the cell (uniform over the 32: all threads merge the same way); 0 = no history
+//   44   float C_n              kGiFlagLightCellTemporal: the draw count behind C_cur; 0 = none
+//   48   32 x { uint light; float W }   light = entry index of the table, W = the RIS weight (0 = empty)
 // The trace kernel looks cells up and inserts missing ones (LightCellLookup); caelix_light_cells.hlsl
 // fills the reservoirs of every live cell before the next trace and evicts cells untouched for 64
 // frames. The fingerprint is claimed with a 32-bit compare-and-swap on key_lo (64-bit buffer atomics
@@ -34,11 +38,13 @@
 #include "render/caelix_scene_trace.hlsl"
 #include "render/caelix_shading.hlsl"
 
-static const uint kLightCellBytes = 296;
+static const uint kLightCellBytes = 304;
 static const uint kLightCellReservoirs = 32;
 static const uint kLightCellCPrevOffset = 32;
 static const uint kLightCellCCurOffset = 36;
-static const uint kLightCellReservoirOffset = 40;
+static const uint kLightCellMOffset = 40;
+static const uint kLightCellCNOffset = 44;
+static const uint kLightCellReservoirOffset = 48;
 static const uint kLightCellProbes = 8;
 // A cell not looked up for this many frames is evicted by the fill pass.
 static const uint kLightCellMaxAge = 64;
@@ -116,14 +122,15 @@ int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord
             if (original == 0u)
             {
                 // Inserted. A slot with key 0 has empty reservoirs (zero at creation, cleared on
-                // eviction), so the cell samples the global table until the next fill. C_prev and
-                // C_cur start at 0 (the MIS proxy is the global one until the second fill).
+                // eviction), so the cell samples the global table until the next fill. C_prev,
+                // C_cur, M and C_n start at 0 (the MIS proxy is the global one until the second
+                // fill; no temporal history).
                 g_light_cells.Store(base + 4, key.y);
                 g_light_cells.Store(base + 8, fc.frame_counter);
                 g_light_cells.Store(base + 12, entity);
                 g_light_cells.Store3(base + 16, asuint(coord));
                 g_light_cells.Store(base + 28, level);
-                g_light_cells.Store2(base + kLightCellCPrevOffset, uint2(0u, 0u));
+                g_light_cells.Store4(base + kLightCellCPrevOffset, uint4(0u, 0u, 0u, 0u));
                 return int(slot);
             }
             key_lo = original;

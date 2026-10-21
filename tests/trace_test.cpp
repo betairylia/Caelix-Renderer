@@ -3477,6 +3477,64 @@ TEST_CASE("light NEE with MIS is unbiased")
     CloseRig(rig);
 }
 
+TEST_CASE("light NEE with temporal cell reuse is unbiased")
+{
+    // Four single-voxel lights in four ceiling bricks: with one brick every cell reservoir holds the
+    // same light with W = 1 / p_hat whatever the merge does, so the temporal reuse is only tested
+    // with several bricks to choose from.
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    EnableLights(rig.scene);
+    World world = LightBoxWalls();
+    FillBox(world, 4, kBoxInterior, 4, 4, kBoxInterior, 4, kWhiteEmitter512);
+    FillBox(world, 20, kBoxInterior, 20, 20, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 4, kBoxInterior, 20, 4, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 12, kBoxInterior, 12, 12, kBoxInterior, 12, kWhiteEmitter512);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 4);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    // The default capacity (65536 cells) and the default history (20 frames).
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> temporal = LightReference(rig, renderer, set, camera, 1024, 200000);
+    CaelixGiStats stats{};
+    caelix_renderer_get_gi_stats(renderer, &stats);
+    CHECK(stats.light_cell_bytes == 65536ull * 304ull);
+    const LightComparison c = CompareLight(pt, temporal, kBoxSize);
+    std::printf("4 lights, light NEE + MIS + temporal cells vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 "
+                "block PSNR %.2f dB\n",
+                c.test_mean, c.ref_mean, c.ratio, c.block_psnr);
+    // The same without the temporal reuse (reported only), and a check that the flag changes the image.
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> fresh = LightReference(rig, renderer, set, camera, 1024, 200000);
+    const LightComparison f = CompareLight(pt, fresh, kBoxSize);
+    std::printf("4 lights, light NEE + MIS (no temporal) vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 block "
+                "PSNR %.2f dB\n",
+                f.test_mean, f.ref_mean, f.ratio, f.block_psnr);
+    CHECK(c.ref_mean > 0.01);
+    CHECK(c.ratio > 0.97);
+    CHECK(c.ratio < 1.03);
+    CHECK(c.block_psnr > 30.0);
+    CHECK(temporal != fresh);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
 TEST_CASE("MIS on a large emitter")
 {
     Rig rig;
@@ -3827,6 +3885,14 @@ TEST_CASE("cells fill and sample")
     ExpectLibraryErrors(1, [&] {
         REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
     });
+    bad.light_level_footprint = 0.0f;
+    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
+    bad.light_temporal_frames = 1025;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.light_temporal_frames = 0;
+    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE;
 
     CaelixGiOptions gi{};
     gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
@@ -3850,7 +3916,7 @@ TEST_CASE("cells fill and sample")
     std::printf("light cells: %llu bytes, fill %.4f ms (frame %llu), trace %.4f ms\n",
                 static_cast<unsigned long long>(stats.light_cell_bytes), stats.light_fill_ms,
                 static_cast<unsigned long long>(timings.frame_number), timings.trace_ms);
-    CHECK(stats.light_cell_bytes == 1024ull * 296ull);
+    CHECK(stats.light_cell_bytes == 1024ull * 304ull);
     CHECK(timings.frame_number != 0);
     CHECK(stats.light_fill_ms > 0.0f);
 
