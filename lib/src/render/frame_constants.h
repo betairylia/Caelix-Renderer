@@ -6,7 +6,7 @@ namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
 // together. One per render call, in a host-visible buffer; its device address is
-// the only push constant of the trace and composite kernels. 704 bytes. Every field sits at an offset
+// the only push constant of the trace and composite kernels. 720 bytes. Every field sits at an offset
 // that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
 // std430 and scalar layout rules give the same offsets.
 struct FrameConstants
@@ -106,8 +106,12 @@ struct FrameConstants
     uint64_t light_indices;             // 688  Scene::light_indices_address(): brick -> light entry map, 0 = none
     uint32_t light_temporal_frames;     // 696  LIGHT_CELL_TEMPORAL: frames of history the fill keeps (0 = none this frame)
     float light_push_confidence;        // 700  LIGHT_CELL_PUSH: the confidence (M) of a pushed sample in the cell fill; 0 without the flag
+    uint32_t light_nee_candidates;      // 704  LIGHT_NEE: candidates per diffuse vertex (1 .. 32; 1 = no resampling)
+    uint32_t pad_708;                   // 708
+    uint32_t pad_712;                   // 712
+    uint32_t pad_716;                   // 716
 };
-static_assert(sizeof(FrameConstants) == 704);
+static_assert(sizeof(FrameConstants) == 720);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -159,6 +163,7 @@ static_assert(offsetof(FrameConstants, di_history_valid) == 684);
 static_assert(offsetof(FrameConstants, light_indices) == 688);
 static_assert(offsetof(FrameConstants, light_temporal_frames) == 696);
 static_assert(offsetof(FrameConstants, light_push_confidence) == 700);
+static_assert(offsetof(FrameConstants, light_nee_candidates) == 704);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

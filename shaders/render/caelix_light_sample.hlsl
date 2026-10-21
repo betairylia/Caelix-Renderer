@@ -503,6 +503,8 @@ float LightCandidateWeight(LightMisDesc d, float3 x_r)
 struct LightNeeProxyContext
 {
     bool cell;           // the cell proxy (a cell with C_prev > 0); false: the global proxy
+    bool vertex;         // cell and kGiFlagLightProxyVertex: the vertex form of the cell proxy (a frame
+                         // constant: every place that rebuilds a context sets it from fc.gi_flags)
     float3 cell_centre;  // world centre of the cell (as the fill computes it)
     float near_d2;       // (cell half size + 4)^2: the fill's distance floor
     float C;             // the cell's C_prev
@@ -515,6 +517,7 @@ LightNeeProxyContext LightNeeProxyOfSlot(CaelixFrameConstants fc, int slot, uint
 {
     LightNeeProxyContext ctx;
     ctx.cell = false;
+    ctx.vertex = false;
     ctx.cell_centre = float3(0.0f, 0.0f, 0.0f);
     ctx.near_d2 = 0.0f;
     ctx.C = 0.0f;
@@ -534,6 +537,7 @@ LightNeeProxyContext LightNeeProxyOfSlot(CaelixFrameConstants fc, int slot, uint
     float4 r2;
     EntityCurRows(fc, entity, r0, r1, r2);
     ctx.cell = true;
+    ctx.vertex = (fc.gi_flags & kGiFlagLightProxyVertex) != 0u;
     ctx.cell_centre = RowsTransform(r0, r1, r2, (float3(coord) + 0.5f) * cell_size);
     ctx.near_d2 = (0.5f * cell_size + 4.0f) * (0.5f * cell_size + 4.0f);
     ctx.C = c_prev;
@@ -600,10 +604,27 @@ float LightNeeProxyPdfArea(LightNeeProxyContext ctx, LightMisDesc d, float3 x_r)
 // density * d^2 / cos_l and p_bsdf = cos_r / pi. Both sides call this function with the same
 // context and description, so the two weights of a point sum to 1 in every branch: a non-finite
 // or degenerate p_sa (cos_l <= 0) counts as +inf (NEE 1, BSDF 0), both densities 0 as NEE 0, BSDF 1.
+// With ctx.vertex (kGiFlagLightProxyVertex, docs/LIGHT_MIS.md "Vertex proxy") the area density is
+// the vertex form instead of LightNeeProxyPdfArea's cell form.
 float LightNeeMisWeight(LightNeeProxyContext ctx, LightMisDesc d, float3 x_r, float3 n_r, float3 w, float d_light,
                         float cos_l, bool nee_side)
 {
-    const float p_area = LightNeeProxyPdfArea(ctx, d, x_r);
+    float p_area;
+    if (ctx.vertex)
+    {
+        // Vertex form (kGiFlagLightProxyVertex): the voxel-face weight times the receiver's own geometry
+        // term over the cell's C: L_f * cos_r * cos_l / max(d^2, 1) / C, 0 when no candidate face has weight.
+        const float w_cand = LightCandidateWeight(d, x_r);
+        const float L_f = d.face_weight[d.face] * d.inv_n_face;
+        const float cos_r = max(0.0f, dot(n_r, w));
+        p_area = (w_cand > 0.0f && ctx.C > 0.0f)
+                     ? L_f * cos_r * cos_l / max(d_light * d_light, 1.0f) / ctx.C
+                     : 0.0f;
+    }
+    else
+    {
+        p_area = LightNeeProxyPdfArea(ctx, d, x_r);
+    }
     const float p_sa = cos_l > 0.0f ? p_area * (d_light * d_light) / cos_l : 0.0f;
     const float p_bsdf = max(0.0f, dot(n_r, w)) * (1.0f / K_PI);
     if (!(cos_l > 0.0f) || !(p_sa <= 3.0e38f))
@@ -891,6 +912,159 @@ LightPoint LightPointAt(CaelixFrameConstants fc, LightEntryHeader header, uint v
     return p;
 }
 
+// The resampled light NEE of LightNextEvent (section 2.6, K = fc.light_nee_candidates >= 2): K
+// candidates, each drawn exactly as a one-sample NEE draws its sample (a reservoir of the sampling
+// cell `slot`, else the global CDF; then a point), the same loop as DiInitialReservoir. Candidate i
+// is the point y_i with the unbiased contribution weight W_i = W_brick / pdf_area. The target at the
+// vertex is the unoccluded contribution p_hat(y) = luminance(L_e) cos_r cos_l / d^2, times w_nee when
+// `mis`; it is 0 inside the near field (distance < g_lightNeeMinDistance), where the NEE's integrand
+// is 0 too (the near field is the BSDF path's), and 0 where cos_r or cos_l <= 0. One candidate y is
+// kept with probability w_i / w_sum, w_i = p_hat(y_i) W_i, and W_out = w_sum / (K p_hat(y)); one shadow
+// ray to y. RIS with the equal input weights 1/K and unbiased input contribution weights: (y, W_out)
+// is an unbiased contribution weight for any integrand whose support lies in the target's support.
+// The candidates read the same 32 reservoirs of one cell and are therefore correlated; that is
+// harmless, since the estimator is linear in the inputs' contribution weights. Five random numbers per
+// candidate (reservoir, global, the point's four, select), the jitter's three before in the caller.
+// Push-back is excluded by the validation (CAELIX_GI_FLAG_LIGHT_CELL_PUSH needs K = 1).
+float3 LightNextEventResampled(CaelixFrameConstants fc, float3 x_r, float3 n_r, int slot, uint count, float total,
+                               uint capacity, bool mis, LightNeeProxyContext ctx, inout uint rng)
+{
+    const uint64_t table = fc.light_table;
+    const uint K = min(fc.light_nee_candidates, 32u);
+    float w_sum = 0.0f;
+    // The kept candidate (scalars, not the whole LightSample, to limit register pressure).
+    float3 kept_radiance = float3(0.0f, 0.0f, 0.0f);
+    float3 kept_w = float3(0.0f, 0.0f, 0.0f);
+    float kept_distance = 0.0f;
+    float kept_d2 = 0.0f;
+    float kept_cos_r = 0.0f;
+    float kept_cos_l = 0.0f;
+    float kept_p_hat = 0.0f;
+    float kept_w_nee = 1.0f;
+    CAELIX_LOOP
+    for (uint i = 0u; i < K; ++i)
+    {
+        const float u_reservoir = RandomFloat01(rng);
+        const float u_global = RandomFloat01(rng);
+        uint light = kNoLight;
+        float W_brick = 0.0f;
+        uint cell_voxel = 0u;
+        uint cell_face = kLightCellFaceBrick;
+        if (slot >= 0)
+        {
+            const uint cell_r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));
+            const uint2 reservoir =
+                g_light_cells.Load2(uint(slot) * kLightCellBytes + kLightCellReservoirOffset + cell_r * 8u);
+            uint entry_index;
+            uint voxel;
+            uint face;
+            if (asfloat(reservoir.y) > 0.0f && LightCellDecode(reservoir.x, count, entry_index, voxel, face))
+            {
+                light = entry_index;
+                W_brick = asfloat(reservoir.y);
+                cell_voxel = voxel;
+                cell_face = face;
+            }
+        }
+        uint64_t address = 0u;
+        LightEntryHeader entry = (LightEntryHeader)0;
+        if (light != kNoLight)
+        {
+            address = LightEntryAddress(table, light);
+            entry = LoadLightEntryHeader(address);
+            // A voxel-face word whose voxel bit is clear (the scene changed): no sample from the cell.
+            if (cell_face < kLightCellFaceBrick && !LightFaceMaskBit(address, cell_face, LightVoxel3(cell_voxel)))
+            {
+                light = kNoLight;
+            }
+        }
+        if (light == kNoLight)
+        {
+            // The global CDF: the brick's probability is total_b / total.
+            cell_face = kLightCellFaceBrick;
+            light = LightCdfSearch(table, capacity, count, u_global * total);
+            address = LightEntryAddress(table, light);
+            entry = LoadLightEntryHeader(address);
+            W_brick = entry.total_weight > 0.0f ? total / entry.total_weight : 0.0f;
+        }
+        // A voxel-face word: a point uniform on its face (pdf_area 1, W the reservoir's); else a point
+        // of the brick (W_brick / pdf_area).
+        LightSample s;
+        if (cell_face < kLightCellFaceBrick)
+        {
+            s = LightSampleFaceOf(fc, entry, address, cell_voxel, cell_face, false, rng);
+        }
+        else
+        {
+            s = SampleLightEntry(fc, entry, address, x_r, rng);
+        }
+        const float u_select = RandomFloat01(rng);
+        if (!s.valid || !(W_brick > 0.0f))
+        {
+            continue;
+        }
+        const float3 d = s.position - x_r;
+        const float d2 = dot(d, d);
+        const float distance = sqrt(d2);
+        if (!(d2 > 0.0f) || distance < g_lightNeeMinDistance)
+        {
+            continue;  // target 0: the near field is the BSDF path's
+        }
+        const float3 w = d / distance;
+        const float cos_r = dot(n_r, w);
+        const float cos_l = -dot(s.normal, w);
+        if (!(cos_r > 0.0f) || !(cos_l > 0.0f))
+        {
+            continue;
+        }
+        float p_hat = CaelixLuminance(s.radiance) * cos_r * cos_l / d2;
+        float w_nee = 1.0f;
+        if (mis)
+        {
+            w_nee = LightNeeMisWeight(ctx, s.mis, x_r, n_r, w, distance, cos_l, true);
+            p_hat *= w_nee;
+        }
+        const float w_i = p_hat * W_brick / s.pdf_area;
+        if (!(w_i > 0.0f))
+        {
+            continue;
+        }
+        w_sum += w_i;
+        if (u_select * w_sum < w_i)
+        {
+            kept_radiance = s.radiance;
+            kept_w = w;
+            kept_distance = distance;
+            kept_d2 = d2;
+            kept_cos_r = cos_r;
+            kept_cos_l = cos_l;
+            kept_p_hat = p_hat;
+            kept_w_nee = w_nee;
+        }
+    }
+    if (!(w_sum > 0.0f) || !(kept_p_hat > 0.0f))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+    const float W_out = w_sum / (float(K) * kept_p_hat);
+    // The point lies on a voxel face: the ray stops 2 push-offs short of it (as GiVisible).
+    RayDesc shadow;
+    shadow.Origin = x_r;
+    shadow.Direction = kept_w;
+    shadow.TMin = 0.0f;
+    shadow.TMax = kept_distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
+    if (shadow.TMax > 0.0f && TraceShadow(fc, shadow))
+    {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
+    float3 contribution = kept_radiance * ((kept_cos_r * (1.0f / K_PI)) * (kept_cos_l / kept_d2) * W_out);
+    if (mis)
+    {
+        contribution *= kept_w_nee;
+    }
+    return contribution;
+}
+
 // Next-event estimation on the light list at a diffuse path vertex (section 2.3): the receiver
 // x_r (the pushed-off vertex position) with world normal n_r, on brick group `group`, entity-local
 // position `object_point` (the hit point moved a little into the air, for the cell coordinate).
@@ -919,6 +1093,12 @@ LightPoint LightPointAt(CaelixFrameConstants fc, LightEntryHeader header, uint v
 // (LightCellRegionFaceMask: then the point's density covers every face any receiver of the cell can
 // see), else its brick-level word with W_brick; nothing usable (no brick weight) an empty entry.
 // visible = 0 only when the shadow ray was traced and hit.
+// Per-vertex resampling (fc.light_nee_candidates >= 2, section 2.6): after the same lookups (the
+// unjittered one for the proxy context, the jittered one for the sampling cell, the three jitter
+// numbers once) LightNextEventResampled draws K candidates from the sampling cell (or the global CDF),
+// keeps one by the exact target at the vertex (times w_nee with `mis`) and traces one shadow ray; the
+// first two random numbers of this function are then unused. With K = 1 the path below runs
+// unchanged (the same random stream as before section 2.6). No push-back with K >= 2 (validation).
 float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint group, float3 object_point, bool mis,
                       inout uint rng, out LightNeeProxyContext ctx)
 {
@@ -934,15 +1114,10 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     }
     const uint capacity = CAELIX_LOAD_U32(table + kLightHeaderCapacity);
 
-    uint light = kNoLight;
-    float W_cell = 0.0f;
-    uint cell_voxel = 0u;
-    uint cell_face = kLightCellFaceBrick;
     int slot = -1;
     uint entity = 0u;
     uint level = 0u;
     int3 sample_coord = int3(0, 0, 0);
-    uint push_index = kNoLight;  // kGiFlagLightCellPush: the claimed push of the sampling cell
     CAELIX_BRANCH
     if (fc.light_cells != 0u)
     {
@@ -966,25 +1141,38 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
             sample_coord = LightCellCoord(cell_point, level);
             slot = LightCellLookup(fc, entity, level, sample_coord);
         }
-        if (slot >= 0)
+    }
+
+    // Per-vertex resampling (section 2.6): K >= 2 candidates of the same sampling cell, one ray.
+    CAELIX_BRANCH
+    if (fc.light_nee_candidates >= 2u)
+    {
+        return LightNextEventResampled(fc, x_r, n_r, slot, count, total, capacity, mis, ctx, rng);
+    }
+
+    uint light = kNoLight;
+    float W_cell = 0.0f;
+    uint cell_voxel = 0u;
+    uint cell_face = kLightCellFaceBrick;
+    uint push_index = kNoLight;  // kGiFlagLightCellPush: the claimed push of the sampling cell
+    if (slot >= 0)
+    {
+        if ((fc.gi_flags & kGiFlagLightCellPush) != 0u)
         {
-            if ((fc.gi_flags & kGiFlagLightCellPush) != 0u)
-            {
-                push_index = LightCellClaimPush(uint(slot));
-            }
-            const uint r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));
-            const uint2 reservoir =
-                g_light_cells.Load2(uint(slot) * kLightCellBytes + kLightCellReservoirOffset + r * 8u);
-            uint entry_index;
-            uint voxel;
-            uint face;
-            if (asfloat(reservoir.y) > 0.0f && LightCellDecode(reservoir.x, count, entry_index, voxel, face))
-            {
-                light = entry_index;
-                W_cell = asfloat(reservoir.y);
-                cell_voxel = voxel;
-                cell_face = face;
-            }
+            push_index = LightCellClaimPush(uint(slot));
+        }
+        const uint r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));
+        const uint2 reservoir =
+            g_light_cells.Load2(uint(slot) * kLightCellBytes + kLightCellReservoirOffset + r * 8u);
+        uint entry_index;
+        uint voxel;
+        uint face;
+        if (asfloat(reservoir.y) > 0.0f && LightCellDecode(reservoir.x, count, entry_index, voxel, face))
+        {
+            light = entry_index;
+            W_cell = asfloat(reservoir.y);
+            cell_voxel = voxel;
+            cell_face = face;
         }
     }
     uint64_t address = 0u;

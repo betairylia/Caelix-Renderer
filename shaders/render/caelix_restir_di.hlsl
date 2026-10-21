@@ -162,6 +162,7 @@ DiReceiver DiReceiverOf(CaelixFrameConstants fc, DiReservoir r)
         total = (count != 0u && table_total > 0.0f) ? table_total : 0.0f;
     }
     v.ctx.cell = r.cell_C > 0.0f;
+    v.ctx.vertex = v.ctx.cell && (fc.gi_flags & kGiFlagLightProxyVertex) != 0u;
     v.ctx.cell_centre = float3(0.0f, 0.0f, 0.0f);
     v.ctx.near_d2 = 0.0f;
     v.ctx.C = 0.0f;

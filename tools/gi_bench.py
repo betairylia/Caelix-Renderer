@@ -8,6 +8,8 @@ against the scene's reference PNG (tools/image_metrics.py); <out>/README.md + re
 The host prints `timings: trace_ms=<f> gi_ms=<f> light_ms=<f> denoise_ms=<f> composite_ms=<f>
 upscale_ms=<f>`; when absent, the status line `trace X ms | denoise ...` gives trace_ms, else "n/a".
 A scene's "pose" may be null: the host then starts at the pose stored in the world file (no --pose).
+A scene's optional "reference" (a string of host arguments) replaces RUNS["reference"] for that scene,
+e.g. a light NEE reference where the plain path tracer does not converge.
 """
 import argparse
 import json
@@ -49,6 +51,24 @@ RUNS = {
     "--light-cell-push",
     "di_push_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --gi-restir-di --light-cell-temporal "
     "--light-cell-push",
+    # Per-vertex resampling of the light NEE (docs/LIGHT_LIST.md section 2.6) and the vertex MIS
+    # proxy (docs/LIGHT_MIS.md "Vertex proxy").
+    "pt_nee_rs1": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-nee-candidates 1",
+    "pt_nee_rs4": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-nee-candidates 4",
+    "pt_nee_rs4_vp": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-nee-candidates 4 --light-proxy-vertex",
+    "pt_nee_rs16_vp": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-nee-candidates 16 --light-proxy-vertex",
+    "pt_nee_rs1_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-nee-candidates 1",
+    "pt_nee_rs4_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-nee-candidates 4",
+    "pt_nee_rs4_vp_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-nee-candidates 4 --light-proxy-vertex",
+    "pt_nee_rs16_vp_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-nee-candidates 16 --light-proxy-vertex",
 }
 
 TIMINGS_RE = re.compile(r"timings:((?:\s+\w+=[-+0-9.eE]+)+)")
@@ -62,7 +82,8 @@ def build_command(host, scene, run, size, out_dir):
         cmd += ["--pose", scene["pose"]]
     cmd += ["--fov", str(scene["fov"]), "--size", size, "--no-input", "--exit-after-screenshot",
             "--screenshot", str(png)]
-    cmd += RUNS[run].split()
+    args = scene["reference"] if run == "reference" and scene.get("reference") else RUNS[run]
+    cmd += args.split()
     cmd += [str(a) for a in scene.get("extra", [])]
     return cmd, png
 

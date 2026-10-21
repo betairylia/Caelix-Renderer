@@ -455,6 +455,15 @@ struct Args {
     /// Light NEE with --light-cell-push: the confidence (M) of a pushed sample in the cell fill.
     #[arg(long, value_name = "F", default_value_t = 8.0)]
     light_push_confidence: f32,
+    /// Light NEE: light candidates per diffuse vertex, resampled by the exact target at the vertex
+    /// before the one shadow ray (docs/LIGHT_LIST.md section 2.6); 1 = no resampling (1..32).
+    /// Default 1 (--light-cell-push needs 1).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=32))]
+    light_nee_candidates: Option<u32>,
+    /// Light NEE with MIS: the vertex form of the MIS proxy density (the voxel-face weight times the
+    /// receiver's own geometry term over the cell's normalisation; docs/LIGHT_MIS.md "Vertex proxy").
+    #[arg(long)]
+    light_proxy_vertex: bool,
     /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 8-voxel
     /// cells, else 32-voxel cells.
     #[arg(long, value_name = "F", default_value_t = 0.25)]
@@ -2105,6 +2114,8 @@ fn main() -> anyhow::Result<()> {
             light_temporal_frames: args.light_temporal_frames,
             light_cell_push: args.light_cell_push,
             light_push_confidence: args.light_push_confidence,
+            light_nee_candidates: args.light_nee_candidates.unwrap_or(1),
+            light_proxy_vertex: args.light_proxy_vertex,
             light_candidates: args.light_candidates,
             light_footprint: args.light_footprint,
             restir_di: args.gi_restir_di,
@@ -2116,6 +2127,14 @@ fn main() -> anyhow::Result<()> {
     }
     if !args.light_cells.is_power_of_two() || !(1024..=1048576).contains(&args.light_cells) {
         bail!("--light-cells {} must be a power of two in 1024..1048576", args.light_cells);
+    }
+    if let Some(candidates) = args.light_nee_candidates {
+        if args.light_cell_push && candidates >= 2 {
+            bail!(
+                "--light-cell-push needs one light NEE candidate per vertex (--light-nee-candidates 1, \
+                 got {candidates}): the push ring takes the vertex's own sample, not a resampled one"
+            );
+        }
     }
     if !(0.0..=1024.0).contains(&args.light_push_confidence) {
         bail!("--light-push-confidence {} must be in 0..1024", args.light_push_confidence);

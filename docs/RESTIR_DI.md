@@ -147,7 +147,7 @@ primary NEE skipped), `shaders/common/caelix_frame.hlsl` + `lib/src/render/frame
 | --- | --- |
 | `DiReservoir` | 32 B, as designed; bit 3 of `visible_flags_m` = diffuse lobe (difference 2) |
 | DI reservoir buffers | 4 x 32 B per pixel: 2 MiB at 128 x 128, 112.5 MiB at 1280 x 720, 253 MiB at 1920 x 1080 |
-| `FrameConstants` | 672 -> 704 B: `di_initial` 648, `di_prev` 656, `di_temp` 664, `di_out` 672, `di_candidates` 680, `di_history_valid` 684, pad to 704 |
+| `FrameConstants` | 672 -> 704 B: `di_initial` 648, `di_prev` 656, `di_temp` 664, `di_out` 672, `di_candidates` 680, `di_history_valid` 684, pad to 704 (720 B since the per-vertex resampling, `LIGHT_LIST.md` section 2.6) |
 | `CaelixGiOptions` | unchanged size (48 B); `light_reserved` -> `di_candidates` |
 | `CaelixGiStats` | unchanged; `reservoir_bytes` = GI + DI buffers, `gi_ms` = every reuse pass |
 

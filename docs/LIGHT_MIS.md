@@ -87,6 +87,32 @@ The balance heuristic: `w_nee = p_sa / (p_sa + p_bsdf)` with `p_sa = p_area * d^
 power heuristic (the densities are proxies; the balance heuristic is the one that is provably never
 much worse than either strategy alone).
 
+### Vertex proxy (`CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX`, 2026-10-22)
+
+With the flag (and `LIGHT_MIS`), a vertex whose context has a cell (`ctx.cell`, `C_c > 0`) uses
+the VERTEX form of the area density instead of the cell form above:
+
+```
+p_area(y) = L_f * cos_r * cos_l / max(d^2, 1) / C_c       (0 when W_cand = 0)
+L_f       = face_weight[f] / n_f                          (the voxel-face weight of the point's face)
+cos_r     = max(0, dot(n_r, w)),  cos_l = the light face's cosine toward the receiver
+```
+
+so `p_sa = L_f * cos_r * d^2 / max(d^2, 1) / C_c`. It follows the receiver's own geometry term
+(its distance and both cosines) where the cell form only knows the distance from the cell centre
+to the brick centre, which is what the per-vertex resampling (`LIGHT_LIST.md` section 2.6)
+samples by. A vertex without a cell keeps the global form. `LightNeeProxyContext::vertex` is set
+from the flag wherever a context is built or rebuilt (`LightNeeProxyOfSlot`, `DiReceiverOf`), so
+the NEE side (`LightNextEvent`, `LightNextEventResampled`), the BSDF side (`TracePath`) and ReSTIR
+DI's target and shade evaluate the same function, `LightNeeMisWeight`.
+
+It is a PROXY like the cell form: any function that both strategies evaluate identically gives
+weights that sum to 1 for every point, so the combination stays unbiased; only the variance
+depends on how well it follows the true NEE density. Its scale is only approximate: `C_c` is the
+cell fill's normalisation of the BRICK-level target `total_b * G` (section 3), not of the
+voxel-face target `L_f * G_vertex`, so the vertex form over- or under-states the NEE density by a
+factor that depends on the brick's size in voxels and on the cell's light distribution.
+
 ## 2. Brick -> entry index map (scene, `light_indices_`)
 
 The BSDF side needs the light table entry of the brick a segment hit. A new growable buffer of
@@ -219,7 +245,7 @@ rule in ReSTIR DI mode (with the bias fix of section 2).
 | `light_indices_` (scene) | 4 B per AABB row, next to `light_words_` (256 KiB at the initial 65536 rows); counted in `CaelixLightStats::table_bytes` |
 | `LightPush` | 72 -> 80 B (`light_indices` after `light_words`; C++ and both shader copies) |
 | light cell | 288 -> 296 B (`C_prev` at 32, `C_cur` at 36, reservoirs at 40) |
-| `FrameConstants` | 704 B unchanged: `light_indices` (u64) at 688 replaces `pad_688`/`pad_692` |
+| `FrameConstants` | 704 B unchanged: `light_indices` (u64) at 688 replaces `pad_688`/`pad_692` (720 B since the per-vertex resampling, `LIGHT_LIST.md` section 2.6) |
 | public ABI | `CAELIX_GI_FLAG_LIGHT_MIS (1u << 8)` only; no struct changed |
 
 ### Kernels and code touched

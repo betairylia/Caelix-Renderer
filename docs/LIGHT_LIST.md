@@ -490,7 +490,83 @@ flag the random stream and the lookup are unchanged. Host: on by default with `l
 
 Built since (variance, not pattern): temporal reuse of the cell reservoirs in the fill (thread r
 merges its old reservoir, M-capped, as one more candidate; `CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL`,
-section 2.2). Not built: several reservoirs per vertex resampled with the exact point target.
+section 2.2). Several reservoirs per vertex resampled with the exact point target: section 2.6.
+
+### 2.6 Per-vertex resampling (`CaelixGiOptions::light_nee_candidates`, 2026-10-22)
+
+Why: the fireflies under study (`Artifacts/gi-experiments-20261020/firefly-split/README.md`) are
+rare large samples of lamps whose sampling share in a cell is tiny. The cell's 32 reservoirs are
+chosen by the cell's brick-level target (the cell centre, not the vertex), so a lamp that is close
+to the vertex but weak from the cell centre is drawn rarely and then carries a large W. A second
+stage at the vertex ("ReGIR" style) draws K candidates and keeps the one that the vertex's own
+target prefers, as ReSTIR DI's `DiInitialReservoir` does for its initial candidates.
+
+At a diffuse path vertex (receiver `x_r`, normal `n_r`) with `K = light_nee_candidates >= 2`
+(`LightNextEventResampled`, `caelix_light_sample.hlsl`):
+
+```
+lookups as before (section 2.3, 2.5): the unjittered cell for the MIS proxy context when MIS is on
+  or the jitter is off, the jittered cell for sampling (the three jitter numbers once per vertex)
+for i in 0 .. K-1:
+    u_reservoir, u_global
+    reservoir r = min(31, u_reservoir * 32) of the sampling cell, decoded (a voxel-face word whose
+      voxel bit is clear counts as none); else the global CDF, W_brick = total / total_b
+    point y_i: LightSampleFaceOf (voxel-face word, pdf_area 1) or SampleLightEntry (brick-level),
+      W_i = W_brick / pdf_area
+    u_select
+    skip when the sample is invalid or W_brick <= 0
+    d = y_i - x_r; skip when d^2 <= 0 or |d| < nee_min_distance (target 0)
+    skip when cos_r = dot(n_r, w) <= 0 or cos_l = -dot(n_l, w) <= 0
+    p_hat_i = luminance(L_e) * cos_r * cos_l / d^2          (times w_nee(y_i) with MIS)
+    w_i = p_hat_i * W_i; w_sum += w_i; keep y_i when u_select * w_sum < w_i
+W_out = w_sum / (K * p_hat(y))
+one shadow ray to y (TMax = |d| - 2 push-offs); unoccluded:
+contribution = L_e * (cos_r / pi) * (cos_l / d^2) * W_out   (times w_nee(y) with MIS)
+```
+
+With `K = 1` the earlier one-sample path runs unchanged (the same random stream; the old
+contribution `W_brick / pdf_area` is the `K = 1` case of `W_out`). With `K >= 2` the function's
+first two random numbers are drawn and not used.
+
+Unbiasedness: this is RIS with the equal input weights `m_i = 1/K` over inputs whose contribution
+weights `W_i` are unbiased (a cell reservoir's `W` is unbiased for every receiver, section 2.3; the
+global CDF and the in-brick point have exact densities). Then `(y, W_out)` is an unbiased
+contribution weight for every integrand whose support lies in the support of `p_hat`. The
+integrand of the NEE is `f(y) = L_e * cos_r / pi * cos_l / d^2 * V(y)` (times `w_nee(y)` with MIS);
+it is 0 wherever `p_hat` is 0: behind the receiver or the light face, where `w_nee = 0`, and inside
+the near field, where the NEE's integrand is 0 by the split (the near field is the BSDF path's, see
+"As built: Near field"). The visibility is in `f` only (the target is the unoccluded contribution).
+The K candidates read the same 32 reservoirs of one cell, so they are correlated (two may even be
+the same reservoir); that is harmless, because the RIS estimator is linear in the inputs'
+contribution weights, so its expectation is the sum of the inputs' expectations whatever their
+joint distribution.
+
+Push-back (section 2.2) is excluded: the push ring takes the vertex's own sample with a brick-level
+contribution weight over the cell's receiver union, and the resampled sample has no such weight
+(its `W_out` depends on the vertex). `caelix_renderer_set_gi_options` rejects
+`CAELIX_GI_FLAG_LIGHT_CELL_PUSH` with `light_nee_candidates >= 2` (0 = 1)
+with `CAELIX_ERROR_INVALID_ARGUMENT`; the push path stays the `K = 1` path.
+
+The MIS proxy can follow the vertex too: `CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX` (docs/LIGHT_MIS.md
+"Vertex proxy").
+
+Names: `CaelixGiOptions::light_nee_candidates` (0 = 1; 1 = no resampling; 1 .. 32; > 32 is
+`INVALID_ARGUMENT`), `FrameConstants::light_nee_candidates` at offset 704 (the effective value,
+written with `LIGHT_NEE`), flag `CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX (1u << 11)`. Host:
+`--light-nee-candidates N` (default 1; an explicit N >= 2 with
+`--light-cell-push` is refused) and `--light-proxy-vertex`; the GI panel has a "light NEE
+candidates" slider (disabled while the push is on; ticking the push sets it to 1) and a "vertex
+MIS proxy" checkbox under the MIS checkbox. Bench runs `pt_nee_rs1`, `pt_nee_rs4`, `pt_nee_rs4_vp`,
+`pt_nee_rs16_vp` and their `_conv` variants; scene `rootfall` with a light NEE reference (the plain
+path tracer does not converge there). Test: "light NEE with per-vertex resampling is unbiased".
+Cost: K times the candidate work (loads, CDF searches, the point and its MIS proxy) per vertex, one
+shadow ray as before.
+
+| ABI item | change |
+| --- | --- |
+| `CaelixGiOptions` | 56 -> 60 B: `uint32_t light_nee_candidates` appended |
+| `CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX` | new, `1u << 11` |
+| `FrameConstants` | 704 -> 720 B: `light_nee_candidates` at 704, pad 708 .. 716 |
 
 ## 3. Frame constants and push constants
 
@@ -511,7 +587,9 @@ uint32_t pad_648[6];         // 648 .. 671
 (Later steps filled the padding and grew the struct to 704 B; the temporal cell reuse uses offset
 696: `uint32_t light_temporal_frames` = the frames of history the fill keeps, 0 = none this frame;
 the push-back uses offset 700: `float light_push_confidence` = the confidence of a pushed sample,
-0 without `LIGHT_CELL_PUSH`.)
+0 without `LIGHT_CELL_PUSH`. The per-vertex resampling (section 2.6) grew it to 720 B:
+`uint32_t light_nee_candidates` at 704 = the effective candidates per vertex, 1 .. 32, 0 without
+`LIGHT_NEE`, then three pad words.)
 
 `TracePush` is unchanged. Scene kernels use `LightPush` (section 1.2, `gpu_structs.h`):
 `{ uint64_t group_infos, slot_tables, page_table, light_words, light_table, materials,
@@ -649,8 +727,8 @@ host flags and UI, `tools/gi_bench.*`.
 | light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md; 304 B since the temporal cell reuse: 19 MiB at 65536; 832 B since the push-back of shadow ray results: 52 MiB at 65536) |
 | `FinalizePush` | 88 -> 104 B (`light_words`, `materials`, `min_emission` in place of `pad`) |
 | `LightPush` | 72 B (see differences); 80 B since step 3 (`light_indices`, docs/LIGHT_MIS.md) |
-| `FrameConstants` | 608 -> 672 B, fields as in section 3 (`frame_counter` at 640) |
-| `CaelixGiOptions` | 32 -> 48 B (52 B since the temporal cell reuse: `light_temporal_frames`); `CaelixGiStats` 16 -> 32 B |
+| `FrameConstants` | 608 -> 672 B, fields as in section 3 (`frame_counter` at 640); 720 B since section 2.6 (`light_nee_candidates` at 704) |
+| `CaelixGiOptions` | 32 -> 48 B (52 B since the temporal cell reuse: `light_temporal_frames`; 56 B since the push-back: `light_push_confidence`; 60 B since section 2.6: `light_nee_candidates`); `CaelixGiStats` 16 -> 32 B |
 | `CaelixLightOptions` | 16 B; `CaelixLightStats` 24 B |
 
 Header word 2 (the design's `pad[0]`) is now `capacity` (= max_bricks, written by the scan): the

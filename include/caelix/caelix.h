@@ -83,7 +83,8 @@ extern "C" {
    (48 -> 52 bytes). The light cell usage counters appended four uint32 fields to CaelixGiStats
    (32 -> 48 bytes). The light cell push-back added CAELIX_GI_FLAG_LIGHT_CELL_PUSH, appended
    light_push_confidence to CaelixGiOptions (52 -> 56 bytes) and two uint32 fields to CaelixGiStats
-   (48 -> 56 bytes). A host built against
+   (48 -> 56 bytes). The per-vertex resampling of the light NEE appended light_nee_candidates to
+   CaelixGiOptions (56 -> 60 bytes) and added CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX. A host built against
    an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1196,7 +1197,14 @@ typedef enum CaelixGiMethod
                                                  the cell; the next fill merges the pushes (confidence
                                                  light_push_confidence, an occluded sample with a lower
                                                  target), so voxel-face samples enter the cells
-                                                 (docs/LIGHT_LIST.md section 2.2). Unbiased */
+                                                 (docs/LIGHT_LIST.md section 2.2). Unbiased. Needs
+                                                 light_nee_candidates 1 */
+#define CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX (1u << 11) /* with LIGHT_MIS: the MIS proxy density of the light NEE
+                                                 at a vertex with a light cell is the vertex form (the
+                                                 voxel-face weight times the receiver's own geometry
+                                                 term over the cell's normalisation) instead of the cell
+                                                 form (docs/LIGHT_MIS.md "Vertex proxy"). Unbiased: both
+                                                 strategies evaluate the same proxy */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
@@ -1241,6 +1249,10 @@ typedef struct CaelixGiOptions
                                        the merge; 1 .. 1024 */
     float light_push_confidence; /* 0 = 8; LIGHT_CELL_PUSH: the confidence (M) of a pushed sample in the
                                     cell fill; finite, 0 .. 1024 */
+    uint32_t light_nee_candidates; /* 0 = 1; LIGHT_NEE: light candidates per diffuse vertex, resampled by
+                                      the exact target at the vertex before the one shadow ray
+                                      (docs/LIGHT_LIST.md section 2.6); 1 = no resampling (one
+                                      sample, the earlier NEE); 1 .. 32. LIGHT_CELL_PUSH needs 1 */
 } CaelixGiOptions;
 
 /* Sets the GI options of the renderer; they apply from the next render on and stay until the next
@@ -1258,8 +1270,9 @@ typedef struct CaelixGiOptions
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,
    light_candidates > 64, CAELIX_GI_FLAG_RESTIR_DI without CAELIX_GI_FLAG_LIGHT_NEE, di_candidates > 32,
-   light_temporal_frames > 1024, a light_push_confidence that is not finite or not in 0 .. 1024
-   -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
+   light_temporal_frames > 1024, a light_push_confidence that is not finite or not in 0 .. 1024,
+   light_nee_candidates > 32, CAELIX_GI_FLAG_LIGHT_CELL_PUSH with an effective light_nee_candidates
+   >= 2 -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);
 
 typedef struct CaelixGiStats

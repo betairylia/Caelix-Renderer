@@ -400,7 +400,8 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                                      CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY |
                                      CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI |
                                      CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_MIS |
-                                     CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL | CAELIX_GI_FLAG_LIGHT_CELL_PUSH;
+                                     CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL | CAELIX_GI_FLAG_LIGHT_CELL_PUSH |
+                                     CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
@@ -473,6 +474,20 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
     {
         CAELIX_LOGE("%s: light_push_confidence %g must be finite and in 0 .. 1024", kFunction,
                     static_cast<double>(options.light_push_confidence));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (options.light_nee_candidates > 32)
+    {
+        CAELIX_LOGE("%s: light_nee_candidates %u is above the maximum 32", kFunction, options.light_nee_candidates);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    // The push ring stores a brick-level contribution weight over the cell's receiver union; the
+    // resampled sample of light_nee_candidates >= 2 has no such weight.
+    if ((options.flags & CAELIX_GI_FLAG_LIGHT_CELL_PUSH) != 0 &&
+        options.light_nee_candidates >= 2)
+    {
+        CAELIX_LOGE("%s: CAELIX_GI_FLAG_LIGHT_CELL_PUSH needs light_nee_candidates 0 or 1 (got %u)", kFunction,
+                    options.light_nee_candidates);
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     // Reservoirs of another method or other reuse flags are not a valid history (GI and DI).

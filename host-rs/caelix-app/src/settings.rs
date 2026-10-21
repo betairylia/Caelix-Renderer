@@ -287,6 +287,13 @@ pub struct GiSettings {
     pub light_cell_push: bool,
     /// Light NEE with `light_cell_push`: the confidence (M) of a pushed sample in the fill.
     pub light_push_confidence: f32,
+    /// Light NEE: light candidates per diffuse vertex, resampled by the exact target before the one
+    /// shadow ray (docs/LIGHT_LIST.md section 2.6); 1 = no resampling (1..32). `light_cell_push`
+    /// needs 1 (the library rejects the push with more).
+    pub light_nee_candidates: u32,
+    /// Light NEE with `light_mis`: the vertex form of the MIS proxy density
+    /// (`CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX`, docs/LIGHT_MIS.md "Vertex proxy").
+    pub light_proxy_vertex: bool,
     /// Candidates per cell reservoir and frame (1..64).
     pub light_candidates: u32,
     /// World units per pixel below which a vertex uses 8-voxel cells (else 32-voxel cells).
@@ -320,6 +327,8 @@ impl Default for GiSettings {
             light_temporal_frames: 20,
             light_cell_push: false,
             light_push_confidence: 8.0,
+            light_nee_candidates: 1,
+            light_proxy_vertex: false,
             light_candidates: 8,
             light_footprint: 0.25,
             restir_di: false,
@@ -354,6 +363,9 @@ impl GiSettings {
             }
             if self.light_mis {
                 flags |= CAELIX_GI_FLAG_LIGHT_MIS;
+                if self.light_proxy_vertex {
+                    flags |= CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX;
+                }
             }
             if self.light_cell_temporal {
                 flags |= CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
@@ -386,6 +398,7 @@ impl GiSettings {
             di_candidates: self.di_candidates,
             light_temporal_frames: self.light_temporal_frames,
             light_push_confidence: self.light_push_confidence,
+            light_nee_candidates: self.light_nee_candidates,
         }
     }
 }

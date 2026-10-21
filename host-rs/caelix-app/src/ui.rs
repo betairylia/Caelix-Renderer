@@ -636,6 +636,14 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             );
             ui.end_row();
 
+            ui.label("light NEE candidates");
+            ui.add_enabled(light && !gi.light_cell_push, Slider::new(&mut gi.light_nee_candidates, 1..=32))
+                .on_hover_text(
+                    "Candidates per diffuse vertex, resampled before the one shadow ray; 1 = no resampling. \
+                     The cell push-back needs 1",
+                );
+            ui.end_row();
+
             ui.label("DI candidates");
             ui.add_enabled(light && gi.restir_di, Slider::new(&mut gi.di_candidates, 1..=32));
             ui.end_row();
@@ -654,19 +662,34 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             "Each cell reservoir merges its previous frame's reservoir (history capped by the light temporal frames); \
              assumes a static scene",
         );
-        ui.add_enabled(
-            lighting && gi.light_nee,
-            egui::Checkbox::new(&mut gi.light_cell_push, "push shadow ray results into light cells"),
-        )
-        .on_hover_text(
-            "Every vertex that sampled a light cell pushes its light sample and its shadow ray result into the \
-             cell; the next fill merges them (an occluded sample with a lower target)",
-        );
+        if ui
+            .add_enabled(
+                lighting && gi.light_nee,
+                egui::Checkbox::new(&mut gi.light_cell_push, "push shadow ray results into light cells"),
+            )
+            .on_hover_text(
+                "Every vertex that sampled a light cell pushes its light sample and its shadow ray result into the \
+                 cell; the next fill merges them (an occluded sample with a lower target). Sets the light NEE \
+                 candidates to 1 (the push needs the vertex's own sample)",
+            )
+            .changed()
+            && gi.light_cell_push
+        {
+            gi.light_nee_candidates = 1;
+        }
         ui.add_enabled(
             lighting && gi.light_nee,
             egui::Checkbox::new(&mut gi.light_mis, "MIS light NEE / diffuse bounce"),
         )
         .on_hover_text("Balance heuristic between the light NEE and the BSDF hit of a list light (docs/LIGHT_MIS.md)");
+        ui.add_enabled(
+            lighting && gi.light_nee && gi.light_mis,
+            egui::Checkbox::new(&mut gi.light_proxy_vertex, "vertex MIS proxy"),
+        )
+        .on_hover_text(
+            "The MIS proxy density at a vertex with a light cell: the voxel-face weight times the receiver's own \
+             geometry term over the cell's normalisation, instead of the cell form (docs/LIGHT_MIS.md)",
+        );
         ui.add_enabled(
             lighting && gi.light_nee,
             egui::Checkbox::new(&mut gi.restir_di, "ReSTIR DI (light list, primary surface)"),

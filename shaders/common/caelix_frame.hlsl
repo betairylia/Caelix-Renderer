@@ -1,6 +1,6 @@
 // Per-frame constants of the trace and composite kernels. Mirrors
 // lib/src/render/frame_constants.h; change both together. The kernel's only push constant is the device address of
-// one CaelixFrameConstants (704 bytes). Every field sits at an offset that is a multiple of its
+// one CaelixFrameConstants (720 bytes). Every field sits at an offset that is a multiple of its
 // size, so std430 and scalar layout rules give the same offsets.
 #ifndef CAELIX_FRAME_HLSL
 #define CAELIX_FRAME_HLSL
@@ -103,7 +103,11 @@ struct CaelixFrameConstants
     uint di_history_valid;          // 684  1 = di_prev holds last frame's DI reservoirs of this renderer
     uint64_t light_indices;         // 688  the scene's brick -> light entry map (u32 per AABB row: index + 1), 0 = none
     uint light_temporal_frames;     // 696  kGiFlagLightCellTemporal: frames of history the cell fill keeps (0 = none this frame)
-    float light_push_confidence;    // 700  kGiFlagLightCellPush: the confidence (M) of a pushed sample in the cell fill; 0 without -> 704
+    float light_push_confidence;    // 700  kGiFlagLightCellPush: the confidence (M) of a pushed sample in the cell fill; 0 without
+    uint light_nee_candidates;      // 704  kGiFlagLightNee: light candidates per diffuse vertex (1 .. 32; 1 = no resampling)
+    uint pad_708;                   // 708
+    uint pad_712;                   // 712
+    uint pad_716;                   // 716  -> 720
 };
 
 struct CaelixTracePush
@@ -147,6 +151,7 @@ static const uint kGiFlagLightCellJitter = 1u << 7;
 static const uint kGiFlagLightMis = 1u << 8;
 static const uint kGiFlagLightCellTemporal = 1u << 9;
 static const uint kGiFlagLightCellPush = 1u << 10;
+static const uint kGiFlagLightProxyVertex = 1u << 11;
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

@@ -80,6 +80,8 @@ constexpr uint32_t kDefaultDiCandidates = 4;
 constexpr uint32_t kDefaultLightTemporalFrames = 20;
 // CaelixGiOptions::light_push_confidence default (docs/LIGHT_LIST.md section 2.2).
 constexpr float kDefaultLightPushConfidence = 8.0f;
+// CaelixGiOptions::light_nee_candidates default (docs/LIGHT_LIST.md section 2.6).
+constexpr uint32_t kDefaultLightNeeCandidates = 1;
 // [numthreads(32, 1, 1)] per cell in caelix_light_cells.hlsl, 1024 cells per dispatch row.
 constexpr uint32_t kLightCellsPerRow = 1024;
 
@@ -670,7 +672,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                                                              CAELIX_GI_FLAG_LIGHT_CELL_JITTER |
                                                              CAELIX_GI_FLAG_LIGHT_MIS |
                                                              CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
-                                                             CAELIX_GI_FLAG_LIGHT_CELL_PUSH) |
+                                                             CAELIX_GI_FLAG_LIGHT_CELL_PUSH |
+                                                             CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX) |
                                        (restir_di ? (kReuseFlags | CAELIX_GI_FLAG_RESTIR_DI) : 0u)));
     if (!lighting)
     {
@@ -746,6 +749,9 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                                                   ? gi_options_.light_push_confidence
                                                   : kDefaultLightPushConfidence;
         }
+        // Per-vertex resampling of the light NEE (section 2.6): candidates per diffuse vertex.
+        constants.light_nee_candidates =
+            gi_options_.light_nee_candidates != 0 ? gi_options_.light_nee_candidates : kDefaultLightNeeCandidates;
     }
     if (sky)
     {
