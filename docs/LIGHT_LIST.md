@@ -126,13 +126,15 @@ rebuild's presence in the flush time (no separate timer).
 
 A hash table of cells owned by the renderer (like the GI reservoir buffers: created at the first
 render that needs it, recreated when the capacity option changes, retired safely). Capacity C =
-`CaelixGiOptions::light_cell_capacity` (0 = 65536, power of two, 2^10 .. 2^20). R = 32 reservoirs
-per cell (`kLightCellReservoirs`, a shader constant).
+`CaelixGiOptions::light_cell_capacity` (0 = 65536, power of two, 2^10 .. 2^20). R = 8 reservoirs
+per cell (`kLightCellReservoirs`, a shader constant; 32 before the oriented cells, section 2.7).
 
 ```
-Cell (832 B since the push-back of shadow ray results, section 2.2; 304 B since the temporal cell
+Cell (256 B since the oriented cells, section 2.7: 8 reservoirs and 8 push entries; 832 B with 32
+and 32 since the push-back of shadow ray results, section 2.2; 304 B since the temporal cell
 reuse; 296 B since step 3, docs/LIGHT_MIS.md; 288 B before, without C_prev and C_cur)
-  uint64_t key;          //   0  0 = empty; else the fingerprint of (entity, level, cell coordinate)
+  uint64_t key;          //   0  0 = empty; else the fingerprint of (entity, level, cell coordinate,
+                         //      receiver face with LIGHT_CELL_ORIENTED)
   uint touched_frame;    //   8  fc.frame_counter (section 3) of the last lookup
   uint entity;           //  12
   int3 coord;            //  16  cell coordinate at `level`
@@ -141,13 +143,15 @@ reuse; 296 B since step 3, docs/LIGHT_MIS.md; 288 B before, without C_prev and C
   float C_cur;           //  36  cell normalisation of the latest fill (mean of w_sum / K; with
                          //      LIGHT_CELL_TEMPORAL the running mean of dedicated draws)
   float M;               //  40  LIGHT_CELL_TEMPORAL: the confidence sum behind the cell's
-                         //      reservoirs (the mean over the 32 threads; they differ by the push
-                         //      confidence where the push ring has fewer than 32 entries); 0 = no history
+                         //      reservoirs (the mean over the 8 threads; they differ by the push
+                         //      confidence where the push ring has fewer than 8 entries); 0 = no history
   float C_n;             //  44  LIGHT_CELL_TEMPORAL: the draw count behind C_cur; 0 = none
-  uint push_count;       //  48  LIGHT_CELL_PUSH: pushes claimed since the latest fill (may exceed 32)
-  uint pad[3];           //  52
-  LightCellReservoir r[32];  // 64 .. 320
-  LightCellPush push[32];    // 320 .. 832  LIGHT_CELL_PUSH: the push ring
+  uint push_count;       //  48  LIGHT_CELL_PUSH: pushes claimed since the latest fill (may exceed 8)
+  uint face;             //  52  the receiver face of the key: 0..5 (+X -X +Y -Y +Z -Z of the world
+                         //      normal) with LIGHT_CELL_ORIENTED, else 6 (kLightCellFaceNone); section 2.7
+  uint pad[2];           //  56
+  LightCellReservoir r[8];   // 64 .. 128
+  LightCellPush push[8];     // 128 .. 256  LIGHT_CELL_PUSH: the push ring
 LightCellReservoir (8 B)
   uint light;            // a light sample word (below), 0xFFFFFFFF = empty
   float W;               // unbiased contribution weight of that sample (0 = empty)
@@ -183,8 +187,8 @@ Lookup from the trace kernel (`LightCellLookup`): probe; a matching key -> write
 `InterlockedCompareExchange(key, 0, fingerprint)`; success or another thread's success with the
 same key -> that cell (touched, reservoirs empty until the next fill); 8 probes without a
 match -> no cell (the vertex samples the global table, section 2.3). The inserting thread also
-writes entity, coord and level, zeroes the header from C_prev to push_count and clears the 32
-reservoirs (plain stores after the CAS; a concurrent reader of the same new cell may see partly
+writes entity, coord, level and face, zeroes the header from C_prev to push_count (a slot with key 0
+has empty reservoirs: zero at creation, cleared on eviction) (plain stores after the CAS; a concurrent reader of the same new cell may see partly
 cleared reservoirs and reads either an empty one or a stale `W` 0 slot, both harmless). A key_lo
 match counts as a match when key_hi equals the fingerprint's high word or is still 0 (2026-10-21):
 key_hi is stored after the claim, and before this rule a thread that lost the CAS to the same key
@@ -197,14 +201,15 @@ fc.frame_counter`. Hash-table removal under linear probing leaves tombstone-free
 is fine here: a later lookup of a displaced key simply inserts again in an earlier slot and the
 displaced old cell ages out.
 
-Usage counters (2026-10-21): the buffer is `C x 832 + 32` bytes; the 32 bytes after the last cell
-(`LightCellCounterBase` = `fc.light_cell_capacity x 832`) hold six uints and 8 bytes of padding:
+Usage counters (2026-10-21): the buffer is `C x 256 + 32` bytes (`C x 832 + 32` before section
+2.7); the 32 bytes after the last cell (`LightCellCounterBase` = `fc.light_cell_capacity x 256`)
+hold six uints and 8 bytes of padding:
 `live` (offset 0), `active` (4), `inserted` (8), `failed` (12), `pushed` (16) and `push_dropped`
 (20). The renderer resets them with a 32-byte `vkCmdFillBuffer` before the fill of every light NEE
 frame (a new buffer is zero-filled whole). The fill's thread 0 adds 1 to `live` for every cell that
 stays after the eviction check (also without a light table), 1 to `active` when that cell's
 `touched_frame == fc.frame_counter - 1` (looked up by the previous frame's trace), and the cell's
-`push_count` split into `min(push_count, 32)` (`pushed`) and the rest (`push_dropped`): the pushes
+`push_count` split into `min(push_count, 8)` (`pushed`) and the rest (`push_dropped`): the pushes
 of the previous frame's trace, counted once per cell in the fill instead of once per push in the
 trace (one counter address for every vertex would serialise the trace's atomics; wave-aggregated
 atomics would need subgroup ballot, which is not a device requirement). `LightCellLookup` adds 1 to
@@ -258,7 +263,8 @@ at the primary vertex, in the throughput after it).
 ### 2.2 Cell fill (`caelix_light_cells`, renderer, trace layout + TracePush, before the trace)
 
 One workgroup of 32 threads per cell slot (C workgroups, split at 65535 like the others). Thread
-r owns reservoir r. Skip the cell when key == 0; evict when aged (section 1.3). Skip the fill
+r owns reservoir r. (Since section 2.7: four cells per workgroup, 8 threads per cell, dispatch
+`min(1024, C / 4) x max(1, C / 4096)`; the design text below says 32 where it now means 8.) Skip the cell when key == 0; evict when aged (section 1.3). Skip the fill
 (keep the reservoirs) when `light_table.count == 0` (write empty reservoirs instead). Otherwise
 each thread draws K = `light_candidates` (0 = 8, 1 .. 64) candidates from the global CDF:
 `u * total_weight` -> binary search over cdf[0 .. count) -> entry i, proposal pdf
@@ -314,9 +320,9 @@ Cell normalisation with the flag: the previous fill's candidates are part of thi
 reservoirs, so a C estimate made from the candidates (even one frame delayed through `C_prev`) is
 correlated with the reservoirs the trace samples, and the MIS proxy (docs/LIGHT_MIS.md section 3)
 must stay independent of them. Each thread therefore makes one dedicated draw from the CDF
-(`w_c = G_j * total`, an unbiased estimate of C), and thread 0 folds the mean of the 32 into
-`C_cur` as a running mean: `n_old = min(C_n, light_temporal_frames * 32)`,
-`C_cur = (C_cur_old * n_old + sum of w_c) / (n_old + 32)`, `C_n = n_old + 32`; `C_prev = C_cur_old`
+(`w_c = G_j * total`, an unbiased estimate of C), and thread 0 folds the mean of the R = 8 into
+`C_cur` as a running mean: `n_old = min(C_n, light_temporal_frames * R)`,
+`C_cur = (C_cur_old * n_old + sum of w_c) / (n_old + R)`, `C_n = n_old + R`; `C_prev = C_cur_old`
 as before. Cost: one more CDF search, entry load and G per thread (the shroom forest at 960 x 540:
 fill 0.6 -> 0.75 ms in one frame's timings, not a careful measurement).
 
@@ -333,7 +339,8 @@ enter the cells only through the pushes.
 Vertex (`LightNextEvent`). When the vertex's sampling cell exists (the jittered one with
 `LIGHT_CELL_JITTER`), it claims a push (`InterlockedAdd` on `push_count`, `LightCellClaimPush`)
 BEFORE it draws its light sample, and writes the claimed entry once at the end
-(`LightCellStorePush`; claims beyond 32 are dropped), whatever happened to the sample:
+(`LightCellStorePush`; claims beyond 8 are dropped, 32 before section 2.7), whatever happened to
+the sample:
 
 - a voxel-face reservoir sample: its own word and the reservoir's W (already a contribution weight
   for every receiver of the cell);
@@ -351,13 +358,13 @@ BEFORE it draws its light sample, and writes the claimed entry once at the end
 sample, near field, cos_r <= 0 or cos_l <= 0). The ReSTIR DI candidates of the trace push nothing
 (not done: the DI shade pass would need the cell slot of the pixel).
 
-Fill. All 32 threads load the ring into groupshared memory (entry r for r < min(push_count, 32),
+Fill. All 8 threads of a cell load the ring into groupshared memory (entry r for r < min(push_count, 8),
 else an empty entry), then thread 0 resets `push_count`. Per thread, after the fresh candidates and
 the temporal history, with one more random number `u_push` (always drawn with the flag, after the
 history's and before the dedicated C draw):
 
 ```
-present  = r < min(push_count, 32)
+present  = r < min(push_count, 8)
 c_p      = light_push_confidence                          // CaelixGiOptions, 0 = 8
 p_hat_p  = LightCellTargetOf(word) * (visible ? 1 : kLightOccludedTarget)   // 0.1
 if present: M_new += c_p                                  // also for an empty entry
@@ -370,8 +377,8 @@ W        = (w_sum / M_new) / p_hat_selected
 `L_v * G_face` with `L_v` = the luminance of the voxel's emission (material table, before
 `emission_scale`) and `G_face = max(0.1, dot(n, to_cell) / |to_cell|) / max(|to_cell|^2, near_d2)`,
 `to_cell` = cell centre - face centre (voxel centre + 0.5 n, world); 0 for an invalid word or a
-voxel-face word whose voxel bit is clear (the scene changed). The header's M is the mean of the 32
-threads' confidence sums (`M_old + K + c_p * entries / 32`); any constant is a valid confidence for
+voxel-face word whose voxel bit is clear (the scene changed). The header's M is the mean of the 8
+threads' confidence sums (`M_old + K + c_p * entries / 8`); any constant is a valid confidence for
 the next merge. C_c (the MIS proxy's normalisation) stays brick-level: the pushes do not enter it.
 
 Why it is unbiased. Streaming RIS with confidences gives, for every receiver f of the cell,
@@ -416,7 +423,7 @@ and shroom is the real check).
 
 ```
 cell = LightCellLookup(entity, level, coordinate)      // touches / inserts
-if (cell && reservoir r = cell.r[floor(u * 32)] has W > 0 and a valid word)
+if (cell && reservoir r = cell.r[floor(u * R)] has W > 0 and a valid word)    // R = 8
     -> entry = light table[word.entry], W = r.W
        face 0..5 and the voxel's bit set: a voxel-face sample (LightSampleFaceOf: a point uniform
        on that face, pdf_area 1)
@@ -432,7 +439,7 @@ stream does not depend on the word. ReSTIR DI's initial candidates (docs/RESTIR_
 cell words the same way (uv quantized). The MIS proxy (docs/LIGHT_MIS.md) stays brick-level for
 both kinds of sample.
 
-The uniform choice of one of the 32 reservoirs needs no factor: each reservoir is an unbiased
+The uniform choice of one of the R reservoirs needs no factor: each reservoir is an unbiased
 estimator of the same integral.
 
 ### 2.4 In the path tracer (`TracePath`, flag `CAELIX_GI_FLAG_LIGHT_NEE`)
@@ -509,7 +516,7 @@ lookups as before (section 2.3, 2.5): the unjittered cell for the MIS proxy cont
   or the jitter is off, the jittered cell for sampling (the three jitter numbers once per vertex)
 for i in 0 .. K-1:
     u_reservoir, u_global
-    reservoir r = min(31, u_reservoir * 32) of the sampling cell, decoded (a voxel-face word whose
+    reservoir r = min(R - 1, u_reservoir * R) of the sampling cell, decoded (a voxel-face word whose
       voxel bit is clear counts as none); else the global CDF, W_brick = total / total_b
     point y_i: LightSampleFaceOf (voxel-face word, pdf_area 1) or SampleLightEntry (brick-level),
       W_i = W_brick / pdf_area
@@ -536,7 +543,7 @@ integrand of the NEE is `f(y) = L_e * cos_r / pi * cos_l / d^2 * V(y)` (times `w
 it is 0 wherever `p_hat` is 0: behind the receiver or the light face, where `w_nee = 0`, and inside
 the near field, where the NEE's integrand is 0 by the split (the near field is the BSDF path's, see
 "As built: Near field"). The visibility is in `f` only (the target is the unoccluded contribution).
-The K candidates read the same 32 reservoirs of one cell, so they are correlated (two may even be
+The K candidates read the same R reservoirs of one cell, so they are correlated (two may even be
 the same reservoir); that is harmless, because the RIS estimator is linear in the inputs'
 contribution weights, so its expectation is the sum of the inputs' expectations whatever their
 joint distribution.
@@ -567,6 +574,85 @@ shadow ray as before.
 | `CaelixGiOptions` | 56 -> 60 B: `uint32_t light_nee_candidates` appended |
 | `CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX` | new, `1u << 11` |
 | `FrameConstants` | 704 -> 720 B: `light_nee_candidates` at 704, pad 708 .. 716 |
+
+### 2.7 Oriented cells (`CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED`, 2026-10-22)
+
+Owner's proposal. Two parts: (A) a smaller cell, without a flag: 8 reservoirs and 8 push entries
+instead of 32 and 32, so a cell is 256 bytes instead of 832 and the same memory holds 3.25 x more
+cells (section 1.3); (B, C) behind the flag, the receiver's orientation in the key and in the
+targets.
+
+Key. With the flag, the receiver face `f = GiFaceIndex(n_r)` (0..5 = +X -X +Y -Y +Z -Z, the axis of
+the receiver's WORLD normal; the index ReSTIR DI stores for its receiver in `visible_flags_m` bits
+0..2) is part of the cell key: `LightCellKey(entity, level, coord, face)` hashes one more splitmix64
+round over the face (`kLightCellFaceNone` = 6 without the flag skips that round, so the unoriented
+hash is unchanged), and the insert writes the face into the header (offset 52). Every spatial cell
+splits into up to 6 oriented cells, one per receiver face that touches it. Every lookup of a vertex
+uses the vertex's face (`LightCellFaceOf(fc, n_r)`): both lookups of `LightNextEvent` (the
+unjittered proxy cell and the jittered sampling cell; the jitter moves only the point),
+`LightNeeProxyAt(fc, x_r, n_r, group, object_point)` and `DiInitialReservoir` (its `face`).
+
+Orientation term. The fill reads the header face; `n_cell = GiFaceNormal(face)` (a world axis: the
+face comes from the world normal, so no entity rotation), 0 for face 6. The brick-level target
+`total * G` (`LightCellG`) and the voxel-face target `L_v * G_face` (`LightCellTargetOf`) get the
+factor
+
+```
+orient_r = max(kLightCellOrientFloor, dot(n_cell, normalize(light - back)))   (n_cell != 0)
+back     = cell centre - (cell half size) * n_cell   // every receiver of the cell lies in front of it
+         = 1                                                                          (unoriented)
+kLightCellOrientFloor = 0.1
+```
+
+toward the brick centre for a brick-level target and toward the face centre for a voxel-face one
+(`LightCellReceiverOrient`). The dedicated C draw of the temporal reuse uses `LightCellG`, so `C_c`
+is the normalisation of the oriented target. The MIS proxy's cell form (`LightNeeProxyPdfArea`,
+docs/LIGHT_MIS.md section 1) multiplies its `G` by the same factor with `ctx.cell_normal` toward the
+brick centre; the vertex form (`CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX`) is unchanged (it has the real
+`cos_r`).
+
+Why the floor must not be 0. A cell's reservoir is an unbiased contribution weight for a receiver
+only when the cell's target is positive wherever that receiver's integrand is (every entry with
+`total > 0` stays reachable with `p_hat > 0`). A receiver can read a cell whose orientation or
+position is not its own: the jittered lookup reads a neighbouring cell of the same face whose
+centre lies elsewhere (a light behind that centre's plane can be in front of the receiver), and a
+key collision merges two cells. A light behind the cell's face then gets the target 0.1 x the
+unoriented one: noise (W up to 10x larger there), not bias. The same rule as `kLightOccludedTarget`.
+
+MIS context. `LightNeeProxyContext::cell_normal` (zero = unoriented or no cell) is set by
+`LightNeeProxyOfSlot` from the LOOKUP's face (as the centre comes from the lookup's coordinate, not
+from the header), so the context is a function of the vertex alone. ReSTIR DI rebuilds it in
+`DiReceiverOf`: with the flag and `cell_C > 0`, `cell_normal = GiFaceNormal(visible face)`, the face
+`DiInitialReservoir` used for its lookup and the face `TracePath`'s `LightNeeProxyAt` derives from
+the same primary normal, so both strategies at the primary vertex evaluate one function.
+
+Push-back. Unchanged: the receiver region of `LightCellRegionFaceMask` is the spatial cell's (a
+superset of an oriented cell's receivers), so a vertex mask equal to the union over the larger
+region is also equal to the union over the oriented cell's receivers.
+
+Fill dispatch (part A). Four cells per workgroup of 32 threads, 8 threads per cell (thread
+`r = thread % 8` owns reservoir r; slot = `(y * 1024 + x) * 4 + thread / 8`), dispatch
+`min(1024, G) x max(1, G / 1024)` with `G = capacity / 4` workgroups (the two smallest capacities,
+1024 and 2048 cells, give one row of 256 or 512 workgroups). The four cells are independent: an
+empty, evicted or out-of-range slot and a fill without a usable table clear a per-thread `active`
+flag instead of returning, so every thread reaches both `GroupMemoryBarrierWithGroupSync` calls.
+`gs_c` and `gs_push` hold 4 x 8 entries; thread r = 0 of each cell does the former thread-0 work
+(counters, push count reset, header writes) over its cell's 8 entries; the history cap of `C_n` and
+the header's mean M use 8.
+
+Names: `CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED (1u << 12)`, HLSL `kGiFlagLightCellOriented`, no new
+frame constant. Host: `--light-cell-oriented`, GI panel checkbox "oriented light cells (receiver face
+in the key)" under the jitter checkbox. Bench runs `pt_nee_or`, `pt_nee_or_k32` (32 fill
+candidates), `pt_nee_or_rs4` (4 light NEE candidates per vertex) and their `_conv` variants; since
+part A, `pt_nee_rs1` and `pt_nee_rs1_conv` are the unoriented 8-reservoir runs. Test: "light NEE with
+oriented cells is unbiased" (the four lights of the temporal test; oriented, oriented + jitter, and
+unoriented for comparison).
+
+| item | change |
+| --- | --- |
+| light cell | 832 -> 256 B: 8 reservoirs (64 .. 128), 8 push entries (128 .. 256), `face` at 52 |
+| `CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED` | new, `1u << 12` |
+| `CaelixGiStats::light_cell_bytes` | `capacity x 256 + 32` |
 
 ## 3. Frame constants and push constants
 
@@ -724,7 +810,7 @@ host flags and UI, `tools/gi_bench.*`.
 | --- | --- |
 | light word | 4 B per AABB row (`Scene::light_words_`, grows with the AABB pool; 256 KiB at the initial 65536 rows) |
 | light table | 64 B header + 132 B per `max_bricks` entry (128 B entry + 4 B CDF): 8.3 MiB at 65536; since step 4 (`LIGHT_FACES.md`) 452 B per entry (448 B entry + 4 B CDF): 28.3 MiB at 65536, 452 MiB at 2^20 |
-| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md; 304 B since the temporal cell reuse: 19 MiB at 65536; 832 B since the push-back of shadow ray results: 52 MiB at 65536) |
+| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md; 304 B since the temporal cell reuse: 19 MiB at 65536; 832 B since the push-back of shadow ray results: 52 MiB at 65536; 256 B since the oriented cells, section 2.7: 16 MiB at 65536, 256 MiB at 2^20) |
 | `FinalizePush` | 88 -> 104 B (`light_words`, `materials`, `min_emission` in place of `pad`) |
 | `LightPush` | 72 B (see differences); 80 B since step 3 (`light_indices`, docs/LIGHT_MIS.md) |
 | `FrameConstants` | 608 -> 672 B, fields as in section 3 (`frame_counter` at 640); 720 B since section 2.6 (`light_nee_candidates` at 704) |
@@ -746,7 +832,8 @@ render kernels need it to find the CDF behind the entries.
   compact, barrier, scan, barrier, copy header[0..16) to a host readback ring (8 slots), barrier
   to HOST, then a barrier to ALL_COMMANDS reads. Inside the flush timer.
 - `caelix_light_cells` (renderer, trace set + `TracePush`, 32 threads per cell, dispatch
-  1024 x capacity / 1024). Before the sky SH kernel and the trace, with its own `GpuTimer`
+  1024 x capacity / 1024; since section 2.7: 8 threads per cell, 4 cells per workgroup, dispatch
+  min(1024, capacity / 4) x max(1, capacity / 4096)). Before the sky SH kernel and the trace, with its own `GpuTimer`
   (`light_timer_` -> `light_fill_ms`) and a compute -> compute barrier after it. A new cell
   buffer is zero-filled (`vkCmdFillBuffer`) before its first fill.
 - Light NEE in `TracePath` at the sun NEE's vertices, own stream

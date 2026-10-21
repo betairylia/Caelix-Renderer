@@ -272,6 +272,10 @@ pub struct GiSettings {
     /// Light NEE: look the cell up at a point jittered by up to half a cell per vertex
     /// (`CAELIX_GI_FLAG_LIGHT_CELL_JITTER`): the per-cell flicker becomes per-pixel noise.
     pub light_cell_jitter: bool,
+    /// Light NEE: the light cell key also holds the receiver's face (the axis of its world normal),
+    /// and the fill's target and the MIS proxy get the receiver orientation term
+    /// (`CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED`, docs/LIGHT_LIST.md section 2.7).
+    pub light_cell_oriented: bool,
     /// Light NEE: MIS between the light NEE and the diffuse bounce (`CAELIX_GI_FLAG_LIGHT_MIS`,
     /// docs/LIGHT_MIS.md); off: a list-light hit after a light NEE vertex is skipped.
     pub light_mis: bool,
@@ -322,6 +326,7 @@ impl Default for GiSettings {
             light_nee: false,
             light_cells: 65536,
             light_cell_jitter: true,
+            light_cell_oriented: false,
             light_mis: true,
             light_cell_temporal: false,
             light_temporal_frames: 20,
@@ -360,6 +365,9 @@ impl GiSettings {
             flags |= CAELIX_GI_FLAG_LIGHT_NEE;
             if self.light_cell_jitter {
                 flags |= CAELIX_GI_FLAG_LIGHT_CELL_JITTER;
+            }
+            if self.light_cell_oriented {
+                flags |= CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED;
             }
             if self.light_mis {
                 flags |= CAELIX_GI_FLAG_LIGHT_MIS;

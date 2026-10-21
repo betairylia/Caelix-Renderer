@@ -82,8 +82,10 @@ constexpr uint32_t kDefaultLightTemporalFrames = 20;
 constexpr float kDefaultLightPushConfidence = 8.0f;
 // CaelixGiOptions::light_nee_candidates default (docs/LIGHT_LIST.md section 2.6).
 constexpr uint32_t kDefaultLightNeeCandidates = 1;
-// [numthreads(32, 1, 1)] per cell in caelix_light_cells.hlsl, 1024 cells per dispatch row.
-constexpr uint32_t kLightCellsPerRow = 1024;
+// [numthreads(32, 1, 1)] per four cells in caelix_light_cells.hlsl (8 threads per cell), at most 1024
+// workgroups per dispatch row.
+constexpr uint32_t kLightCellsPerGroup = 4;
+constexpr uint32_t kLightCellGroupsPerRow = 1024;
 
 // The barriers of one vkCmdPipelineBarrier2: image barriers (any layout -> GENERAL; mip 0,
 // `layer_count` layers) and at most one global memory barrier.
@@ -673,7 +675,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                                                              CAELIX_GI_FLAG_LIGHT_MIS |
                                                              CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
                                                              CAELIX_GI_FLAG_LIGHT_CELL_PUSH |
-                                                             CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX) |
+                                                             CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX |
+                                                             CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED) |
                                        (restir_di ? (kReuseFlags | CAELIX_GI_FLAG_RESTIR_DI) : 0u)));
     if (!lighting)
     {
@@ -856,7 +859,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fill.pipeline());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fill.layout(), 0, 1, &slot->set, 0, nullptr);
         vkCmdPushConstants(cmd, fill.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        vkCmdDispatch(cmd, kLightCellsPerRow, light_cell_capacity_ / kLightCellsPerRow, 1);
+        // capacity / 4 workgroups (the capacity is a power of two >= 1024): one row of 256 or 512 for
+        // the two smallest capacities, else rows of 1024.
+        const uint32_t groups = light_cell_capacity_ / kLightCellsPerGroup;
+        const uint32_t groups_x = std::min(groups, kLightCellGroupsPerRow);
+        vkCmdDispatch(cmd, groups_x, groups / groups_x, 1);
         if (timed)
         {
             light_timer_.End(cmd);

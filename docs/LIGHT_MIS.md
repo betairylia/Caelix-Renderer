@@ -87,6 +87,23 @@ The balance heuristic: `w_nee = p_sa / (p_sa + p_bsdf)` with `p_sa = p_area * d^
 power heuristic (the densities are proxies; the balance heuristic is the one that is provably never
 much worse than either strategy alone).
 
+### Oriented cells (`CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED`, 2026-10-22)
+
+With oriented light cells (docs/LIGHT_LIST.md section 2.7) the fill's target carries the receiver
+orientation term of the cell's face, so the cell form of the proxy carries it too:
+
+```
+p_hat_c(b) = total_weight_b * orient * orient_r / max(|centre_b - centre_c|^2, near_d2(level))
+orient_r   = max(0.1, dot(n_cell, normalize(centre_b - centre_c)))   (n_cell = the cell face's world axis)
+           = 1                                                        (unoriented cell)
+```
+
+`n_cell` is `LightNeeProxyContext::cell_normal`, set from the face of the vertex's own unjittered
+lookup (`LightNeeProxyOfSlot`), and rebuilt by ReSTIR DI from the receiver's stored face index
+(`DiReceiverOf`), so both strategies evaluate the same function. The floor keeps `w_nee > 0`
+wherever the NEE can sample (condition (b) above). `C_c` is the fill's normalisation of the oriented
+target (the dedicated draws use the same `G`). The vertex form below is unchanged.
+
 ### Vertex proxy (`CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX`, 2026-10-22)
 
 With the flag (and `LIGHT_MIS`), a vertex whose context has a cell (`ctx.cell`, `C_c > 0`) uses
@@ -139,11 +156,12 @@ trace reads this one) and `C_cur` (written by the latest fill). The fill moves `
 `C_prev` before writing. A cell inserted by a lookup starts with both at 0; an evicted cell gets
 both 0; `C_prev = 0` selects the global proxy (the first frame of a cell).
 
-Cell layout (832 bytes since the push-back of shadow ray results; 304 since the temporal cell
-reuse; 296 in step 3, 288 before): `0 key_lo, 4 key_hi, 8 touched_frame, 12 entity, 16 coord (3),
-28 level, 32 C_prev, 36 C_cur, 40 M, 44 C_n, 48 push_count, 64 reservoirs (32 x 8), 320 push ring
-(32 x 16)`. `kLightCellBytes`, `kLightCellReservoirOffset` and the renderer's `kLightCellBytes`
-(`renderer.h`) change together; the ABI comments say "832 bytes per cell".
+Cell layout (256 bytes since the oriented cells, docs/LIGHT_LIST.md section 2.7; 832 since the
+push-back of shadow ray results; 304 since the temporal cell reuse; 296 in step 3, 288 before):
+`0 key_lo, 4 key_hi, 8 touched_frame, 12 entity, 16 coord (3), 28 level, 32 C_prev, 36 C_cur, 40 M,
+44 C_n, 48 push_count, 52 face, 64 reservoirs (8 x 8), 128 push ring (8 x 16)`. `kLightCellBytes`,
+`kLightCellReservoirOffset` and the renderer's `kLightCellBytes` (`renderer.h`) change together; the
+ABI comments say "256 bytes per cell". The fill averages over the 8 threads of a cell.
 
 With `CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL` (docs/LIGHT_LIST.md section 2.2) the normalisation comes
 from dedicated draws: each fill thread draws one more entry from the CDF only for the estimate,

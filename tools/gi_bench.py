@@ -69,6 +69,20 @@ RUNS = {
     "--light-nee-candidates 4 --light-proxy-vertex",
     "pt_nee_rs16_vp_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
     "--light-nee-candidates 16 --light-proxy-vertex",
+    # Oriented light cells (docs/LIGHT_LIST.md section 2.7); since then a cell holds 8 reservoirs, so
+    # pt_nee_rs1 and pt_nee_rs1_conv are the unoriented 8-reservoir runs.
+    "pt_nee_or": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-cell-oriented",
+    "pt_nee_or_k32": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-cell-oriented --light-candidates 32",
+    "pt_nee_or_rs4": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-cell-oriented --light-nee-candidates 4",
+    "pt_nee_or_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-cell-oriented",
+    "pt_nee_or_k32_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-cell-oriented --light-candidates 32",
+    "pt_nee_or_rs4_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
+    "--light-cell-oriented --light-nee-candidates 4",
 }
 
 TIMINGS_RE = re.compile(r"timings:((?:\s+\w+=[-+0-9.eE]+)+)")

@@ -84,7 +84,9 @@ extern "C" {
    (32 -> 48 bytes). The light cell push-back added CAELIX_GI_FLAG_LIGHT_CELL_PUSH, appended
    light_push_confidence to CaelixGiOptions (52 -> 56 bytes) and two uint32 fields to CaelixGiStats
    (48 -> 56 bytes). The per-vertex resampling of the light NEE appended light_nee_candidates to
-   CaelixGiOptions (56 -> 60 bytes) and added CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX. A host built against
+   CaelixGiOptions (56 -> 60 bytes) and added CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX. The oriented light cells
+   added CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED and shrank a light cell to 256 bytes (8 reservoirs,
+   CaelixGiStats::light_cell_bytes changes accordingly). A host built against
    an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1205,6 +1207,12 @@ typedef enum CaelixGiMethod
                                                  term over the cell's normalisation) instead of the cell
                                                  form (docs/LIGHT_MIS.md "Vertex proxy"). Unbiased: both
                                                  strategies evaluate the same proxy */
+#define CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED (1u << 12) /* with LIGHT_NEE: the light cell key also holds the
+                                                 receiver's face (the axis of its world normal, 6 values),
+                                                 so a spatial cell splits into up to 6 oriented cells; the
+                                                 fill's target and the MIS proxy's cell form get the
+                                                 receiver orientation term (floor 0.1, never 0)
+                                                 (docs/LIGHT_LIST.md section 2.7). Unbiased */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
@@ -1239,7 +1247,7 @@ typedef struct CaelixGiOptions
     float depth_threshold;    /* 0 = 0.1: |x_v(q) - x_v(r)| must be below threshold * view_z(r) */
     uint32_t reset;           /* 1 = drop the reservoir history with the next render */
     uint32_t light_cell_capacity; /* 0 = 65536 light cells; else a power of two in 1024 .. 1048576
-                                     (832 bytes per cell) */
+                                     (256 bytes per cell) */
     uint32_t light_candidates;    /* 0 = 8; 1 .. 64 candidates per cell reservoir and frame */
     float light_level_footprint;  /* 0 = 0.25: a vertex whose pixel footprint (world units per pixel at
                                      its camera distance) is below this uses 8-voxel cells, else 32 */
@@ -1265,7 +1273,7 @@ typedef struct CaelixGiOptions
    the DI reservoir buffers (4 x 48 bytes per pixel) likewise at the first render with
    CAELIX_GI_FLAG_RESTIR_DI. The DI history is also dropped when the scene's light table was rebuilt
    since the renderer's previous render.
-   The light cells (light_cell_capacity x 832 bytes + 32) are allocated at the first render with
+   The light cells (light_cell_capacity x 256 bytes + 32) are allocated at the first render with
    CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity changes.
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,

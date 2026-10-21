@@ -3509,7 +3509,7 @@ TEST_CASE("light NEE with temporal cell reuse is unbiased")
     const std::vector<float> temporal = LightReference(rig, renderer, set, camera, 1024, 200000);
     CaelixGiStats stats{};
     caelix_renderer_get_gi_stats(renderer, &stats);
-    CHECK(stats.light_cell_bytes == 65536ull * 832ull + 32ull);  // the cells and the usage counters
+    CHECK(stats.light_cell_bytes == 65536ull * 256ull + 32ull);  // the cells and the usage counters
     const LightComparison c = CompareLight(pt, temporal, kBoxSize);
     std::printf("4 lights, light NEE + MIS + temporal cells vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 "
                 "block PSNR %.2f dB\n",
@@ -3666,6 +3666,70 @@ TEST_CASE("light NEE with per-vertex resampling is unbiased")
     }
     // The vertex proxy changes the MIS weights, so the images differ.
     CHECK(images[0] != images[1]);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("light NEE with oriented cells is unbiased")
+{
+    // The four lights of the temporal test (docs/LIGHT_LIST.md section 2.7): the light cell key holds
+    // the receiver's face, and the fill's target and the MIS proxy's cell form carry the receiver
+    // orientation term (floor 0.1). The ceiling's receivers face down while the lights sit in the
+    // ceiling plane, so their cells weigh every light near the floor. With and without the jittered
+    // lookup (a jittered receiver reads a cell of its own face but another position).
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    EnableLights(rig.scene);
+    World world = LightBoxWalls();
+    FillBox(world, 4, kBoxInterior, 4, 4, kBoxInterior, 4, kWhiteEmitter512);
+    FillBox(world, 20, kBoxInterior, 20, 20, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 4, kBoxInterior, 20, 4, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 12, kBoxInterior, 12, 12, kBoxInterior, 12, kWhiteEmitter512);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 4);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    constexpr uint32_t kFlags = CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED | CAELIX_GI_FLAG_LIGHT_NEE |
+                                CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
+    const uint32_t modes[3] = {kFlags, kFlags | CAELIX_GI_FLAG_LIGHT_CELL_JITTER,
+                               kFlags & ~static_cast<uint32_t>(CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED)};
+    const char* names[3] = {"oriented cells", "oriented cells + jitter", "unoriented cells"};
+    std::vector<float> images[3];
+    for (int m = 0; m < 3; ++m)
+    {
+        gi.flags = modes[m];
+        gi.light_nee_candidates = 1;
+        // The validation accepts the flag (with every light NEE flag it combines with here).
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+        images[m] = LightReference(rig, renderer, set, camera, 1024, 200000);
+        CaelixGiStats stats{};
+        caelix_renderer_get_gi_stats(renderer, &stats);
+        const LightComparison c = CompareLight(pt, images[m], kBoxSize);
+        std::printf("4 lights, light NEE + MIS + temporal cells, %s vs path tracer: mean %.5f vs %.5f, ratio %.4f, "
+                    "16x16 block PSNR %.2f dB, pixel PSNR %.2f dB (live cells %u)\n",
+                    names[m], c.test_mean, c.ref_mean, c.ratio, c.block_psnr, PixelPsnr(pt, images[m], kBoxSize),
+                    stats.light_cells_live);
+        CHECK(stats.light_cell_bytes == 65536ull * 256ull + 32ull);  // the cells and the usage counters
+        CHECK(c.ref_mean > 0.01);
+        CHECK(c.ratio > 0.97);
+        CHECK(c.ratio < 1.03);
+        CHECK(c.block_psnr > 30.0);
+    }
+    // The receiver face changes the cells and their targets, so the images differ.
+    CHECK(images[0] != images[2]);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);
@@ -4055,7 +4119,7 @@ TEST_CASE("cells fill and sample")
     std::printf("light cells: %llu bytes, fill %.4f ms (frame %llu), trace %.4f ms\n",
                 static_cast<unsigned long long>(stats.light_cell_bytes), stats.light_fill_ms,
                 static_cast<unsigned long long>(timings.frame_number), timings.trace_ms);
-    CHECK(stats.light_cell_bytes == 1024ull * 832ull + 32ull);  // the cells and the usage counters
+    CHECK(stats.light_cell_bytes == 1024ull * 256ull + 32ull);  // the cells and the usage counters
     CHECK(timings.frame_number != 0);
     CHECK(stats.light_fill_ms > 0.0f);
     // The usage counters of the same frame: some cells live, never more than the capacity.

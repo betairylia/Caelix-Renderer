@@ -400,7 +400,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     bool segment_mis = false;
     float3 segment_x_r = float3(0.0f, 0.0f, 0.0f);
     float3 segment_n_r = float3(0.0f, 0.0f, 0.0f);
-    LightNeeProxyContext segment_ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), 0.0f);
+    LightNeeProxyContext segment_ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), kLightCellFaceNone, 0.0f);
     CAELIX_BRANCH
     if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
     {
@@ -421,7 +421,8 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
             // The DI's receiver: the pushed-off primary point, its face's axis normal and the
             // unjittered cell's context (DiInitialReservoir stores the same one).
             segment_mis = true;
-            segment_ctx = LightNeeProxyAt(fc, primary_shade.bounce_origin, surface.group, LightCellPoint(surface));
+            segment_ctx = LightNeeProxyAt(fc, primary_shade.bounce_origin, surface.normal, surface.group,
+                                          LightCellPoint(surface));
         }
         segment_light_nee = true;
         segment_x_r = primary_shade.bounce_origin;

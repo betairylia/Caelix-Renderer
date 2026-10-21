@@ -4,25 +4,29 @@
 // MIS with the BSDF path (docs/LIGHT_MIS.md: the density proxy, LightNeeMisWeight, LightListCanSample).
 //
 // Light cells: a hash table of fc.light_cell_capacity cells in g_light_cells (trace set binding
-// 21), 832 bytes each (288 before step 3 of the light list, 296 before the temporal cell reuse, 304
-// before the push-back of shadow ray results):
-//   0    uint key_lo, key_hi    the 64-bit fingerprint of (entity, level, coordinate); key_lo 0 = empty
+// 21), 256 bytes each (288 before step 3 of the light list, 296 before the temporal cell reuse, 304
+// before the push-back of shadow ray results, 832 with 32 reservoirs and 32 push entries before the
+// oriented cells, docs/LIGHT_LIST.md section 2.7):
+//   0    uint key_lo, key_hi    the 64-bit fingerprint of (entity, level, coordinate, face); key_lo 0 = empty
 //   8    uint touched_frame     fc.frame_counter of the newest lookup
 //   12   uint entity
 //   16   int3 coord             the cell coordinate at `level`: floor(p) >> (3 + 2 level), p entity-local
 //   28   uint level             0: 8-voxel cells, 1: 32-voxel cells
 //   32   float C_prev           the cell normalisation C_c of the fill before the latest one (the MIS
 //                               proxy reads this one; 0 = none yet: the global proxy)
-//   36   float C_cur            C_c of the latest fill: the mean of w_sum / K over the 32 reservoirs
+//   36   float C_cur            C_c of the latest fill: the mean of w_sum / K over the 8 reservoirs
 //                               (kGiFlagLightCellTemporal: the running mean of dedicated draws)
 //   40   float M                kGiFlagLightCellTemporal: the candidate count behind every reservoir of
-//                               the cell (uniform over the 32: all threads merge the same way); 0 = no history
+//                               the cell (uniform over the 8: all threads merge the same way); 0 = no history
 //   44   float C_n              kGiFlagLightCellTemporal: the draw count behind C_cur; 0 = none
-//   48   uint push_count        kGiFlagLightCellPush: pushes claimed since the latest fill (may exceed 32)
-//   52   12 bytes of padding
-//   64   32 x { uint light; float W }   the reservoirs: light = a light sample word (below), W = its
+//   48   uint push_count        kGiFlagLightCellPush: pushes claimed since the latest fill (may exceed 8)
+//   52   uint face              the receiver face of the key (kGiFlagLightCellOriented: 0..5 = +X -X +Y
+//                               -Y +Z -Z of the receivers' world normal, GiFaceIndex), else
+//                               kLightCellFaceNone (6); written by the insert, read by the fill
+//   56   8 bytes of padding
+//   64   8 x { uint light; float W }   the reservoirs: light = a light sample word (below), W = its
 //                               unbiased contribution weight (0 = empty)
-//   320  32 x { uint word; float W; float visible; uint pad }   kGiFlagLightCellPush: the push ring,
+//   128  8 x { uint word; float W; float visible; uint pad }   kGiFlagLightCellPush: the push ring,
 //                               the light samples that the trace's vertices drew from this cell
 //                               (LightCellClaimPush, LightCellStorePush); the fill merges entry r
 //                               into reservoir r
@@ -32,7 +36,7 @@
 // voxel, area 1), 6 = kLightCellFaceBrick a brick-level sample (the vertex samples a point inside the
 // brick; voxel bits 0), 7 only in kNoLight (empty). The fill's fresh candidates are brick-level;
 // voxel-face samples enter the cells only through the push ring.
-// After the last cell (byte fc.light_cell_capacity x 832, LightCellCounterBase) the buffer holds 32
+// After the last cell (byte fc.light_cell_capacity x 256, LightCellCounterBase) the buffer holds 32
 // bytes of usage counters, zeroed by the renderer before every fill and copied to the host after the
 // trace (CaelixGiStats):
 //   0    uint live              cells with a key after this frame's eviction (fill, thread 0)
@@ -40,7 +44,7 @@
 //   8    uint inserted          cells inserted by this frame's lookups (LightCellLookup)
 //   12   uint failed            lookups that found neither the key nor a free slot in 8 probes
 //   16   uint pushed            pushes of the previous frame's trace that got a ring slot (fill, thread 0)
-//   20   uint push_dropped      pushes of the previous frame's trace beyond the 32 slots (fill, thread 0)
+//   20   uint push_dropped      pushes of the previous frame's trace beyond the 8 slots (fill, thread 0)
 //   24   8 bytes of padding
 // The trace kernel looks cells up and inserts missing ones (LightCellLookup); caelix_light_cells.hlsl
 // fills the reservoirs of every live cell before the next trace and evicts cells untouched for 64
@@ -62,18 +66,27 @@
 #include "common/caelix_light.hlsl"
 #include "render/caelix_scene_trace.hlsl"
 #include "render/caelix_shading.hlsl"
+#include "render/caelix_restir_gi.hlsl"
 
-static const uint kLightCellBytes = 832;
-static const uint kLightCellReservoirs = 32;
+static const uint kLightCellBytes = 256;
+static const uint kLightCellReservoirs = 8;
 static const uint kLightCellCPrevOffset = 32;
 static const uint kLightCellCCurOffset = 36;
 static const uint kLightCellMOffset = 40;
 static const uint kLightCellCNOffset = 44;
 static const uint kLightCellPushCountOffset = 48;
 static const uint kLightCellReservoirOffset = 64;
-static const uint kLightCellPushOffset = 320;
-static const uint kLightCellPushSlots = 32;
+static const uint kLightCellFaceOffset = 52;
+static const uint kLightCellPushOffset = 128;
+static const uint kLightCellPushSlots = 8;
 static const uint kLightCellPushBytes = 16;
+// The header face of an unoriented cell (kGiFlagLightCellOriented off): no receiver face in the key.
+static const uint kLightCellFaceNone = 6u;
+// The floor of the receiver orientation term of an oriented cell (LightCellReceiverOrient): never 0,
+// because a receiver may read a cell of another orientation or position (the jittered lookup, a
+// merged slot) and every reservoir must stay an unbiased contribution weight for it; the floor costs
+// noise there (W up to 10x), not bias.
+static const float kLightCellOrientFloor = 0.1f;
 // The light sample word of a cell reservoir or push entry (see above).
 static const uint kLightCellEntryMask = 0xFFFFFu;
 static const uint kLightCellVoxelShift = 20u;
@@ -124,13 +137,18 @@ uint64_t SplitMix64(uint64_t x)
     return x ^ (x >> 31);
 }
 
-// The fingerprint of a cell: three rounds of splitmix64 over the packed words; the low word is
-// forced non-zero (0 marks an empty slot).
-uint2 LightCellKey(uint entity, uint level, int3 coord)
+// The fingerprint of a cell: three rounds of splitmix64 over the packed words, a fourth over the
+// receiver face of an oriented cell (face 0..5; kLightCellFaceNone keeps the unoriented hash); the
+// low word is forced non-zero (0 marks an empty slot).
+uint2 LightCellKey(uint entity, uint level, int3 coord, uint face)
 {
     uint64_t h = SplitMix64((uint64_t(entity) << 32) | uint64_t(level));
     h = SplitMix64(h ^ ((uint64_t(asuint(coord.y)) << 32) | uint64_t(asuint(coord.x))));
     h = SplitMix64(h ^ uint64_t(asuint(coord.z)));
+    if (face != kLightCellFaceNone)
+    {
+        h = SplitMix64(h ^ uint64_t(face));
+    }
     const uint lo = uint(h);
     return uint2(lo != 0u ? lo : 1u, uint(h >> 32));
 }
@@ -154,12 +172,47 @@ int3 LightCellCoord(float3 p, uint level)
     return int3(floor(p)) >> int(3u + 2u * level);
 }
 
-// Finds the cell of (entity, level, coord), touching it, or inserts it (empty reservoirs). Returns
-// the slot, or -1 when 8 probes found neither the key nor a free slot. Counts each insert and each
-// failed lookup in the usage counters (kLightCellCounterInserted, kLightCellCounterFailed).
-int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord)
+// The receiver face of the cell key of a vertex with world normal `n_r` (docs/LIGHT_LIST.md section
+// 2.7): with kGiFlagLightCellOriented the face index of the normal (GiFaceIndex, 0..5, the index that
+// ReSTIR DI stores for its receiver), else kLightCellFaceNone.
+uint LightCellFaceOf(CaelixFrameConstants fc, float3 n_r)
 {
-    const uint2 key = LightCellKey(entity, level, coord);
+    return (fc.gi_flags & kGiFlagLightCellOriented) != 0u ? GiFaceIndex(n_r) : kLightCellFaceNone;
+}
+
+// The world normal of a cell's receiver face (GiFaceNormal; the face comes from the world normal, so
+// no entity rotation), the zero vector for kLightCellFaceNone (an unoriented cell).
+float3 LightCellFaceNormal(uint face)
+{
+    return face < kLightCellFaceNone ? GiFaceNormal(face) : float3(0.0f, 0.0f, 0.0f);
+}
+
+// The receiver orientation term of an oriented cell (docs/LIGHT_LIST.md section 2.7) for a light at
+// world position `light`: max(kLightCellOrientFloor, dot(n_cell, direction from the cell's BACK plane
+// point to the light)), where the back plane point is the cell centre moved half a cell against the
+// face normal (`near_d2` = (half + 4)^2 as in the fill, so half = sqrt(near_d2) - 4). Every receiver of
+// the cell lies in front of that plane, so a light at a receiver's own height (a lamp standing on the
+// floor the receivers are part of) keeps a positive cosine instead of the floor; the term is an upper
+// bound of the receivers' cosines in height, never 0. 1 for an unoriented cell (n_cell 0).
+float LightCellReceiverOrient(float3 n_cell, float3 cell_centre, float near_d2, float3 light)
+{
+    if (any(n_cell != 0.0f))
+    {
+        const float half_cell = sqrt(near_d2) - 4.0f;
+        const float3 to_light = light - (cell_centre - half_cell * n_cell);
+        const float d2 = dot(to_light, to_light);
+        return d2 > 1e-12f ? max(kLightCellOrientFloor, dot(n_cell, to_light) * rsqrt(d2)) : 1.0f;
+    }
+    return 1.0f;
+}
+
+// Finds the cell of (entity, level, coord, face), touching it, or inserts it (empty reservoirs).
+// Returns the slot, or -1 when 8 probes found neither the key nor a free slot. Counts each insert and
+// each failed lookup in the usage counters (kLightCellCounterInserted, kLightCellCounterFailed).
+// `face`: LightCellFaceOf of the receiver (kLightCellFaceNone without kGiFlagLightCellOriented).
+int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord, uint face)
+{
+    const uint2 key = LightCellKey(entity, level, coord, face);
     const uint mask = fc.light_cell_capacity - 1u;
     CAELIX_LOOP
     for (uint probe = 0; probe < kLightCellProbes; ++probe)
@@ -184,7 +237,7 @@ int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord
                 g_light_cells.Store3(base + 16, asuint(coord));
                 g_light_cells.Store(base + 28, level);
                 g_light_cells.Store4(base + kLightCellCPrevOffset, uint4(0u, 0u, 0u, 0u));
-                g_light_cells.Store(base + kLightCellPushCountOffset, 0u);
+                g_light_cells.Store2(base + kLightCellPushCountOffset, uint2(0u, face));
                 g_light_cells.InterlockedAdd(LightCellCounterBase(fc) + kLightCellCounterInserted, 1u);
                 return int(slot);
             }
@@ -506,19 +559,24 @@ struct LightNeeProxyContext
     bool vertex;         // cell and kGiFlagLightProxyVertex: the vertex form of the cell proxy (a frame
                          // constant: every place that rebuilds a context sets it from fc.gi_flags)
     float3 cell_centre;  // world centre of the cell (as the fill computes it)
+    float3 cell_normal;  // kGiFlagLightCellOriented: the world normal of the cell's receiver face (the
+                         // fill's receiver orientation term); zero = an unoriented cell or no cell
     float near_d2;       // (cell half size + 4)^2: the fill's distance floor
     float C;             // the cell's C_prev
     float total;         // the light table's total weight; 0 without a table or without entries
 };
 
-// The context of cell `slot` (-1 = none) of (entity, level, coord); `total` = the table's total.
+// The context of cell `slot` (-1 = none) of (entity, level, coord, face); `total` = the table's total.
+// The cell normal comes from the lookup's `face` (as the centre from its coordinate), so that the
+// context is a function of the vertex; ReSTIR DI rebuilds the same normal from its stored face index.
 LightNeeProxyContext LightNeeProxyOfSlot(CaelixFrameConstants fc, int slot, uint entity, uint level, int3 coord,
-                                         float total)
+                                         uint face, float total)
 {
     LightNeeProxyContext ctx;
     ctx.cell = false;
     ctx.vertex = false;
     ctx.cell_centre = float3(0.0f, 0.0f, 0.0f);
+    ctx.cell_normal = float3(0.0f, 0.0f, 0.0f);
     ctx.near_d2 = 0.0f;
     ctx.C = 0.0f;
     ctx.total = total;
@@ -539,15 +597,17 @@ LightNeeProxyContext LightNeeProxyOfSlot(CaelixFrameConstants fc, int slot, uint
     ctx.cell = true;
     ctx.vertex = (fc.gi_flags & kGiFlagLightProxyVertex) != 0u;
     ctx.cell_centre = RowsTransform(r0, r1, r2, (float3(coord) + 0.5f) * cell_size);
+    ctx.cell_normal = LightCellFaceNormal(face);
     ctx.near_d2 = (0.5f * cell_size + 4.0f) * (0.5f * cell_size + 4.0f);
     ctx.C = c_prev;
     return ctx;
 }
 
-// The proxy context of the vertex x_r (pushed-off position) on brick group `group`, entity-local
-// point `object_point` (LightCellPoint): the unjittered cell lookup (it inserts the cell when it is
-// missing, as every lookup does). LightNextEvent builds the same context from the same lookup.
-LightNeeProxyContext LightNeeProxyAt(CaelixFrameConstants fc, float3 x_r, uint group, float3 object_point)
+// The proxy context of the vertex x_r (pushed-off position) with world normal `n_r` on brick group
+// `group`, entity-local point `object_point` (LightCellPoint): the unjittered cell lookup (it inserts
+// the cell when it is missing, as every lookup does; the receiver face of n_r with
+// kGiFlagLightCellOriented). LightNextEvent builds the same context from the same lookup.
+LightNeeProxyContext LightNeeProxyAt(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint group, float3 object_point)
 {
     float total = 0.0f;
     if (fc.light_table != 0u)
@@ -560,14 +620,15 @@ LightNeeProxyContext LightNeeProxyAt(CaelixFrameConstants fc, float3 x_r, uint g
     uint entity = 0;
     uint level = 0;
     int3 coord = int3(0, 0, 0);
+    const uint face = LightCellFaceOf(fc, n_r);
     if (fc.light_cells != 0u && total > 0.0f)
     {
         level = LightCellLevel(fc, x_r);
         entity = GroupEntity(fc, group);
         coord = LightCellCoord(object_point, level);
-        slot = LightCellLookup(fc, entity, level, coord);
+        slot = LightCellLookup(fc, entity, level, coord, face);
     }
-    return LightNeeProxyOfSlot(fc, slot, entity, level, coord, total);
+    return LightNeeProxyOfSlot(fc, slot, entity, level, coord, face, total);
 }
 
 // The proxy area density of the light NEE at the point of `d` seen from the receiver `x_r`
@@ -575,7 +636,9 @@ LightNeeProxyContext LightNeeProxyAt(CaelixFrameConstants fc, float3 x_r, uint g
 // sampler's: face_weight[face] / W_cand / n_face, W_cand = LightCandidateWeight(d, x_r) (0 when no
 // candidate face has weight: the NEE cannot sample the brick from there). With a cell: p_hat_c(b) /
 // C_c times the in-brick density, p_hat_c(b) = total_b * G, G and orient as in the fill kernel
-// (caelix_light_cells.hlsl). Without one: the global CDF, total_b / total times the in-brick density.
+// (caelix_light_cells.hlsl), times the receiver orientation term of an oriented cell
+// (LightCellReceiverOrient of ctx.cell_normal toward the brick centre, docs/LIGHT_LIST.md section
+// 2.7). Without one: the global CDF, total_b / total times the in-brick density.
 float LightNeeProxyPdfArea(LightNeeProxyContext ctx, LightMisDesc d, float3 x_r)
 {
     const float w_cand = LightCandidateWeight(d, x_r);
@@ -591,7 +654,9 @@ float LightNeeProxyPdfArea(LightNeeProxyContext ctx, LightMisDesc d, float3 x_r)
         {
             orient = max(0.1f, dot(d.brick_normal, to_cell * rsqrt(d2)));
         }
-        const float G = orient / max(d2, ctx.near_d2);
+        // The fill's receiver orientation term (1 for an unoriented cell): toward the brick centre.
+        const float orient_r = LightCellReceiverOrient(ctx.cell_normal, ctx.cell_centre, ctx.near_d2, d.brick_centre);
+        const float G = orient * orient_r / max(d2, ctx.near_d2);
         return G * weighted / ctx.C;
     }
     return ctx.total > 0.0f ? weighted / ctx.total : 0.0f;
@@ -866,9 +931,9 @@ uint LightCellRegionFaceMask(CaelixFrameConstants fc, uint entity, uint level, i
                                             float3(c0.y, c1.y, c2.y) * h, float3(c0.z, c1.z, c2.z) * h);
 }
 
-// Claims a push of cell `slot` (kGiFlagLightCellPush) and returns its index: the first 32 claims of
+// Claims a push of cell `slot` (kGiFlagLightCellPush) and returns its index: the first 8 claims of
 // a frame get a ring entry, later ones are dropped (the fill counts both from push_count). A vertex
-// claims BEFORE it draws its light sample: which vertices win the 32 entries then depends on the
+// claims BEFORE it draws its light sample: which vertices win the 8 entries then depends on the
 // paths' timing up to the claim, never on the sample (a claim after the shadow ray lets the vertices
 // without a ray win, a sample-dependent choice: 0.36 % dark in the 4-light box).
 uint LightCellClaimPush(uint slot)
@@ -878,7 +943,7 @@ uint LightCellClaimPush(uint slot)
     return index;
 }
 
-// Writes the claimed push `index` of cell `slot` (no-op beyond the 32 ring entries).
+// Writes the claimed push `index` of cell `slot` (no-op beyond the 8 ring entries).
 void LightCellStorePush(uint slot, uint index, uint word, float W, bool visible)
 {
     if (index < kLightCellPushSlots)
@@ -922,7 +987,7 @@ LightPoint LightPointAt(CaelixFrameConstants fc, LightEntryHeader header, uint v
 // kept with probability w_i / w_sum, w_i = p_hat(y_i) W_i, and W_out = w_sum / (K p_hat(y)); one shadow
 // ray to y. RIS with the equal input weights 1/K and unbiased input contribution weights: (y, W_out)
 // is an unbiased contribution weight for any integrand whose support lies in the target's support.
-// The candidates read the same 32 reservoirs of one cell and are therefore correlated; that is
+// The candidates read the same 8 reservoirs of one cell and are therefore correlated; that is
 // harmless, since the estimator is linear in the inputs' contribution weights. Five random numbers per
 // candidate (reservoir, global, the point's four, select), the jitter's three before in the caller.
 // Push-back is excluded by the validation (CAELIX_GI_FLAG_LIGHT_CELL_PUSH needs K = 1).
@@ -1068,7 +1133,7 @@ float3 LightNextEventResampled(CaelixFrameConstants fc, float3 x_r, float3 n_r, 
 // Next-event estimation on the light list at a diffuse path vertex (section 2.3): the receiver
 // x_r (the pushed-off vertex position) with world normal n_r, on brick group `group`, entity-local
 // position `object_point` (the hit point moved a little into the air, for the cell coordinate).
-// The light sample comes from one of the 32 reservoirs of the vertex's light cell when it holds a
+// The light sample comes from one of the 8 reservoirs of the vertex's light cell when it holds a
 // valid one, else from the global CDF: a brick-level sample (a brick, then a point by
 // SampleLightEntry, W = W_brick / pdf_area) or a voxel-face sample (a point uniform on that face by
 // LightSampleFaceOf, W = the reservoir's W, pdf_area 1; a word whose voxel bit is clear counts as no
@@ -1076,7 +1141,7 @@ float3 LightNextEventResampled(CaelixFrameConstants fc, float3 x_r, float3 n_r, 
 // (the albedo is in the caller's throughput, as for the sun NEE), 0 without a usable sample.
 // With kGiFlagLightCellJitter (section 2.5) the cell is looked up at `object_point` moved by a
 // uniform random offset in (-0.5, 0.5) cells per axis: the pixels of one brick then read up to 8
-// cells instead of the same one, so the variance of the cell contents (one refill of 32 reservoirs
+// cells instead of the same one, so the variance of the cell contents (one refill of 8 reservoirs
 // per frame) turns from a per-cell flicker into per-pixel noise. Unbiased: every cell's reservoirs
 // are unbiased estimators for any receiver (W does not depend on the receiver).
 // `mis` (kGiFlagLightMis, docs/LIGHT_MIS.md): the contribution is multiplied by the balance
@@ -1107,7 +1172,8 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     const uint64_t table = fc.light_table;
     const uint count = CAELIX_LOAD_U32(table + kLightHeaderCount);
     const float total = asfloat(CAELIX_LOAD_U32(table + kLightHeaderTotal));
-    ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), (count != 0u && total > 0.0f) ? total : 0.0f);
+    ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), kLightCellFaceNone,
+                              (count != 0u && total > 0.0f) ? total : 0.0f);
     if (count == 0u || !(total > 0.0f))
     {
         return float3(0.0f, 0.0f, 0.0f);
@@ -1123,15 +1189,18 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     {
         level = LightCellLevel(fc, x_r);
         entity = GroupEntity(fc, group);
+        // kGiFlagLightCellOriented: both lookups use the receiver face of n_r (the jitter moves only
+        // the point).
+        const uint face = LightCellFaceOf(fc, n_r);
         const bool jitter = (fc.gi_flags & kGiFlagLightCellJitter) != 0u;
         // The proxy's cell is the unjittered one; without the jitter it is also the sampling cell.
         if (mis || !jitter)
         {
             sample_coord = LightCellCoord(object_point, level);
-            slot = LightCellLookup(fc, entity, level, sample_coord);
+            slot = LightCellLookup(fc, entity, level, sample_coord, face);
             if (mis)
             {
-                ctx = LightNeeProxyOfSlot(fc, slot, entity, level, sample_coord, total);
+                ctx = LightNeeProxyOfSlot(fc, slot, entity, level, sample_coord, face, total);
             }
         }
         if (jitter)
@@ -1139,7 +1208,7 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
             const float3 u_jitter = float3(RandomFloat01(rng), RandomFloat01(rng), RandomFloat01(rng));
             const float3 cell_point = object_point + (u_jitter - 0.5f) * float(8u << (2u * level));
             sample_coord = LightCellCoord(cell_point, level);
-            slot = LightCellLookup(fc, entity, level, sample_coord);
+            slot = LightCellLookup(fc, entity, level, sample_coord, face);
         }
     }
 

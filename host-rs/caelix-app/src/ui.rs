@@ -656,6 +656,14 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         .on_hover_text("Each vertex reads one of up to 8 cells around its hit point: per-cell flicker becomes per-pixel noise");
         ui.add_enabled(
             lighting && gi.light_nee,
+            egui::Checkbox::new(&mut gi.light_cell_oriented, "oriented light cells (receiver face in the key)"),
+        )
+        .on_hover_text(
+            "The cell key also holds the receiver's face (the axis of its normal): each cell splits into up to 6 \
+             oriented cells whose fill and MIS proxy weigh the lights by the receiver's orientation (floor 0.1)",
+        );
+        ui.add_enabled(
+            lighting && gi.light_nee,
             egui::Checkbox::new(&mut gi.light_cell_temporal, "temporal reuse in light cell fill"),
         )
         .on_hover_text(

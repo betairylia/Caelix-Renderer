@@ -426,7 +426,7 @@ struct Args {
     /// points closer than this are left to the BSDF path.
     #[arg(long, value_name = "F", default_value_t = 0.0)]
     light_nee_distance: f32,
-    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 832 bytes each).
+    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 256 bytes each).
     #[arg(long, value_name = "N", default_value_t = 65536)]
     light_cells: u32,
     /// Light NEE: candidates per cell reservoir and frame (1..64).
@@ -436,6 +436,11 @@ struct Args {
     /// jittered by up to half a cell (the jitter turns the per-cell flicker into per-pixel noise).
     #[arg(long)]
     light_no_cell_jitter: bool,
+    /// Light NEE: oriented light cells (docs/LIGHT_LIST.md section 2.7): the cell key also holds the
+    /// receiver's face (the axis of its world normal), and the fill's target and the MIS proxy get
+    /// the receiver orientation term.
+    #[arg(long)]
+    light_cell_oriented: bool,
     /// Light NEE: no MIS between the light NEE and the diffuse bounce (docs/LIGHT_MIS.md): a
     /// list-light hit after a light NEE vertex is skipped instead (the step 1 rule).
     #[arg(long)]
@@ -2109,6 +2114,7 @@ fn main() -> anyhow::Result<()> {
             light_nee: args.gi_light_nee,
             light_cells: args.light_cells,
             light_cell_jitter: !args.light_no_cell_jitter,
+            light_cell_oriented: args.light_cell_oriented,
             light_mis: !args.light_no_mis,
             light_cell_temporal: args.light_cell_temporal,
             light_temporal_frames: args.light_temporal_frames,

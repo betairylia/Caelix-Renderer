@@ -372,7 +372,7 @@ void Renderer::EnsureLightCells(uint32_t capacity, uint64_t frame)
     {
         return;
     }
-    // 832 bytes per cell and the 32 bytes of usage counters at the tail (render/caelix_light_sample.hlsl),
+    // 256 bytes per cell and the 32 bytes of usage counters at the tail (render/caelix_light_sample.hlsl),
     // and the counters' readback ring. On a throw the old buffers stay.
     GpuBuffer fresh = GpuBuffer::DeviceLocal(device_.allocator(), device_.device(),
                                              kLightCellBytes * capacity + kLightCellCounterBytes);
@@ -401,7 +401,7 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                                      CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI |
                                      CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_MIS |
                                      CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL | CAELIX_GI_FLAG_LIGHT_CELL_PUSH |
-                                     CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX;
+                                     CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX | CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);

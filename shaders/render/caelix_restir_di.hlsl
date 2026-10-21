@@ -141,7 +141,9 @@ bool DiMisEnabled(CaelixFrameConstants fc)
 // The receiver of a reservoir: its visible point, the axis normal of its visible face and its MIS
 // proxy context rebuilt from the stored fields. The context equals the one LightNeeProxyOfSlot built
 // in the trace kernel (and LightNeeProxyAt in TracePath, for the first segment's w_bsdf): the same
-// cell centre and C_prev, near_d2 from the level flag, and the table's total of this frame.
+// cell centre and C_prev, near_d2 from the level flag, the table's total of this frame, and with
+// kGiFlagLightCellOriented the cell normal of the visible face index (the face of the cell key,
+// docs/LIGHT_LIST.md section 2.7).
 struct DiReceiver
 {
     float3 x_v;
@@ -164,6 +166,7 @@ DiReceiver DiReceiverOf(CaelixFrameConstants fc, DiReservoir r)
     v.ctx.cell = r.cell_C > 0.0f;
     v.ctx.vertex = v.ctx.cell && (fc.gi_flags & kGiFlagLightProxyVertex) != 0u;
     v.ctx.cell_centre = float3(0.0f, 0.0f, 0.0f);
+    v.ctx.cell_normal = float3(0.0f, 0.0f, 0.0f);
     v.ctx.near_d2 = 0.0f;
     v.ctx.C = 0.0f;
     v.ctx.total = total;
@@ -172,6 +175,10 @@ DiReceiver DiReceiverOf(CaelixFrameConstants fc, DiReservoir r)
         const uint level = (r.visible_flags_m & kDiCellLevel) != 0u ? 1u : 0u;
         const float cell_size = float(8u << (2u * level));
         v.ctx.cell_centre = r.cell_centre;
+        // The trace kernel looked the cell up with this face (LightCellFaceOf of the same normal).
+        v.ctx.cell_normal = (fc.gi_flags & kGiFlagLightCellOriented) != 0u
+                                ? LightCellFaceNormal(DiVisibleFace(r))
+                                : float3(0.0f, 0.0f, 0.0f);
         v.ctx.near_d2 = (0.5f * cell_size + 4.0f) * (0.5f * cell_size + 4.0f);
         v.ctx.C = r.cell_C;
     }
@@ -392,13 +399,15 @@ DiReservoir DiMergeFinishWithCount(DiMerge s, DiReservoir own, uint count)
 
 // The initial reservoir of a pixel (trace kernel): `candidates` light points by streaming RIS at the
 // visible point x_v (the pushed-off primary point) with the face index `face` of its normal. Each
-// candidate: one of the 32 reservoirs of the pixel's light cell (looked up once; a light sample
+// candidate: one of the 8 reservoirs of the pixel's light cell (looked up once; a light sample
 // word and its W), or the global CDF when the cell or that reservoir is empty, then
 // SampleLightEntryWith for a brick-level sample or LightSampleFaceOf for a voxel-face one (uv
 // quantized to the reservoir's 16 bits) -> point with pdf_area (1 for a voxel-face sample);
 // candidate weight p_hat * W / pdf_area. W = w_sum / (candidates * p_hat(selected)), M = 1. No
 // shadow ray. The DI candidates push nothing into the cells (kGiFlagLightCellPush: not done).
-// `group` and `object_point` locate the cell as in LightNextEvent. Own random stream.
+// `group` and `object_point` locate the cell as in LightNextEvent (with kGiFlagLightCellOriented the
+// key's receiver face is `face`, the index LightCellFaceOf gives for the same normal). Own random
+// stream.
 // With DiMisEnabled the same (unjittered) cell lookup gives the receiver's proxy context
 // (LightNeeProxyOfSlot; TracePath's LightNeeProxyAt finds the same slot and C_prev for the first
 // segment), which is stored in the reservoir, and p_hat includes each candidate's NEE weight w_nee
@@ -423,17 +432,18 @@ DiReservoir DiInitialReservoir(CaelixFrameConstants fc, uint2 pixel, float3 x_v,
     const bool mis = DiMisEnabled(fc);
 
     int slot = -1;
-    LightNeeProxyContext ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), total);
+    LightNeeProxyContext ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), kLightCellFaceNone, total);
     CAELIX_BRANCH
     if (fc.light_cells != 0u)
     {
         const uint level = LightCellLevel(fc, x_v);
         const uint entity = GroupEntity(fc, group);
         const int3 coord = LightCellCoord(object_point, level);
-        slot = LightCellLookup(fc, entity, level, coord);
+        const uint cell_face = (fc.gi_flags & kGiFlagLightCellOriented) != 0u ? face : kLightCellFaceNone;
+        slot = LightCellLookup(fc, entity, level, coord, cell_face);
         if (mis)
         {
-            ctx = LightNeeProxyOfSlot(fc, slot, entity, level, coord, total);
+            ctx = LightNeeProxyOfSlot(fc, slot, entity, level, coord, cell_face, total);
             if (ctx.cell)
             {
                 r.cell_centre = ctx.cell_centre;
