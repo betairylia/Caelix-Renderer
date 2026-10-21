@@ -102,7 +102,7 @@ constexpr uint64_t LightTableBytes(uint32_t max_bricks)
     return kLightTableHeaderBytes + static_cast<uint64_t>(max_bricks) * (sizeof(LightEntry) + sizeof(float));
 }
 
-// Push constants of the light table kernels (caelix_light_compact, caelix_light_scan). 72 bytes.
+// Push constants of the light table kernels (caelix_light_compact, caelix_light_scan). 80 bytes.
 // The table itself is set 0 binding 0 of the kernels (a storage buffer: the compact kernel counts
 // with atomics, which need a descriptor in this DXC version); the rest is read through addresses.
 struct LightPush
@@ -111,6 +111,7 @@ struct LightPush
     uint64_t slot_tables;
     uint64_t page_table;
     uint64_t light_words;
+    uint64_t light_indices;  // u32 per AABB row: entry index + 1, 0 = none (written by the compact kernel)
     uint64_t materials;
     uint32_t group_base;   // the first group index of this dispatch (dispatches split at 65535)
     uint32_t group_count;  // groups_.size(): group indices [0, group_count)
@@ -121,7 +122,7 @@ struct LightPush
     uint32_t encoding;
     float min_emission;
 };
-static_assert(sizeof(LightPush) == 72);
+static_assert(sizeof(LightPush) == 80);
 
 // One AABB row: float3 min, float3 max (entity-local block coordinates). All NaN
 // = inactive primitive.

@@ -174,3 +174,86 @@ keeps it in the path-trace method like `LIGHT_CELL_JITTER`. `CaelixGiOptions` is
 
 `tools/gi_bench.py`: `pt_nee` gains the flag by default (host default), `pt_nee_nomis` is the old
 behaviour; the four scenes at 1 spp against their references.
+
+## As built (phase A: sections 1-4, 6-8; 2026-10-21)
+
+Section 5 (ReSTIR DI with MIS) is not built: the DI target, reservoir and shade pass are unchanged,
+and the primary vertex keeps the exclusive rule in ReSTIR DI mode (with the bias fix of section 2).
+
+### Sizes
+
+| item | size |
+| --- | --- |
+| `light_indices_` (scene) | 4 B per AABB row, next to `light_words_` (256 KiB at the initial 65536 rows); counted in `CaelixLightStats::table_bytes` |
+| `LightPush` | 72 -> 80 B (`light_indices` after `light_words`; C++ and both shader copies) |
+| light cell | 288 -> 296 B (`C_prev` at 32, `C_cur` at 36, reservoirs at 40) |
+| `FrameConstants` | 704 B unchanged: `light_indices` (u64) at 688 replaces `pad_688`/`pad_692` |
+| public ABI | `CAELIX_GI_FLAG_LIGHT_MIS (1u << 8)` only; no struct changed |
+
+### Kernels and code touched
+
+- `caelix_light_compact.hlsl`: `CompactBrick` returns entry index + 1 (0 = no entry); `main` writes
+  the map for every dense id below the high water.
+- `caelix_light_scan.hlsl`: the push struct only.
+- `caelix_light_cells.hlsl`: `gs_c[32]` + one barrier after the reservoir store; thread 0 moves
+  `C_cur` to `C_prev` and stores the mean of `w_sum / K`. Eviction and the "no usable table" case
+  zero both values. Every early return stays workgroup-uniform; the normal path has none before the
+  barrier.
+- `caelix_light_sample.hlsl`: `RowsTransform`/`RowsRotate` (moved from the fill kernel),
+  `LightMisDesc` (+ `LightMisDescWith`, `LightMisDescOf`), `LightCandidateFaces`,
+  `LightNeeProxyContext` (+ `LightNeeProxyOfSlot`, `LightNeeProxyAt`), `LightNeeProxyPdfArea`,
+  `LightNeeMisWeight`, `LightListCanSample`; `LightSample` carries `mis`; `LightNextEvent` takes
+  `mis` and returns the context through `out LightNeeProxyContext ctx`.
+- `caelix_path_trace.hlsl` (`TracePath`): `light_mis`, the per-segment state (`segment_mis`,
+  `segment_x_r`, `segment_n_r`, `segment_ctx`) and the hit rule of section 4.
+- Scene: the map is reserved, grown, moved (`light_moves_`), zero-filled (new rows) and zeroed (freed
+  ids) exactly like `light_words_`. Renderer: `constants.light_indices`, `kCellBytes` 296, the flag in
+  `kKnownFlags` and in the path-trace flag mask.
+- Host: `GiSettings::light_mis` (default on, only with `light_nee`), `--light-no-mis`, a "MIS light
+  NEE / diffuse bounce" checkbox in the GI section. `tools/gi_bench.py`: `pt_nee_nomis` and
+  `pt_nee_nomis_conv`.
+
+### Differences from the design, and why
+
+1. `LightNextEvent` builds the proxy context (and does the extra unjittered lookup) only when `mis`
+   is set; without it the context is the global one, and the lookups and random numbers are the
+   same as before step 3 (without MIS nothing reads the context). With `mis` and the jitter on, a
+   vertex does two lookups (unjittered for the proxy, jittered for sampling); with the jitter off one
+   lookup serves both. The MIS draws no random number.
+2. The function the design calls `LightNeeProxyPdf` is `LightNeeProxyPdfArea`; the shared cell part
+   is `LightNeeProxyOfSlot`, so that `LightNextEvent` and `LightNeeProxyAt` build the context from
+   the same code. `LightNeeProxyAt` is not called yet (phase B, ReSTIR DI, needs it).
+3. `LightMisDesc` computes the brick centre and the world mean normal from the voxel frame's axes
+   (`centre_b = voxel centre + R (3.5 - voxel)`) instead of a second load of the entity rows. The NEE
+   side (`SampleLightEntryWith`) and the BSDF side (`LightMisDescOf`) both go through
+   `LightMisDescWith` with the same frame function, so both evaluate the same numbers.
+4. Degenerate densities in `LightNeeMisWeight`: `cos_l <= 0` or a non-finite `p_sa` counts as
+   `p_sa = +inf` (NEE 1, BSDF 0); `p_sa + p_bsdf = 0` gives NEE 0, BSDF 1. Every branch keeps
+   `w_nee + w_bsdf = 1` for the same inputs.
+5. The "dropped bricks keep their emission" test also runs with MIS (the dropped brick gets
+   `w_bsdf = 1` there as well).
+6. Test helpers: `LightBoxWalls()` builds the walls for the three box variants; the pixel metric
+   helpers (`PixelPsnr`, `PixelRmse`, `ColorPixels`) moved up in `trace_test.cpp` so that the new
+   tests can use them.
+7. "ReSTIR GI: set_gi_options validation" used `1u << 7` as an unknown flag, which has been
+   `LIGHT_CELL_JITTER` since the cell jitter commit (the test failed since then); it uses `1u << 31`
+   now. All 27 trace test cases pass.
+
+### Measurements (`tests/trace_test.cpp`, RTX 5080, 128 x 128, 4 bounces)
+
+| test | result |
+| --- | --- |
+| light NEE with MIS is unbiased (1 voxel, 1024 frames vs 4096-frame PT) | ratio 1.0095, block PSNR 45.78 dB (light NEE without MIS: 1.0095, 45.78 dB; PT vs PT other seeds: 1.0060, 42.04 dB) |
+| MIS on a large emitter (8 x 8 panel), light NEE | ratio 1.0035, 64-frame RMSE 1.4757 |
+| MIS on a large emitter, light NEE + MIS | ratio 1.0032, 64-frame RMSE 1.4578 (0.988 x) |
+| dropped bricks keep their emission (`max_bricks` 1, 1 of 2 bricks dropped), light NEE | ratio 1.0032, block PSNR 39.55 dB |
+| dropped bricks, light NEE + MIS | ratio 1.0032, block PSNR 39.55 dB |
+
+The single-voxel light: from the floor a voxel face subtends about 1 / d^2 = 1 / 600 sr, so
+`p_sa` is about 3 orders of magnitude above `p_bsdf` and `w_nee` is about 0.999: the image is the
+NEE image to 4 digits. The panel (0.1 sr from the floor) gives `w_nee` about 0.97 and a small gain
+(1.2 %): the 64-frame error there is dominated by other terms (indirect bounces, NEE samples on the
+covered side faces of the panel voxels). MIS helps where an emitter just beyond the near field
+covers a large part of the hemisphere; the bench scenes (`pt_nee` vs `pt_nee_nomis`) are the real
+measure and were not run in this step. The dropped-bricks case before this step lost the dropped
+light (the BSDF path skipped it and the NEE could not sample it); its ratio is now 1.003.

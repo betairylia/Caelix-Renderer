@@ -101,8 +101,7 @@ struct CaelixFrameConstants
     uint64_t di_out;                // 672  spatial ping-pong
     uint di_candidates;             // 680  initial candidates per pixel (1 .. 32)
     uint di_history_valid;          // 684  1 = di_prev holds last frame's DI reservoirs of this renderer
-    uint pad_688;                   // 688
-    uint pad_692;                   // 692
+    uint64_t light_indices;         // 688  the scene's brick -> light entry map (u32 per AABB row: index + 1), 0 = none
     uint pad_696;                   // 696
     uint pad_700;                   // 700  -> 704
 };
@@ -145,6 +144,7 @@ static const uint kGiFlagDiffuseOnly = 1u << 4;
 static const uint kGiFlagLightNee = 1u << 5;
 static const uint kGiFlagRestirDi = 1u << 6;
 static const uint kGiFlagLightCellJitter = 1u << 7;
+static const uint kGiFlagLightMis = 1u << 8;
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

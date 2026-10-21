@@ -426,7 +426,7 @@ struct Args {
     /// points closer than this are left to the BSDF path.
     #[arg(long, value_name = "F", default_value_t = 0.0)]
     light_nee_distance: f32,
-    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 288 bytes each).
+    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 296 bytes each).
     #[arg(long, value_name = "N", default_value_t = 65536)]
     light_cells: u32,
     /// Light NEE: candidates per cell reservoir and frame (1..64).
@@ -436,6 +436,10 @@ struct Args {
     /// jittered by up to half a cell (the jitter turns the per-cell flicker into per-pixel noise).
     #[arg(long)]
     light_no_cell_jitter: bool,
+    /// Light NEE: no MIS between the light NEE and the diffuse bounce (docs/LIGHT_MIS.md): a
+    /// list-light hit after a light NEE vertex is skipped instead (the step 1 rule).
+    #[arg(long)]
+    light_no_mis: bool,
     /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 8-voxel
     /// cells, else 32-voxel cells.
     #[arg(long, value_name = "F", default_value_t = 0.25)]
@@ -2071,6 +2075,7 @@ fn main() -> anyhow::Result<()> {
             light_nee: args.gi_light_nee,
             light_cells: args.light_cells,
             light_cell_jitter: !args.light_no_cell_jitter,
+            light_mis: !args.light_no_mis,
             light_candidates: args.light_candidates,
             light_footprint: args.light_footprint,
             restir_di: args.gi_restir_di,

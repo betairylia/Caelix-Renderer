@@ -130,13 +130,15 @@ void Scene::PrepareGroupAabbs(Group& group)
         aabb_moves_.push_back(VkBufferCopy{aabbs_.ByteOffset(group.aabb_gpu_rows.offset),
                                            aabbs_.ByteOffset(group.aabb_rows.offset),
                                            aabbs_.ByteOffset(kept)});
-        // The light words move with their AABB rows.
+        // The light words and the entry map move with their AABB rows.
         light_moves_.push_back(VkBufferCopy{group.aabb_gpu_rows.offset * kWord, group.aabb_rows.offset * kWord,
                                             kept * kWord});
     }
     fills_.push_back(PendingFill{aabbs_.buffer(), aabbs_.ByteOffset(group.aabb_rows.offset + kept),
                                  aabbs_.ByteOffset(group.aabb_rows.rows - kept), kQuietNaNBits});
     fills_.push_back(PendingFill{light_words_.buffer(), (group.aabb_rows.offset + kept) * kWord,
+                                 (group.aabb_rows.rows - kept) * kWord, 0});
+    fills_.push_back(PendingFill{light_indices_.buffer(), (group.aabb_rows.offset + kept) * kWord,
                                  (group.aabb_rows.rows - kept) * kWord, 0});
     group.aabb_gpu_rows = group.aabb_rows;
     lights_dirty_ = true;
@@ -258,12 +260,15 @@ bool Scene::StageGroup(uint32_t group_index, Group& group)
                                        cursor - run_begin});
     }
 
-    // NaN rows and zero light words of freed ids.
+    // NaN rows, zero light words and zero entry map words of freed ids.
     for (const uint16_t id : group.nan_ids)
     {
         pending_.push_back(PendingCopy{nan_row_offset_, aabbs_.buffer(),
                                        aabbs_.ByteOffset(group.aabb_rows.offset + id), kAabbRowBytes});
         pending_.push_back(PendingCopy{zero_word_offset_, light_words_.buffer(),
+                                       (static_cast<VkDeviceSize>(group.aabb_rows.offset) + id) * sizeof(uint32_t),
+                                       sizeof(uint32_t)});
+        pending_.push_back(PendingCopy{zero_word_offset_, light_indices_.buffer(),
                                        (static_cast<VkDeviceSize>(group.aabb_rows.offset) + id) * sizeof(uint32_t),
                                        sizeof(uint32_t)});
     }
@@ -711,6 +716,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
     take_growth(entity_infos_.TakeGrowthSource(), entity_infos_.buffer());
     take_growth(page_table_.TakeGrowthSource(), page_table_.buffer());
     take_growth(light_words_.TakeGrowthSource(), light_words_.buffer());
+    take_growth(light_indices_.TakeGrowthSource(), light_indices_.buffer());
     // The dirty list and the instance array are rewritten every time they are used
     // and need no copy.
     if (std::optional<GpuBuffer> old = dirty_buffer_.TakeGrowthSource(); old.has_value())
@@ -770,6 +776,8 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
             {
                 const size_t n = std::min(kMaxRegionsPerCopy, light_moves_.size() - i);
                 vkCmdCopyBuffer(cmd, light_words_.buffer(), light_words_.buffer(), static_cast<uint32_t>(n),
+                                light_moves_.data() + i);
+                vkCmdCopyBuffer(cmd, light_indices_.buffer(), light_indices_.buffer(), static_cast<uint32_t>(n),
                                 light_moves_.data() + i);
             }
             for (const PendingFill& fill : fills_)

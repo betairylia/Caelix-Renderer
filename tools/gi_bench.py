@@ -32,6 +32,8 @@ RUNS = {
     # Light list (docs/LIGHT_LIST.md): next-event estimation on list lights.
     "pt_nee": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee",
     "pt_nee_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee",
+    "pt_nee_nomis": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-no-mis",
+    "pt_nee_nomis_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-no-mis",
     # Per-pixel ReSTIR DI on the light list (docs/RESTIR_DI.md).
     "di": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di",
     "di_unbiased": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di --gi-unbiased",

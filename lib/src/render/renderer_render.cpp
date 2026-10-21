@@ -663,7 +663,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.gi_flags =
         restir ? gi_options_.flags
                : (gi_options_.flags & (static_cast<uint32_t>(CAELIX_GI_FLAG_DIFFUSE_ONLY | CAELIX_GI_FLAG_LIGHT_NEE |
-                                                             CAELIX_GI_FLAG_LIGHT_CELL_JITTER) |
+                                                             CAELIX_GI_FLAG_LIGHT_CELL_JITTER |
+                                                             CAELIX_GI_FLAG_LIGHT_MIS) |
                                        (restir_di ? (kReuseFlags | CAELIX_GI_FLAG_RESTIR_DI) : 0u)));
     if (!lighting)
     {
@@ -710,6 +711,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     ++frame_counter_;
     constants.frame_counter = frame_counter_;
     constants.light_table = light_table;
+    constants.light_indices = scene_.light_indices_address();
     constants.light_min_emission = scene_.light_min_emission();
     constants.light_nee_min_distance = scene_.light_nee_min_distance();
     if (light_nee)

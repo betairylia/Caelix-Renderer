@@ -1,21 +1,27 @@
 // Light list sampling of the render kernels (docs/LIGHT_LIST.md, section 2): the light cells
 // (world-space ReGIR reservoirs over the scene's light table), the global CDF of the table, the
-// point sampling inside a brick entry and the next-event estimation at a diffuse path vertex.
+// point sampling inside a brick entry, the next-event estimation at a diffuse path vertex and its
+// MIS with the BSDF path (docs/LIGHT_MIS.md: the density proxy, LightNeeMisWeight, LightListCanSample).
 //
 // Light cells: a hash table of fc.light_cell_capacity cells in g_light_cells (trace set binding
-// 21), 288 bytes each:
+// 21), 296 bytes each (288 before step 3 of the light list):
 //   0    uint key_lo, key_hi    the 64-bit fingerprint of (entity, level, coordinate); key_lo 0 = empty
 //   8    uint touched_frame     fc.frame_counter of the newest lookup
 //   12   uint entity
 //   16   int3 coord             the cell coordinate at `level`: floor(p) >> (3 + 2 level), p entity-local
 //   28   uint level             0: 8-voxel cells, 1: 32-voxel cells
-//   32   32 x { uint light; float W }   light = entry index of the table, W = the RIS weight (0 = empty)
+//   32   float C_prev           the cell normalisation C_c of the fill before the latest one (the MIS
+//                               proxy reads this one; 0 = none yet: the global proxy)
+//   36   float C_cur            C_c of the latest fill: the mean of w_sum / K over the 32 reservoirs
+//   40   32 x { uint light; float W }   light = entry index of the table, W = the RIS weight (0 = empty)
 // The trace kernel looks cells up and inserts missing ones (LightCellLookup); caelix_light_cells.hlsl
 // fills the reservoirs of every live cell before the next trace and evicts cells untouched for 64
 // frames. The fingerprint is claimed with a 32-bit compare-and-swap on key_lo (64-bit buffer atomics
 // are not a device requirement); key_hi is stored after the claim. A lookup that sees key_lo match
 // but key_hi not yet written probes on and may insert the same key twice: harmless, every
-// reservoir carries its own W.
+// reservoir carries its own W. A trace never reads the C_c computed from the reservoirs it samples
+// (the fill moves C_cur to C_prev before writing C_cur): a ratio of two estimates from the same
+// reservoirs would be biased.
 //
 // Include after common/caelix_frame.hlsl, common/caelix_light.hlsl, render/caelix_trace_set.hlsl,
 // render/caelix_scene_trace.hlsl and render/caelix_shading.hlsl.
@@ -28,9 +34,11 @@
 #include "render/caelix_scene_trace.hlsl"
 #include "render/caelix_shading.hlsl"
 
-static const uint kLightCellBytes = 288;
+static const uint kLightCellBytes = 296;
 static const uint kLightCellReservoirs = 32;
-static const uint kLightCellReservoirOffset = 32;
+static const uint kLightCellCPrevOffset = 32;
+static const uint kLightCellCCurOffset = 36;
+static const uint kLightCellReservoirOffset = 40;
 static const uint kLightCellProbes = 8;
 // A cell not looked up for this many frames is evicted by the fill pass.
 static const uint kLightCellMaxAge = 64;
@@ -44,6 +52,18 @@ static const uint kNoLight = 0xFFFFFFFFu;
 // the same distance from the same pushed-off origin, so the split is unbiased. Every kernel sets
 // it from CaelixFrameConstants::light_nee_min_distance before the first use.
 static float g_lightNeeMinDistance;
+
+// The point `p` and the direction `v` of an entity under its rows (EntityCurRows) in world space.
+float3 RowsTransform(float4 r0, float4 r1, float4 r2, float3 p)
+{
+    const float4 h = float4(p, 1.0f);
+    return float3(dot(r0, h), dot(r1, h), dot(r2, h));
+}
+
+float3 RowsRotate(float4 r0, float4 r1, float4 r2, float3 v)
+{
+    return float3(dot(r0.xyz, v), dot(r1.xyz, v), dot(r2.xyz, v));
+}
 
 uint64_t SplitMix64(uint64_t x)
 {
@@ -96,12 +116,14 @@ int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord
             if (original == 0u)
             {
                 // Inserted. A slot with key 0 has empty reservoirs (zero at creation, cleared on
-                // eviction), so the cell samples the global table until the next fill.
+                // eviction), so the cell samples the global table until the next fill. C_prev and
+                // C_cur start at 0 (the MIS proxy is the global one until the second fill).
                 g_light_cells.Store(base + 4, key.y);
                 g_light_cells.Store(base + 8, fc.frame_counter);
                 g_light_cells.Store(base + 12, entity);
                 g_light_cells.Store3(base + 16, asuint(coord));
                 g_light_cells.Store(base + 28, level);
+                g_light_cells.Store2(base + kLightCellCPrevOffset, uint2(0u, 0u));
                 return int(slot);
             }
             key_lo = original;
@@ -157,6 +179,35 @@ uint NthSetBit(uint v, uint k)
     return position;
 }
 
+// The description of a list-light point for the MIS proxy (docs/LIGHT_MIS.md section 1), the same
+// for every point of one voxel: the voxel's world frame (centre and the three entity axes, for the
+// face count), pdf_base = region_weight[z] / n_z of its slice z (n_z = the set bits of the slice
+// mask), the entry's total weight, and its brick's world centre (origin + 4) and mean normal
+// (world, length 0 without one).
+struct LightMisDesc
+{
+    float3 centre;
+    float3 axes[3];
+    float pdf_base;
+    float brick_total;
+    float3 brick_centre;
+    float3 brick_normal;
+};
+
+LightMisDesc LightMisDescZero()
+{
+    LightMisDesc d;
+    d.centre = float3(0.0f, 0.0f, 0.0f);
+    d.axes[0] = float3(0.0f, 0.0f, 0.0f);
+    d.axes[1] = float3(0.0f, 0.0f, 0.0f);
+    d.axes[2] = float3(0.0f, 0.0f, 0.0f);
+    d.pdf_base = 0.0f;
+    d.brick_total = 0.0f;
+    d.brick_centre = float3(0.0f, 0.0f, 0.0f);
+    d.brick_normal = float3(0.0f, 0.0f, 0.0f);
+    return d;
+}
+
 struct LightSample
 {
     bool valid;
@@ -168,6 +219,7 @@ struct LightSample
     uint voxel;       // v = x | y << 3 | z << 6 inside the entry's brick
     uint face;        // +X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5 (entity-local axes)
     float2 uv;        // the point on the face in (-0.5, 0.5)^2 along (e1, e2) of LightFaceBasis
+    LightMisDesc mis; // the point's MIS description (LightMisDescOf of the entry and the voxel)
 };
 
 // The world frame of voxel `voxel` of `entry` under the entity's CURRENT transform: the voxel
@@ -192,6 +244,172 @@ LightVoxelFrame LightVoxelFrameOf(CaelixFrameConstants fc, LightEntry entry, uin
     f.axes[1] = float3(r0.y, r1.y, r2.y);
     f.axes[2] = float3(r0.z, r1.z, r2.z);
     return f;
+}
+
+// The MIS description of voxel `voxel` of `entry` from its frame; `n` = the set bits of the voxel's
+// slice mask. The brick centre and the mean normal go through the frame's axes (the rotation part
+// of the rows), so no second load of the rows is needed: centre_b = voxel centre + R (3.5 - voxel).
+LightMisDesc LightMisDescWith(LightEntry entry, LightVoxelFrame frame, uint3 voxel, uint n)
+{
+    LightMisDesc d;
+    d.centre = frame.centre;
+    d.axes[0] = frame.axes[0];
+    d.axes[1] = frame.axes[1];
+    d.axes[2] = frame.axes[2];
+    d.pdf_base = n > 0u ? entry.region_weight[voxel.z] / float(n) : 0.0f;
+    d.brick_total = entry.total_weight;
+    const float3 o = 3.5f - float3(voxel);
+    d.brick_centre = frame.centre + frame.axes[0] * o.x + frame.axes[1] * o.y + frame.axes[2] * o.z;
+    d.brick_normal = float3(0.0f, 0.0f, 0.0f);
+    if (entry.mean_normal != 0u)
+    {
+        const float3 n_local = DecodeOctahedral(entry.mean_normal);
+        d.brick_normal = frame.axes[0] * n_local.x + frame.axes[1] * n_local.y + frame.axes[2] * n_local.z;
+    }
+    return d;
+}
+
+// The MIS description of voxel `voxel` (0..7 per axis) of `entry` (the BSDF side: TracePath).
+// SampleLightEntryWith builds the NEE side's with the same function from the same frame.
+LightMisDesc LightMisDescOf(CaelixFrameConstants fc, LightEntry entry, uint3 voxel)
+{
+    const LightVoxelFrame frame = LightVoxelFrameOf(fc, entry, voxel);
+    const uint2 bits = entry.mask[voxel.z];
+    return LightMisDescWith(entry, frame, voxel, countbits(bits.x) + countbits(bits.y));
+}
+
+// The number of candidate faces (1..3) of the voxel of `d` seen from the receiver `x_r`: the axes
+// whose outward face normal points to the receiver's side of the voxel centre, exactly as
+// SampleLightEntryWith counts them (at least 1: the degenerate receiver on all three centre planes,
+// where the NEE draws nothing).
+uint LightCandidateFaces(LightMisDesc d, float3 x_r)
+{
+    const float3 to_receiver = x_r - d.centre;
+    uint faces = 0;
+    CAELIX_UNROLL
+    for (uint a = 0; a < 3; ++a)
+    {
+        const float s = dot(d.axes[a], to_receiver);
+        faces += (s > 0.0f || s < 0.0f) ? 1u : 0u;
+    }
+    return max(faces, 1u);
+}
+
+// The per-vertex half of the light NEE's density proxy (docs/LIGHT_MIS.md section 1): the
+// UNJITTERED light cell of the vertex, when it has a normalisation from an earlier fill, else the
+// global CDF. A deterministic function of the vertex, so that the NEE (LightNextEvent) and the BSDF
+// segment that leaves the vertex (TracePath) evaluate the same density.
+struct LightNeeProxyContext
+{
+    bool cell;           // the cell proxy (a cell with C_prev > 0); false: the global proxy
+    float3 cell_centre;  // world centre of the cell (as the fill computes it)
+    float near_d2;       // (cell half size + 4)^2: the fill's distance floor
+    float C;             // the cell's C_prev
+    float total;         // the light table's total weight; 0 without a table or without entries
+};
+
+// The context of cell `slot` (-1 = none) of (entity, level, coord); `total` = the table's total.
+LightNeeProxyContext LightNeeProxyOfSlot(CaelixFrameConstants fc, int slot, uint entity, uint level, int3 coord,
+                                         float total)
+{
+    LightNeeProxyContext ctx;
+    ctx.cell = false;
+    ctx.cell_centre = float3(0.0f, 0.0f, 0.0f);
+    ctx.near_d2 = 0.0f;
+    ctx.C = 0.0f;
+    ctx.total = total;
+    if (slot < 0)
+    {
+        return ctx;
+    }
+    const float c_prev = asfloat(g_light_cells.Load(uint(slot) * kLightCellBytes + kLightCellCPrevOffset));
+    if (!(c_prev > 0.0f))
+    {
+        return ctx;
+    }
+    const float cell_size = float(8u << (2u * level));
+    float4 r0;
+    float4 r1;
+    float4 r2;
+    EntityCurRows(fc, entity, r0, r1, r2);
+    ctx.cell = true;
+    ctx.cell_centre = RowsTransform(r0, r1, r2, (float3(coord) + 0.5f) * cell_size);
+    ctx.near_d2 = (0.5f * cell_size + 4.0f) * (0.5f * cell_size + 4.0f);
+    ctx.C = c_prev;
+    return ctx;
+}
+
+// The proxy context of the vertex x_r (pushed-off position) on brick group `group`, entity-local
+// point `object_point` (LightCellPoint): the unjittered cell lookup (it inserts the cell when it is
+// missing, as every lookup does). LightNextEvent builds the same context from the same lookup.
+LightNeeProxyContext LightNeeProxyAt(CaelixFrameConstants fc, float3 x_r, uint group, float3 object_point)
+{
+    float total = 0.0f;
+    if (fc.light_table != 0u)
+    {
+        const uint count = CAELIX_LOAD_U32(fc.light_table + kLightHeaderCount);
+        const float table_total = asfloat(CAELIX_LOAD_U32(fc.light_table + kLightHeaderTotal));
+        total = (count != 0u && table_total > 0.0f) ? table_total : 0.0f;
+    }
+    int slot = -1;
+    uint entity = 0;
+    uint level = 0;
+    int3 coord = int3(0, 0, 0);
+    if (fc.light_cells != 0u && total > 0.0f)
+    {
+        level = LightCellLevel(fc, x_r);
+        entity = GroupEntity(fc, group);
+        coord = LightCellCoord(object_point, level);
+        slot = LightCellLookup(fc, entity, level, coord);
+    }
+    return LightNeeProxyOfSlot(fc, slot, entity, level, coord, total);
+}
+
+// The proxy area density of the light NEE at a point of the voxel of `d`, with `n_faces` candidate
+// faces (docs/LIGHT_MIS.md section 1). With a cell: p_hat_c(b) / C_c times the in-brick density,
+// where the entry's total weight cancels: G * pdf_base / (C_c * n_faces), G and orient as in the
+// fill kernel (caelix_light_cells.hlsl). Without one: the global CDF, pdf_base / (total * n_faces).
+float LightNeeProxyPdfArea(LightNeeProxyContext ctx, LightMisDesc d, uint n_faces)
+{
+    const float faces = float(max(n_faces, 1u));
+    if (ctx.cell)
+    {
+        const float3 to_cell = ctx.cell_centre - d.brick_centre;
+        const float d2 = dot(to_cell, to_cell);
+        float orient = 1.0f;
+        if (any(d.brick_normal != 0.0f) && d2 > 1e-12f)
+        {
+            orient = max(0.1f, dot(d.brick_normal, to_cell * rsqrt(d2)));
+        }
+        const float G = orient / max(d2, ctx.near_d2);
+        return G * d.pdf_base / (ctx.C * faces);
+    }
+    return ctx.total > 0.0f ? d.pdf_base / (ctx.total * faces) : 0.0f;
+}
+
+// The balance heuristic between the light NEE and the cosine-weighted diffuse bounce at the
+// receiver (x_r, n_r) for the light point of `d` in direction `w` (unit) at distance `d_light`;
+// cos_l = the light face's cosine toward the receiver. `nee_side`: the NEE's weight
+// p_sa / (p_sa + p_bsdf), else the BSDF's p_bsdf / (p_sa + p_bsdf), with p_sa = the proxy area
+// density * d^2 / cos_l and p_bsdf = cos_r / pi. Both sides call this function with the same
+// context and description, so the two weights of a point sum to 1 in every branch: a non-finite
+// or degenerate p_sa (cos_l <= 0) counts as +inf (NEE 1, BSDF 0), both densities 0 as NEE 0, BSDF 1.
+float LightNeeMisWeight(LightNeeProxyContext ctx, LightMisDesc d, float3 x_r, float3 n_r, float3 w, float d_light,
+                        float cos_l, bool nee_side)
+{
+    const float p_area = LightNeeProxyPdfArea(ctx, d, LightCandidateFaces(d, x_r));
+    const float p_sa = cos_l > 0.0f ? p_area * (d_light * d_light) / cos_l : 0.0f;
+    const float p_bsdf = max(0.0f, dot(n_r, w)) * (1.0f / K_PI);
+    if (!(cos_l > 0.0f) || !(p_sa <= 3.0e38f))
+    {
+        return nee_side ? 1.0f : 0.0f;
+    }
+    const float sum = p_sa + p_bsdf;
+    if (!(sum > 0.0f))
+    {
+        return nee_side ? 0.0f : 1.0f;
+    }
+    return (nee_side ? p_sa : p_bsdf) / sum;
 }
 
 // The outward normal of `face` (+X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5) and its basis: e1 = entity axis
@@ -242,6 +460,7 @@ LightSample SampleLightEntryWith(CaelixFrameConstants fc, LightEntry entry, floa
     s.voxel = 0u;
     s.face = 0u;
     s.uv = float2(0.0f, 0.0f);
+    s.mis = LightMisDescZero();
     const float u_region = RandomFloat01(rng);
     const float u_voxel = RandomFloat01(rng);
     const float u_face = RandomFloat01(rng);
@@ -345,6 +564,7 @@ LightSample SampleLightEntryWith(CaelixFrameConstants fc, LightEntry entry, floa
     s.pdf_area = (entry.region_weight[slice] / entry.total_weight) * (1.0f / float(n)) * (1.0f / float(faces));
     s.voxel = bit | (slice << 6);
     s.face = face;
+    s.mis = LightMisDescWith(entry, frame, voxel, n);
     s.valid = s.pdf_area > 0.0f;
     return s;
 }
@@ -390,14 +610,20 @@ LightPoint LightPointAt(CaelixFrameConstants fc, LightEntry entry, uint voxel_in
 // cells instead of the same one, so the variance of the cell contents (one refill of 32 reservoirs
 // per frame) turns from a per-cell flicker into per-pixel noise. Unbiased: every cell's reservoirs
 // are unbiased estimators for any receiver (W does not depend on the receiver).
-float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint group, float3 object_point,
-                      inout uint rng)
+// `mis` (kGiFlagLightMis, docs/LIGHT_MIS.md): the contribution is multiplied by the balance
+// heuristic weight LightNeeMisWeight(nee_side = true), and `ctx` receives the vertex's proxy context
+// (the unjittered cell, LightNeeProxyAt's lookup; with the jitter on, the sampling cell is a second
+// lookup) for the BSDF segment that leaves the vertex. Without `mis`, `ctx` is the global context
+// and the lookups and random numbers are the same as before step 3. The MIS draws no random number.
+float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint group, float3 object_point, bool mis,
+                      inout uint rng, out LightNeeProxyContext ctx)
 {
     const float u_reservoir = RandomFloat01(rng);
     const float u_global = RandomFloat01(rng);
     const uint64_t table = fc.light_table;
     const uint count = CAELIX_LOAD_U32(table + kLightHeaderCount);
     const float total = asfloat(CAELIX_LOAD_U32(table + kLightHeaderTotal));
+    ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), (count != 0u && total > 0.0f) ? total : 0.0f);
     if (count == 0u || !(total > 0.0f))
     {
         return float3(0.0f, 0.0f, 0.0f);
@@ -410,13 +636,25 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     if (fc.light_cells != 0u)
     {
         const uint level = LightCellLevel(fc, x_r);
-        float3 cell_point = object_point;
-        if ((fc.gi_flags & kGiFlagLightCellJitter) != 0u)
+        const uint entity = GroupEntity(fc, group);
+        const bool jitter = (fc.gi_flags & kGiFlagLightCellJitter) != 0u;
+        int slot = -1;
+        // The proxy's cell is the unjittered one; without the jitter it is also the sampling cell.
+        if (mis || !jitter)
+        {
+            const int3 coord = LightCellCoord(object_point, level);
+            slot = LightCellLookup(fc, entity, level, coord);
+            if (mis)
+            {
+                ctx = LightNeeProxyOfSlot(fc, slot, entity, level, coord, total);
+            }
+        }
+        if (jitter)
         {
             const float3 u_jitter = float3(RandomFloat01(rng), RandomFloat01(rng), RandomFloat01(rng));
-            cell_point += (u_jitter - 0.5f) * float(8u << (2u * level));
+            const float3 cell_point = object_point + (u_jitter - 0.5f) * float(8u << (2u * level));
+            slot = LightCellLookup(fc, entity, level, LightCellCoord(cell_point, level));
         }
-        const int slot = LightCellLookup(fc, GroupEntity(fc, group), level, LightCellCoord(cell_point, level));
         if (slot >= 0)
         {
             const uint r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));
@@ -474,7 +712,53 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     {
         return float3(0.0f, 0.0f, 0.0f);
     }
-    return s.radiance * ((cos_r * (1.0f / K_PI)) * (cos_l / d2) / s.pdf_area * W_brick);
+    const float3 contribution = s.radiance * ((cos_r * (1.0f / K_PI)) * (cos_l / d2) / s.pdf_area * W_brick);
+    return mis ? contribution * LightNeeMisWeight(ctx, s.mis, x_r, n_r, w, distance, cos_l, true) : contribution;
+}
+
+// Whether the light NEE can produce the point that the ray of `hit` found on a list light
+// (docs/LIGHT_MIS.md sections 2 and 4): the hit brick has an entry in the light table (the scene's
+// brick -> entry map, fc.light_indices: entry index + 1 per AABB row, GroupInfo word 6 =
+// aabb_row_base) and the hit voxel's mask bit is set. False for a brick the table dropped (beyond
+// its capacity) or a voxel whose material is no longer a list light: the BSDF path keeps their
+// emission in full, since no NEE samples them. On true: the entry, the voxel (0..7 per axis inside
+// the entry's brick: the hit point moved a quarter voxel against the object normal) and the hit face
+// (+X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5, entity-local axes).
+bool LightListCanSample(CaelixFrameConstants fc, TraceResult hit, out LightEntry entry, out uint3 voxel,
+                        out uint face)
+{
+    entry = (LightEntry)0;
+    voxel = uint3(0u, 0u, 0u);
+    face = 0u;
+    if (fc.light_indices == 0u || fc.light_table == 0u)
+    {
+        return false;
+    }
+    const uint aabb_row_base = CAELIX_LOAD_U32(fc.group_infos + uint64_t(hit.group) * 32 + 24);
+    const uint index = CAELIX_LOAD_U32(fc.light_indices + (uint64_t(aabb_row_base) + hit.id) * 4);
+    const uint count = CAELIX_LOAD_U32(fc.light_table + kLightHeaderCount);
+    if (index == 0u || index - 1u >= count)
+    {
+        return false;
+    }
+    entry = LoadLightEntry(LightEntryAddress(fc.light_table, index - 1u));
+    const float3 object_normal = float3(UnpackObjectNormal(hit.attrib));
+    const int3 v = int3(floor(hit.object_hit - 0.25f * object_normal)) - entry.origin;
+    if (any(v < 0) || any(v > 7))
+    {
+        return false;
+    }
+    voxel = uint3(v);
+    const uint bit = voxel.x | (voxel.y << 3);
+    const uint2 bits = entry.mask[voxel.z];
+    if ((((bit < 32u ? bits.x : bits.y) >> (bit & 31u)) & 1u) == 0u)
+    {
+        return false;
+    }
+    const uint axis = abs(object_normal.x) > 0.5f ? 0u : (abs(object_normal.y) > 0.5f ? 1u : 2u);
+    const float component = axis == 0u ? object_normal.x : (axis == 1u ? object_normal.y : object_normal.z);
+    face = axis * 2u + (component < 0.0f ? 1u : 0u);
+    return true;
 }
 
 #endif  // CAELIX_LIGHT_SAMPLE_HLSL

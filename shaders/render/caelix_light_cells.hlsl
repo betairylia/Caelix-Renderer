@@ -15,6 +15,12 @@
 // weight of the brick for every point of the cell, since p_hat_i > 0 for every entry. No temporal
 // reuse. Random stream per (slot, reservoir, frame).
 //
+// The cell normalisation (docs/LIGHT_MIS.md section 3): w_sum / K of every reservoir is an unbiased
+// estimate of C_c = sum over the table of p_hat_i; thread 0 moves the header's C_cur to C_prev and
+// stores the mean over the 32 threads as the new C_cur. The trace reads C_prev only (the MIS proxy),
+// so it never divides by an estimate made from the reservoirs it samples. An evicted cell and a cell
+// filled without a usable table get C_prev = C_cur = 0 (the global proxy).
+//
 // Inputs: the trace set (binding 21 = the cells) and TracePush (the frame constants).
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_record.hlsl"
@@ -30,16 +36,8 @@
 // Slots per dispatch row (the dispatch is 1024 x capacity / 1024; the capacity is at least 1024).
 static const uint kLightCellsPerRow = 1024;
 
-float3 RowsTransform(float4 r0, float4 r1, float4 r2, float3 p)
-{
-    const float4 h = float4(p, 1.0f);
-    return float3(dot(r0, h), dot(r1, h), dot(r2, h));
-}
-
-float3 RowsRotate(float4 r0, float4 r1, float4 r2, float3 v)
-{
-    return float3(dot(r0.xyz, v), dot(r1.xyz, v), dot(r2.xyz, v));
-}
+// w_sum / K of every thread's reservoir: thread 0 averages them into C_cur.
+groupshared float gs_c[32];
 
 [numthreads(32, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
@@ -59,10 +57,11 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     const uint touched = g_light_cells.Load(base + 8);
     if (touched + kLightCellMaxAge < fc.frame_counter)
     {
-        // Evicted: the key and every reservoir become empty.
+        // Evicted: the key, both normalisations and every reservoir become empty.
         if (thread_id.x == 0u)
         {
             g_light_cells.Store2(base, uint2(0u, 0u));
+            g_light_cells.Store2(base + kLightCellCPrevOffset, uint2(0u, 0u));
         }
         g_light_cells.Store2(reservoir, uint2(kNoLight, 0u));
         return;
@@ -72,6 +71,11 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     const float total = table != 0u ? asfloat(CAELIX_LOAD_U32(table + kLightHeaderTotal)) : 0.0f;
     if (count == 0u || !(total > 0.0f))
     {
+        // No usable table (uniform for the workgroup): empty reservoirs, no normalisation.
+        if (thread_id.x == 0u)
+        {
+            g_light_cells.Store2(base + kLightCellCPrevOffset, uint2(0u, 0u));
+        }
         g_light_cells.Store2(reservoir, uint2(kNoLight, 0u));
         return;
     }
@@ -138,4 +142,19 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     const float W = (selected != kNoLight && p_hat_selected > 0.0f) ? (w_sum / float(candidates)) / p_hat_selected
                                                                      : 0.0f;
     g_light_cells.Store2(reservoir, uint2(W > 0.0f ? selected : kNoLight, asuint(W)));
+
+    // Every thread of the workgroup reaches this barrier: the returns above are uniform.
+    gs_c[thread_id.x] = w_sum / float(candidates);
+    GroupMemoryBarrierWithGroupSync();
+    if (thread_id.x == 0u)
+    {
+        float c_sum = 0.0f;
+        CAELIX_UNROLL
+        for (uint t = 0; t < 32; ++t)
+        {
+            c_sum += gs_c[t];
+        }
+        const float c_prev = asfloat(g_light_cells.Load(base + kLightCellCCurOffset));
+        g_light_cells.Store2(base + kLightCellCPrevOffset, uint2(asuint(c_prev), asuint(c_sum * (1.0f / 32.0f))));
+    }
 }

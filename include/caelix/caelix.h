@@ -77,7 +77,8 @@ extern "C" {
    CAELIX_GI_FLAG_LIGHT_NEE, and appended the light cell fields to the experimental CaelixGiOptions
    (32 -> 48 bytes) and CaelixGiStats (16 -> 32 bytes), also without a bump. The ReSTIR DI step
    (docs/RESTIR_DI.md) added CAELIX_GI_FLAG_RESTIR_DI and renamed CaelixGiOptions::light_reserved to
-   di_candidates (same size). The light cell jitter added CAELIX_GI_FLAG_LIGHT_CELL_JITTER. A host built against
+   di_candidates (same size). The light cell jitter added CAELIX_GI_FLAG_LIGHT_CELL_JITTER. The light MIS step
+   (docs/LIGHT_MIS.md) added CAELIX_GI_FLAG_LIGHT_MIS (no struct changed). A host built against
    an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -536,10 +537,10 @@ typedef struct CaelixLightOptions
 } CaelixLightOptions;
 
 /* Scene-wide. The light table is built only once this function was called (a host that never calls
-   it, the Unity plugin today, pays nothing beyond the 4-byte light words); pass zeros for the
-   defaults. min_emission applies to bricks finalized after
-   the call and to the next table rebuild; bricks finalized before keep their light word until they
-   are finalized again (call before the uploads). A new max_bricks reallocates the table at the next
+   it, the Unity plugin today, pays nothing beyond the 4-byte light word and entry map word per AABB
+   row); pass zeros for the defaults. min_emission applies to bricks finalized after the call and
+   to the next table rebuild; bricks finalized before keep their light word until they are
+   finalized again (call before the uploads). A new max_bricks reallocates the table at the next
    flush. Validation: min_emission not finite or negative, max_bricks above 1048576 ->
    CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_scene_set_light_options(CaelixScene* scene, const CaelixLightOptions* options);
@@ -1171,6 +1172,9 @@ typedef enum CaelixGiMethod
                                                  jittered by up to half a cell, so that neighbouring pixels read
                                                  different cells (the per-cell flicker becomes per-pixel noise;
                                                  docs/LIGHT_LIST.md section 2.5). Unbiased. */
+#define CAELIX_GI_FLAG_LIGHT_MIS (1u << 8)    /* with LIGHT_NEE: MIS (balance heuristic) between the light NEE and
+                                                 the diffuse bounce (docs/LIGHT_MIS.md); without it a list-light
+                                                 hit after a light NEE vertex is skipped */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
@@ -1181,8 +1185,11 @@ typedef enum CaelixGiMethod
    point on a list light (an emissive voxel face whose material is a list light of the scene, see
    CaelixLightOptions) through the renderer's light cells (world-space reservoirs keyed by entity,
    level and cell coordinate, refilled before every trace) and traces a shadow ray; a segment that
-   leaves such a vertex no longer counts the emission of the list light it hits. The light_* fields
-   size the cells.
+   leaves such a vertex no longer counts the emission of a list light it hits when the NEE can
+   sample that point (a brick the table dropped keeps its emission). With CAELIX_GI_FLAG_LIGHT_MIS
+   the NEE and such a hit are combined by multiple importance sampling instead (balance heuristic
+   over a proxy of the NEE density and the cosine density of the diffuse bounce); the primary
+   vertex keeps the exclusive rule with ReSTIR GI and ReSTIR DI. The light_* fields size the cells.
    CAELIX_GI_FLAG_RESTIR_DI (with LIGHT_NEE, either method, bounce_count >= 1): the primary vertex's
    one-sample light NEE is replaced by per-pixel ReSTIR DI: di_candidates initial light points per
    pixel, then temporal and spatial reuse with the TEMPORAL, SPATIAL, VISIBILITY and UNBIASED flags
@@ -1199,7 +1206,7 @@ typedef struct CaelixGiOptions
     float depth_threshold;    /* 0 = 0.1: |x_v(q) - x_v(r)| must be below threshold * view_z(r) */
     uint32_t reset;           /* 1 = drop the reservoir history with the next render */
     uint32_t light_cell_capacity; /* 0 = 65536 light cells; else a power of two in 1024 .. 1048576
-                                     (288 bytes per cell) */
+                                     (296 bytes per cell) */
     uint32_t light_candidates;    /* 0 = 8; 1 .. 64 candidates per cell reservoir and frame */
     float light_level_footprint;  /* 0 = 0.25: a vertex whose pixel footprint (world units per pixel at
                                      its camera distance) is below this uses 8-voxel cells, else 32 */
@@ -1216,7 +1223,7 @@ typedef struct CaelixGiOptions
    the DI reservoir buffers (4 x 32 bytes per pixel) likewise at the first render with
    CAELIX_GI_FLAG_RESTIR_DI. The DI history is also dropped when the scene's light table was rebuilt
    since the renderer's previous render.
-   The light cells (light_cell_capacity x 288 bytes) are allocated at the first render with
+   The light cells (light_cell_capacity x 296 bytes) are allocated at the first render with
    CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity changes.
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,

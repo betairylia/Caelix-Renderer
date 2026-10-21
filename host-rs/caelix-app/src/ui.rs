@@ -619,6 +619,11 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         .on_hover_text("Each vertex reads one of up to 8 cells around its hit point: per-cell flicker becomes per-pixel noise");
         ui.add_enabled(
             lighting && gi.light_nee,
+            egui::Checkbox::new(&mut gi.light_mis, "MIS light NEE / diffuse bounce"),
+        )
+        .on_hover_text("Balance heuristic between the light NEE and the BSDF hit of a list light (docs/LIGHT_MIS.md)");
+        ui.add_enabled(
+            lighting && gi.light_nee,
             egui::Checkbox::new(&mut gi.restir_di, "ReSTIR DI (light list, primary surface)"),
         );
         ui.add_enabled(

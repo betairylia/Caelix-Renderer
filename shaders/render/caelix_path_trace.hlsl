@@ -63,15 +63,22 @@
 //                   kGiFlagLightNee (docs/LIGHT_LIST.md, render/caelix_light_sample.hlsl): every
 //                   diffuse vertex with a next segment also samples the scene's light list
 //                   (LightNextEvent) and the segment that leaves it does not count the emission
-//                   of the list light it hits; in ReSTIR mode the primary vertex's light NEE goes
-//                   to the diffuse target unpacked (the shade pass adds the reservoir to it).
+//                   of a list light it hits when the NEE can sample that point (the brick has a
+//                   table entry and the voxel's mask bit is set, LightListCanSample); in ReSTIR
+//                   mode the primary vertex's light NEE goes to the diffuse target unpacked (the
+//                   shade pass adds the reservoir to it).
+//                   kGiFlagLightMis (docs/LIGHT_MIS.md, with kGiFlagLightNee): instead of that
+//                   exclusive rule, the NEE and such a list-light hit are weighted by the balance
+//                   heuristic over a density proxy of the NEE and the cosine density of the
+//                   diffuse bounce (LightNeeMisWeight); the primary vertex keeps the exclusive
+//                   rule in ReSTIR GI and ReSTIR DI mode (other pixels reuse its sample).
 //                   kGiFlagRestirDi (docs/RESTIR_DI.md, render/caelix_restir_di.hlsl; with
 //                   kGiFlagLightNee): the primary vertex's light NEE is replaced by the pixel's
 //                   initial DI reservoir (fc.di_initial, di_candidates candidates, no shadow ray),
 //                   written for every opaque primary surface (the diffuse-lobe bit tells the DI
 //                   shade pass whether to add its contribution); the first segment after a
-//                   diffuse primary vertex still skips list-light emission. The bounce vertices keep
-//                   their light NEE.
+//                   diffuse primary vertex still skips list-light emission that the NEE can
+//                   sample. The bounce vertices keep their light NEE.
 //
 // Inputs: the push constant is the device address of the frame constants; the
 // scene's tables (page table, slot rows, group infos, entity infos) are read by
@@ -297,13 +304,24 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // Light NEE (kGiFlagLightNee with a light table): at the same vertices as the sun NEE
 // (diffuse lobe, a next segment exists) LightNextEvent * throughput is added, from its own
 // random stream; the segment that leaves such a vertex skips the emission of a list light it
-// hits (luminance of the emission >= fc.light_min_emission), so NEE replaces exactly that
-// emission. A segment that leaves a vertex without light NEE (a specular lobe) still counts it.
+// hits (luminance of the emission >= fc.light_min_emission, at least the near-field distance
+// away) when the NEE can sample that point (LightListCanSample: the brick has a table entry and
+// the voxel's mask bit is set), so NEE replaces exactly that emission. A point the NEE cannot
+// sample (a brick dropped beyond the table's capacity, a voxel whose material changed) keeps its
+// emission: before step 3 (docs/LIGHT_MIS.md) such light was lost. A segment that leaves a vertex
+// without light NEE (a specular lobe) still counts every emission.
+// Light MIS (kGiFlagLightMis with light NEE): the vertex's NEE is multiplied by the balance
+// heuristic weight w_nee and a list-light hit of the segment that leaves it (one the NEE can
+// sample, beyond the near field) counts its emission times w_bsdf = 1 - w_nee of that point; both
+// weights come from LightNeeMisWeight with the vertex's proxy context (kept in segment_ctx with
+// segment_x_r and segment_n_r), so the two strategies sum to the full emission at every point. The
+// primary vertex keeps the exclusive rule (segment_mis false) with `restir` and `restir_di`: its
+// BSDF sample is reused by other pixels, so a pixel-dependent weight would bias the reuse.
 // `primary_light` receives the primary vertex's light NEE; with `restir` it is not in the
 // returned radiance (the caller writes it to the diffuse target, the shade pass adds it).
 // `restir_di` (ReSTIR DI): the primary vertex draws no light NEE (primary_light stays 0, the DI
 // passes add the direct light of the list lights there), but its first segment still skips the
-// emission of a list light it hits when the vertex took the diffuse lobe.
+// emission of a list light it hits (one the NEE can sample) when the vertex took the diffuse lobe.
 struct GiInitialSample
 {
     bool valid;            // the path had a first segment (bounce_count >= 1)
@@ -335,6 +353,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     const bool nee = !restir && (fc.flags & kRenderFlagSunNee) != 0u && any(fc.sun_radiance.xyz > 0.0f);
     uint light_rng = InitRandom(pixel, fc.frame_seed ^ 0x7F4A7C15u);
     const bool light_nee = (fc.gi_flags & kGiFlagLightNee) != 0u && fc.light_table != 0u;
+    const bool light_mis = light_nee && (fc.gi_flags & kGiFlagLightMis) != 0u;
     primary_light = float3(0.0f, 0.0f, 0.0f);
     const uint surface_block = (surface.attrib >> 16) & 0xFFFFu;
     const CaelixShadeResult primary_shade =
@@ -362,15 +381,23 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         radiance += SunNextEvent(fc, primary_shade.bounce_origin, surface.normal, nee_rng) * throughput;
         segment_sees_sun = false;
     }
-    // Light NEE at the primary vertex.
+    // Light NEE at the primary vertex. The state of the segment that leaves a light NEE vertex:
+    // segment_mis = the MIS of kGiFlagLightMis applies to its list-light hits, with the vertex's
+    // receiver (segment_x_r, segment_n_r) and proxy context (segment_ctx).
     bool segment_light_nee = false;
+    bool segment_mis = false;
+    float3 segment_x_r = float3(0.0f, 0.0f, 0.0f);
+    float3 segment_n_r = float3(0.0f, 0.0f, 0.0f);
+    LightNeeProxyContext segment_ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), 0.0f);
     CAELIX_BRANCH
     if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
     {
         if (!restir_di)
         {
+            // ReSTIR GI reuses the primary vertex's BSDF sample: the exclusive rule there.
+            segment_mis = light_mis && !restir;
             primary_light = LightNextEvent(fc, primary_shade.bounce_origin, surface.normal, surface.group,
-                                           LightCellPoint(surface), light_rng) *
+                                           LightCellPoint(surface), segment_mis, light_rng, segment_ctx) *
                             throughput;
             if (!restir)
             {
@@ -378,6 +405,8 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
             }
         }
         segment_light_nee = true;
+        segment_x_r = primary_shade.bounce_origin;
+        segment_n_r = surface.normal;
     }
 
     RayDesc bounce;
@@ -436,12 +465,33 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
                           bounce.Direction, hit.normal, rng, medium);
         bounce_index += 1;
 
-        // A list light's emission belongs to the light NEE of the vertex the segment left, except
-        // when the hit is closer than the near-field split (the near field is the BSDF path's).
-        if (!(segment_light_nee && shade.emission_luminance >= fc.light_min_emission &&
-              hit.T >= g_lightNeeMinDistance))
+        // A list light's emission belongs to the light NEE of the vertex the segment left when the
+        // NEE can sample the point (LightListCanSample), except when the hit is closer than the
+        // near-field split (the near field is the BSDF path's). With MIS at that vertex the
+        // emission counts with the BSDF's balance heuristic weight instead of 0.
+        float emission_weight = 1.0f;
+        CAELIX_BRANCH
+        if (segment_light_nee && shade.emission_luminance >= fc.light_min_emission &&
+            hit.T >= g_lightNeeMinDistance)
         {
-            radiance += shade.emission * throughput;
+            LightEntry light_entry;
+            uint3 light_voxel;
+            uint light_face;
+            if (LightListCanSample(fc, hit, light_entry, light_voxel, light_face))
+            {
+                emission_weight = 0.0f;
+                if (segment_mis)
+                {
+                    const LightMisDesc desc = LightMisDescOf(fc, light_entry, light_voxel);
+                    const float cos_l = -dot(hit.normal, bounce.Direction);
+                    emission_weight = LightNeeMisWeight(segment_ctx, desc, segment_x_r, segment_n_r,
+                                                        bounce.Direction, hit.T, cos_l, false);
+                }
+            }
+        }
+        if (emission_weight > 0.0f)
+        {
+            radiance += shade.emission * (throughput * emission_weight);
         }
         throughput *= shade.albedo / max(0.001f, shade.k);
 
@@ -453,13 +503,17 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
             segment_sees_sun = false;
         }
         segment_light_nee = false;
+        segment_mis = false;
         CAELIX_BRANCH
         if (light_nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
         {
             radiance += LightNextEvent(fc, shade.bounce_origin, hit.normal, hit.group, LightCellPoint(hit),
-                                       light_rng) *
+                                       light_mis, light_rng, segment_ctx) *
                         throughput;
             segment_light_nee = true;
+            segment_mis = light_mis;
+            segment_x_r = shade.bounce_origin;
+            segment_n_r = hit.normal;
         }
 
         // Russian roulette: dark paths stop early. A zero throughput must stop here,

@@ -78,7 +78,7 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // until safe) when the render size changes, kept while another method runs.
 //
 // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE, lighting modes; docs/LIGHT_LIST.md): the renderer owns the
-// light cells (CaelixGiOptions::light_cell_capacity x 288 bytes, trace set binding 21), created and
+// light cells (CaelixGiOptions::light_cell_capacity x 296 bytes, trace set binding 21), created and
 // zero-filled at the first render with the flag, recreated (the old buffer retired until safe) when
 // the capacity changes, kept while the flag is off. When the scene has a light table, the light cell
 // fill (caelix_light_cells, trace set, TracePush) runs before the sky SH kernel and the trace, with
@@ -359,7 +359,7 @@ private:
     uint64_t di_light_rebuilds_ = 0;     // CaelixLightStats::rebuilds at the previous ReSTIR DI render
     std::vector<RetiredGiBuffers> retired_di_;
     // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE).
-    GpuBuffer light_cells_;                  // capacity x 288 bytes (render/caelix_light_sample.hlsl)
+    GpuBuffer light_cells_;                  // capacity x 296 bytes (render/caelix_light_sample.hlsl)
     uint32_t light_cell_capacity_ = 0;       // cells of light_cells_
     bool light_cells_need_clear_ = false;    // light_cells_ is new: the next render zero-fills it
     uint64_t light_cells_last_frame_ = 0;    // the last frame that used light_cells_

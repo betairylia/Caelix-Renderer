@@ -195,6 +195,12 @@ public:
     {
         return light_table_built_ ? light_table_.buffer.address() : 0;
     }
+    // The brick -> light table entry map (u32 per AABB row: entry index + 1, 0 = no entry;
+    // docs/LIGHT_MIS.md section 2) under the same condition as light_table_address().
+    VkDeviceAddress light_indices_address() const
+    {
+        return light_table_built_ ? light_indices_.address() : 0;
+    }
     // The list-light threshold (CaelixLightOptions::min_emission after the default).
     float light_min_emission() const
     {
@@ -444,7 +450,10 @@ private:
 
     // Light list (docs/LIGHT_LIST.md).
     GrowableBuffer light_words_;              // u32 per AABB row: asuint(luminance sum), 0 = no list light
-    std::vector<VkBufferCopy> light_moves_;   // inside light_words_, mirrors aabb_moves_ (4 B rows)
+    GrowableBuffer light_indices_;            // u32 per AABB row: entry index + 1, 0 = none (written by the
+                                              // compact kernel; docs/LIGHT_MIS.md section 2)
+    std::vector<VkBufferCopy> light_moves_;   // inside light_words_ and light_indices_, mirrors aabb_moves_
+                                              // (4 B rows)
     VkDeviceSize zero_word_offset_ = 0;       // a zero u32 in the ring next to the NaN row
     float light_min_emission_ = 0.0f;         // set by Create (the default) and SetLightOptions
     float light_nee_min_distance_ = 0.0f;     // same

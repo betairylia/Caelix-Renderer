@@ -12,6 +12,13 @@
 // (InterlockedAdd); an index at or above the capacity counts in `dropped` instead. The entry's
 // total also goes to cdf[index], which caelix_light_scan turns into the prefix sum.
 //
+// The brick -> entry map (docs/LIGHT_MIS.md section 2): every dense id below the high water gets
+// light_indices[aabb_row_base + id] = entry index + 1, or 0 when it has no entry (light word 0, not
+// resident, a total of 0, dropped beyond the capacity). Writing every id, not only the ones with a
+// light word, leaves no stale index of an earlier rebuild behind; ids above the high water are never
+// hit by a ray. The path tracer reads the map to find the entry of a list light that a BSDF segment
+// hit (render/caelix_light_sample.hlsl, LightListCanSample).
+//
 // Freed groups have high water 0 in their GroupInfo row (the scene restages it when it releases the
 // group), so they contribute nothing. The CPU zeroes the header's first 16 bytes before the dispatch.
 //
@@ -27,6 +34,7 @@ struct LightPush
     uint64_t slot_tables;
     uint64_t page_table;
     uint64_t light_words;
+    uint64_t light_indices;
     uint64_t materials;
     uint group_base;
     uint group_count;
@@ -56,13 +64,14 @@ bool MaskBit(uint2 slices[8], int x, int y, int z)
     return ((y < 4 ? s.x : s.y) >> (uint(x) + 8u * (uint(y) & 3u)) & 1u) != 0u;
 }
 
-// Builds and stores the entry of one brick.
-void CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_base)
+// Builds and stores the entry of one brick. Returns the entry index + 1, or 0 when the brick got no
+// entry (not resident, a total of 0, dropped).
+uint CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_base)
 {
     const uint4 row = CAELIX_LOAD_U32x4(g_push.slot_tables + (uint64_t(slot_row_base) + id) * kSlotRowBytes);
     if (SlotRowState(row.x) != kSlotStateResident || row.z == kInvalidRecord)
     {
-        return;
+        return 0u;
     }
     const uint64_t record = RecordAddress(row.z);
 
@@ -160,7 +169,7 @@ void CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_ba
     }
     if (!(total > 0.0f))
     {
-        return;
+        return 0u;
     }
 
     uint index;
@@ -169,7 +178,7 @@ void CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_ba
     {
         uint ignored;
         g_table.InterlockedAdd(kLightHeaderDropped, 1u, ignored);
-        return;
+        return 0u;
     }
     const uint shift = g_push.group_shift;
     const uint pos_mask = (1u << shift) - 1u;
@@ -190,6 +199,7 @@ void CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_ba
     g_table.Store4(address + 96, uint4(asuint(total), group, id, entity));
     g_table.Store4(address + 112, uint4(asuint(origin), mean_normal));
     g_table.Store(kLightHeaderBytes + g_push.max_bricks * kLightEntryBytes + index * 4, asuint(total));
+    return index + 1u;
 }
 
 [numthreads(64, 1, 1)]
@@ -210,9 +220,7 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     for (uint id = thread_id.x; id < high_water; id += 64u)
     {
         const uint word = CAELIX_LOAD_U32(g_push.light_words + (uint64_t(w1.z) + id) * 4);
-        if (word != 0u)
-        {
-            CompactBrick(group, id, int3(w0.xyz), w0.w, w1.x);
-        }
+        const uint entry = word != 0u ? CompactBrick(group, id, int3(w0.xyz), w0.w, w1.x) : 0u;
+        CAELIX_STORE_U32(g_push.light_indices + (uint64_t(w1.z) + id) * 4, entry);
     }
 }

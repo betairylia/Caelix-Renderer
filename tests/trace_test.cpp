@@ -3016,7 +3016,7 @@ TEST_CASE("ReSTIR GI: set_gi_options validation")
     };
     CaelixGiOptions bad = GiOptions(2, 0);  // unknown method
     expect_invalid(bad);
-    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 7);  // unknown flag
+    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 31);  // unknown flag (bits 0 .. 8 are defined)
     expect_invalid(bad);
     bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
     bad.spatial_samples = 9;
@@ -3160,9 +3160,9 @@ void EnableLights(CaelixScene* scene)
     REQUIRE(caelix_scene_set_light_options(scene, &options) == CAELIX_OK);
 }
 
-void UploadLightBox(Rig& rig)
+// The walls of the light box (grey, 1 voxel thick around the interior [0, 24)^3, no light).
+World LightBoxWalls()
 {
-    EnableLights(rig.scene);
     World world;
     const int32_t lo = -1;
     const int32_t hi = kBoxInterior;
@@ -3172,7 +3172,27 @@ void UploadLightBox(Rig& rig)
     FillBox(world, hi, lo, lo, hi, hi, hi, kGreyFloor);  // +X wall
     FillBox(world, lo, lo, lo, hi, hi, lo, kGreyFloor);  // -Z wall
     FillBox(world, lo, lo, hi, hi, hi, hi, kGreyFloor);  // +Z wall
-    FillBox(world, 12, hi, 12, 12, hi, 12, kWhiteEmitter512);
+    return world;
+}
+
+void UploadLightBox(Rig& rig)
+{
+    EnableLights(rig.scene);
+    World world = LightBoxWalls();
+    FillBox(world, 12, kBoxInterior, 12, 12, kBoxInterior, 12, kWhiteEmitter512);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+}
+
+// The light box with an 8 x 8 panel of strength-3 white voxels in the ceiling (y = 24, x and z in
+// 8 .. 15: one brick) instead of the single voxel: 25 units above the floor, beyond the near-field
+// split, and large on the hemisphere of the floor, so that both the light NEE and the BSDF path
+// carry weight under MIS.
+void UploadLightPanelBox(Rig& rig)
+{
+    EnableLights(rig.scene);
+    World world = LightBoxWalls();
+    FillBox(world, 8, kBoxInterior, 8, 15, kBoxInterior, 15, kWhiteEmitter512);
     Upload(rig, world, KeysOf(world));
     DrainBuilds(rig);
 }
@@ -3378,6 +3398,179 @@ TEST_CASE("light NEE is unbiased")
     CloseRig(rig);
 }
 
+namespace {
+
+// PSNR over every pixel of two size x size RGBA32F images (both clamped to [0, 1], peak 1).
+double PixelPsnr(const std::vector<float>& ref, const std::vector<float>& test, uint32_t size)
+{
+    double squared = 0.0;
+    for (size_t p = 0; p < static_cast<size_t>(size) * size; ++p)
+    {
+        for (int ch = 0; ch < 3; ++ch)
+        {
+            const double d = std::clamp(static_cast<double>(test[p * 4 + ch]), 0.0, 1.0) -
+                             std::clamp(static_cast<double>(ref[p * 4 + ch]), 0.0, 1.0);
+            squared += d * d;
+        }
+    }
+    const double mse = squared / (3.0 * size * size);
+    return mse > 0.0 ? 10.0 * std::log10(1.0 / mse) : 99.0;
+}
+
+// Linear RMSE (no clamp) over every pixel and channel.
+double PixelRmse(const std::vector<float>& ref, const std::vector<float>& test, uint32_t size)
+{
+    double squared = 0.0;
+    for (size_t p = 0; p < static_cast<size_t>(size) * size; ++p)
+    {
+        for (int ch = 0; ch < 3; ++ch)
+        {
+            const double d = static_cast<double>(test[p * 4 + ch]) - static_cast<double>(ref[p * 4 + ch]);
+            squared += d * d;
+        }
+    }
+    return std::sqrt(squared / (3.0 * size * size));
+}
+
+std::vector<float> ColorPixels(const Target& color)
+{
+    std::vector<float> image(static_cast<size_t>(color.width) * color.height * 4);
+    std::memcpy(image.data(), color.bytes.data(), image.size() * sizeof(float));
+    return image;
+}
+
+}  // namespace
+
+TEST_CASE("light NEE with MIS is unbiased")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadLightBox(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 1);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> mis = LightReference(rig, renderer, set, camera, 1024, 200000);
+    const LightComparison c = CompareLight(pt, mis, kBoxSize);
+    std::printf("light NEE + MIS vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 block PSNR %.2f dB\n",
+                c.test_mean, c.ref_mean, c.ratio, c.block_psnr);
+    CHECK(c.ref_mean > 0.01);
+    CHECK(c.ratio > 0.97);
+    CHECK(c.ratio < 1.03);
+    CHECK(c.block_psnr > 30.0);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("MIS on a large emitter")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadLightPanelBox(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 1);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    const uint32_t modes[2] = {CAELIX_GI_FLAG_LIGHT_NEE, CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS};
+    const char* names[2] = {"light NEE", "light NEE + MIS"};
+    double rmse[2] = {0.0, 0.0};
+    for (int m = 0; m < 2; ++m)
+    {
+        gi.flags = modes[m];
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+        const std::vector<float> converged = LightReference(rig, renderer, set, camera, 1024, 200000);
+        const LightComparison c = CompareLight(pt, converged, kBoxSize);
+        // The noise of a short accumulation: 64 frames against the 4096-frame path tracer.
+        const std::vector<float> short_run = LightReference(rig, renderer, set, camera, 64, 500000);
+        rmse[m] = PixelRmse(pt, short_run, kBoxSize);
+        std::printf("panel, %s vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 block PSNR %.2f dB, "
+                    "64-frame RMSE %.5f\n",
+                    names[m], c.test_mean, c.ref_mean, c.ratio, c.block_psnr, rmse[m]);
+        CHECK(c.ref_mean > 0.01);
+        CHECK(c.ratio > 0.97);
+        CHECK(c.ratio < 1.03);
+    }
+    std::printf("panel: 64-frame RMSE without MIS %.5f, with MIS %.5f (ratio %.3f)\n", rmse[0], rmse[1],
+                rmse[1] / rmse[0]);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("dropped bricks keep their emission")
+{
+    // Two single-voxel lights in two ceiling bricks and a table capacity of one brick: the table
+    // drops one of them, the light NEE never samples it, and the BSDF path must keep its emission
+    // (docs/LIGHT_MIS.md section 2: the brick -> entry map has no entry for it).
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    CaelixLightOptions options{};
+    options.max_bricks = 1;
+    REQUIRE(caelix_scene_set_light_options(rig.scene, &options) == CAELIX_OK);
+    World world = LightBoxWalls();
+    FillBox(world, 4, kBoxInterior, 4, 4, kBoxInterior, 4, kWhiteEmitter512);
+    FillBox(world, 20, kBoxInterior, 20, 20, kBoxInterior, 20, kWhiteEmitter512);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    const CaelixLightStats stats = LightStats(rig.scene);
+    std::printf("dropped bricks: %u bricks, %u dropped\n", stats.bricks, stats.bricks_dropped);
+    REQUIRE(stats.bricks == 1);
+    REQUIRE(stats.bricks_dropped == 1);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    const uint32_t modes[2] = {CAELIX_GI_FLAG_LIGHT_NEE, CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS};
+    const char* names[2] = {"light NEE", "light NEE + MIS"};
+    for (int m = 0; m < 2; ++m)
+    {
+        gi.flags = modes[m];
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+        const LightComparison c =
+            CompareLight(pt, LightReference(rig, renderer, set, camera, 1024, 200000), kBoxSize);
+        std::printf("dropped bricks, %s vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 block PSNR %.2f dB\n",
+                    names[m], c.test_mean, c.ref_mean, c.ratio, c.block_psnr);
+        CHECK(c.ref_mean > 0.01);
+        CHECK(c.ratio > 0.97);
+        CHECK(c.ratio < 1.03);
+    }
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
 TEST_CASE("path tracer unchanged without the flag")
 {
     // The ReSTIR GI room (an emitter of strength 1: luminance 8). Scene A sets min_emission 1, so its
@@ -3467,7 +3660,7 @@ TEST_CASE("cells fill and sample")
     std::printf("light cells: %llu bytes, fill %.4f ms (frame %llu), trace %.4f ms\n",
                 static_cast<unsigned long long>(stats.light_cell_bytes), stats.light_fill_ms,
                 static_cast<unsigned long long>(timings.frame_number), timings.trace_ms);
-    CHECK(stats.light_cell_bytes == 1024ull * 288ull);
+    CHECK(stats.light_cell_bytes == 1024ull * 296ull);
     CHECK(timings.frame_number != 0);
     CHECK(stats.light_fill_ms > 0.0f);
 
@@ -3491,49 +3684,6 @@ TEST_CASE("cells fill and sample")
     DestroyTarget(rig.gpu, color);
     CloseRig(rig);
 }
-
-namespace {
-
-// PSNR over every pixel of two size x size RGBA32F images (both clamped to [0, 1], peak 1).
-double PixelPsnr(const std::vector<float>& ref, const std::vector<float>& test, uint32_t size)
-{
-    double squared = 0.0;
-    for (size_t p = 0; p < static_cast<size_t>(size) * size; ++p)
-    {
-        for (int ch = 0; ch < 3; ++ch)
-        {
-            const double d = std::clamp(static_cast<double>(test[p * 4 + ch]), 0.0, 1.0) -
-                             std::clamp(static_cast<double>(ref[p * 4 + ch]), 0.0, 1.0);
-            squared += d * d;
-        }
-    }
-    const double mse = squared / (3.0 * size * size);
-    return mse > 0.0 ? 10.0 * std::log10(1.0 / mse) : 99.0;
-}
-
-// Linear RMSE (no clamp) over every pixel and channel.
-double PixelRmse(const std::vector<float>& ref, const std::vector<float>& test, uint32_t size)
-{
-    double squared = 0.0;
-    for (size_t p = 0; p < static_cast<size_t>(size) * size; ++p)
-    {
-        for (int ch = 0; ch < 3; ++ch)
-        {
-            const double d = static_cast<double>(test[p * 4 + ch]) - static_cast<double>(ref[p * 4 + ch]);
-            squared += d * d;
-        }
-    }
-    return std::sqrt(squared / (3.0 * size * size));
-}
-
-std::vector<float> ColorPixels(const Target& color)
-{
-    std::vector<float> image(static_cast<size_t>(color.width) * color.height * 4);
-    std::memcpy(image.data(), color.bytes.data(), image.size() * sizeof(float));
-    return image;
-}
-
-}  // namespace
 
 TEST_CASE("ReSTIR DI unbiased")
 {

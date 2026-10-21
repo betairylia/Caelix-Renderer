@@ -272,6 +272,9 @@ pub struct GiSettings {
     /// Light NEE: look the cell up at a point jittered by up to half a cell per vertex
     /// (`CAELIX_GI_FLAG_LIGHT_CELL_JITTER`): the per-cell flicker becomes per-pixel noise.
     pub light_cell_jitter: bool,
+    /// Light NEE: MIS between the light NEE and the diffuse bounce (`CAELIX_GI_FLAG_LIGHT_MIS`,
+    /// docs/LIGHT_MIS.md); off: a list-light hit after a light NEE vertex is skipped.
+    pub light_mis: bool,
     /// Candidates per cell reservoir and frame (1..64).
     pub light_candidates: u32,
     /// World units per pixel below which a vertex uses 8-voxel cells (else 32-voxel cells).
@@ -300,6 +303,7 @@ impl Default for GiSettings {
             light_nee: false,
             light_cells: 65536,
             light_cell_jitter: true,
+            light_mis: true,
             light_candidates: 8,
             light_footprint: 0.25,
             restir_di: false,
@@ -331,6 +335,9 @@ impl GiSettings {
             flags |= CAELIX_GI_FLAG_LIGHT_NEE;
             if self.light_cell_jitter {
                 flags |= CAELIX_GI_FLAG_LIGHT_CELL_JITTER;
+            }
+            if self.light_mis {
+                flags |= CAELIX_GI_FLAG_LIGHT_MIS;
             }
             // RESTIR_DI needs LIGHT_NEE (the library rejects it alone).
             if self.restir_di {

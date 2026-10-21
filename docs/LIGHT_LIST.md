@@ -124,13 +124,15 @@ render that needs it, recreated when the capacity option changes, retired safely
 per cell (`kLightCellReservoirs`, a shader constant).
 
 ```
-Cell (288 B)
+Cell (296 B since step 3, docs/LIGHT_MIS.md; 288 B before, without C_prev and C_cur)
   uint64_t key;          //   0  0 = empty; else the fingerprint of (entity, level, cell coordinate)
   uint touched_frame;    //   8  fc.frame_counter (section 3) of the last lookup
   uint entity;           //  12
   int3 coord;            //  16  cell coordinate at `level`
   uint level;            //  28
-  LightCellReservoir r[32];  // 32 .. 288
+  float C_prev;          //  32  cell normalisation of the fill before the latest one (MIS proxy)
+  float C_cur;           //  36  cell normalisation of the latest fill (mean of w_sum / K)
+  LightCellReservoir r[32];  // 40 .. 296
 LightCellReservoir (8 B)
   uint light;            // entry index in the light table, 0xFFFFFFFF = empty
   float W;               // unbiased contribution weight of the brick-level target (0 = empty)
@@ -257,6 +259,10 @@ that value first and ADDS the reservoir's contribution before packing. Without t
 trace kernel writes 0 there as today.
 
 Sun NEE and fog are untouched. Specular vertices get no light NEE (as the sun).
+
+Step 3 (docs/LIGHT_MIS.md) replaces this exclusive rule: a list-light hit is skipped only when the
+NEE can sample the point (the brick has a table entry and the voxel's mask bit is set), and with
+`CAELIX_GI_FLAG_LIGHT_MIS` the NEE and the hit are weighted by the balance heuristic instead.
 
 ### 2.5 Jittered cell lookup (`CAELIX_GI_FLAG_LIGHT_CELL_JITTER`, 2026-10-21)
 
@@ -435,9 +441,9 @@ host flags and UI, `tools/gi_bench.*`.
 | --- | --- |
 | light word | 4 B per AABB row (`Scene::light_words_`, grows with the AABB pool; 256 KiB at the initial 65536 rows) |
 | light table | 64 B header + 132 B per `max_bricks` entry (128 B entry + 4 B CDF): 8.3 MiB at 65536 |
-| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 |
+| light cells | 288 B per cell: 18 MiB at 65536, 288 KiB at 1024 (296 B since step 3, docs/LIGHT_MIS.md) |
 | `FinalizePush` | 88 -> 104 B (`light_words`, `materials`, `min_emission` in place of `pad`) |
-| `LightPush` | 72 B (see differences) |
+| `LightPush` | 72 B (see differences); 80 B since step 3 (`light_indices`, docs/LIGHT_MIS.md) |
 | `FrameConstants` | 608 -> 672 B, fields as in section 3 (`frame_counter` at 640) |
 | `CaelixGiOptions` | 32 -> 48 B; `CaelixGiStats` 16 -> 32 B |
 | `CaelixLightOptions` | 16 B; `CaelixLightStats` 24 B |
@@ -555,8 +561,7 @@ render kernels need it to find the CDF behind the entries.
 - Covered faces: the entry has no per-face data, so a voxel with covered side faces wastes most
   NEE samples (a light voxel set into a ceiling, as in test 2: 2 of 3). Per-face open bits per entry (6 bits
   per light voxel, or a face mask per slice) would remove that waste.
-- No MIS: bright emitters close to a vertex keep high variance (speckles in a 256-frame light NEE
-  accumulation of the Cornell box). MIS with the BSDF path is the next step after ReSTIR DI.
+- MIS with the BSDF path and the bias fix for dropped bricks: see docs/LIGHT_MIS.md (step 3).
 - Material changes do not rewrite light words: a brick whose word is 0 under the old table stays
   out until it is finalized again (an entry whose lights vanished is dropped by the compact
   kernel, difference 5).

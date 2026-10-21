@@ -371,8 +371,8 @@ void Renderer::EnsureLightCells(uint32_t capacity, uint64_t frame)
     {
         return;
     }
-    // 288 bytes per cell (render/caelix_light_sample.hlsl). On a throw the old buffer stays.
-    constexpr VkDeviceSize kCellBytes = 288;
+    // 296 bytes per cell (render/caelix_light_sample.hlsl). On a throw the old buffer stays.
+    constexpr VkDeviceSize kCellBytes = 296;
     GpuBuffer fresh = GpuBuffer::DeviceLocal(device_.allocator(), device_.device(), kCellBytes * capacity);
     if (light_cells_.valid())
     {
@@ -392,7 +392,7 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
     constexpr uint32_t kKnownFlags = CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_VISIBILITY |
                                      CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY |
                                      CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI |
-                                     CAELIX_GI_FLAG_LIGHT_CELL_JITTER;
+                                     CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_MIS;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);

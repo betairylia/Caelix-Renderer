@@ -18,6 +18,7 @@ struct LightPush
     uint64_t slot_tables;
     uint64_t page_table;
     uint64_t light_words;
+    uint64_t light_indices;
     uint64_t materials;
     uint group_base;
     uint group_count;

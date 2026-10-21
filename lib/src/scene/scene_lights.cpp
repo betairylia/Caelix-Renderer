@@ -88,6 +88,7 @@ void Scene::DestroyLightObjects()
 void Scene::ReserveLightWords()
 {
     light_words_.Reserve(aabbs_.bytes() / kAabbRowBytes * sizeof(uint32_t));
+    light_indices_.Reserve(aabbs_.bytes() / kAabbRowBytes * sizeof(uint32_t));
 }
 
 CaelixResult Scene::SetLightOptions(const CaelixLightOptions& options)
@@ -111,7 +112,7 @@ CaelixResult Scene::SetLightOptions(const CaelixLightOptions& options)
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     // The table is opt-in: a host that never calls this function (the Unity plugin today) pays
-    // nothing beyond the light words.
+    // nothing beyond the light words and the entry map.
     lights_enabled_ = true;
     lights_dirty_ = true;
     const float min_emission = options.min_emission != 0.0f ? options.min_emission : kDefaultMinEmission;
@@ -134,7 +135,7 @@ void Scene::GetLightStats(CaelixLightStats& out) const
     out = CaelixLightStats{};
     out.bricks = light_stats_count_;
     out.bricks_dropped = light_stats_dropped_;
-    out.table_bytes = light_table_.buffer.size() + light_words_.bytes();
+    out.table_bytes = light_table_.buffer.size() + light_words_.bytes() + light_indices_.bytes();
     out.rebuilds = light_rebuilds_;
 }
 
@@ -209,6 +210,7 @@ void Scene::RecordLightRebuild(VkCommandBuffer cmd, uint64_t frame)
     push.slot_tables = slot_tables_.address();
     push.page_table = page_table_.address();
     push.light_words = light_words_.address();
+    push.light_indices = light_indices_.address();
     push.materials = material_buffer_.address();
     push.group_count = static_cast<uint32_t>(groups_.size());
     push.max_bricks = light_table_.capacity;
