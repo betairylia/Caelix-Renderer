@@ -15,7 +15,12 @@
 //                                (on the brick border, or the neighbour inside the brick is empty)
 //   384   float face_weight[6]   luminance sum over the set bits of face_mask[f]
 //   408   float total_weight     luminance sum over the brick's list-light voxels (the CDF weight)
-//   412   uint group; 416 uint id; 420 uint entity; 424 int3 origin; 436 uint pad[3]
+//   412   uint group; 416 uint id; 420 uint entity; 424 int3 origin
+//   436   uint face_extent[2]    8 bits per face in face order (+X..-Y in bytes 0..3 of [0], +Z and
+//                                -Z in bytes 0 and 1 of [1]): for a +a face the lowest row (0..7)
+//                                along axis a over the set bits of face_mask[f], for a -a face the
+//                                highest; 0xFF when face_mask[f] is empty
+//   444   uint pad
 // Voxel v = x | y << 3 | z << 6 (x fastest); slice z of a face mask is a uint2 (low half: y 0..3,
 // high half: y 4..7; bit x + 8 (y & 3) in the half). The render kernels load the 64 bytes from 384
 // on as a LightEntryHeader and a face mask only when they need it.
@@ -31,6 +36,7 @@ static const uint kLightEntryFaceMaskBytes = 64;   // one face's mask: 8 slices 
 static const uint kLightEntryWeightsOffset = 384;  // face_weight[6], the start of the header part
 static const uint kLightEntryTotalOffset = 408;
 static const uint kLightEntryOriginOffset = 424;
+static const uint kLightEntryFaceExtentOffset = 436;
 static const uint kLightHeaderCount = 0;     // byte offsets in the table header
 static const uint kLightHeaderDropped = 4;
 static const uint kLightHeaderCapacity = 8;
@@ -45,6 +51,7 @@ struct LightEntryHeader
     uint id;               // dense brick id
     uint entity;
     int3 origin;           // entity-local voxel origin of the brick
+    uint face_extent[2];   // per face the lowest (+a) or highest (-a) row of its mask, 0xFF = empty
 };
 
 float CaelixLuminance(float3 c)
@@ -88,7 +95,18 @@ LightEntryHeader LoadLightEntryHeader(uint64_t address)
     h.id = w2.x;
     h.entity = w2.y;
     h.origin = int3(w2.z, w2.w, w3.x);
+    h.face_extent[0] = w3.y;
+    h.face_extent[1] = w3.z;
     return h;
+}
+
+// The extent byte of face `face` (0..5) from the entry's two extent words: for a +a face the lowest
+// row along axis a that holds a voxel of the face's mask, for a -a face the highest; 0xFF when the
+// face's mask is empty.
+uint LightFaceExtent(uint extent0, uint extent1, uint face)
+{
+    const uint word = face < 4u ? extent0 : extent1;
+    return (word >> (8u * (face & 3u))) & 0xFFu;
 }
 
 // The mask of face `face` (0..5) of the entry at `address`: slice z in mask[z].

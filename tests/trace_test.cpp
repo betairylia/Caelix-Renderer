@@ -3160,18 +3160,20 @@ void EnableLights(CaelixScene* scene)
     REQUIRE(caelix_scene_set_light_options(scene, &options) == CAELIX_OK);
 }
 
-// The walls of the light box (grey, 1 voxel thick around the interior [0, 24)^3, no light).
-World LightBoxWalls()
+// The walls of the light box (grey, 1 voxel thick around the interior [0, 24) on x and z and
+// [0, height) on y, no light; the default height gives the cube [0, 24)^3).
+World LightBoxWalls(int32_t height = kBoxInterior)
 {
     World world;
     const int32_t lo = -1;
     const int32_t hi = kBoxInterior;
-    FillBox(world, lo, lo, lo, hi, lo, hi, kGreyFloor);  // floor
-    FillBox(world, lo, hi, lo, hi, hi, hi, kGreyFloor);  // ceiling
-    FillBox(world, lo, lo, lo, lo, hi, hi, kGreyFloor);  // -X wall
-    FillBox(world, hi, lo, lo, hi, hi, hi, kGreyFloor);  // +X wall
-    FillBox(world, lo, lo, lo, hi, hi, lo, kGreyFloor);  // -Z wall
-    FillBox(world, lo, lo, hi, hi, hi, hi, kGreyFloor);  // +Z wall
+    const int32_t top = height;
+    FillBox(world, lo, lo, lo, hi, lo, hi, kGreyFloor);     // floor
+    FillBox(world, lo, top, lo, hi, top, hi, kGreyFloor);   // ceiling
+    FillBox(world, lo, lo, lo, lo, top, hi, kGreyFloor);    // -X wall
+    FillBox(world, hi, lo, lo, hi, top, hi, kGreyFloor);    // +X wall
+    FillBox(world, lo, lo, lo, hi, top, lo, kGreyFloor);    // -Z wall
+    FillBox(world, lo, lo, hi, hi, top, hi, kGreyFloor);    // +Z wall
     return world;
 }
 
@@ -3574,6 +3576,70 @@ TEST_CASE("closed faces are never sampled")
     std::printf("closed faces: %u of %u floor and wall pixels lit at 1 spp (%.1f %%; step 1: about 60 %% of "
                 "the pixels)\n",
                 lit, counted, 100.0 * fraction);
+    CHECK(counted > kBoxSize * kBoxSize / 2);
+    CHECK(fraction > 0.95);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, normal);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("border faces use the mask extent")
+{
+    // docs/LIGHT_FACES.md section 3 ("As built", face extents): a box of height 32 with the single
+    // light voxel at (12, 31, 12), the top row of the brick y 24..31, under the ceiling at y = 32
+    // (the next brick). Its +Y face lies on the brick border, so the compact kernel counts it open,
+    // but the ceiling covers it. Step 4's brick-slab rule made +Y a candidate for every receiver in
+    // 0 < t_y < 8, so a share of the NEE samples picked the covered face; with the extents +Y is a
+    // candidate only above its plane (t_y > 7 + 1), which no receiver in the box reaches. The camera
+    // looks at the +Z wall from the brick's height band (every visible wall point lies in y 23..32),
+    // so nearly every pixel is lit at 1 spp with light NEE.
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    EnableLights(rig.scene);
+    World world = LightBoxWalls(32);
+    FillBox(world, 12, 31, 12, 12, 31, 12, kWhiteEmitter512);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 1);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    Target normal = CreateTarget(rig.gpu, VK_FORMAT_R16G16B16A16_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    set.t[kNormal] = &normal;
+    const double position[3] = {12.0, 27.5, 12.0};
+    const double forward[3] = {0.0, 0.0, 1.0};
+    const CaelixCamera camera = LookAlong(position, forward, std::tan(20.0 * 3.14159265358979323846 / 180.0));
+
+    CaelixGiOptions gi{};
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    Render(rig, renderer, set, camera, GlassOptions(CAELIX_MODE_PATH_TRACE, 4, 0, 4321));
+
+    const float* pixels = reinterpret_cast<const float*>(color.bytes.data());
+    uint32_t counted = 0;
+    uint32_t lit = 0;
+    for (uint32_t y = 0; y < kBoxSize; ++y)
+    {
+        for (uint32_t x = 0; x < kBoxSize; ++x)
+        {
+            if (normal.F16(x, y, 3) != 1.0f || normal.F16(x, y, 1) < -0.5f)
+            {
+                continue;  // no hit, or the ceiling (normal -Y)
+            }
+            const size_t p = static_cast<size_t>(y) * kBoxSize + x;
+            const double v = pixels[p * 4] + pixels[p * 4 + 1] + pixels[p * 4 + 2];
+            ++counted;
+            lit += v > 0.0 ? 1u : 0u;
+        }
+    }
+    const double fraction = counted > 0 ? static_cast<double>(lit) / counted : 0.0;
+    std::printf("border faces: %u of %u wall pixels lit at 1 spp (%.1f %%)\n", lit, counted, 100.0 * fraction);
     CHECK(counted > kBoxSize * kBoxSize / 2);
     CHECK(fraction > 0.95);
 

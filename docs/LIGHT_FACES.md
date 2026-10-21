@@ -32,14 +32,20 @@ open; a neighbour brick is not consulted), as in step 1's mean normal.
 416   uint id
 420   uint entity
 424   int3 origin
-436   uint pad[3]             -> 448
+436   uint face_extent[2]     8 bits per face in face order (+X 0, -X 1, +Y 2, -Y 3 in bytes 0..3 of
+                              [0]; +Z 4, -Z 5 in bytes 0 and 1 of [1]): for a +a face the lowest row
+                              (0..7) along axis a over the set bits of face_mask[f], for a -a face
+                              the highest; 0xFF when face_mask[f] is empty (added after step 4, see
+                              "As built", "Face extents")
+444   uint pad                -> 448
 ```
 
 `mean_normal` is gone: the cell fill's orientation term derives it from the face weights,
 `normalize(w0 - w1, w2 - w3, w4 - w5)` (0 = none; length 0 when every direction weighs the same).
 That is the luminance-weighted version of step 1's open-face direction sum.
 
-HLSL: `LightEntryHeader` (bytes 384..447: the six weights, total, group, id, entity, origin) is what
+HLSL: `LightEntryHeader` (bytes 384..447: the six weights, total, group, id, entity, origin, the two
+extent words) is what
 the sampler, the fill, the DI resolve and the BSDF-side MIS load (`LoadLightEntryHeader`, 4 x 16 B);
 a face's mask is loaded on demand (`LoadLightFaceMask(address, face)` -> `uint2[8]`, 4 x 16 B;
 `LightFaceMaskBit(address, face, voxel)` -> one 8 B load). The step 1 `LightEntry` with the full
@@ -68,16 +74,19 @@ unchanged.
 Given the header and the receiver `x_r`:
 
 1. Candidate faces, per axis `a`, from the receiver's coordinate `t_a = dot(axis_a, x_r - brick
-   origin)` in voxel units (the brick spans `0..8`): `+a` is a candidate when `t_a > 0`, `-a` when
-   `t_a < 8`; both when the receiver lies within the brick's slab on that axis. This is the smallest
-   per-brick set that holds every face a point of the brick can show to the receiver: a `+a` face
-   plane lies at `t >= 1`, so `cos_l > 0` needs `t_a > 1`; a `-a` plane at `t <= 7` needs `t_a < 7`.
-   A brick-centre sign test (one face per axis) would give pdf 0 to visible faces of a receiver
-   inside the slab (the top faces of the lower rows seen from a floor at the brick's height), a
-   bias, so it is not used; step 1's per-voxel sign test is replaced, not kept. Inside the slab a
-   voxel whose chosen face points away from the receiver gets `cos_l <= 0`: a wasted sample, not a
-   bias. The BSDF-side proxy uses the SAME rule (`LightCandidateWeight(d, x_r)`), and 1..6 faces are
-   candidates.
+   origin)` in voxel units (the brick spans `0..8`) and the entry's face extents (section 1): `+a`
+   is a candidate when `t_a > min_row(+a) + 1` (the lowest `+a` face plane of the face's mask), `-a`
+   when `t_a < max_row(-a)` (the highest `-a` face plane); a face with an empty mask (extent 0xFF)
+   never is. Both are candidates when the receiver lies between the two planes. This holds every
+   face a point of the brick can show to the receiver: a `+a` face at row `r` has its plane at
+   `r + 1 >= min_row + 1`, so `cos_l > 0` needs `t_a > min_row + 1`; a `-a` face at `r <= max_row`
+   needs `t_a < max_row`. A brick-centre sign test (one face per axis) would give pdf 0 to visible
+   faces of a receiver inside the slab (the top faces of the lower rows seen from a floor at the
+   brick's height), a bias, so it is not used; step 1's per-voxel sign test is replaced, not kept.
+   Between the planes a voxel whose chosen face points away from the receiver gets `cos_l <= 0`: a
+   wasted sample, not a bias. The BSDF-side proxy uses the SAME rule (`LightCandidateWeight(d,
+   x_r)`), and 1..6 faces are candidates. (As designed, the rule was the brick slab, `t_a > 0` and
+   `t_a < 8`; see "As built", "Face extents".)
 2. Face `f` among the candidates with probability `face_weight[f] / W_cand`, `W_cand` = the sum
    over the candidate faces. `W_cand = 0` -> no sample (every candidate face is covered: the NEE
    cannot reach this brick from there; the BSDF side gives such a point `w_bsdf = 1` through the
@@ -215,3 +224,36 @@ light voxel and no wasted candidates there is nothing for the reuse to choose be
 the side faces of the inner panel voxels are covered inside the brick and no longer sampled, so the
 64-frame RMSE drops by 1.5x (NEE) and 2.2x (DI). MIS on the panel is now neutral to slightly worse
 for the NEE (1.015x) and still helps the DI (0.980x).
+
+### Face extents (after step 4, 2026-10-21)
+
+**Why.** The bench showed a loss on Cornell at 1 spp against step 3 (`pt_nee` -0.54 dB PSNR,
+-1.85 dB block PSNR; `Artifacts/gi-experiments-20261020/light-faces/README.md`). The cause: the
+light voxel sits in the top row of its brick, so its +Y face lies on the brick border and counts as
+open (no neighbour brick is consulted), and the slab rule `t_y > 0` made +Y a candidate for every
+receiver in the brick's height band. The ceiling in the next brick covers that face, so those
+samples were wasted.
+
+**Change.** The entry's pad at 436..443 holds `face_extent[2]` (section 1); the compact kernel
+computes the extents in its store loop from the masked slice words it already forms (x: the bytes
+of the slice words folded with OR; y: one bit per nonzero byte; z: one bit per nonzero slice; then
+`firstbitlow` for a +a face, `firstbithigh` for a -a face) and stores them in the last 16-byte
+word, so the store count is unchanged. `LightEntryHeader` loads them from that word,
+`LightFaceExtent(extent0, extent1, face)` reads one byte, `LightCandidateFaceMask` takes the two
+words and uses the face planes (section 3), and `LightMisDesc` carries the two words (29 values,
+was 27), so the sampler and the proxy still compute the same `W_cand`. The C++ `LightEntry` has
+`face_extent[2]` + `pad` (`static_assert` on offset 436). No ABI change.
+
+**Remaining waste.** A border face covered by a neighbour brick is still a candidate for a receiver
+beyond its plane (the shadow ray finds the cover); a face between the planes of an axis still gives
+`cos_l <= 0` for some voxels.
+
+**Measured** (`Artifacts/gi-experiments-20261020/light-faces-extent/README.md`): all 30 trace test
+cases pass; the new case "border faces use the mask extent" (the light voxel in the top row of its
+brick under the ceiling of the next brick) lights 100.0 % of the wall pixels at 1 spp (90.3 % with
+the slab rule, which fails the case). The panel 64-frame RMSE drops further (light NEE 0.964 ->
+0.910, ReSTIR DI 1.192 -> 1.179): the panel's side faces on the brick border are no longer candidates
+for the floor receivers between them. Cornell at 1 spp, step 3 / step 4 / step 4 + extents: `pt_nee`
+PSNR 16.03 / 15.49 / 16.12 dB, block PSNR 30.74 / 28.89 / 30.96 dB, lit 96.81 / 94.45 / 97.20 %;
+`di_unbiased` 16.51 / 16.33 / 16.55 dB, block PSNR 32.50 / 31.91 / 32.60 dB, lit 97.21 / 96.59 /
+97.40 %.

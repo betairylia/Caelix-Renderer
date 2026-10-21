@@ -93,12 +93,16 @@ struct LightEntry
     uint32_t id;               // dense brick id
     uint32_t entity;
     int32_t origin[3];         // entity-local voxel origin of the brick (brick key * 8)
-    uint32_t pad[3];
+    uint32_t face_extent[2];   // 8 bits per face in face order (+X..-Y in [0], +Z, -Z in bytes 0, 1
+                               // of [1]): the lowest (+a face) or highest (-a face) row along the
+                               // face's axis over the set bits of face_mask[f]; 0xFF = empty mask
+    uint32_t pad;
 };
 static_assert(sizeof(LightEntry) == 448);
 static_assert(offsetof(LightEntry, face_weight) == 384);
 static_assert(offsetof(LightEntry, total_weight) == 408);
 static_assert(offsetof(LightEntry, origin) == 424);
+static_assert(offsetof(LightEntry, face_extent) == 436);
 
 constexpr uint64_t kLightTableHeaderBytes = sizeof(LightTableHeader);
 // Bytes of a light table of `max_bricks` entries.

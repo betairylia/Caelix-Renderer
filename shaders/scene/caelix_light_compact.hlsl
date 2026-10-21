@@ -9,7 +9,9 @@
 // its emission luminance to the total and, for each of its six faces that is open (on the brick
 // border, or the neighbour voxel inside the brick is not occupied; a neighbour brick is not
 // consulted), to that face's weight; the face masks are the list-light voxels ANDed with the open
-// bits of each face (OpenWord), so a face mask and its weight always cover the same voxels. An
+// bits of each face (OpenWord), so a face mask and its weight always cover the same voxels. Each
+// face also gets its extent along its axis (the lowest row of a +a face mask, the highest of a -a
+// one, 0xFF when empty), which the sampler's candidate rule uses as the face plane. An
 // entry with a total of 0 (the materials changed since the light word was written) is not stored.
 // The entry takes the next index of the header's count (InterlockedAdd); an index at or above the
 // capacity counts in `dropped` instead. The entry's total also goes to cdf[index], which
@@ -234,17 +236,57 @@ uint CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_ba
     const int3 origin = (coord * int(1u << shift) + brick) * 8;
 
     // 24 x 16 B of face masks (face-major, two slices per store), then the 64 bytes of the header
-    // part: the six weights, total, group, id, entity, origin and the pad.
+    // part: the six weights, total, group, id, entity, origin, the two extent words and the pad.
+    // The extent of a face (docs/LIGHT_FACES.md section 1): the rows along the face's axis that hold
+    // a voxel of its mask as 8 bits (x: the bytes of the slice words folded with OR; y: one bit per
+    // nonzero byte, low half rows 0..3, high half 4..7; z: one bit per nonzero slice), then the
+    // lowest row for a +a face, the highest for a -a face, 0xFF when the mask is empty.
     const uint address = kLightHeaderBytes + index * kLightEntryBytes;
+    uint extent0 = 0u;
+    uint extent1 = 0u;
     CAELIX_LOOP
     for (uint f4 = 0; f4 < 6; ++f4)
     {
+        uint2 face_bits = uint2(0u, 0u);
+        uint z_rows = 0u;
         CAELIX_UNROLL
         for (uint w = 0; w < 4; ++w)
         {
             const uint2 lo = mask[2 * w] & OpenWord(occupied, f4, 2 * w);
             const uint2 hi = mask[2 * w + 1] & OpenWord(occupied, f4, 2 * w + 1);
             g_table.Store4(address + f4 * kLightEntryFaceMaskBytes + w * 16, uint4(lo, hi));
+            face_bits |= lo | hi;
+            z_rows |= any(lo != 0u) ? 1u << (2 * w) : 0u;
+            z_rows |= any(hi != 0u) ? 2u << (2 * w) : 0u;
+        }
+        uint rows;
+        if (f4 < 2u)
+        {
+            const uint x_word = face_bits.x | face_bits.y;
+            rows = (x_word | (x_word >> 8) | (x_word >> 16) | (x_word >> 24)) & 0xFFu;
+        }
+        else if (f4 < 4u)
+        {
+            rows = 0u;
+            CAELIX_UNROLL
+            for (uint r = 0; r < 4; ++r)
+            {
+                rows |= ((face_bits.x >> (8u * r)) & 0xFFu) != 0u ? 1u << r : 0u;
+                rows |= ((face_bits.y >> (8u * r)) & 0xFFu) != 0u ? 16u << r : 0u;
+            }
+        }
+        else
+        {
+            rows = z_rows;
+        }
+        const uint row = rows == 0u ? 0xFFu : ((f4 & 1u) == 0u ? firstbitlow(rows) : firstbithigh(rows));
+        if (f4 < 4u)
+        {
+            extent0 |= row << (8u * f4);
+        }
+        else
+        {
+            extent1 |= row << (8u * (f4 - 4u));
         }
     }
     g_table.Store4(address + kLightEntryWeightsOffset,
@@ -252,7 +294,7 @@ uint CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_ba
     g_table.Store4(address + kLightEntryWeightsOffset + 16,
                    uint4(asuint(face_weight[4]), asuint(face_weight[5]), asuint(total), group));
     g_table.Store4(address + kLightEntryTotalOffset + 8, uint4(id, entity, asuint(origin.x), asuint(origin.y)));
-    g_table.Store4(address + kLightEntryOriginOffset + 8, uint4(asuint(origin.z), 0u, 0u, 0u));
+    g_table.Store4(address + kLightEntryOriginOffset + 8, uint4(asuint(origin.z), extent0, extent1, 0u));
     g_table.Store(kLightHeaderBytes + g_push.max_bricks * kLightEntryBytes + index * 4, asuint(total));
     return index + 1u;
 }

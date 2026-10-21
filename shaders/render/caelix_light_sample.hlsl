@@ -201,23 +201,30 @@ LightBrickFrame LightBrickFrameOf(CaelixFrameConstants fc, LightEntryHeader head
     return b;
 }
 
-// The candidate faces of a brick (origin and axes, world) seen from the receiver `x_r`, as a 6-bit
-// mask (bit f = face f, +X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5; docs/LIGHT_FACES.md section 3): per axis
-// a, t_a = dot(axis_a, x_r - origin) in voxel units (the brick spans 0..8); +a is a candidate when
-// t_a > 0, -a when t_a < 8, both when the receiver lies inside the brick's slab on that axis. Every
-// face of the brick that a receiver can see (cos_l > 0) is a candidate: a +a face plane lies at
-// t >= 1, a -a plane at t <= 7. The sampler and the MIS proxy both call this function.
-uint LightCandidateFaceMask(float3 origin, float3 axis0, float3 axis1, float3 axis2, float3 x_r)
+// The candidate faces of a brick (origin and axes, world; the entry's two extent words) seen from the
+// receiver `x_r`, as a 6-bit mask (bit f = face f, +X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5;
+// docs/LIGHT_FACES.md section 3): per axis a, t_a = dot(axis_a, x_r - origin) in voxel units (the
+// brick spans 0..8); +a is a candidate when t_a > min_row + 1 (the lowest +a face plane of the
+// face's mask), -a when t_a < max_row (the highest -a face plane); a face with an empty mask (extent
+// 0xFF) never is. Both faces of an axis are candidates for a receiver between the two planes. Every
+// face that a receiver can see (cos_l > 0) is a candidate: a +a face at row r has its plane at
+// r + 1 >= min_row + 1, a -a face at r <= max_row. A face on the brick border whose planes all lie
+// beyond the receiver (a top-row voxel's +Y face seen from below) is not. The sampler and the MIS
+// proxy both call this function.
+uint LightCandidateFaceMask(float3 origin, float3 axis0, float3 axis1, float3 axis2, uint extent0, uint extent1,
+                            float3 x_r)
 {
     const float3 d = x_r - origin;
     const float3 t = float3(dot(axis0, d), dot(axis1, d), dot(axis2, d));
     uint mask = 0u;
-    mask |= t.x > 0.0f ? 0x01u : 0u;
-    mask |= t.x < 8.0f ? 0x02u : 0u;
-    mask |= t.y > 0.0f ? 0x04u : 0u;
-    mask |= t.y < 8.0f ? 0x08u : 0u;
-    mask |= t.z > 0.0f ? 0x10u : 0u;
-    mask |= t.z < 8.0f ? 0x20u : 0u;
+    CAELIX_UNROLL
+    for (uint a = 0; a < 3; ++a)
+    {
+        const uint lowest = LightFaceExtent(extent0, extent1, 2u * a);        // lowest +a face row
+        const uint highest = LightFaceExtent(extent0, extent1, 2u * a + 1u);  // highest -a face row
+        mask |= (lowest != 0xFFu && t[a] > float(lowest) + 1.0f) ? 1u << (2u * a) : 0u;
+        mask |= (highest != 0xFFu && t[a] < float(highest)) ? 2u << (2u * a) : 0u;
+    }
     return mask;
 }
 
@@ -236,14 +243,16 @@ float LightCandidateWeightSum(float face_weight[6], uint mask)
 
 // The description of a list-light point for the MIS proxy (docs/LIGHT_MIS.md section 1,
 // docs/LIGHT_FACES.md section 4), the same for every point of one face of one voxel: the brick's
-// world frame (origin corner and the three entity axes, for the candidate faces of a receiver), the
-// six face weights, the point's face and 1 / n_face (n_face = the set bits of that face's mask), the
-// entry's total weight, and the brick's world centre (origin + 4 along each axis) and mean normal
-// (world, LightBrickNormalLocal rotated; length 0 without one).
+// world frame (origin corner and the three entity axes) and the entry's two face extent words (for
+// the candidate faces of a receiver), the six face weights, the point's face and 1 / n_face
+// (n_face = the set bits of that face's mask), the entry's total weight, and the brick's world
+// centre (origin + 4 along each axis) and mean normal (world, LightBrickNormalLocal rotated; length 0
+// without one).
 struct LightMisDesc
 {
     float3 origin;
     float3 axes[3];
+    uint face_extent[2];
     float face_weight[6];
     uint face;
     float inv_n_face;
@@ -259,6 +268,8 @@ LightMisDesc LightMisDescZero()
     d.axes[0] = float3(0.0f, 0.0f, 0.0f);
     d.axes[1] = float3(0.0f, 0.0f, 0.0f);
     d.axes[2] = float3(0.0f, 0.0f, 0.0f);
+    d.face_extent[0] = 0xFFFFFFFFu;  // every face empty
+    d.face_extent[1] = 0xFFFFFFFFu;
     CAELIX_UNROLL
     for (uint f = 0; f < 6; ++f)
     {
@@ -319,6 +330,8 @@ LightMisDesc LightMisDescWith(LightEntryHeader header, LightBrickFrame b, uint f
     d.axes[0] = b.axes[0];
     d.axes[1] = b.axes[1];
     d.axes[2] = b.axes[2];
+    d.face_extent[0] = header.face_extent[0];
+    d.face_extent[1] = header.face_extent[1];
     CAELIX_UNROLL
     for (uint f = 0; f < 6; ++f)
     {
@@ -361,7 +374,8 @@ LightMisDesc LightMisDescOf(CaelixFrameConstants fc, LightEntryHeader header, ui
 // (LightCandidateFaceMask, exactly as SampleLightEntryWith computes it).
 float LightCandidateWeight(LightMisDesc d, float3 x_r)
 {
-    return LightCandidateWeightSum(d.face_weight, LightCandidateFaceMask(d.origin, d.axes[0], d.axes[1], d.axes[2], x_r));
+    return LightCandidateWeightSum(d.face_weight, LightCandidateFaceMask(d.origin, d.axes[0], d.axes[1], d.axes[2],
+                                                                         d.face_extent[0], d.face_extent[1], x_r));
 }
 
 // The per-vertex half of the light NEE's density proxy (docs/LIGHT_MIS.md section 1): the
@@ -521,9 +535,10 @@ float LightUvDequantize(uint q)
 // (LightCandidateFaceMask) with probability face_weight[f] / W_cand, a voxel uniformly among the set
 // bits of that face's mask (the list-light voxels whose face f is open inside the brick), and a point
 // uniformly on that face (area 1). A face covered inside the brick is never chosen; a face on the
-// brick border covered by a neighbour brick can be (the shadow ray finds it). Inside the slab of an
-// axis both faces are candidates, and a chosen face that points away from the receiver gives
-// cos_l <= 0: a wasted sample, not a bias. pdf_area = face_weight[f] / W_cand / n_f; the brick's own
+// brick border covered by a neighbour brick can be when the receiver lies beyond its plane (the
+// shadow ray finds it). Between the lowest +a and the highest -a face plane of an axis both faces
+// are candidates, and a chosen face that points away from the receiver gives cos_l <= 0: a wasted
+// sample, not a bias. pdf_area = face_weight[f] / W_cand / n_f; the brick's own
 // probability is not in it. Four random numbers in every branch (face, voxel, u, v).
 // `quantize_uv`: the point is the centre of its unorm16 uv cell (LightUvQuantize), so that the
 // ReSTIR DI reservoir, which stores the uv in 2 x 16 bits, names exactly the sampled point.
@@ -551,7 +566,8 @@ LightSample SampleLightEntryWith(CaelixFrameConstants fc, LightEntryHeader heade
 
     // 1. Face: a candidate by its weight.
     const LightBrickFrame brick = LightBrickFrameOf(fc, header);
-    const uint candidates = LightCandidateFaceMask(brick.origin, brick.axes[0], brick.axes[1], brick.axes[2], x_r);
+    const uint candidates = LightCandidateFaceMask(brick.origin, brick.axes[0], brick.axes[1], brick.axes[2],
+                                                   header.face_extent[0], header.face_extent[1], x_r);
     const float w_cand = LightCandidateWeightSum(header.face_weight, candidates);
     if (!(w_cand > 0.0f))
     {
