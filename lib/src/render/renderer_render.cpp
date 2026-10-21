@@ -662,7 +662,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                                      CAELIX_GI_FLAG_UNBIASED;
     constants.gi_flags =
         restir ? gi_options_.flags
-               : (gi_options_.flags & (static_cast<uint32_t>(CAELIX_GI_FLAG_DIFFUSE_ONLY | CAELIX_GI_FLAG_LIGHT_NEE) |
+               : (gi_options_.flags & (static_cast<uint32_t>(CAELIX_GI_FLAG_DIFFUSE_ONLY | CAELIX_GI_FLAG_LIGHT_NEE |
+                                                             CAELIX_GI_FLAG_LIGHT_CELL_JITTER) |
                                        (restir_di ? (kReuseFlags | CAELIX_GI_FLAG_RESTIR_DI) : 0u)));
     if (!lighting)
     {

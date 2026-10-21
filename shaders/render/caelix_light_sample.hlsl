@@ -385,6 +385,11 @@ LightPoint LightPointAt(CaelixFrameConstants fc, LightEntry entry, uint voxel_in
 // from the global CDF; the point from SampleLightEntry; one shadow ray. Returns the demodulated
 // incident radiance of the Lambert lobe (the albedo is in the caller's throughput, as for the sun
 // NEE), 0 without a usable sample.
+// With kGiFlagLightCellJitter (section 2.5) the cell is looked up at `object_point` moved by a
+// uniform random offset in (-0.5, 0.5) cells per axis: the pixels of one brick then read up to 8
+// cells instead of the same one, so the variance of the cell contents (one refill of 32 reservoirs
+// per frame) turns from a per-cell flicker into per-pixel noise. Unbiased: every cell's reservoirs
+// are unbiased estimators for any receiver (W does not depend on the receiver).
 float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint group, float3 object_point,
                       inout uint rng)
 {
@@ -405,7 +410,13 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     if (fc.light_cells != 0u)
     {
         const uint level = LightCellLevel(fc, x_r);
-        const int slot = LightCellLookup(fc, GroupEntity(fc, group), level, LightCellCoord(object_point, level));
+        float3 cell_point = object_point;
+        if ((fc.gi_flags & kGiFlagLightCellJitter) != 0u)
+        {
+            const float3 u_jitter = float3(RandomFloat01(rng), RandomFloat01(rng), RandomFloat01(rng));
+            cell_point += (u_jitter - 0.5f) * float(8u << (2u * level));
+        }
+        const int slot = LightCellLookup(fc, GroupEntity(fc, group), level, LightCellCoord(cell_point, level));
         if (slot >= 0)
         {
             const uint r = min(kLightCellReservoirs - 1u, uint(u_reservoir * float(kLightCellReservoirs)));

@@ -144,6 +144,7 @@ static const uint kGiFlagUnbiased = 1u << 3;
 static const uint kGiFlagDiffuseOnly = 1u << 4;
 static const uint kGiFlagLightNee = 1u << 5;
 static const uint kGiFlagRestirDi = 1u << 6;
+static const uint kGiFlagLightCellJitter = 1u << 7;
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

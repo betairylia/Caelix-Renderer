@@ -77,8 +77,8 @@ extern "C" {
    CAELIX_GI_FLAG_LIGHT_NEE, and appended the light cell fields to the experimental CaelixGiOptions
    (32 -> 48 bytes) and CaelixGiStats (16 -> 32 bytes), also without a bump. The ReSTIR DI step
    (docs/RESTIR_DI.md) added CAELIX_GI_FLAG_RESTIR_DI and renamed CaelixGiOptions::light_reserved to
-   di_candidates (same size). A host built against an older version-2 header must be rebuilt (the library reads and
-   writes the larger structs). */
+   di_candidates (same size). The light cell jitter added CAELIX_GI_FLAG_LIGHT_CELL_JITTER. A host built against
+   an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
 typedef struct CaelixVersion
@@ -1167,6 +1167,10 @@ typedef enum CaelixGiMethod
                                                  diffuse vertex (docs/LIGHT_LIST.md); both methods */
 #define CAELIX_GI_FLAG_RESTIR_DI (1u << 6)    /* per-pixel ReSTIR DI on the light list at the primary
                                                  surface (docs/RESTIR_DI.md); needs LIGHT_NEE; both methods */
+#define CAELIX_GI_FLAG_LIGHT_CELL_JITTER (1u << 7) /* light NEE: each vertex looks its light cell up at a point
+                                                 jittered by up to half a cell, so that neighbouring pixels read
+                                                 different cells (the per-cell flicker becomes per-pixel noise;
+                                                 docs/LIGHT_LIST.md section 2.5). Unbiased. */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the

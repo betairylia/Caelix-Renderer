@@ -614,6 +614,11 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         ui.add_enabled(lighting, egui::Checkbox::new(&mut gi.light_nee, "light NEE (light list)"));
         ui.add_enabled(
             lighting && gi.light_nee,
+            egui::Checkbox::new(&mut gi.light_cell_jitter, "jitter light cell lookup"),
+        )
+        .on_hover_text("Each vertex reads one of up to 8 cells around its hit point: per-cell flicker becomes per-pixel noise");
+        ui.add_enabled(
+            lighting && gi.light_nee,
             egui::Checkbox::new(&mut gi.restir_di, "ReSTIR DI (light list, primary surface)"),
         );
         ui.add_enabled(

@@ -432,6 +432,10 @@ struct Args {
     /// Light NEE: candidates per cell reservoir and frame (1..64).
     #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64))]
     light_candidates: u32,
+    /// Light NEE: look every vertex's light cell up at the hit point itself instead of a point
+    /// jittered by up to half a cell (the jitter turns the per-cell flicker into per-pixel noise).
+    #[arg(long)]
+    light_no_cell_jitter: bool,
     /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 8-voxel
     /// cells, else 32-voxel cells.
     #[arg(long, value_name = "F", default_value_t = 0.25)]
@@ -2066,6 +2070,7 @@ fn main() -> anyhow::Result<()> {
             depth_threshold: args.gi_depth_threshold,
             light_nee: args.gi_light_nee,
             light_cells: args.light_cells,
+            light_cell_jitter: !args.light_no_cell_jitter,
             light_candidates: args.light_candidates,
             light_footprint: args.light_footprint,
             restir_di: args.gi_restir_di,

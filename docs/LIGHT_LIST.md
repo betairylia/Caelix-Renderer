@@ -258,6 +258,34 @@ trace kernel writes 0 there as today.
 
 Sun NEE and fog are untouched. Specular vertices get no light NEE (as the sun).
 
+### 2.5 Jittered cell lookup (`CAELIX_GI_FLAG_LIGHT_CELL_JITTER`, 2026-10-21)
+
+Observed (owner, 1 spp, light NEE alone, a scene with many lights): the image flickers in a
+blocky per-brick pattern. Cause: every pixel whose vertex lies in one cell reads the same 32
+reservoirs of that frame, and the fill rebuilds them every frame from 32 x K draws of the global
+CDF (at most 256 of N light bricks, chosen by emission, not by distance). With N >> 256 the
+frames in which the near strong bricks are among the draws give the whole cell a large W, the
+other frames leave it dark. The pixels of a cell are fully correlated, neighbouring cells are
+independent: a per-cell flicker that no spatial filter can average. The estimate stays unbiased
+(the bench converged, section 5); only the variance is concentrated in the cell choice. The RNG
+(one stream per pixel and frame in the trace, one per slot, reservoir and frame in the fill) is
+not the cause.
+
+Fix 1 (built): with the flag, `LightNextEvent` looks the cell up at `object_point + (u - 0.5) *
+cell_size` per axis (`u` three fresh numbers of the light stream), so the pixels of one brick read
+up to 8 different cells and the block pattern becomes per-pixel noise. Unbiased: a cell's
+reservoir is an unbiased estimator of the brick-level integral for every receiver (its W does
+not depend on the receiver). Costs: up to 8 x more live cells near the camera (more fill work, the
+capacity stays 65536) and one more frame with empty reservoirs for newly touched cells. The jitter
+is per vertex, every bounce, path trace and ReSTIR GI methods; ReSTIR DI's initial candidates
+(`DiInitialReservoir`) are NOT jittered (the DI reuse already decorrelates the cells). Without the
+flag the random stream and the lookup are unchanged. Host: on by default with `light NEE`,
+`--light-no-cell-jitter` / the "jitter light cell lookup" checkbox turn it off.
+
+Not built (variance, not pattern): temporal reuse of the cell reservoirs in the fill (thread r
+merges its old reservoir, M-capped, as one more candidate), and several reservoirs per vertex
+resampled with the exact point target.
+
 ## 3. Frame constants and push constants
 
 `FrameConstants` grows from 608 to 672 B (CPU + HLSL + static_asserts):

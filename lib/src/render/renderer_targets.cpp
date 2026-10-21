@@ -391,7 +391,8 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
     constexpr const char* kFunction = "caelix_renderer_set_gi_options";
     constexpr uint32_t kKnownFlags = CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_VISIBILITY |
                                      CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY |
-                                     CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI;
+                                     CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI |
+                                     CAELIX_GI_FLAG_LIGHT_CELL_JITTER;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
