@@ -21,6 +21,13 @@ namespace caelix {
 class Scene;
 class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 
+// The light cell layout (render/caelix_light_sample.hlsl): kLightCellBytes per cell, then the
+// usage counters (live, active, inserted, failed: four uints) at the buffer's tail.
+constexpr VkDeviceSize kLightCellBytes = 304;
+constexpr VkDeviceSize kLightCellCounterBytes = 16;
+// Readback slots of the light cell counters (slot = frame_number % kLightCounterSlots).
+constexpr uint32_t kLightCounterSlots = 8;
+
 // Traces one scene into the host's targets (caelix_renderer_*).
 //
 // Several renderers (one per view) may share one scene. The immutable objects are
@@ -78,7 +85,8 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // until safe) when the render size changes, kept while another method runs.
 //
 // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE, lighting modes; docs/LIGHT_LIST.md): the renderer owns the
-// light cells (CaelixGiOptions::light_cell_capacity x 304 bytes, trace set binding 21), created and
+// light cells (CaelixGiOptions::light_cell_capacity x 304 bytes + 16 bytes of usage counters, trace
+// set binding 21; the counters are reset before the fill and read back after the trace), created and
 // zero-filled at the first render with the flag, recreated (the old buffer retired until safe) when
 // the capacity changes, kept while the flag is off. When the scene has a light table, the light cell
 // fill (caelix_light_cells, trace set, TracePush) runs before the sky SH kernel and the trace, with
@@ -212,6 +220,7 @@ private:
     {
         uint64_t frame = 0;  // the last frame that used it
         GpuBuffer buffer;
+        GpuBuffer counter_readback;
     };
     struct RetiredUpscaler
     {
@@ -362,8 +371,14 @@ private:
     uint64_t di_light_rebuilds_ = 0;     // CaelixLightStats::rebuilds at the previous ReSTIR DI render
     std::vector<RetiredGiBuffers> retired_di_;
     // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE).
-    GpuBuffer light_cells_;                  // capacity x 304 bytes (render/caelix_light_sample.hlsl)
+    GpuBuffer light_cells_;                  // capacity x 304 bytes + 16 bytes of usage counters
+                                             // (render/caelix_light_sample.hlsl)
     uint32_t light_cell_capacity_ = 0;       // cells of light_cells_
+    // The usage counters of the light cells, copied after the trace of each light NEE frame into
+    // slot frame_number % kLightCounterSlots (16 bytes each; persistently mapped), and the frame of
+    // each slot (0 = none). Created and retired with light_cells_.
+    GpuBuffer light_counter_readback_;
+    std::array<uint64_t, kLightCounterSlots> light_counter_frames_{};
     bool light_cells_need_clear_ = false;    // light_cells_ is new: the next render zero-fills it
     uint64_t light_cells_last_frame_ = 0;    // the last frame that used light_cells_
     bool light_cell_reset_ = false;          // CaelixGiOptions::reset: the next fill drops the cell history

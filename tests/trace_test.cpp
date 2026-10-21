@@ -3509,7 +3509,7 @@ TEST_CASE("light NEE with temporal cell reuse is unbiased")
     const std::vector<float> temporal = LightReference(rig, renderer, set, camera, 1024, 200000);
     CaelixGiStats stats{};
     caelix_renderer_get_gi_stats(renderer, &stats);
-    CHECK(stats.light_cell_bytes == 65536ull * 304ull);
+    CHECK(stats.light_cell_bytes == 65536ull * 304ull + 16ull);  // the cells and the usage counters
     const LightComparison c = CompareLight(pt, temporal, kBoxSize);
     std::printf("4 lights, light NEE + MIS + temporal cells vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 "
                 "block PSNR %.2f dB\n",
@@ -3916,9 +3916,14 @@ TEST_CASE("cells fill and sample")
     std::printf("light cells: %llu bytes, fill %.4f ms (frame %llu), trace %.4f ms\n",
                 static_cast<unsigned long long>(stats.light_cell_bytes), stats.light_fill_ms,
                 static_cast<unsigned long long>(timings.frame_number), timings.trace_ms);
-    CHECK(stats.light_cell_bytes == 1024ull * 304ull);
+    CHECK(stats.light_cell_bytes == 1024ull * 304ull + 16ull);  // the cells and the usage counters
     CHECK(timings.frame_number != 0);
     CHECK(stats.light_fill_ms > 0.0f);
+    // The usage counters of the same frame: some cells live, never more than the capacity.
+    std::printf("light cells: live %u, active %u, inserted %u, lookups failed %u\n", stats.light_cells_live,
+                stats.light_cells_active, stats.light_cells_inserted, stats.light_cell_lookups_failed);
+    CHECK(stats.light_cells_live > 0);
+    CHECK(stats.light_cells_live <= 1024);
 
     // Not black: the last frame's lit pixels (1 spp with light NEE: almost every pixel).
     const float* pixels = reinterpret_cast<const float*>(color.bytes.data());

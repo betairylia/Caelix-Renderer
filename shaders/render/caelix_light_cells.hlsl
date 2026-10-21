@@ -4,9 +4,10 @@
 // One workgroup of 32 threads per cell slot (dispatch 1024 x capacity / 1024: slot = y * 1024 + x);
 // thread r owns reservoir r. An empty slot (key_lo 0) is skipped. A cell not looked up for 64
 // frames is evicted (key 0, reservoirs empty). Without a light table or with an empty one the
-// reservoirs are emptied. Otherwise each thread draws K = fc.light_candidates bricks from the
-// table's CDF (proposal p_i = total_i / total) and keeps one by streaming RIS with the brick-level
-// target p_hat_i = total_i * G_i (LightCellG):
+// reservoirs are emptied. Thread 0 of every cell that stays counts it in the usage counters after
+// the last cell (live; active when the previous frame's trace looked it up). Otherwise each thread
+// draws K = fc.light_candidates bricks from the table's CDF (proposal p_i = total_i / total) and
+// keeps one by streaming RIS with the brick-level target p_hat_i = total_i * G_i (LightCellG):
 //   G_i = orient / max(|centre_i - cell centre|^2, (cell half size + 4)^2),
 //   orient = max(0.1, dot(mean normal_i, direction from the brick centre to the cell centre)),
 //            1 without a mean normal (the normal comes from the entry's face weights,
@@ -108,6 +109,17 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         }
         g_light_cells.Store2(reservoir, uint2(kNoLight, 0u));
         return;
+    }
+    // Usage counters: the cell stays live; it is active when the previous frame's trace looked it up.
+    // Before the no-table return: a live cell is live without a table too.
+    if (thread_id.x == 0u)
+    {
+        const uint counters = LightCellCounterBase(fc);
+        g_light_cells.InterlockedAdd(counters + kLightCellCounterLive, 1u);
+        if (touched == fc.frame_counter - 1u)
+        {
+            g_light_cells.InterlockedAdd(counters + kLightCellCounterActive, 1u);
+        }
     }
     const uint64_t table = fc.light_table;
     const uint count = table != 0u ? CAELIX_LOAD_U32(table + kLightHeaderCount) : 0u;

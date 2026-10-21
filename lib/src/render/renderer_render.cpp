@@ -799,16 +799,32 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
 
     const uint32_t groups_x = (width + kWorkgroupSize - 1) / kWorkgroupSize;
     const uint32_t groups_y = (height + kWorkgroupSize - 1) / kWorkgroupSize;
-    // Light cells: a new buffer is zero-filled (empty keys and reservoirs) before its first use.
-    if (light_nee && light_cells_need_clear_)
+    // Light cells: a new buffer is zero-filled (empty keys and reservoirs, zero counters) before its
+    // first use; otherwise only the usage counters at the tail are reset for this frame. The first
+    // barrier orders the previous frame's kernel writes and counter copy (a transfer read) before
+    // this transfer write.
+    if (light_nee && light_cells_.valid())
     {
-        vkCmdFillBuffer(cmd, light_cells_.buffer(), 0, VK_WHOLE_SIZE, 0);
+        Barriers to_fill;
+        to_fill.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        to_fill.Record(cmd);
+        if (light_cells_need_clear_)
+        {
+            vkCmdFillBuffer(cmd, light_cells_.buffer(), 0, VK_WHOLE_SIZE, 0);
+            light_cells_need_clear_ = false;
+        }
+        else
+        {
+            vkCmdFillBuffer(cmd, light_cells_.buffer(), kLightCellBytes * light_cell_capacity_,
+                            kLightCellCounterBytes, 0);
+        }
         Barriers cleared;
         cleared.Memory(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         cleared.Record(cmd);
-        light_cells_need_clear_ = false;
     }
     if (light_nee)
     {
@@ -861,6 +877,27 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     vkCmdPushConstants(cmd, trace.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
     timer_.End(cmd);
+
+    // Light cell usage counters: the trace made the frame's last lookups (the ReSTIR DI initial
+    // reservoirs are part of it), so the 16 tail bytes are final here; they go to the readback slot
+    // of this frame (CaelixGiStats, read once the frame is safe).
+    if (light_nee && light_cells_.valid())
+    {
+        Barriers traced;
+        traced.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        traced.Record(cmd);
+        const uint32_t counter_slot = static_cast<uint32_t>(frame.frame_number % kLightCounterSlots);
+        const VkBufferCopy region{kLightCellBytes * light_cell_capacity_,
+                                  static_cast<VkDeviceSize>(counter_slot) * kLightCellCounterBytes,
+                                  kLightCellCounterBytes};
+        vkCmdCopyBuffer(cmd, light_cells_.buffer(), light_counter_readback_.buffer(), 1, &region);
+        Barriers copied;
+        copied.Memory(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+        copied.Record(cmd);
+        light_counter_frames_[counter_slot] = frame.frame_number;
+    }
 
     // ReSTIR GI: temporal, spatial (SPATIAL flag, gi_spatial_passes times), shade; then ReSTIR DI:
     // the same three kernels on the DI reservoirs, its shade adding to the diffuse radiance target

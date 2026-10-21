@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <iterator>
 #include <utility>
 
@@ -371,14 +372,20 @@ void Renderer::EnsureLightCells(uint32_t capacity, uint64_t frame)
     {
         return;
     }
-    // 304 bytes per cell (render/caelix_light_sample.hlsl). On a throw the old buffer stays.
-    constexpr VkDeviceSize kCellBytes = 304;
-    GpuBuffer fresh = GpuBuffer::DeviceLocal(device_.allocator(), device_.device(), kCellBytes * capacity);
+    // 304 bytes per cell and the 16 bytes of usage counters at the tail (render/caelix_light_sample.hlsl),
+    // and the counters' readback ring. On a throw the old buffers stay.
+    GpuBuffer fresh = GpuBuffer::DeviceLocal(device_.allocator(), device_.device(),
+                                             kLightCellBytes * capacity + kLightCellCounterBytes);
+    GpuBuffer fresh_readback = GpuBuffer::HostReadback(device_.allocator(), device_.device(),
+                                                       kLightCellCounterBytes * kLightCounterSlots);
     if (light_cells_.valid())
     {
-        retired_light_cells_.push_back(RetiredLightCells{light_cells_last_frame_, std::move(light_cells_)});
+        retired_light_cells_.push_back(RetiredLightCells{light_cells_last_frame_, std::move(light_cells_),
+                                                         std::move(light_counter_readback_)});
     }
     light_cells_ = std::move(fresh);
+    light_counter_readback_ = std::move(fresh_readback);
+    light_counter_frames_.fill(0);
     light_cell_capacity_ = capacity;
     light_cells_need_clear_ = true;
     light_cells_last_frame_ = frame;
@@ -494,6 +501,20 @@ void Renderer::GetGiStats(CaelixGiStats& out) const
     if (frame != 0 && light_timer_.MsForFrame(frame, light_ms))
     {
         out.light_fill_ms = light_ms;
+    }
+    // The light cell counters of the same frame: its readback slot, when that slot still holds it
+    // (the frame is safe, so the copy has completed).
+    const uint32_t slot = static_cast<uint32_t>(frame % kLightCounterSlots);
+    if (frame != 0 && light_counter_readback_.valid() && light_counter_frames_[slot] == frame)
+    {
+        const VkDeviceSize offset = static_cast<VkDeviceSize>(slot) * kLightCellCounterBytes;
+        light_counter_readback_.InvalidateHostReads(offset, kLightCellCounterBytes);
+        uint32_t counters[4];
+        std::memcpy(counters, light_counter_readback_.mapped() + offset, sizeof(counters));
+        out.light_cells_live = counters[0];
+        out.light_cells_active = counters[1];
+        out.light_cells_inserted = counters[2];
+        out.light_cell_lookups_failed = counters[3];
     }
 }
 

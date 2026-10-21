@@ -295,7 +295,7 @@ fn debug_windows(ctx: &egui::Context, panel: &mut Panel<'_>, open: StartOpen) {
     egui::Window::new("Stats")
         .default_pos([screen.min.x + margin, screen.min.y + margin])
         .default_open(demo)
-        .show(ctx, |ui| stats_window(ui, panel.stats, demo));
+        .show(ctx, |ui| stats_window(ui, panel.stats, panel.settings.gi.light_cells, demo));
     let (camera_pivot, camera_x) = if demo {
         (egui::Align2::CENTER_BOTTOM, screen.center().x - 260.0)
     } else {
@@ -341,7 +341,8 @@ fn value_grid(ui: &mut egui::Ui, id: &str, rows: &[(&str, String)]) {
     });
 }
 
-fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
+/// `light_cells`: the light cell capacity of the GI settings (the renderer's capacity equals it).
+fn stats_window(ui: &mut egui::Ui, stats: &Stats, light_cells: u32, demo: bool) {
     ui.label("F1 hides the debug UI.");
     let t = &stats.timings;
     let s = &stats.scene;
@@ -367,6 +368,18 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
                 ("reservoirs", format!("{:.0} MB", stats.gi.reservoir_bytes as f64 / 1e6)),
                 ("light fill", format!("{:.2} ms", stats.gi.light_fill_ms)),
                 ("light cells", format!("{:.1} MB", stats.gi.light_cell_bytes as f64 / 1e6)),
+                (
+                    "light cells used",
+                    format!(
+                        "{} / {} ({:.0} %)",
+                        stats.gi.light_cells_live,
+                        light_cells,
+                        100.0 * stats.gi.light_cells_live as f64 / light_cells.max(1) as f64
+                    ),
+                ),
+                ("light cells active", stats.gi.light_cells_active.to_string()),
+                ("light cell inserts", stats.gi.light_cells_inserted.to_string()),
+                ("light cell misses", stats.gi.light_cell_lookups_failed.to_string()),
                 ("light bricks", stats.light.bricks.to_string()),
                 ("light dropped", stats.light.bricks_dropped.to_string()),
                 ("denoise", format!("{:.2} ms", t.denoise_ms)),

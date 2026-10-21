@@ -177,6 +177,21 @@ fc.frame_counter`. Hash-table removal under linear probing leaves tombstone-free
 is fine here: a later lookup of a displaced key simply inserts again in an earlier slot and the
 displaced old cell ages out.
 
+Usage counters (2026-10-21): the buffer is `C x 304 + 16` bytes; the 16 bytes after the last cell
+(`LightCellCounterBase` = `fc.light_cell_capacity x 304`) hold four uints: `live` (offset 0),
+`active` (4), `inserted` (8) and `failed` (12). The renderer resets them with a 16-byte
+`vkCmdFillBuffer` before the fill of every light NEE frame (a new buffer is zero-filled whole). The
+fill's thread 0 adds 1 to `live` for every cell that stays after the eviction check (also without a
+light table) and 1 to `active` when that cell's `touched_frame == fc.frame_counter - 1` (looked up
+by the previous frame's trace). `LightCellLookup` adds 1 to `inserted` on a successful insert and 1
+to `failed` when 8 probes found neither the key nor a free slot. After the trace dispatch (every
+lookup of the frame, the ReSTIR DI initial reservoirs included, is in the trace kernel) the renderer
+copies the 16 bytes into slot `frame_number % 8` of a persistently mapped readback ring (created
+and retired with the cells). `caelix_renderer_get_gi_stats` reports the slot of the frame of
+`CaelixGpuTimings` as `CaelixGiStats::light_cells_live`, `light_cells_active`,
+`light_cells_inserted` and `light_cell_lookups_failed` (0 when that frame ran no light NEE).
+`CaelixGiStats::light_cell_bytes` is the whole buffer, the 16-byte tail included.
+
 ## 2. Sampling
 
 ### 2.1 Within a brick (`SampleLightEntry`)

@@ -1217,8 +1217,16 @@ impl App {
                         );
                         let light = light_stats(state.scene);
                         println!(
-                            "light: bricks={} dropped={} table_bytes={} cell_bytes={}",
-                            light.bricks, light.bricks_dropped, light.table_bytes, gi.light_cell_bytes
+                            "light: bricks={} dropped={} table_bytes={} cell_bytes={} \
+                             cells live/active/inserted/failed={}/{}/{}/{}",
+                            light.bricks,
+                            light.bricks_dropped,
+                            light.table_bytes,
+                            gi.light_cell_bytes,
+                            gi.light_cells_live,
+                            gi.light_cells_active,
+                            gi.light_cells_inserted,
+                            gi.light_cell_lookups_failed
                         );
                         self.screenshot = Screenshot::Done;
                         if self.args.exit_after_screenshot {

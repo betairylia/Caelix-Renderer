@@ -18,6 +18,13 @@
 //                               the cell (uniform over the 32: all threads merge the same way); 0 = no history
 //   44   float C_n              kGiFlagLightCellTemporal: the draw count behind C_cur; 0 = none
 //   48   32 x { uint light; float W }   light = entry index of the table, W = the RIS weight (0 = empty)
+// After the last cell (byte fc.light_cell_capacity x 304, LightCellCounterBase) the buffer holds 16
+// bytes of usage counters, zeroed by the renderer before every fill and copied to the host after the
+// trace (CaelixGiStats):
+//   0    uint live              cells with a key after this frame's eviction (fill, thread 0)
+//   4    uint active            of those, looked up by the previous frame's trace (fill, thread 0)
+//   8    uint inserted          cells inserted by this frame's lookups (LightCellLookup)
+//   12   uint failed            lookups that found neither the key nor a free slot in 8 probes
 // The trace kernel looks cells up and inserts missing ones (LightCellLookup); caelix_light_cells.hlsl
 // fills the reservoirs of every live cell before the next trace and evicts cells untouched for 64
 // frames. The fingerprint is claimed with a 32-bit compare-and-swap on key_lo (64-bit buffer atomics
@@ -49,6 +56,11 @@ static const uint kLightCellProbes = 8;
 // A cell not looked up for this many frames is evicted by the fill pass.
 static const uint kLightCellMaxAge = 64;
 static const uint kNoLight = 0xFFFFFFFFu;
+// The usage counters after the last cell (byte offsets from LightCellCounterBase).
+static const uint kLightCellCounterLive = 0;
+static const uint kLightCellCounterActive = 4;
+static const uint kLightCellCounterInserted = 8;
+static const uint kLightCellCounterFailed = 12;
 // Light points closer than this (world units) to the receiver belong to the BSDF path, not to the
 // light NEE: TracePath keeps the emission of a list light that a segment hits closer than this,
 // and ReSTIR DI gives such points a zero target. Area sampling with a 1/d^2 term and a brick
@@ -90,6 +102,12 @@ uint2 LightCellKey(uint entity, uint level, int3 coord)
     return uint2(lo != 0u ? lo : 1u, uint(h >> 32));
 }
 
+// The byte offset of the usage counters in g_light_cells (after the last cell).
+uint LightCellCounterBase(CaelixFrameConstants fc)
+{
+    return fc.light_cell_capacity * kLightCellBytes;
+}
+
 // The level of a path vertex at world position `x` (its pixel footprint at its camera distance).
 uint LightCellLevel(CaelixFrameConstants fc, float3 x)
 {
@@ -104,7 +122,8 @@ int3 LightCellCoord(float3 p, uint level)
 }
 
 // Finds the cell of (entity, level, coord), touching it, or inserts it (empty reservoirs). Returns
-// the slot, or -1 when 8 probes found neither the key nor a free slot.
+// the slot, or -1 when 8 probes found neither the key nor a free slot. Counts each insert and each
+// failed lookup in the usage counters (kLightCellCounterInserted, kLightCellCounterFailed).
 int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord)
 {
     const uint2 key = LightCellKey(entity, level, coord);
@@ -131,6 +150,7 @@ int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord
                 g_light_cells.Store3(base + 16, asuint(coord));
                 g_light_cells.Store(base + 28, level);
                 g_light_cells.Store4(base + kLightCellCPrevOffset, uint4(0u, 0u, 0u, 0u));
+                g_light_cells.InterlockedAdd(LightCellCounterBase(fc) + kLightCellCounterInserted, 1u);
                 return int(slot);
             }
             key_lo = original;
@@ -144,6 +164,7 @@ int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord
             return int(slot);
         }
     }
+    g_light_cells.InterlockedAdd(LightCellCounterBase(fc) + kLightCellCounterFailed, 1u);
     return -1;
 }
 

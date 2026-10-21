@@ -80,7 +80,8 @@ extern "C" {
    di_candidates (same size). The light cell jitter added CAELIX_GI_FLAG_LIGHT_CELL_JITTER. The light MIS step
    (docs/LIGHT_MIS.md) added CAELIX_GI_FLAG_LIGHT_MIS (no struct changed). The light cell temporal reuse
    added CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL and appended light_temporal_frames to CaelixGiOptions
-   (48 -> 52 bytes). A host built against
+   (48 -> 52 bytes). The light cell usage counters appended four uint32 fields to CaelixGiStats
+   (32 -> 48 bytes). A host built against
    an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1256,6 +1257,13 @@ typedef struct CaelixGiStats
     uint64_t light_cell_bytes; /* bytes of the light cell table currently allocated */
     float light_fill_ms;       /* GPU time of the light cell fill of the frame of CaelixGpuTimings (0 when
                                   that frame ran no fill) */
+    /* The light cell usage counters of the frame of CaelixGpuTimings (all 0 when that frame ran no
+       light NEE). light_cell_bytes includes their 16 bytes at the tail of the cell table. */
+    uint32_t light_cells_live;          /* cells with a key after this frame's eviction */
+    uint32_t light_cells_active;        /* of those, looked up by the previous frame's trace */
+    uint32_t light_cells_inserted;      /* cells inserted by this frame's lookups */
+    uint32_t light_cell_lookups_failed; /* lookups that found neither the key nor a free slot in 8 probes
+                                           (the table is full around there) */
 } CaelixGiStats;
 
 /* Fills *out; a null argument is ignored. */
