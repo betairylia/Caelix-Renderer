@@ -19,11 +19,16 @@
 //   40   float M                kGiFlagLightCellTemporal: the candidate count behind every reservoir of
 //                               the cell (uniform over the R: all threads merge the same way); 0 = no history
 //   44   float C_n              kGiFlagLightCellTemporal: the draw count behind C_cur; 0 = none
-//   48   uint reserved          written 0
+//   48   uint sun_tests         kGiFlagNeeCellVisibility: sun shadow rays traced from receivers of the
+//                               cell (TracePath, NextEventAtVertex; atomics), decayed by 1/8 per fill;
+//                               0 at insert and eviction
 //   52   uint face              the receiver face of the key (kGiFlagLightCellOriented: 0..5 = +X -X +Y
 //                               -Y +Z -Z of the receivers' world normal, GiFaceIndex), else
 //                               kLightCellFaceNone (6); written by the insert, read by the fill
-//   56   8 bytes of padding
+//   56   uint sun_visible       kGiFlagNeeCellVisibility: of those, the rays that found the sun
+//                               unoccluded (same decay); the combined NEE's sun hint is
+//                               max(kNeeSunHintFloor, sun_visible / sun_tests) (docs/LIGHT_NEE.md section 10)
+//   60   4 bytes of padding
 //   64   R x { uint light; float W }   the reservoirs: light = the entry index of a brick of the light
 //                               table (kNoLight = empty), W = its unbiased contribution weight (0 =
 //                               empty); the vertex samples a point inside the brick
@@ -63,8 +68,9 @@ static const uint kLightCellCPrevOffset = 32;
 static const uint kLightCellCCurOffset = 36;
 static const uint kLightCellMOffset = 40;
 static const uint kLightCellCNOffset = 44;
-static const uint kLightCellReservedOffset = 48;
+static const uint kLightCellSunTestsOffset = 48;
 static const uint kLightCellFaceOffset = 52;
+static const uint kLightCellSunVisibleOffset = 56;
 static const uint kLightCellReservoirOffset = 64;
 // The header face of an unoriented cell (kGiFlagLightCellOriented off): no receiver face in the key.
 static const uint kLightCellFaceNone = 6u;
@@ -73,6 +79,10 @@ static const uint kLightCellFaceNone = 6u;
 // merged slot) and every reservoir must stay an unbiased contribution weight for it; the floor costs
 // noise there (W up to 10x), not bias.
 static const float kLightCellOrientFloor = 0.1f;
+// The floor of the sun hint of the combined NEE (kGiFlagNeeCellVisibility, docs/LIGHT_NEE.md section
+// 10): the sun candidate's selection weight is multiplied by max(this, visible / tests) of the
+// sampling cell, never 0, so that a visible sun keeps a positive selection probability (unbiased).
+static const float kNeeSunHintFloor = 0.05f;
 static const uint kLightCellProbes = 8;
 // A cell not looked up for this many frames is evicted by the fill pass.
 static const uint kLightCellMaxAge = 64;
@@ -218,14 +228,14 @@ int LightCellLookup(CaelixFrameConstants fc, uint entity, uint level, int3 coord
                 // Inserted. A slot with key 0 has empty reservoirs (zero at creation, cleared on
                 // eviction), so the cell samples the global table until the next fill. C_prev,
                 // C_cur, M and C_n start at 0 (the MIS proxy is the global one until the second
-                // fill; no temporal history).
+                // fill; no temporal history). The sun visibility counters start at 0.
                 g_light_cells.Store(base + 4, key.y);
                 g_light_cells.Store(base + 8, fc.frame_counter);
                 g_light_cells.Store(base + 12, entity);
                 g_light_cells.Store3(base + 16, asuint(coord));
                 g_light_cells.Store(base + 28, level);
                 g_light_cells.Store4(base + kLightCellCPrevOffset, uint4(0u, 0u, 0u, 0u));
-                g_light_cells.Store2(base + kLightCellReservedOffset, uint2(0u, face));
+                g_light_cells.Store4(base + kLightCellSunTestsOffset, uint4(0u, face, 0u, 0u));
                 g_light_cells.InterlockedAdd(LightCellCounterBase(fc) + kLightCellCounterInserted, 1u);
                 return int(slot);
             }
@@ -760,22 +770,63 @@ void LightPickBrick(CaelixFrameConstants fc, int slot, uint count, float total, 
     entry = LoadLightEntryHeader(address);
 }
 
-// The resampled light NEE of LightNextEvent (docs/LIGHT_NEE.md section 5.3, K = fc.light_nee_candidates
-// >= 2): K candidates, each drawn exactly as a one-sample NEE draws its sample (a brick from a
-// reservoir of the sampling cell `slot`, else from the global CDF; then a point in the brick).
-// Candidate i is the point y_i with the unbiased contribution weight W_i = W_brick / pdf_area. The
-// target at the vertex is the unoccluded contribution p_hat(y) = luminance(L_e) cos_r cos_l / d^2,
+// One next-event candidate before its shadow ray: the demodulated incident radiance it would add
+// when unoccluded (W and the MIS weight included), the ray toward it and its length.
+struct NeeCandidate
+{
+    bool valid;
+    float3 direction;
+    float t_max;          // shadow ray TMax (kRayTMax for the sun)
+    float3 contribution;  // unoccluded demodulated radiance of the Lambert lobe
+};
+
+NeeCandidate NeeCandidateNone()
+{
+    NeeCandidate c;
+    c.valid = false;
+    c.direction = float3(0.0f, 0.0f, 0.0f);
+    c.t_max = 0.0f;
+    c.contribution = float3(0.0f, 0.0f, 0.0f);
+    return c;
+}
+
+// Whether the candidate `c` is visible from `origin`: a shadow ray of length c.t_max (none with
+// kGiFlagDebugNeeNoShadow, timing only: every candidate counts as visible). A candidate with
+// t_max <= 0 is never visible. Shadow rays treat glass as opaque (TraceShadow).
+bool NeeVisible(CaelixFrameConstants fc, float3 origin, NeeCandidate c)
+{
+    if (c.t_max <= 0.0f)
+    {
+        return false;
+    }
+    if ((fc.gi_flags & kGiFlagDebugNeeNoShadow) != 0u)
+    {
+        return true;
+    }
+    RayDesc shadow;
+    shadow.Origin = origin;
+    shadow.Direction = c.direction;
+    shadow.TMin = 0.0f;
+    shadow.TMax = c.t_max;
+    return !TraceShadow(fc, shadow);
+}
+
+// The resampled light NEE of LightNextEventSample (docs/LIGHT_NEE.md section 5.3, K =
+// fc.light_nee_candidates >= 2): K candidates, each drawn exactly as a one-sample NEE draws its sample
+// (a brick from a reservoir of the sampling cell `slot`, else from the global CDF; then a point in the
+// brick). Candidate i is the point y_i with the unbiased contribution weight W_i = W_brick / pdf_area.
+// The target at the vertex is the unoccluded contribution p_hat(y) = luminance(L_e) cos_r cos_l / d^2,
 // times w_nee when `mis`; it is 0 inside the near field (distance < g_lightNeeMinDistance), where the
 // NEE's integrand is 0 too (the near field is the BSDF path's), and 0 where cos_r or cos_l <= 0. One
 // candidate y is kept with probability w_i / w_sum, w_i = p_hat(y_i) W_i, and W_out = w_sum / (K
-// p_hat(y)); one shadow ray to y. RIS with the equal input weights 1/K and unbiased input
-// contribution weights: (y, W_out) is an unbiased contribution weight for any integrand whose support
-// lies in the target's support. The candidates read the same R reservoirs of one cell and are
+// p_hat(y)); the caller traces one shadow ray to y. RIS with the equal input weights 1/K and unbiased
+// input contribution weights: (y, W_out) is an unbiased contribution weight for any integrand whose
+// support lies in the target's support. The candidates read the same R reservoirs of one cell and are
 // therefore correlated; that is harmless, since the estimator is linear in the inputs' contribution
 // weights. Seven random numbers per candidate (reservoir, global, the point's four, select), the
-// jitter's three before in the caller.
-float3 LightNextEventResampled(CaelixFrameConstants fc, float3 x_r, float3 n_r, int slot, uint count, float total,
-                               uint capacity, bool mis, LightNeeProxyContext ctx, inout uint rng)
+// jitter's three before in the caller. Returns the kept candidate (its unoccluded contribution).
+NeeCandidate LightNextEventResampled(CaelixFrameConstants fc, float3 x_r, float3 n_r, int slot, uint count,
+                                     float total, uint capacity, bool mis, LightNeeProxyContext ctx, inout uint rng)
 {
     const uint K = min(fc.light_nee_candidates, 32u);
     float w_sum = 0.0f;
@@ -842,37 +893,32 @@ float3 LightNextEventResampled(CaelixFrameConstants fc, float3 x_r, float3 n_r, 
             kept_w_nee = w_nee;
         }
     }
+    NeeCandidate c = NeeCandidateNone();
     if (!(w_sum > 0.0f) || !(kept_p_hat > 0.0f))
     {
-        return float3(0.0f, 0.0f, 0.0f);
+        return c;
     }
     const float W_out = w_sum / (float(K) * kept_p_hat);
     // The point lies on a voxel face: the ray stops 2 push-offs short of it (as GiVisible).
-    RayDesc shadow;
-    shadow.Origin = x_r;
-    shadow.Direction = kept_w;
-    shadow.TMin = 0.0f;
-    shadow.TMax = kept_distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
-    if (shadow.TMax > 0.0f && (fc.gi_flags & kGiFlagDebugNeeNoShadow) == 0u && TraceShadow(fc, shadow))
-    {
-        return float3(0.0f, 0.0f, 0.0f);
-    }
-    float3 contribution = kept_radiance * ((kept_cos_r * (1.0f / K_PI)) * (kept_cos_l / kept_d2) * W_out);
+    c.direction = kept_w;
+    c.t_max = kept_distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
+    c.contribution = kept_radiance * ((kept_cos_r * (1.0f / K_PI)) * (kept_cos_l / kept_d2) * W_out);
     if (mis)
     {
-        contribution *= kept_w_nee;
+        c.contribution *= kept_w_nee;
     }
-    return contribution;
+    c.valid = c.t_max > 0.0f;
+    return c;
 }
 
-// Next-event estimation on the light list at a diffuse path vertex (docs/LIGHT_NEE.md section 5):
-// the receiver x_r (the pushed-off vertex position) with world normal n_r, on brick group `group`,
-// entity-local position `object_point` (the hit point moved a little into the air, for the cell
-// coordinate). The light sample is a brick from one of the R reservoirs of the vertex's light cell
-// when it holds a valid one, else from the global CDF (LightPickBrick), then a point in the brick by
-// SampleLightEntry (W = W_brick / pdf_area). One shadow ray. Returns the demodulated incident
-// radiance of the Lambert lobe (the albedo is in the caller's throughput, as for the sun NEE), 0
-// without a usable sample.
+// The light NEE candidate at a diffuse path vertex (docs/LIGHT_NEE.md section 5), before its shadow
+// ray: the receiver x_r (the pushed-off vertex position) with world normal n_r, on brick group
+// `group`, entity-local position `object_point` (the hit point moved a little into the air, for the
+// cell coordinate). The light sample is a brick from one of the R reservoirs of the vertex's light
+// cell when it holds a valid one, else from the global CDF (LightPickBrick), then a point in the brick
+// by SampleLightEntry (W = W_brick / pdf_area). The candidate's contribution is the demodulated
+// incident radiance of the Lambert lobe when unoccluded (the albedo is in the caller's throughput, as
+// for the sun NEE); invalid without a usable sample.
 // With kGiFlagLightCellJitter (section 5.1) the cell is looked up at `object_point` moved by a
 // uniform random offset in (-0.5, 0.5) cells per axis: the pixels of one brick then read up to 8
 // cells instead of the same one, so the variance of the cell contents (one refill per frame) turns
@@ -884,11 +930,15 @@ float3 LightNextEventResampled(CaelixFrameConstants fc, float3 x_r, float3 n_r, 
 // the vertex. Without `mis`, `ctx` is the global context. The MIS draws no random number.
 // Per-vertex resampling (fc.light_nee_candidates >= 2, section 5.3): after the same lookups (the
 // unjittered one for the proxy context, the jittered one for the sampling cell, the three jitter
-// numbers once) LightNextEventResampled draws K candidates from the sampling cell (or the global CDF),
-// keeps one by the exact target at the vertex (times w_nee with `mis`) and traces one shadow ray; the
-// first two random numbers of this function are then unused. With K = 1 the path below runs.
-float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint group, float3 object_point, bool mis,
-                      inout uint rng, out LightNeeProxyContext ctx)
+// numbers once) LightNextEventResampled draws K candidates from the sampling cell (or the global CDF)
+// and keeps one by the exact target at the vertex (times w_nee with `mis`); the first two random
+// numbers of this function are then unused. With K = 1 the path below runs.
+// `sample_slot`: the cell slot the sample came from (-1 = none: no cells, or a failed lookup);
+// `hint_slot`: the UNJITTERED cell's slot when that lookup ran (`mis` or no jitter), else sample_slot
+// (section 10: the sun visibility counters are written there).
+NeeCandidate LightNextEventSample(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint group, float3 object_point,
+                                  bool mis, inout uint rng, out LightNeeProxyContext ctx, out int hint_slot,
+                                  out int sample_slot)
 {
     const float u_reservoir = RandomFloat01(rng);
     const float u_global = RandomFloat01(rng);
@@ -897,9 +947,12 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     const float total = asfloat(CAELIX_LOAD_U32(table + kLightHeaderTotal));
     ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), kLightCellFaceNone,
                               (count != 0u && total > 0.0f) ? total : 0.0f);
+    hint_slot = -1;
+    sample_slot = -1;
+    NeeCandidate c = NeeCandidateNone();
     if (count == 0u || !(total > 0.0f))
     {
-        return float3(0.0f, 0.0f, 0.0f);
+        return c;
     }
     const uint capacity = CAELIX_LOAD_U32(table + kLightHeaderCapacity);
 
@@ -918,6 +971,7 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
         {
             const int3 coord = LightCellCoord(object_point, level);
             slot = LightCellLookup(fc, entity, level, coord, face);
+            hint_slot = slot;
             if (mis)
             {
                 ctx = LightNeeProxyOfSlot(fc, slot, entity, level, coord, face, total);
@@ -928,8 +982,13 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
             const float3 u_jitter = float3(RandomFloat01(rng), RandomFloat01(rng), RandomFloat01(rng));
             const float3 cell_point = object_point + (u_jitter - 0.5f) * LightCellSize(level);
             slot = LightCellLookup(fc, entity, level, LightCellCoord(cell_point, level), face);
+            if (!mis)
+            {
+                hint_slot = slot;
+            }
         }
     }
+    sample_slot = slot;
 
     // Per-vertex resampling (section 5.3): K >= 2 candidates of the same sampling cell, one ray.
     CAELIX_BRANCH
@@ -945,38 +1004,45 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     const LightSample s = SampleLightEntry(fc, entry, address, x_r, rng);
     if (!s.valid || !(W_brick > 0.0f))
     {
-        return float3(0.0f, 0.0f, 0.0f);
+        return c;
     }
     const float3 d = s.position - x_r;
     const float d2 = dot(d, d);
     const float distance = sqrt(d2);
     if (!(d2 > 0.0f) || distance < g_lightNeeMinDistance)
     {
-        return float3(0.0f, 0.0f, 0.0f);  // the near field is the BSDF path's
+        return c;  // the near field is the BSDF path's
     }
     const float3 w = d / distance;
     const float cos_r = dot(n_r, w);
     const float cos_l = -dot(s.normal, w);
     if (!(cos_r > 0.0f) || !(cos_l > 0.0f))
     {
-        return float3(0.0f, 0.0f, 0.0f);
+        return c;
     }
     // The point lies on a voxel face: the ray stops 2 push-offs short of it (as GiVisible).
-    RayDesc shadow;
-    shadow.Origin = x_r;
-    shadow.Direction = w;
-    shadow.TMin = 0.0f;
-    shadow.TMax = distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
-    if (shadow.TMax > 0.0f && (fc.gi_flags & kGiFlagDebugNeeNoShadow) == 0u && TraceShadow(fc, shadow))
-    {
-        return float3(0.0f, 0.0f, 0.0f);
-    }
-    float3 contribution = s.radiance * ((cos_r * (1.0f / K_PI)) * (cos_l / d2) / s.pdf_area * W_brick);
+    c.direction = w;
+    c.t_max = distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
+    c.contribution = s.radiance * ((cos_r * (1.0f / K_PI)) * (cos_l / d2) / s.pdf_area * W_brick);
     if (mis)
     {
-        contribution *= LightNeeMisWeight(ctx, s.mis, x_r, n_r, w, distance, cos_l, true);
+        c.contribution *= LightNeeMisWeight(ctx, s.mis, x_r, n_r, w, distance, cos_l, true);
     }
-    return contribution;
+    c.valid = c.t_max > 0.0f;
+    return c;
+}
+
+// Next-event estimation on the light list at a diffuse path vertex: LightNextEventSample and its
+// shadow ray (NeeVisible). Returns the demodulated incident radiance of the Lambert lobe, 0 without a
+// usable sample or when the point is occluded.
+float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint group, float3 object_point, bool mis,
+                      inout uint rng, out LightNeeProxyContext ctx)
+{
+    int hint_slot;
+    int sample_slot;
+    const NeeCandidate c =
+        LightNextEventSample(fc, x_r, n_r, group, object_point, mis, rng, ctx, hint_slot, sample_slot);
+    return c.valid && NeeVisible(fc, x_r, c) ? c.contribution : float3(0.0f, 0.0f, 0.0f);
 }
 
 // Whether the light NEE can produce the point that the ray of `hit` found on a list light

@@ -98,7 +98,9 @@ struct CaelixFrameConstants
     uint light_temporal_frames;     // 656  kGiFlagLightCellTemporal: frames of history the cell fill keeps (0 = none this frame)
     uint light_nee_candidates;      // 660  kGiFlagLightNee: light candidates per diffuse vertex (1 .. 32; 1 = no resampling)
     uint light_cell_reservoirs;     // 664  kGiFlagLightNee: reservoirs per light cell, a power of two in 1 .. 64
-    uint pad_668;                   // 668  -> 672
+    uint nee_combine;               // 668  0: one shadow ray per NEE strategy; 1: one ray per NEE vertex (both
+                                    //      candidates drawn, one chosen); 2: as 0 at the primary vertex, as 1 at
+                                    //      the bounce vertices (docs/LIGHT_NEE.md section 10) -> 672
 };
 
 struct CaelixTracePush
@@ -143,6 +145,7 @@ static const uint kGiFlagLightCellTemporal = 1u << 8;
 static const uint kGiFlagLightCellOriented = 1u << 9;
 static const uint kGiFlagPairwiseMis = 1u << 10;
 static const uint kGiFlagDebugNeeNoShadow = 1u << 11;  // timing only: NEE without shadow rays (biased)
+static const uint kGiFlagNeeCellVisibility = 1u << 12; // nee_combine: per-cell sun visibility hint of the choice
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

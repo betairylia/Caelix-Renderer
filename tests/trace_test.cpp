@@ -3219,14 +3219,28 @@ CaelixCamera LightBoxCamera()
 }
 
 // Reference mode over `frames` frames (seeds seed0 ..), 4 bounces, black sky, no sun; the colour
-// (the running mean) is read back after the last frame.
+// (the running mean) is read back after the last frame. `sun_nee`: sun NEE on with the sun of
+// SunOptions (1000 x a 2-degree disk), tilted so that the walls see it too; the closed box occludes
+// it, so it must add nothing.
 std::vector<float> LightReference(Rig& rig, CaelixRenderer* renderer, TargetSet& set, const CaelixCamera& camera,
-                                  uint32_t frames, uint32_t seed0)
+                                  uint32_t frames, uint32_t seed0, bool sun_nee = false)
 {
     for (uint32_t i = 0; i < frames; ++i)
     {
         CaelixRenderOptions options = GlassOptions(CAELIX_MODE_REFERENCE, 4, 0, seed0 + i);
         options.reset_accumulation = i == 0 ? 1u : 0u;
+        if (sun_nee)
+        {
+            options.flags |= CAELIX_RENDER_FLAG_SUN_NEE;
+            const double sun[3] = {0.4, 0.8, 0.45};
+            const double length = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+            for (int a = 0; a < 3; ++a)
+            {
+                options.sun_dir[a] = static_cast<float>(sun[a] / length);
+            }
+            options.sun_radiance[0] = options.sun_radiance[1] = options.sun_radiance[2] = kNeeSunRadiance;
+            options.sun_angular_radius = static_cast<float>(kNeeSunRadiusDegrees * 3.14159265358979323846 / 180.0);
+        }
         Render(rig, renderer, set, camera, options, i + 1 == frames);
     }
     const Target& color = *set.t[kColor];
@@ -4018,6 +4032,16 @@ TEST_CASE("cells fill and sample")
     bad.light_nee_candidates = 32;
     REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
     bad.light_nee_candidates = 0;
+    // NEE combine (docs/LIGHT_NEE.md section 10): 0 .. 2.
+    bad.nee_combine = 3;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.nee_combine = 2;
+    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_NEE_CELL_VISIBILITY;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
+    bad.nee_combine = 0;
+    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE;
     // Reservoirs per cell (docs/LIGHT_NEE.md section 3.4): 0 (= 8) or a power of two in 1 .. 64.
     bad.light_cell_reservoirs = 3;  // not a power of two
     ExpectLibraryErrors(1, [&] {
@@ -4143,4 +4167,68 @@ TEST_CASE("light NEE with 64 reservoirs per cell is unbiased")
     caelix_renderer_destroy(renderer);
     DestroyTarget(rig.gpu, color);
     CloseRig(rig);
+}
+
+namespace {
+
+// The combined sun + light NEE (docs/LIGHT_NEE.md section 10) in the four-light box with every kept
+// light NEE option (as "64 reservoirs per cell"), `combine` = nee_combine and `extra_flags`, sun NEE
+// on with a sun that the closed box occludes: against the 4096-frame path tracer without the sun.
+void CheckNeeCombine(uint32_t combine, uint32_t extra_flags)
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    EnableLights(rig.scene);
+    World world = LightBoxWalls();
+    FillBox(world, 4, kBoxInterior, 4, 4, kBoxInterior, 4, kWhiteEmitter512);
+    FillBox(world, 20, kBoxInterior, 20, 20, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 4, kBoxInterior, 20, 4, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 12, kBoxInterior, 12, 12, kBoxInterior, 12, kWhiteEmitter512);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 4);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
+    TargetSet set;
+    set.t[kColor] = &color;
+    const CaelixCamera camera = LightBoxCamera();
+
+    CaelixGiOptions gi{};
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED |
+               CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL | CAELIX_GI_FLAG_LIGHT_MIS | extra_flags;
+    gi.light_cell_capacity = 4096;
+    gi.light_cell_reservoirs = 64;
+    gi.light_nee_candidates = 4;
+    gi.nee_combine = combine;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
+    const std::vector<float> image = LightReference(rig, renderer, set, camera, 1024, 200000, true);
+    const LightComparison c = CompareLight(pt, image, kBoxSize);
+    std::printf("4 lights, every light option, occluded sun NEE, nee_combine %u, flags 0x%x vs path tracer: mean "
+                "%.5f vs %.5f, ratio %.4f, 16x16 block PSNR %.2f dB, pixel PSNR %.2f dB\n",
+                combine, gi.flags, c.test_mean, c.ref_mean, c.ratio, c.block_psnr, PixelPsnr(pt, image, kBoxSize));
+    CHECK(c.ref_mean > 0.01);
+    CHECK(c.ratio > 0.97);
+    CHECK(c.ratio < 1.03);
+    CHECK(c.block_psnr > 30.0);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+}  // namespace
+
+TEST_CASE("combined sun and light NEE (one ray per vertex, cell sun visibility) is unbiased")
+{
+    CheckNeeCombine(1, CAELIX_GI_FLAG_NEE_CELL_VISIBILITY);
+}
+
+TEST_CASE("combined sun and light NEE at the bounce vertices is unbiased")
+{
+    CheckNeeCombine(2, 0);
 }

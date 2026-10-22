@@ -649,6 +649,12 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             ui.add_enabled(light, Slider::new(&mut gi.light_nee_candidates, 1..=32))
                 .on_hover_text("Candidates per diffuse vertex, resampled before the one shadow ray; 1 = no resampling");
             ui.end_row();
+
+            ui.label("NEE combine (0 separate, 1 one ray, 2 one ray at bounces)");
+            ui.add_enabled(light, Slider::new(&mut gi.nee_combine, 0..=2)).on_hover_text(
+                "One shadow ray per NEE vertex for the sun and the light candidate, chosen in proportion to their                  unoccluded contributions (unbiased; docs/LIGHT_NEE.md section 10)",
+            );
+            ui.end_row();
         });
         ui.add_enabled(lighting, egui::Checkbox::new(&mut gi.light_nee, "light NEE (light list)"));
         ui.add_enabled(
@@ -678,6 +684,13 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         )
         .on_hover_text(
             "Balance heuristic between the light NEE and the BSDF hit of a list light (docs/LIGHT_NEE.md section 6)",
+        );
+        ui.add_enabled(
+            lighting && gi.light_nee && gi.nee_combine >= 1,
+            egui::Checkbox::new(&mut gi.nee_cell_visibility, "Cell sun visibility hint"),
+        )
+        .on_hover_text(
+            "NEE combine: the sun candidate's weight times max(0.05, visible / tests) of the light cell's traced sun              rays (a selection hint, unbiased)",
         );
         ui.add_enabled(
             lighting && gi.method == GiMethod::Pt,

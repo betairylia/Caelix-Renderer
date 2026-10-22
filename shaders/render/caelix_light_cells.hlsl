@@ -154,11 +154,13 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         touched = g_light_cells.Load(base + 8);
         if (touched + kLightCellMaxAge < fc.frame_counter)
         {
-            // Evicted: the key, both normalisations, the history and every reservoir become empty.
+            // Evicted: the key, both normalisations, the history, the sun visibility counters and every
+            // reservoir become empty (the face word is rewritten by the next insert).
             if (r == 0u)
             {
                 g_light_cells.Store2(base, uint2(0u, 0u));
                 g_light_cells.Store4(base + kLightCellCPrevOffset, uint4(0u, 0u, 0u, 0u));
+                g_light_cells.Store4(base + kLightCellSunTestsOffset, uint4(0u, 0u, 0u, 0u));
             }
             g_light_cells.Store2(reservoir, uint2(kNoLight, 0u));
             active = false;
@@ -173,6 +175,16 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         if (touched == fc.frame_counter - 1u)
         {
             g_light_cells.InterlockedAdd(counters + kLightCellCounterActive, 1u);
+        }
+        // kGiFlagNeeCellVisibility (docs/LIGHT_NEE.md section 10): the sun visibility counters decay by
+        // 1/8 per fill, so that they hold about 8 to 16 frames of sun shadow rays (a cell with n tests
+        // per frame settles near 8 n). Kept without a usable table: the hint does not depend on it.
+        if ((fc.gi_flags & kGiFlagNeeCellVisibility) != 0u)
+        {
+            const uint tests = g_light_cells.Load(base + kLightCellSunTestsOffset);
+            const uint visible = g_light_cells.Load(base + kLightCellSunVisibleOffset);
+            g_light_cells.Store(base + kLightCellSunTestsOffset, tests - (tests >> 3));
+            g_light_cells.Store(base + kLightCellSunVisibleOffset, visible - (visible >> 3));
         }
     }
     const uint64_t table = fc.light_table;

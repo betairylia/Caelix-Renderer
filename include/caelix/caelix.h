@@ -1191,6 +1191,13 @@ typedef enum CaelixGiMethod
 #define CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW (1u << 11) /* TIMING ONLY (biased: every NEE sample counts as
                                                  visible): the sun NEE and the light NEE skip their shadow
                                                  ray. Measures the cost of the NEE sampling without the rays */
+#define CAELIX_GI_FLAG_NEE_CELL_VISIBILITY (1u << 12) /* with LIGHT_NEE and nee_combine 1 or 2: every traced sun
+                                                 shadow ray counts into its vertex's light cell (tests,
+                                                 visible), and the combined choice multiplies the sun
+                                                 candidate's weight by max(0.05, visible / tests) of the
+                                                 vertex's sampling cell (1 without tests). A selection hint
+                                                 only: unbiased for any positive value (docs/LIGHT_NEE.md
+                                                 section 10) */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
@@ -1237,6 +1244,11 @@ typedef struct CaelixGiOptions
     uint32_t light_cell_reservoirs; /* 0 = 8; LIGHT_NEE: reservoirs per light cell, a power of two in
                                        1 .. 64. A cell is 64 + 8 x this bytes (128 at 8); a change
                                        recreates the cell table (history dropped) */
+    uint32_t nee_combine;           /* 0 = every NEE vertex traces one shadow ray per strategy (sun NEE and
+                                       light NEE); 1 = every NEE vertex draws both candidates and traces ONE
+                                       shadow ray, chosen in proportion to the candidates' unoccluded
+                                       contributions (unbiased); 2 = as 0 at the primary vertex, as 1 at the
+                                       bounce vertices. Experimental (docs/LIGHT_NEE.md section 10). */
 } CaelixGiOptions;
 
 /* Sets the GI options of the renderer; they apply from the next render on and stay until the next
@@ -1252,8 +1264,8 @@ typedef struct CaelixGiOptions
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,
    light_candidates > 64, light_temporal_frames > 1024, light_nee_candidates > 32, a
-   light_cell_reservoirs that is not 0 or a power of two in 1 .. 64, a cell table (with the defaults
-   for zero fields) above the device's maxStorageBufferRange
+   light_cell_reservoirs that is not 0 or a power of two in 1 .. 64, nee_combine > 2, a cell table
+   (with the defaults for zero fields) above the device's maxStorageBufferRange
    -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);
 

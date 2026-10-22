@@ -133,29 +133,34 @@ bool PreviousPixel(CaelixFrameConstants fc, float3 p, out float2 pixel, out floa
     return all(abs(pixel) < 1e30f);
 }
 
-// Sun next-event estimation at a diffuse path vertex with world normal `normal`
-// and pushed-off position `origin`: one direction L uniform in the sun cone (pdf
-// 1 / omega) and a shadow ray. Returns the demodulated incident radiance of the
-// Lambert lobe, sun_radiance * omega * dot(N, L) / pi when L is unoccluded, else 0
-// (the albedo of the vertex is in the caller's throughput, as for the bounces).
-float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout uint rng)
+// The sun next-event candidate at a diffuse path vertex with world normal `normal`: one
+// direction L uniform in the sun cone (pdf 1 / omega; two random numbers in every branch).
+// Its contribution is the demodulated incident radiance of the Lambert lobe when L is
+// unoccluded, sun_radiance * omega * dot(N, L) / pi (the albedo of the vertex is in the
+// caller's throughput, as for the bounces); invalid when dot(N, L) <= 0.
+NeeCandidate SunNextEventSample(CaelixFrameConstants fc, float3 normal, inout uint rng)
 {
     const float3 L = SampleSunDirection(fc, rng);
     const float cos_l = dot(normal, L);
+    NeeCandidate c = NeeCandidateNone();
     if (!(cos_l > 0.0f))
     {
-        return float3(0.0f, 0.0f, 0.0f);
+        return c;
     }
-    RayDesc shadow;
-    shadow.Origin = origin;
-    shadow.Direction = L;
-    shadow.TMin = 0.0f;
-    shadow.TMax = kRayTMax;
-    if ((fc.gi_flags & kGiFlagDebugNeeNoShadow) == 0u && TraceShadow(fc, shadow))
-    {
-        return float3(0.0f, 0.0f, 0.0f);
-    }
-    return fc.sun_radiance.xyz * (fc.sun_solid_angle * cos_l * (1.0f / K_PI));
+    c.valid = true;
+    c.direction = L;
+    c.t_max = kRayTMax;
+    c.contribution = fc.sun_radiance.xyz * (fc.sun_solid_angle * cos_l * (1.0f / K_PI));
+    return c;
+}
+
+// Sun next-event estimation at a diffuse path vertex with pushed-off position `origin`:
+// SunNextEventSample and its shadow ray (NeeVisible). Returns the candidate's contribution
+// when L is unoccluded, else 0.
+float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout uint rng)
+{
+    const NeeCandidate c = SunNextEventSample(fc, normal, rng);
+    return c.valid && NeeVisible(fc, origin, c) ? c.contribution : float3(0.0f, 0.0f, 0.0f);
 }
 
 // NRD lobe rule of a path that went through a delta interface (primary surface
@@ -309,6 +314,10 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // segment_x_r and segment_n_r), so the two strategies sum to the full emission at every point. The
 // primary vertex keeps the exclusive rule (segment_mis false) with `restir` (ReSTIR GI): its BSDF
 // sample is reused by other pixels, so a pixel-dependent weight would bias the reuse.
+// NEE combine (fc.nee_combine, docs/LIGHT_NEE.md section 10): both NEEs run in NextEventAtVertex;
+// with 1 (every NEE vertex) or 2 (the bounce vertices only) a vertex with both candidates traces one
+// shadow ray toward one of them, chosen in proportion to their unoccluded contributions, and divides
+// the chosen contribution by its probability (unbiased; one extra random number of the sun stream).
 // `primary_light` receives the primary vertex's light NEE; with `restir` it is not in the
 // returned radiance (the caller writes it to the diffuse target, the shade pass adds it).
 struct GiInitialSample
@@ -326,6 +335,124 @@ struct GiInitialSample
 float3 LightCellPoint(TraceResult hit)
 {
     return hit.object_hit + 0.25f * float3(UnpackObjectNormal(hit.attrib));
+}
+
+// Next-event estimation at a diffuse vertex (sun and / or light list). `combine` (fc.nee_combine):
+// both candidates are drawn, one shadow ray is traced toward the candidate chosen with probability
+// w_i / (w_s + w_l), w = luminance of the unoccluded contribution (the sun's times the cell hint
+// with kGiFlagNeeCellVisibility), and the chosen contribution is divided by that probability:
+// E = C_sun V_sun + C_light V_light, as the two separate rays. Without `combine` each valid
+// candidate traces its own ray. Returns the sun's and the light's demodulated radiance separately
+// (`light_part` goes to primary_light in ReSTIR mode).
+// `sun`: the sun candidate is drawn from nee_rng (two numbers; with `combine` one more for the
+// choice, drawn even when both weights are 0, so that the stream does not depend on the data).
+// `light`: the light candidate is drawn from light_rng (LightNextEventSample with `mis` at the cell
+// point `cell_point` of brick group `group`); `ctx` receives its proxy context (the global one
+// without `light`). kGiFlagNeeCellVisibility (docs/LIGHT_NEE.md section 10): the sun hint
+// max(kNeeSunHintFloor, visible / tests) is read from the light candidate's SAMPLING cell, and every
+// traced sun shadow ray counts into the vertex's UNJITTERED cell (hint_slot), in both modes.
+void NextEventAtVertex(CaelixFrameConstants fc, bool sun, bool light, bool mis, bool combine,
+                       float3 origin, float3 normal, uint group, float3 cell_point,
+                       inout uint nee_rng, inout uint light_rng,
+                       out LightNeeProxyContext ctx, out float3 sun_part, out float3 light_part)
+{
+    sun_part = float3(0.0f, 0.0f, 0.0f);
+    light_part = float3(0.0f, 0.0f, 0.0f);
+    NeeCandidate s = NeeCandidateNone();
+    if (sun)
+    {
+        s = SunNextEventSample(fc, normal, nee_rng);
+    }
+    int hint_slot = -1;
+    int sample_slot = -1;
+    NeeCandidate l = NeeCandidateNone();
+    CAELIX_BRANCH
+    if (light)
+    {
+        l = LightNextEventSample(fc, origin, normal, group, cell_point, mis, light_rng, ctx, hint_slot,
+                                 sample_slot);
+    }
+    else
+    {
+        ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), kLightCellFaceNone, 0.0f);
+    }
+    const bool cell_visibility = (fc.gi_flags & kGiFlagNeeCellVisibility) != 0u;
+
+    bool sun_traced = false;
+    bool sun_visible = false;
+    CAELIX_BRANCH
+    if (!combine)
+    {
+        // One shadow ray per valid candidate.
+        if (s.valid)
+        {
+            sun_traced = true;
+            sun_visible = NeeVisible(fc, origin, s);
+            sun_part = sun_visible ? s.contribution : float3(0.0f, 0.0f, 0.0f);
+        }
+        if (l.valid && NeeVisible(fc, origin, l))
+        {
+            light_part = l.contribution;
+        }
+    }
+    else
+    {
+        // The sun hint of the sampling cell: 1 without the flag, without a cell or without a test.
+        float hint = 1.0f;
+        if (cell_visibility && sample_slot >= 0)
+        {
+            const uint base = uint(sample_slot) * LightCellBytes(fc);
+            const uint tests = g_light_cells.Load(base + kLightCellSunTestsOffset);
+            if (tests > 0u)
+            {
+                const uint visible_count = g_light_cells.Load(base + kLightCellSunVisibleOffset);
+                hint = max(kNeeSunHintFloor, float(visible_count) / float(tests));
+            }
+        }
+        const float w_s = s.valid ? CaelixLuminance(s.contribution) * hint : 0.0f;
+        const float w_l = l.valid ? CaelixLuminance(l.contribution) : 0.0f;
+        const float w_sum = w_s + w_l;
+        float u = 0.0f;
+        if (sun)
+        {
+            u = RandomFloat01(nee_rng);
+        }
+        if (w_sum > 0.0f)
+        {
+            // One-sample choice between the two strategies; the chosen part divided by its probability.
+            const bool pick_sun = u * w_sum < w_s;
+            NeeCandidate picked = l;
+            if (pick_sun)
+            {
+                picked = s;
+            }
+            const float p = (pick_sun ? w_s : w_l) / w_sum;
+            const bool visible = NeeVisible(fc, origin, picked);
+            const float3 part = visible ? picked.contribution / p : float3(0.0f, 0.0f, 0.0f);
+            if (pick_sun)
+            {
+                sun_traced = true;
+                sun_visible = visible;
+                sun_part = part;
+            }
+            else
+            {
+                light_part = part;
+            }
+        }
+    }
+
+    // The sun visibility counters of the vertex's unjittered cell (both modes).
+    CAELIX_BRANCH
+    if (cell_visibility && sun_traced && hint_slot >= 0)
+    {
+        const uint base = uint(hint_slot) * LightCellBytes(fc);
+        g_light_cells.InterlockedAdd(base + kLightCellSunTestsOffset, 1u);
+        if (sun_visible)
+        {
+            g_light_cells.InterlockedAdd(base + kLightCellSunVisibleOffset, 1u);
+        }
+    }
 }
 
 CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
@@ -362,37 +489,51 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     bool segment_diffuse = !primary_shade.specular_lobe;
     float segment_roughness = primary_shade.roughness;
 
-    // NEE at the primary vertex (demodulated: throughput 1 / k).
+    // NEE at the primary vertex (demodulated: throughput 1 / k): the sun and the light list
+    // (NextEventAtVertex; one shadow ray for both with fc.nee_combine 1). The state of the segment
+    // that leaves a light NEE vertex: segment_mis = the MIS of kGiFlagLightMis applies to its
+    // list-light hits, with the vertex's receiver (segment_x_r, segment_n_r) and proxy context
+    // (segment_ctx).
     bool segment_sees_sun = true;
-    CAELIX_BRANCH
-    if (nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
-    {
-        radiance += SunNextEvent(fc, primary_shade.bounce_origin, surface.normal, nee_rng) * throughput;
-        segment_sees_sun = false;
-    }
-    // Light NEE at the primary vertex. The state of the segment that leaves a light NEE vertex:
-    // segment_mis = the MIS of kGiFlagLightMis applies to its list-light hits, with the vertex's
-    // receiver (segment_x_r, segment_n_r) and proxy context (segment_ctx).
     bool segment_light_nee = false;
     bool segment_mis = false;
     float3 segment_x_r = float3(0.0f, 0.0f, 0.0f);
     float3 segment_n_r = float3(0.0f, 0.0f, 0.0f);
     LightNeeProxyContext segment_ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), kLightCellFaceNone, 0.0f);
-    CAELIX_BRANCH
-    if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
     {
-        // ReSTIR GI reuses the primary vertex's BSDF sample: the exclusive rule there.
-        segment_mis = light_mis && !restir;
-        primary_light = LightNextEvent(fc, primary_shade.bounce_origin, surface.normal, surface.group,
-                                       LightCellPoint(surface), segment_mis, light_rng, segment_ctx) *
-                        throughput;
-        if (!restir)
+        const bool next_segment = !primary_shade.specular_lobe && fc.bounce_count >= 1u;
+        const bool sun_here = nee && next_segment;
+        const bool light_here = light_nee && next_segment;
+        CAELIX_BRANCH
+        if (sun_here || light_here)
         {
-            radiance += primary_light;
+            // ReSTIR GI reuses the primary vertex's BSDF sample: the exclusive rule there.
+            const bool mis_here = light_mis && !restir;
+            LightNeeProxyContext ctx;
+            float3 sun_part;
+            float3 light_part;
+            NextEventAtVertex(fc, sun_here, light_here, mis_here, fc.nee_combine == 1u, primary_shade.bounce_origin,
+                              surface.normal, surface.group, LightCellPoint(surface), nee_rng, light_rng, ctx,
+                              sun_part, light_part);
+            if (sun_here)
+            {
+                radiance += sun_part * throughput;
+                segment_sees_sun = false;
+            }
+            if (light_here)
+            {
+                primary_light = light_part * throughput;
+                if (!restir)
+                {
+                    radiance += primary_light;
+                }
+                segment_light_nee = true;
+                segment_mis = mis_here;
+                segment_x_r = primary_shade.bounce_origin;
+                segment_n_r = surface.normal;
+                segment_ctx = ctx;
+            }
         }
-        segment_light_nee = true;
-        segment_x_r = primary_shade.bounce_origin;
-        segment_n_r = surface.normal;
     }
 
     RayDesc bounce;
@@ -483,25 +624,39 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         }
         throughput *= shade.albedo / max(0.001f, shade.k);
 
+        // NEE at the bounce vertex: the sun and the light list (NextEventAtVertex; one shadow ray for
+        // both with fc.nee_combine 1 or 2).
         segment_sees_sun = true;
-        CAELIX_BRANCH
-        if (nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
-        {
-            radiance += SunNextEvent(fc, shade.bounce_origin, hit.normal, nee_rng) * throughput;
-            segment_sees_sun = false;
-        }
         segment_light_nee = false;
         segment_mis = false;
-        CAELIX_BRANCH
-        if (light_nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
         {
-            radiance += LightNextEvent(fc, shade.bounce_origin, hit.normal, hit.group, LightCellPoint(hit),
-                                       light_mis, light_rng, segment_ctx) *
-                        throughput;
-            segment_light_nee = true;
-            segment_mis = light_mis;
-            segment_x_r = shade.bounce_origin;
-            segment_n_r = hit.normal;
+            const bool next_segment = !shade.specular_lobe && bounce_index <= fc.bounce_count;
+            const bool sun_here = nee && next_segment;
+            const bool light_here = light_nee && next_segment;
+            CAELIX_BRANCH
+            if (sun_here || light_here)
+            {
+                LightNeeProxyContext ctx;
+                float3 sun_part;
+                float3 light_part;
+                NextEventAtVertex(fc, sun_here, light_here, light_mis, fc.nee_combine >= 1u, shade.bounce_origin,
+                                  hit.normal, hit.group, LightCellPoint(hit), nee_rng, light_rng, ctx, sun_part,
+                                  light_part);
+                if (sun_here)
+                {
+                    radiance += sun_part * throughput;
+                    segment_sees_sun = false;
+                }
+                if (light_here)
+                {
+                    radiance += light_part * throughput;
+                    segment_light_nee = true;
+                    segment_mis = light_mis;
+                    segment_x_r = shade.bounce_origin;
+                    segment_n_r = hit.normal;
+                    segment_ctx = ctx;
+                }
+            }
         }
 
         // Russian roulette: dark paths stop early. A zero throughput must stop here,

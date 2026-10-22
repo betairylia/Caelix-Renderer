@@ -176,9 +176,10 @@ A cell is `64 + 8 R` bytes (`LightCellBytes`), R = `light_cell_reservoirs` (a po
 | 36 | `float C_cur` | cell normalisation of the latest fill |
 | 40 | `float M` | temporal reuse: confidence sum behind every reservoir of the cell; 0 = no history |
 | 44 | `float C_n` | temporal reuse: draw count behind `C_cur` |
-| 48 | `uint reserved` | written 0 |
+| 48 | `uint sun_tests` | `CAELIX_GI_FLAG_NEE_CELL_VISIBILITY`: sun shadow rays traced from receivers of the cell, decayed by 1/8 per fill; 0 at insert and eviction (section 10) |
 | 52 | `uint face` | receiver face of the key (0..5, or 6 for an unoriented cell) |
-| 56 | 8 bytes | padding |
+| 56 | `uint sun_visible` | of those, the rays that found the sun unoccluded (same decay, same resets) |
+| 60 | 4 bytes | padding |
 | 64 | `R x { uint light; float W }` | reservoirs: `light` = the entry index of a brick (`kNoLight` = 0xFFFFFFFF = empty), `W` = its unbiased contribution weight (0 = empty) |
 
 A reservoir holds a brick only; the vertex samples the point inside the brick (section 5.4). The
@@ -304,7 +305,9 @@ has a next segment (the primary vertex when `bounce_count >= 1`, every later dif
 separate from the path's, so a frame without the flag stays bit-identical. The result is the
 demodulated incident radiance of the Lambert lobe times the path throughput. In ReSTIR GI mode the
 primary vertex's NEE goes unpacked into the diffuse target and the shade pass adds the reservoir's
-contribution to it.
+contribution to it. `TracePath` runs both NEEs (sun and light list) through `NextEventAtVertex`:
+`LightNextEventSample` and `SunNextEventSample` draw the candidates, `NeeVisible` traces the shadow
+rays; `fc.nee_combine` can merge the two rays into one (section 10).
 
 ### 5.1 Lookups and jitter
 
@@ -449,6 +452,8 @@ kept option by default (owner decision, 2026-10-22).
 | `light_level_footprint` | 0.25 | 0.25 | `--light-footprint` |
 | `light_temporal_frames` | 20 (1 .. 1024) | 128 | `--light-temporal-frames` |
 | `light_nee_candidates` | 1 (1 .. 32) | 2 | `--light-nee-candidates` |
+| `nee_combine` (section 10) | 0 (0 .. 2) | 0 | `--nee-combine` |
+| `CAELIX_GI_FLAG_NEE_CELL_VISIBILITY` (bit 12, section 10) | off | off | `--nee-cell-visibility` |
 | `CaelixLightOptions::min_emission` | 20.0 | 0 (library) | `--light-min-emission` |
 | `CaelixLightOptions::max_bricks` | 65536 | 65536 | `--light-max-bricks` |
 | `CaelixLightOptions::nee_min_distance` | 8.0 | 0 (library) | `--light-nee-distance` |
@@ -511,3 +516,60 @@ Removed on 2026-10-22 (branch `light-nee-experiments`); the code is at tag `ligh
 - Ball and cube light sampling (branch `gi-experiments`, removed before this branch). Verdict:
   unbiased, noisier than the per-face masks at 1 spp in bistro and shroom. Archived:
   `LIGHT_BALLS.md`.
+
+## 10. Combined sun and light NEE (experimental)
+
+With the sun NEE (`CAELIX_RENDER_FLAG_SUN_NEE`) and the light NEE both on, every diffuse vertex with a
+next segment traces two shadow rays: one toward the sun direction and one toward the light point.
+`CaelixGiOptions::nee_combine` (`fc.nee_combine`, host `--nee-combine`) merges them into one ray:
+
+- 0: one shadow ray per strategy (the behaviour before this option; bit-identical).
+- 1: at every NEE vertex both candidates are drawn and ONE shadow ray is traced.
+- 2: as 0 at the primary vertex, as 1 at the bounce vertices.
+
+The code is `NextEventAtVertex` in `caelix_path_trace.hlsl`; the light list needs a light table
+(`kGiFlagLightNee`), so the library passes `nee_combine` only with `CAELIX_GI_FLAG_LIGHT_NEE`.
+
+### 10.1 Estimator
+
+Each candidate i (sun s, light l) has the unoccluded contribution C_i (the demodulated incident
+radiance of the Lambert lobe with its own W and, for the light, its MIS weight; 0 for an invalid
+candidate) and the visibility V_i of its shadow ray. The separate rays estimate
+`E = C_s V_s + C_l V_l`. The combined vertex picks one candidate with probability
+`p_i = w_i / (w_s + w_l)`, `w_s = luminance(C_s) * hint`, `w_l = luminance(C_l)`, traces its ray only,
+and returns `C_i V_i / p_i` for the picked one (0 for the other). One-sample MIS over two strategies:
+
+```
+E[estimate] = p_s (C_s V_s / p_s) + p_l (C_l V_l / p_l) = C_s V_s + C_l V_l
+```
+
+whenever `p_i > 0` for every candidate with `C_i != 0`. That holds: a candidate with nonzero C_i has
+a positive luminance (the luminance weights are positive), and the hint is at least 0.05. When both
+weights are 0 nothing is traced and both parts are 0 (both C_i are 0 then). The sun part and the
+light part are returned separately (`light_part` is the primary vertex's `primary_light` in ReSTIR
+mode, where the sun NEE is off and the combination is a no-op).
+
+### 10.2 Cell sun visibility hint (`CAELIX_GI_FLAG_NEE_CELL_VISIBILITY`)
+
+The choice by unoccluded contribution wastes rays on an occluded sun (indoors the sun candidate often
+outweighs the lamps and then finds a wall). With the flag (host `--nee-cell-visibility`) every TRACED
+sun shadow ray (both modes, so the counters warm up with `nee_combine` 0 too) adds 1 to `sun_tests`
+(cell word 48) and, when unoccluded, 1 to `sun_visible` (word 56) of the vertex's UNJITTERED light
+cell (the lookup that the MIS proxy uses; the sampling cell when that lookup does not run). The
+combined choice reads the hint from the light candidate's SAMPLING (jittered) cell:
+`hint = max(0.05, sun_visible / sun_tests)` (`kNeeSunHintFloor`), 1 without tests or without a cell.
+The hint changes only the selection probability, never the estimate's expectation (section 10.1),
+so stale, noisy or jitter-shifted counters cost variance, not bias.
+
+The fill decays both counters of every live cell by 1/8 per frame (`x - (x >> 3)`, thread 0 of the
+cell, also without a usable table: the hint does not depend on it), so they hold about 8 to 16 frames
+of rays: a cell with n tests per frame settles near 8 n. Insert and eviction zero them. The counters
+are 32-bit atomics in the cell table (no extra buffer).
+
+### 10.3 Random streams
+
+The sun candidate draws its two numbers from the sun NEE stream (`frame_seed ^ 0x68E31DA4`) as
+before; the combined choice draws ONE extra number from the same stream at every combined vertex
+where the sun candidate was drawn, even when both weights are 0, so the stream does not depend on
+the data. The light candidate's numbers (light stream) and the path's numbers are unchanged. With
+`nee_combine` 0 no extra number is drawn.

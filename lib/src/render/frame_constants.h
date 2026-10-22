@@ -100,7 +100,7 @@ struct FrameConstants
     uint32_t light_temporal_frames;     // 656  LIGHT_CELL_TEMPORAL: frames of history the fill keeps (0 = none this frame)
     uint32_t light_nee_candidates;      // 660  LIGHT_NEE: candidates per diffuse vertex (1 .. 32; 1 = no resampling)
     uint32_t light_cell_reservoirs;     // 664  LIGHT_NEE: reservoirs per light cell (a power of two in 1 .. 64)
-    uint32_t pad_668;                   // 668
+    uint32_t nee_combine;               // 668  NEE: 0 one shadow ray per strategy, 1 one ray per vertex, 2 one ray at the bounces
 };
 static_assert(sizeof(FrameConstants) == 672);
 static_assert(offsetof(FrameConstants, size) == 64);
@@ -152,6 +152,7 @@ static_assert(offsetof(FrameConstants, light_indices) == 648);
 static_assert(offsetof(FrameConstants, light_temporal_frames) == 656);
 static_assert(offsetof(FrameConstants, light_nee_candidates) == 660);
 static_assert(offsetof(FrameConstants, light_cell_reservoirs) == 664);
+static_assert(offsetof(FrameConstants, nee_combine) == 668);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

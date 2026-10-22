@@ -654,7 +654,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                                                             CAELIX_GI_FLAG_LIGHT_MIS |
                                                             CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
                                                             CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED |
-                                                            CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW));
+                                                            CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW |
+                                                            CAELIX_GI_FLAG_NEE_CELL_VISIBILITY));
     if (!lighting)
     {
         constants.gi_flags &= ~static_cast<uint32_t>(CAELIX_GI_FLAG_LIGHT_NEE);
@@ -710,6 +711,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         // diffuse vertex.
         constants.light_nee_candidates =
             gi_options_.light_nee_candidates != 0 ? gi_options_.light_nee_candidates : kDefaultLightNeeCandidates;
+        // One shadow ray per NEE vertex for the sun and the light candidate (docs/LIGHT_NEE.md section 10).
+        constants.nee_combine = gi_options_.nee_combine;
     }
     if (sky)
     {

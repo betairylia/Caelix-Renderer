@@ -301,6 +301,14 @@ pub struct GiSettings {
     /// TIMING ONLY (biased): the sun NEE and the light NEE skip their shadow rays
     /// (`CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW`).
     pub debug_nee_no_shadow: bool,
+    /// NEE combine (`CaelixGiOptions::nee_combine`, docs/LIGHT_NEE.md section 10): 0 = one shadow ray
+    /// per strategy (sun NEE and light NEE); 1 = one shadow ray per NEE vertex toward one of the two
+    /// candidates, chosen in proportion to their unoccluded contributions; 2 = as 0 at the primary
+    /// vertex, as 1 at the bounce vertices.
+    pub nee_combine: u32,
+    /// Light NEE with `nee_combine` 1 or 2: the per-light-cell sun visibility hint of the choice
+    /// (`CAELIX_GI_FLAG_NEE_CELL_VISIBILITY`).
+    pub nee_cell_visibility: bool,
 }
 
 impl Default for GiSettings {
@@ -331,6 +339,8 @@ impl Default for GiSettings {
             light_candidates: 16,
             light_footprint: 0.25,
             debug_nee_no_shadow: false,
+            nee_combine: 0,
+            nee_cell_visibility: false,
         }
     }
 }
@@ -371,6 +381,9 @@ impl GiSettings {
             if self.light_cell_temporal {
                 flags |= CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
             }
+            if self.nee_cell_visibility {
+                flags |= CAELIX_GI_FLAG_NEE_CELL_VISIBILITY;
+            }
         }
         if self.debug_nee_no_shadow {
             flags |= CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW;
@@ -395,6 +408,7 @@ impl GiSettings {
             light_temporal_frames: self.light_temporal_frames,
             light_nee_candidates: self.light_nee_candidates,
             light_cell_reservoirs: self.light_cell_reservoirs,
+            nee_combine: self.nee_combine,
         }
     }
 }

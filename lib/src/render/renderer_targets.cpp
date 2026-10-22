@@ -365,7 +365,7 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                                      CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_JITTER |
                                      CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
                                      CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED | CAELIX_GI_FLAG_PAIRWISE_MIS |
-                                     CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW;
+                                     CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW | CAELIX_GI_FLAG_NEE_CELL_VISIBILITY;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
@@ -433,6 +433,11 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
     {
         CAELIX_LOGE("%s: light_cell_reservoirs %u must be 0 or a power of two in 1 .. 64", kFunction,
                     options.light_cell_reservoirs);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (options.nee_combine > 2)
+    {
+        CAELIX_LOGE("%s: nee_combine %u is above the maximum 2", kFunction, options.nee_combine);
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     // The cell table is one storage buffer descriptor (trace set binding 21), and the kernels address
