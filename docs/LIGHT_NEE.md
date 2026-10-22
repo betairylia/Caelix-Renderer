@@ -452,8 +452,8 @@ kept option by default (owner decision, 2026-10-22).
 | `light_level_footprint` | 0.25 | 0.25 | `--light-footprint` |
 | `light_temporal_frames` | 20 (1 .. 1024) | 128 | `--light-temporal-frames` |
 | `light_nee_candidates` | 1 (1 .. 32) | 2 | `--light-nee-candidates` |
-| `nee_combine` (section 10) | 0 (0 .. 2) | 0 | `--nee-combine` |
-| `CAELIX_GI_FLAG_NEE_CELL_VISIBILITY` (bit 12, section 10) | off | off | `--nee-cell-visibility` |
+| `nee_combine` (section 10) | 0 (0 .. 2) | 1 | `--nee-combine` |
+| `CAELIX_GI_FLAG_NEE_CELL_VISIBILITY` (bit 12, section 10) | off | on | `--nee-no-cell-visibility` |
 | `CaelixLightOptions::min_emission` | 20.0 | 0 (library) | `--light-min-emission` |
 | `CaelixLightOptions::max_bricks` | 65536 | 65536 | `--light-max-bricks` |
 | `CaelixLightOptions::nee_min_distance` | 8.0 | 0 (library) | `--light-nee-distance` |
@@ -516,6 +516,14 @@ Removed on 2026-10-22 (branch `light-nee-experiments`); the code is at tag `ligh
 - Ball and cube light sampling (branch `gi-experiments`, removed before this branch). Verdict:
   unbiased, noisier than the per-face masks at 1 spp in bistro and shroom. Archived:
   `LIGHT_BALLS.md`.
+- Per-pixel reprojected sun visibility hint for the combined NEE (`CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY`,
+  2026-10-22, commit `d88f179`, reverted by `905addc`): an 8-bit per-pixel estimate of the primary
+  vertex's sun visibility carried through the motion vector (renderer buffer pair, frame constants
+  688 B), used instead of the cell hint at the primary vertex. Verdict: unbiased; equal to the cell
+  hint on bistro (1 spp 12.22 vs 12.19 dB) and 0.15 .. 0.25 dB weaker on emberdeep, where the cell
+  hint also serves the bounce vertices; both together +0.1 dB over the cell hint alone for two 8 MB
+  buffers at 1080p. Owner: the cell hint is enough. Numbers in `Artifacts/nee-budget-20261022/
+  pixel-hint-smoke/README.md`.
 
 ## 10. Combined sun and light NEE (experimental)
 
@@ -552,7 +560,7 @@ mode, where the sun NEE is off and the combination is a no-op).
 ### 10.2 Cell sun visibility hint (`CAELIX_GI_FLAG_NEE_CELL_VISIBILITY`)
 
 The choice by unoccluded contribution wastes rays on an occluded sun (indoors the sun candidate often
-outweighs the lamps and then finds a wall). With the flag (host `--nee-cell-visibility`) every TRACED
+outweighs the lamps and then finds a wall). With the flag (host default; `--nee-no-cell-visibility` turns it off) every TRACED
 sun shadow ray (both modes, so the counters warm up with `nee_combine` 0 too) adds 1 to `sun_tests`
 (cell word 48) and, when unoccluded, 1 to `sun_visible` (word 56) of the vertex's UNJITTERED light
 cell (the lookup that the MIS proxy uses; the sampling cell when that lookup does not run). The

@@ -339,8 +339,8 @@ impl Default for GiSettings {
             light_candidates: 16,
             light_footprint: 0.25,
             debug_nee_no_shadow: false,
-            nee_combine: 0,
-            nee_cell_visibility: false,
+            nee_combine: 1,
+            nee_cell_visibility: true,
         }
     }
 }

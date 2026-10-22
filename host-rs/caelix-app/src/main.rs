@@ -480,15 +480,15 @@ struct Args {
     /// 0 = every NEE vertex traces one shadow ray per strategy (sun NEE and light NEE); 1 = every NEE
     /// vertex draws both candidates and traces ONE shadow ray, chosen in proportion to the
     /// candidates' unoccluded contributions (unbiased); 2 = as 0 at the primary vertex, as 1 at the
-    /// bounce vertices. Experimental (docs/LIGHT_NEE.md section 10).
-    #[arg(long, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2))]
+    /// bounce vertices (docs/LIGHT_NEE.md section 10). Default 1 (owner decision 2026-10-22).
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(0..=2))]
     nee_combine: u32,
-    /// Light NEE with --nee-combine 1 or 2: every traced sun shadow ray counts into its vertex's
-    /// light cell, and the combined choice multiplies the sun candidate's weight by
-    /// max(0.05, visible / tests) of the vertex's sampling cell (a selection hint, unbiased;
-    /// docs/LIGHT_NEE.md section 10).
+    /// Light NEE with --nee-combine 1 or 2: no cell sun visibility hint. By default every traced sun
+    /// shadow ray counts into its vertex's light cell, and the combined choice multiplies the sun
+    /// candidate's weight by max(0.05, visible / tests) of the vertex's sampling cell (a selection
+    /// hint, unbiased; docs/LIGHT_NEE.md section 10).
     #[arg(long)]
-    nee_cell_visibility: bool,
+    nee_no_cell_visibility: bool,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -2161,7 +2161,7 @@ fn main() -> anyhow::Result<()> {
             light_footprint: args.light_footprint,
             debug_nee_no_shadow: args.debug_nee_no_shadow,
             nee_combine: args.nee_combine,
-            nee_cell_visibility: args.nee_cell_visibility,
+            nee_cell_visibility: !args.nee_no_cell_visibility,
         },
     };
     if !args.light_cells.is_power_of_two() || !(1024..=1048576).contains(&args.light_cells) {
