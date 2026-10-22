@@ -566,6 +566,16 @@ cell, also without a usable table: the hint does not depend on it), so they hold
 of rays: a cell with n tests per frame settles near 8 n. Insert and eviction zero them. The counters
 are 32-bit atomics in the cell table (no extra buffer).
 
+Cost of the counting (bistro 1080p, 100-frame means, 2026-10-22): one atomic per lane cost about
+1.4 ms per frame. Two measures bring it below the measurement noise: (a) the lanes of a wave that
+share a slot add their counts with one atomic (a `WaveReadLaneFirst` / `WaveActiveCountBits` loop
+over the distinct slots of the wave; at the primary vertex an 8 x 4 pixel block mostly shares one
+cell), and (b) only one wave in `kNeeCountWaveShare` = 4 counts at all, decided per wave from the
+first active lane's sun stream state (uniform branch, no random number consumed). Counting at the
+bounce vertices alone cost about 0.4 ms before (b): their slots are scattered, so (a) does not help
+there. The hint is a ratio, so the lower count rate costs only its precision; the 1 spp PSNR and
+block PSNR of `c1_vis` did not change (bistro 12.20 / 17.38 dB before and after).
+
 ### 10.3 Random streams
 
 The sun candidate draws its two numbers from the sun NEE stream (`frame_seed ^ 0x68E31DA4`) as

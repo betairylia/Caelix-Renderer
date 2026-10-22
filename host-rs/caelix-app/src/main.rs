@@ -146,6 +146,11 @@ struct Args {
     /// Exit with code 0 after N presented frames. Default: run until the window closes.
     #[arg(long, value_name = "N")]
     frames: Option<u64>,
+    /// With --screenshot --exit-after-screenshot: keep running after the screenshot until N more
+    /// frames have GPU timings, print `timings_avg: trace_ms=<mean> median=<median> min=<min> n=N`
+    /// on stdout and exit then. The single-frame `timings:` line varies by 1 .. 2 ms between runs.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    timing_frames: u64,
     /// Debug log level (includes Vulkan validation layer and loader messages).
     /// RUST_LOG overrides this.
     #[arg(long)]
@@ -622,6 +627,10 @@ struct Timing {
     window_start: Instant,
     window_frames: u64,
     fps: f64,
+    /// --timing-frames: trace_ms of every distinct timed frame after the screenshot.
+    samples: Vec<f32>,
+    /// The frame number of the newest sample (0 = none).
+    sample_frame: u64,
 }
 
 /// The --sky cubemap, converted on the CPU before the window exists and uploaded in `create_state`.
@@ -1254,7 +1263,7 @@ impl App {
                             gi.light_cell_lookups_failed
                         );
                         self.screenshot = Screenshot::Done;
-                        if self.args.exit_after_screenshot {
+                        if self.args.exit_after_screenshot && self.args.timing_frames == 0 {
                             event_loop.exit();
                             return Ok(());
                         }
@@ -1323,6 +1332,31 @@ impl App {
                     info.dispatch_count,
                     if info.failed != 0 { ", FAILED (denoising disabled)" } else { "" }
                 );
+            }
+        }
+
+        // --timing-frames: the trace time of every distinct timed frame after the screenshot.
+        if self.args.timing_frames > 0 && self.screenshot == Screenshot::Done {
+            let t = gpu_timings(state.renderer);
+            if t.frame_number != 0 && t.frame_number != self.timing.sample_frame {
+                self.timing.sample_frame = t.frame_number;
+                self.timing.samples.push(t.trace_ms);
+            }
+            if self.timing.samples.len() as u64 >= self.args.timing_frames {
+                let mut sorted = self.timing.samples.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let n = sorted.len();
+                let mean = sorted.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+                let median = if n % 2 == 1 {
+                    sorted[n / 2] as f64
+                } else {
+                    (sorted[n / 2 - 1] as f64 + sorted[n / 2] as f64) * 0.5
+                };
+                println!("timings_avg: trace_ms={mean:.3} median={median:.3} min={:.3} n={n}", sorted[0]);
+                if self.args.exit_after_screenshot {
+                    event_loop.exit();
+                    return Ok(());
+                }
             }
         }
 
@@ -2223,7 +2257,13 @@ fn main() -> anyhow::Result<()> {
         frames_presented: 0,
         resize_requested: false,
         screenshot: Screenshot::Waiting,
-        timing: Timing { window_start: Instant::now(), window_frames: 0, fps: 0.0 },
+        timing: Timing {
+            window_start: Instant::now(),
+            window_frames: 0,
+            fps: 0.0,
+            samples: Vec::new(),
+            sample_frame: 0,
+        },
         load_mismatch: false,
         nrd_frames: 0,
         upscaler_support: None,

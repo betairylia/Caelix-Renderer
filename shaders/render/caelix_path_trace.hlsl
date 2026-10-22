@@ -102,6 +102,8 @@
 
 static const float kRayTMax = 1e30f;
 static const uint kStepsHeatMax = 64;
+// kGiFlagNeeCellVisibility: one wave in this many counts its sun shadow rays into the cells.
+static const uint kNeeCountWaveShare = 4;
 // Internal view_z of a miss (beyond any denoising range).
 static const float kInternalMissViewZ = 1e30f;
 
@@ -442,15 +444,41 @@ void NextEventAtVertex(CaelixFrameConstants fc, bool sun, bool light, bool mis, 
         }
     }
 
-    // The sun visibility counters of the vertex's unjittered cell (both modes).
+    // The sun visibility counters of the vertex's unjittered cell (both modes), aggregated over the
+    // wave: the lanes of one 8 x 4 pixel block mostly share a cell at the primary vertex, so the lanes
+    // with the same slot add their counts with one atomic (the first of them). The loop takes the
+    // first active lane's slot, counts the lanes that match it and retires them; every lane is counted
+    // exactly once in whatever lane grouping the hardware runs (OpGroupNonUniform ops act on the
+    // active lanes). The counts are not reduced in a loop: a serial same-address atomic per lane costs
+    // about 1.4 ms per frame on bistro at 1080p.
+    // Only one wave in kNeeCountWaveShare counts (decided per wave from the first active lane's random
+    // state, so the branch is uniform): the hint is a ratio, so a lower count rate costs only its
+    // precision (the fill's decay holds about 8 counted frames), and the scattered atomics of the
+    // bounce vertices cost about 0.4 ms per frame on bistro at 1080p when every wave counts.
+    const bool count = (HashU32(WaveReadLaneFirst(nee_rng) ^ 0x9E3779B9u) % kNeeCountWaveShare) == 0u;
     CAELIX_BRANCH
-    if (cell_visibility && sun_traced && hint_slot >= 0)
+    if (cell_visibility && count && sun_traced && hint_slot >= 0)
     {
-        const uint base = uint(hint_slot) * LightCellBytes(fc);
-        g_light_cells.InterlockedAdd(base + kLightCellSunTestsOffset, 1u);
-        if (sun_visible)
+        CAELIX_LOOP
+        for (;;)
         {
-            g_light_cells.InterlockedAdd(base + kLightCellSunVisibleOffset, 1u);
+            const int first_slot = WaveReadLaneFirst(hint_slot);
+            const bool mine = hint_slot == first_slot;
+            const uint tests = WaveActiveCountBits(mine);
+            const uint visible = WaveActiveCountBits(mine && sun_visible);
+            if (mine)
+            {
+                if (WaveIsFirstLane())
+                {
+                    const uint base = uint(first_slot) * LightCellBytes(fc);
+                    g_light_cells.InterlockedAdd(base + kLightCellSunTestsOffset, tests);
+                    if (visible != 0u)
+                    {
+                        g_light_cells.InterlockedAdd(base + kLightCellSunVisibleOffset, visible);
+                    }
+                }
+                break;
+            }
         }
     }
 }
