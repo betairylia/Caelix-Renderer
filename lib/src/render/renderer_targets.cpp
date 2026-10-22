@@ -329,6 +329,42 @@ bool Renderer::EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame)
     return true;
 }
 
+bool Renderer::EnsureSunVisBuffers(uint32_t width, uint32_t height, uint64_t frame)
+{
+    if (sun_vis_buffers_[0].valid() && sun_vis_width_ == width && sun_vis_height_ == height)
+    {
+        return false;
+    }
+    if (sun_vis_buffers_[0].valid())
+    {
+        RetiredSunVis retired;
+        retired.frame = sun_vis_last_frame_;
+        retired.buffers = std::move(sun_vis_buffers_);
+        retired_sun_vis_.push_back(std::move(retired));
+    }
+    // One uint per pixel (bits 0..7 = estimate x 255, bit 8 = valid). On a throw the buffer
+    // created so far is destroyed with `fresh`, and the next render tries again.
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * sizeof(uint32_t);
+    std::array<GpuBuffer, 2> fresh;
+    for (GpuBuffer& buffer : fresh)
+    {
+        buffer = GpuBuffer::DeviceLocalWithUsage(
+            device_.allocator(), device_.device(), bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    }
+    sun_vis_buffers_ = std::move(fresh);
+    sun_vis_cur_ = 0;
+    sun_vis_width_ = width;
+    sun_vis_height_ = height;
+    sun_vis_last_frame_ = frame;
+    sun_vis_history_valid_ = false;
+    sun_vis_needs_init_ = true;
+    CAELIX_LOGI("renderer: pixel sun visibility buffers created at %ux%u (%.1f MiB)", width, height,
+                static_cast<double>(bytes * 2) / (1024.0 * 1024.0));
+    return true;
+}
+
 void Renderer::EnsureLightCells(uint32_t capacity, uint32_t reservoirs, uint64_t frame)
 {
     if (light_cells_.valid() && light_cell_capacity_ == capacity && light_cell_reservoirs_ == reservoirs)
@@ -365,7 +401,8 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                                      CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_JITTER |
                                      CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
                                      CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED | CAELIX_GI_FLAG_PAIRWISE_MIS |
-                                     CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW | CAELIX_GI_FLAG_NEE_CELL_VISIBILITY;
+                                     CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW | CAELIX_GI_FLAG_NEE_CELL_VISIBILITY |
+                                     CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
@@ -511,6 +548,9 @@ void Renderer::FreeRetired(uint64_t safe_frame)
         return retired.frame <= safe_frame;
     });
     std::erase_if(retired_gi_, [safe_frame](const RetiredGiBuffers& retired) {
+        return retired.frame <= safe_frame;
+    });
+    std::erase_if(retired_sun_vis_, [safe_frame](const RetiredSunVis& retired) {
         return retired.frame <= safe_frame;
     });
     std::erase_if(retired_light_cells_, [safe_frame](const RetiredLightCells& retired) {

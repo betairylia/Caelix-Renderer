@@ -382,6 +382,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                                                                 : kDefaultLightCellReservoirs,
                          frame.frame_number);
     }
+    // The pixel sun visibility hint (docs/LIGHT_NEE.md section 10.4): the history pair of this size.
+    const bool pixel_sun_vis = light_nee && (gi_options_.flags & CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY) != 0;
+    if (pixel_sun_vis)
+    {
+        EnsureSunVisBuffers(width, height, frame.frame_number);
+    }
     const bool light_fill = light_nee && light_table != 0;
     CaelixLightStats light_stats{};
     scene_.GetLightStats(light_stats);
@@ -655,7 +661,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                                                             CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
                                                             CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED |
                                                             CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW |
-                                                            CAELIX_GI_FLAG_NEE_CELL_VISIBILITY));
+                                                            CAELIX_GI_FLAG_NEE_CELL_VISIBILITY |
+                                                            CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY));
     if (!lighting)
     {
         constants.gi_flags &= ~static_cast<uint32_t>(CAELIX_GI_FLAG_LIGHT_NEE);
@@ -713,6 +720,14 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
             gi_options_.light_nee_candidates != 0 ? gi_options_.light_nee_candidates : kDefaultLightNeeCandidates;
         // One shadow ray per NEE vertex for the sun and the light candidate (docs/LIGHT_NEE.md section 10).
         constants.nee_combine = gi_options_.nee_combine;
+    }
+    // Pixel sun visibility hint: this frame writes buffer sun_vis_cur_ and reads the other one when it
+    // holds the previous frame's words. A restart of the accumulation keeps the history (a wrong hint
+    // costs variance only; the kernel checks the reprojected pixel).
+    if (pixel_sun_vis)
+    {
+        constants.sun_vis_cur = sun_vis_buffers_[sun_vis_cur_].address();
+        constants.sun_vis_prev = sun_vis_history_valid_ ? sun_vis_buffers_[1 - sun_vis_cur_].address() : 0;
     }
     if (sky)
     {
@@ -807,6 +822,30 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     if (light_nee)
     {
         light_cells_last_frame_ = frame.frame_number;
+    }
+    // A new pixel sun visibility pair is zero-filled (no data) before its first use; the barriers
+    // are those of the light cell clear.
+    if (pixel_sun_vis && sun_vis_needs_init_)
+    {
+        Barriers to_fill;
+        to_fill.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        to_fill.Record(cmd);
+        for (const GpuBuffer& buffer : sun_vis_buffers_)
+        {
+            vkCmdFillBuffer(cmd, buffer.buffer(), 0, VK_WHOLE_SIZE, 0);
+        }
+        Barriers cleared;
+        cleared.Memory(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        cleared.Record(cmd);
+        sun_vis_needs_init_ = false;
+    }
+    if (pixel_sun_vis)
+    {
+        sun_vis_last_frame_ = frame.frame_number;
     }
     // Light cell fill: refills the reservoirs of every live cell from the scene's light table (the
     // previous frame's trace inserted cells; the "before" barrier ordered its writes before this
@@ -1116,6 +1155,17 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     last_frame_ = frame.frame_number;
     has_rendered_ = true;
     last_mode_ = options.mode;
+    // The pixel sun visibility pair: this frame's words become the next frame's history; a frame
+    // without the flag leaves the write buffer stale and breaks the history.
+    if (pixel_sun_vis)
+    {
+        sun_vis_history_valid_ = true;
+        sun_vis_cur_ = 1 - sun_vis_cur_;
+    }
+    else
+    {
+        sun_vis_history_valid_ = false;
+    }
     if (lighting)
     {
         // A lighting frame without ReSTIR breaks the reservoir history.

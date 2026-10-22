@@ -82,7 +82,7 @@ constexpr uint32_t kLightCounterSlots = 8;
 // executor is created at the first denoised render and recreated (history lost)
 // when the size changes, the old one is destroyed once its last frame is safe.
 // Per-frame resources
-// live in a ring of slots (four descriptor sets + 672-byte constants buffer); a
+// live in a ring of slots (four descriptor sets + 688-byte constants buffer); a
 // slot is reused only when its frame is safe. The camera of each successful
 // render call is kept as the previous camera of the next one (motion targets). A
 // renderer renders at most once per frame number (last_frame_).
@@ -219,6 +219,13 @@ private:
         uint64_t frame = 0;  // the last frame that used them
         GiBuffers buffers;
     };
+    // The per-pixel sun visibility history pair (CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY): one uint per
+    // pixel each; sun_vis_cur_ is this frame's write buffer, the other one the previous frame's.
+    struct RetiredSunVis
+    {
+        uint64_t frame = 0;  // the last frame that used them
+        std::array<GpuBuffer, 2> buffers;
+    };
     struct RetiredLightCells
     {
         uint64_t frame = 0;  // the last frame that used it
@@ -265,6 +272,11 @@ private:
     // ones are retired until `frame` is safe and the history is dropped. Returns true when it
     // created them.
     bool EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame);
+    // Creates the pixel sun visibility pair (CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY) when it is missing
+    // or of another size; the old pair is retired until `frame` is safe and the history is dropped.
+    // A new pair is zero-filled by the next render (sun_vis_needs_init_). Returns true when it
+    // created them.
+    bool EnsureSunVisBuffers(uint32_t width, uint32_t height, uint64_t frame);
     // Creates the light cells when they are missing or of another capacity or reservoir count; the
     // old buffer is retired until `frame` is safe. A new buffer is zero-filled by the next render
     // (light_cells_need_clear_).
@@ -274,7 +286,7 @@ private:
     {
         return gi_buffers_[gi_index_[which]].address();
     }
-    // Destroys retired internal targets, reservoir buffers, NRD executors and upscalers whose
+    // Destroys retired internal targets, reservoir buffers, sun visibility pairs, NRD executors and upscalers whose
     // frame is <= safe_frame.
     void FreeRetired(uint64_t safe_frame);
     // The render size of `upscaler` at `quality` for an output_width x output_height colour target
@@ -372,6 +384,16 @@ private:
     uint64_t light_cell_rebuilds_ = 0;       // CaelixLightStats::rebuilds at the previous light cell fill
     std::vector<RetiredLightCells> retired_light_cells_;
     GpuTimer light_timer_;                   // the light cell fill
+    // Pixel sun visibility hint (CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY, docs/LIGHT_NEE.md section 10.4).
+    // Kept while the flag is off; destroyed with the renderer.
+    std::array<GpuBuffer, 2> sun_vis_buffers_;   // width x height uint each
+    uint32_t sun_vis_cur_ = 0;                   // index of this frame's write buffer
+    uint32_t sun_vis_width_ = 0;                 // size of sun_vis_buffers_
+    uint32_t sun_vis_height_ = 0;
+    uint64_t sun_vis_last_frame_ = 0;            // the last frame that used sun_vis_buffers_
+    bool sun_vis_history_valid_ = false;         // sun_vis_buffers_[1 - sun_vis_cur_] holds the previous frame's words
+    bool sun_vis_needs_init_ = false;            // sun_vis_buffers_ are new: the next render zero-fills them
+    std::vector<RetiredSunVis> retired_sun_vis_;
     uint32_t frame_counter_ = 0;             // render calls of this renderer (the cells' clock)
 };
 

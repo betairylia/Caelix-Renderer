@@ -3016,7 +3016,7 @@ TEST_CASE("ReSTIR GI: set_gi_options validation")
     };
     CaelixGiOptions bad = GiOptions(2, 0);  // unknown method
     expect_invalid(bad);
-    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 31);  // unknown flag (bits 0 .. 10 are defined)
+    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 31);  // unknown flag (bits 0 .. 13 are defined)
     expect_invalid(bad);
     bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
     bad.spatial_samples = 9;
@@ -4038,7 +4038,7 @@ TEST_CASE("cells fill and sample")
         REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
     });
     bad.nee_combine = 2;
-    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_NEE_CELL_VISIBILITY;
+    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_NEE_CELL_VISIBILITY | CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY;
     REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
     bad.nee_combine = 0;
     bad.flags = CAELIX_GI_FLAG_LIGHT_NEE;
@@ -4226,6 +4226,13 @@ void CheckNeeCombine(uint32_t combine, uint32_t extra_flags)
 TEST_CASE("combined sun and light NEE (one ray per vertex, cell sun visibility) is unbiased")
 {
     CheckNeeCombine(1, CAELIX_GI_FLAG_NEE_CELL_VISIBILITY);
+}
+
+// The pixel hint (docs/LIGHT_NEE.md section 10.4) at the primary vertex, the cell hint at the bounce
+// vertices. The harness camera is static: the previous pixel is the pixel itself.
+TEST_CASE("combined sun and light NEE (one ray per vertex, pixel and cell sun visibility) is unbiased")
+{
+    CheckNeeCombine(1, CAELIX_GI_FLAG_NEE_CELL_VISIBILITY | CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY);
 }
 
 TEST_CASE("combined sun and light NEE at the bounce vertices is unbiased")

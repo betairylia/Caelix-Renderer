@@ -6,7 +6,7 @@ namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
 // together. One per render call, in a host-visible buffer; its device address is
-// the only push constant of the trace and composite kernels. 672 bytes. Every field sits at an offset
+// the only push constant of the trace and composite kernels. 688 bytes. Every field sits at an offset
 // that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
 // std430 and scalar layout rules give the same offsets.
 struct FrameConstants
@@ -101,8 +101,11 @@ struct FrameConstants
     uint32_t light_nee_candidates;      // 660  LIGHT_NEE: candidates per diffuse vertex (1 .. 32; 1 = no resampling)
     uint32_t light_cell_reservoirs;     // 664  LIGHT_NEE: reservoirs per light cell (a power of two in 1 .. 64)
     uint32_t nee_combine;               // 668  NEE: 0 one shadow ray per strategy, 1 one ray per vertex, 2 one ray at the bounces
+    // CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY (docs/LIGHT_NEE.md section 10.4): one uint per pixel.
+    uint64_t sun_vis_prev;              // 672  the previous frame's pixel sun visibility words (0 = no history)
+    uint64_t sun_vis_cur;               // 680  this frame's words (written by the trace kernel for every pixel; 0 = off)
 };
-static_assert(sizeof(FrameConstants) == 672);
+static_assert(sizeof(FrameConstants) == 688);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -153,6 +156,8 @@ static_assert(offsetof(FrameConstants, light_temporal_frames) == 656);
 static_assert(offsetof(FrameConstants, light_nee_candidates) == 660);
 static_assert(offsetof(FrameConstants, light_cell_reservoirs) == 664);
 static_assert(offsetof(FrameConstants, nee_combine) == 668);
+static_assert(offsetof(FrameConstants, sun_vis_prev) == 672);
+static_assert(offsetof(FrameConstants, sun_vis_cur) == 680);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

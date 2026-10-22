@@ -1,6 +1,6 @@
 // Per-frame constants of the trace and composite kernels. Mirrors
 // lib/src/render/frame_constants.h; change both together. The kernel's only push constant is the device address of
-// one CaelixFrameConstants (672 bytes). Every field sits at an offset that is a multiple of its
+// one CaelixFrameConstants (688 bytes). Every field sits at an offset that is a multiple of its
 // size, so std430 and scalar layout rules give the same offsets.
 #ifndef CAELIX_FRAME_HLSL
 #define CAELIX_FRAME_HLSL
@@ -100,7 +100,11 @@ struct CaelixFrameConstants
     uint light_cell_reservoirs;     // 664  kGiFlagLightNee: reservoirs per light cell, a power of two in 1 .. 64
     uint nee_combine;               // 668  0: one shadow ray per NEE strategy; 1: one ray per NEE vertex (both
                                     //      candidates drawn, one chosen); 2: as 0 at the primary vertex, as 1 at
-                                    //      the bounce vertices (docs/LIGHT_NEE.md section 10) -> 672
+                                    //      the bounce vertices (docs/LIGHT_NEE.md section 10)
+    // kGiFlagNeePixelVisibility (docs/LIGHT_NEE.md section 10.4): one uint per pixel (bits 0..7 =
+    // estimate x 255, bit 8 = valid; 0 = no data), index pixel.y * size.x + pixel.x.
+    uint64_t sun_vis_prev;          // 672  the previous frame's pixel sun visibility words (0 = no history)
+    uint64_t sun_vis_cur;           // 680  this frame's words (written by the trace kernel for every pixel; 0 = off) -> 688
 };
 
 struct CaelixTracePush
@@ -146,6 +150,7 @@ static const uint kGiFlagLightCellOriented = 1u << 9;
 static const uint kGiFlagPairwiseMis = 1u << 10;
 static const uint kGiFlagDebugNeeNoShadow = 1u << 11;  // timing only: NEE without shadow rays (biased)
 static const uint kGiFlagNeeCellVisibility = 1u << 12; // nee_combine: per-cell sun visibility hint of the choice
+static const uint kGiFlagNeePixelVisibility = 1u << 13; // nee_combine: per-pixel reprojected sun visibility hint
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

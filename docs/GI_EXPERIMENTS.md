@@ -205,7 +205,7 @@ rays, internal targets), the frame constants as the push constant, and `TracePus
 struct. Barriers: a compute -> compute memory barrier (storage write -> storage read) between every
 pass. GPU timer `gi_timer_` around passes 2..4 -> `CaelixGiStats::gi_ms`.
 
-Frame constants (internal, both mirrors) grow from 544 to 608 bytes (672 bytes today, with the
+Frame constants (internal, both mirrors) grow from 544 to 608 bytes (688 bytes today, with the
 light NEE fields after them):
 
 ```

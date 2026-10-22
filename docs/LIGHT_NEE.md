@@ -454,6 +454,7 @@ kept option by default (owner decision, 2026-10-22).
 | `light_nee_candidates` | 1 (1 .. 32) | 2 | `--light-nee-candidates` |
 | `nee_combine` (section 10) | 0 (0 .. 2) | 0 | `--nee-combine` |
 | `CAELIX_GI_FLAG_NEE_CELL_VISIBILITY` (bit 12, section 10) | off | off | `--nee-cell-visibility` |
+| `CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY` (bit 13, section 10.4) | off | off | `--nee-pixel-visibility` |
 | `CaelixLightOptions::min_emission` | 20.0 | 0 (library) | `--light-min-emission` |
 | `CaelixLightOptions::max_bricks` | 65536 | 65536 | `--light-max-bricks` |
 | `CaelixLightOptions::nee_min_distance` | 8.0 | 0 (library) | `--light-nee-distance` |
@@ -583,3 +584,47 @@ before; the combined choice draws ONE extra number from the same stream at every
 where the sun candidate was drawn, even when both weights are 0, so the stream does not depend on
 the data. The light candidate's numbers (light stream) and the path's numbers are unchanged. With
 `nee_combine` 0 no extra number is drawn.
+
+### 10.4 Per-pixel reprojected hint (`CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY`)
+
+A second, screen-space source for the sun hint, for comparison with the cell hint (host
+`--nee-pixel-visibility`). Every pixel keeps an 8-bit estimate of its primary vertex's sun
+visibility and carries it from frame to frame through the motion vector that the trace kernel
+already computes.
+
+Word layout: one `uint` per pixel at index `pixel.y * size.x + pixel.x` (the render size of the
+trace kernel). Bits 0..7 = estimate x 255 (rounded), bit 8 = valid; 0 = no data.
+
+Reprojection: `PreviousPixel` (the motion of the primary hit, as for the motion target) gives the
+continuous previous pixel (pixel i covers [i, i + 1)); the kernel reads the word of
+`floor(prev_pixel)` when it is inside the target and the hit had a previous pixel (a hit, a previous
+camera). Nearest pixel, no depth test: a disoccluded pixel reads its neighbour's estimate, which
+costs variance only.
+
+Precedence: at the primary vertex the combined choice uses `hint = max(0.05, h)` when the pixel read a
+valid word h, else the cell hint of section 10.2 (1 without that flag). The bounce vertices always use
+the cell hint (or 1). As for the cell hint, the value changes only the selection probability (section
+10.1): unbiased. With `nee_combine` 2 the primary vertex does not combine, so the pixel hint is
+collected but not used there.
+
+Update rule (`kNeePixelHintAlpha` = 0.25), at the primary vertex after its NEE:
+
+- a sun shadow ray was traced (every mode: with `nee_combine` 0 every sun ray counts, so the history
+  warms up there too): `v` = 1 if it found the sun, else 0; `est = lerp(h, v, 0.25)` with a valid h,
+  else `est = v`; the word is valid;
+- no sun ray, valid h: `est = h` (carried);
+- else the word is 0 (no data). A lighting pixel without a surface writes 0.
+
+Every pixel of a frame with the flag writes its word, so the write buffer never holds a stale one.
+No random number is drawn for the hint, and every new load and store is behind the flag: without it
+the output is bit-identical.
+
+Buffers and lifetime (`Renderer::EnsureSunVisBuffers`, `sun_vis_buffers_`): a pair of
+`width x height x 4` byte buffers (8.3 MB each at 1920 x 1080), created at the first lighting frame
+with `LIGHT_NEE` and the flag, recreated on a size change (the old pair is retired until its last
+frame is safe, like the ReSTIR GI reservoirs), zero-filled before their first use. Frame constants
+`sun_vis_cur` (offset 680, this frame's write buffer, 0 = off) and `sun_vis_prev` (672, the other
+buffer when it holds the previous frame's words, else 0). After a frame with the flag the roles swap
+and the history is valid; a frame without the flag (or a non-lighting frame) invalidates it. A
+`reset_accumulation` does not: a wrong hint costs variance only, and the kernel checks the
+reprojected pixel. The pair is kept while the flag is off and destroyed with the renderer.

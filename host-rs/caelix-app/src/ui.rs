@@ -693,6 +693,14 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             "NEE combine: the sun candidate's weight times max(0.05, visible / tests) of the light cell's traced sun              rays (a selection hint, unbiased)",
         );
         ui.add_enabled(
+            lighting && gi.light_nee && gi.nee_combine >= 1,
+            egui::Checkbox::new(&mut gi.nee_pixel_visibility, "Pixel sun visibility hint"),
+        )
+        .on_hover_text(
+            "NEE combine: the primary vertex's sun candidate weight times max(0.05, h), h = the pixel's \
+             reprojected sun visibility of the previous frames (a selection hint, unbiased)",
+        );
+        ui.add_enabled(
             lighting && gi.method == GiMethod::Pt,
             egui::Checkbox::new(&mut gi.diffuse_only, "diffuse only (path tracer; ReSTIR always)"),
         );
