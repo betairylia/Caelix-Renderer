@@ -104,9 +104,6 @@ static const float kRayTMax = 1e30f;
 static const uint kStepsHeatMax = 64;
 // kGiFlagNeeCellVisibility: one wave in this many counts its sun shadow rays into the cells.
 static const uint kNeeCountWaveShare = 4;
-// kGiFlagNeePixelVisibility (docs/LIGHT_NEE.md section 10.4): the weight of the newest sun shadow ray
-// result in the pixel's exponential average of its primary vertex's sun visibility.
-static const float kNeePixelHintAlpha = 0.25f;
 // Internal view_z of a miss (beyond any denoising range).
 static const float kInternalMissViewZ = 1e30f;
 
@@ -356,15 +353,10 @@ float3 LightCellPoint(TraceResult hit)
 // without `light`). kGiFlagNeeCellVisibility (docs/LIGHT_NEE.md section 10): the sun hint
 // max(kNeeSunHintFloor, visible / tests) is read from the light candidate's SAMPLING cell, and every
 // traced sun shadow ray counts into the vertex's UNJITTERED cell (hint_slot), in both modes.
-// `pixel_hint` (kGiFlagNeePixelVisibility, docs/LIGHT_NEE.md section 10.4): the pixel's reprojected sun
-// visibility estimate at the primary vertex, -1 = none (the bounce vertices); when present it replaces
-// the cell hint as max(kNeeSunHintFloor, pixel_hint). `sun_traced` / `sun_visible`: a sun shadow ray
-// was traced from the vertex, and its result.
 void NextEventAtVertex(CaelixFrameConstants fc, bool sun, bool light, bool mis, bool combine,
-                       float3 origin, float3 normal, uint group, float3 cell_point, float pixel_hint,
+                       float3 origin, float3 normal, uint group, float3 cell_point,
                        inout uint nee_rng, inout uint light_rng,
-                       out LightNeeProxyContext ctx, out float3 sun_part, out float3 light_part,
-                       out bool sun_traced, out bool sun_visible)
+                       out LightNeeProxyContext ctx, out float3 sun_part, out float3 light_part)
 {
     sun_part = float3(0.0f, 0.0f, 0.0f);
     light_part = float3(0.0f, 0.0f, 0.0f);
@@ -388,8 +380,8 @@ void NextEventAtVertex(CaelixFrameConstants fc, bool sun, bool light, bool mis, 
     }
     const bool cell_visibility = (fc.gi_flags & kGiFlagNeeCellVisibility) != 0u;
 
-    sun_traced = false;
-    sun_visible = false;
+    bool sun_traced = false;
+    bool sun_visible = false;
     CAELIX_BRANCH
     if (!combine)
     {
@@ -407,14 +399,9 @@ void NextEventAtVertex(CaelixFrameConstants fc, bool sun, bool light, bool mis, 
     }
     else
     {
-        // The sun hint: the pixel's reprojected estimate when present, else the one of the sampling
-        // cell (1 without the flag, without a cell or without a test).
+        // The sun hint of the sampling cell: 1 without the flag, without a cell or without a test.
         float hint = 1.0f;
-        if (pixel_hint >= 0.0f)
-        {
-            hint = max(kNeeSunHintFloor, pixel_hint);
-        }
-        else if (cell_visibility && sample_slot >= 0)
+        if (cell_visibility && sample_slot >= 0)
         {
             const uint base = uint(sample_slot) * LightCellBytes(fc);
             const uint tests = g_light_cells.Load(base + kLightCellSunTestsOffset);
@@ -496,15 +483,10 @@ void NextEventAtVertex(CaelixFrameConstants fc, bool sun, bool light, bool mis, 
     }
 }
 
-// `prev_valid` / `prev_pixel`: the primary hit's pixel in the previous frame (continuous coordinates,
-// pixel i covers [i, i + 1)); `sun_vis_word` receives the pixel's new sun visibility word
-// (kGiFlagNeePixelVisibility, docs/LIGHT_NEE.md section 10.4; 0 without the flag).
 CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
-                            uint medium, bool restir, bool prev_valid, float2 prev_pixel, inout uint rng,
-                            out float4 stochastic, out GiInitialSample gi, out float3 primary_light,
-                            out uint sun_vis_word)
+                            uint medium, bool restir, inout uint rng, out float4 stochastic,
+                            out GiInitialSample gi, out float3 primary_light)
 {
-    sun_vis_word = 0u;
     gi.valid = false;
     gi.sky = false;
     gi.sample_pos = float3(0.0f, 0.0f, 0.0f);
@@ -547,26 +529,6 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     float3 segment_n_r = float3(0.0f, 0.0f, 0.0f);
     LightNeeProxyContext segment_ctx = LightNeeProxyOfSlot(fc, -1, 0u, 0u, int3(0, 0, 0), kLightCellFaceNone, 0.0f);
     {
-        // kGiFlagNeePixelVisibility: the previous frame's estimate at the reprojected pixel (nearest
-        // pixel, no depth test), -1 = none.
-        const bool pixel_visibility = (fc.gi_flags & kGiFlagNeePixelVisibility) != 0u;
-        float pixel_hint = -1.0f;
-        CAELIX_BRANCH
-        if (pixel_visibility && fc.sun_vis_prev != 0u && prev_valid)
-        {
-            const int2 pp = int2(floor(prev_pixel));
-            if (all(pp >= int2(0, 0)) && all(pp < int2(fc.size)))
-            {
-                const uint word =
-                    CAELIX_LOAD_U32(fc.sun_vis_prev + uint64_t(uint(pp.y) * fc.size.x + uint(pp.x)) * 4);
-                if ((word & 0x100u) != 0u)
-                {
-                    pixel_hint = float(word & 0xFFu) / 255.0f;
-                }
-            }
-        }
-        bool sun_traced = false;
-        bool sun_visible = false;
         const bool next_segment = !primary_shade.specular_lobe && fc.bounce_count >= 1u;
         const bool sun_here = nee && next_segment;
         const bool light_here = light_nee && next_segment;
@@ -579,8 +541,8 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
             float3 sun_part;
             float3 light_part;
             NextEventAtVertex(fc, sun_here, light_here, mis_here, fc.nee_combine == 1u, primary_shade.bounce_origin,
-                              surface.normal, surface.group, LightCellPoint(surface), pixel_hint, nee_rng,
-                              light_rng, ctx, sun_part, light_part, sun_traced, sun_visible);
+                              surface.normal, surface.group, LightCellPoint(surface), nee_rng, light_rng, ctx,
+                              sun_part, light_part);
             if (sun_here)
             {
                 radiance += sun_part * throughput;
@@ -598,25 +560,6 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
                 segment_x_r = primary_shade.bounce_origin;
                 segment_n_r = surface.normal;
                 segment_ctx = ctx;
-            }
-        }
-        // The pixel's new word: the exponential average of the primary vertex's sun shadow rays (every
-        // traced one, in every nee_combine mode), the carried estimate without a ray, else no data.
-        if (pixel_visibility)
-        {
-            float estimate = -1.0f;
-            if (sun_traced)
-            {
-                const float v = sun_visible ? 1.0f : 0.0f;
-                estimate = pixel_hint >= 0.0f ? lerp(pixel_hint, v, kNeePixelHintAlpha) : v;
-            }
-            else if (pixel_hint >= 0.0f)
-            {
-                estimate = pixel_hint;
-            }
-            if (estimate >= 0.0f)
-            {
-                sun_vis_word = uint(saturate(estimate) * 255.0f + 0.5f) | 0x100u;
             }
         }
     }
@@ -724,11 +667,9 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
                 LightNeeProxyContext ctx;
                 float3 sun_part;
                 float3 light_part;
-                bool sun_traced;
-                bool sun_visible;
                 NextEventAtVertex(fc, sun_here, light_here, light_mis, fc.nee_combine >= 1u, shade.bounce_origin,
-                                  hit.normal, hit.group, LightCellPoint(hit), -1.0f, nee_rng, light_rng, ctx,
-                                  sun_part, light_part, sun_traced, sun_visible);
+                                  hit.normal, hit.group, LightCellPoint(hit), nee_rng, light_rng, ctx, sun_part,
+                                  light_part);
                 if (sun_here)
                 {
                     radiance += sun_part * throughput;
@@ -906,9 +847,6 @@ void main(uint3 thread_id : SV_DispatchThreadID)
 
     // Motion: the host target and the internal one of the lighting modes.
     float2 motion = float2(0.0f, 0.0f);
-    // The previous pixel of the hit (kGiFlagNeePixelVisibility reads its sun visibility word there).
-    bool prev_valid = false;
-    float2 prev_pixel_for_hint = float2(0.0f, 0.0f);
     float motion_view_z = 0.0f;  // previous view z - current view z
     CAELIX_BRANCH
     if (((targets & kTargetMotion) != 0u || lighting) && hit && fc.has_prev_camera != 0u)
@@ -932,8 +870,6 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             // unjittered pinhole. So the motion is the surface's own motion, free of jitter.
             motion = prev_pixel - CaelixSamplePosition(fc, thread_id.xy);
             motion_view_z = prev_view_z - view_z;
-            prev_valid = true;
-            prev_pixel_for_hint = prev_pixel;
         }
     }
     CAELIX_BRANCH
@@ -975,8 +911,6 @@ void main(uint3 thread_id : SV_DispatchThreadID)
 
         // ReSTIR GI: the pixel's initial reservoir (empty without a surface or a usable sample).
         GiReservoir gi_reservoir = GiEmptyReservoir();
-        // kGiFlagNeePixelVisibility: the pixel's sun visibility word (0 = no data without a surface).
-        uint sun_vis_word = 0u;
 
         CAELIX_BRANCH
         if (surface)
@@ -984,9 +918,8 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             float4 stochastic;
             GiInitialSample gi_sample;
             float3 primary_light;
-            const CaelixShadeResult shade =
-                TracePath(fc, pixel, chain.ray, chain.surface, chain.medium, restir, prev_valid, prev_pixel_for_hint,
-                          rng, stochastic, gi_sample, primary_light, sun_vis_word);
+            const CaelixShadeResult shade = TracePath(fc, pixel, chain.ray, chain.surface, chain.medium, restir,
+                                                      rng, stochastic, gi_sample, primary_light);
             // The chain's transmission modulates everything the surface sends (Unity:
             // AlbedoTarget = throughput * albedo, deterministic = throughput * emission).
             material_albedo = chain.throughput * shade.albedo;
@@ -1090,12 +1023,6 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         if (restir)
         {
             StoreGiReservoir(GiReservoirAddress(fc.gi_initial, fc, pixel), gi_reservoir);
-        }
-        // Every pixel writes its word, so the buffer never holds a stale one.
-        CAELIX_BRANCH
-        if (fc.sun_vis_cur != 0u)
-        {
-            CAELIX_STORE_U32(fc.sun_vis_cur + uint64_t(pixel.y * fc.size.x + pixel.x) * 4, sun_vis_word);
         }
         g_int_normal_roughness[pixel] = normal_roughness;
         // Coverage is albedo.a.

@@ -309,9 +309,6 @@ pub struct GiSettings {
     /// Light NEE with `nee_combine` 1 or 2: the per-light-cell sun visibility hint of the choice
     /// (`CAELIX_GI_FLAG_NEE_CELL_VISIBILITY`).
     pub nee_cell_visibility: bool,
-    /// Light NEE with `nee_combine` 1 or 2: the per-pixel reprojected sun visibility hint at the
-    /// primary vertex (`CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY`).
-    pub nee_pixel_visibility: bool,
 }
 
 impl Default for GiSettings {
@@ -344,7 +341,6 @@ impl Default for GiSettings {
             debug_nee_no_shadow: false,
             nee_combine: 0,
             nee_cell_visibility: false,
-            nee_pixel_visibility: false,
         }
     }
 }
@@ -387,9 +383,6 @@ impl GiSettings {
             }
             if self.nee_cell_visibility {
                 flags |= CAELIX_GI_FLAG_NEE_CELL_VISIBILITY;
-            }
-            if self.nee_pixel_visibility {
-                flags |= CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY;
             }
         }
         if self.debug_nee_no_shadow {

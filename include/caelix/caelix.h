@@ -1198,15 +1198,6 @@ typedef enum CaelixGiMethod
                                                  vertex's sampling cell (1 without tests). A selection hint
                                                  only: unbiased for any positive value (docs/LIGHT_NEE.md
                                                  section 10) */
-#define CAELIX_GI_FLAG_NEE_PIXEL_VISIBILITY (1u << 13) /* with LIGHT_NEE and nee_combine 1 or 2: the primary
-                                                 vertex's sun candidate weight is multiplied by
-                                                 max(0.05, h), h = the pixel's sun visibility estimate of
-                                                 the previous frame read through the motion vector (an
-                                                 8-bit per-pixel history pair kept by the renderer,
-                                                 exponential average over the frames where the pixel
-                                                 traced a sun ray); the bounce vertices use the cell hint
-                                                 when that flag is on, else 1. A selection hint only:
-                                                 unbiased (docs/LIGHT_NEE.md section 10.4) */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the

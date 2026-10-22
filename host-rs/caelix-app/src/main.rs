@@ -489,14 +489,6 @@ struct Args {
     /// docs/LIGHT_NEE.md section 10).
     #[arg(long)]
     nee_cell_visibility: bool,
-    /// Light NEE with --nee-combine 1 or 2: the primary vertex's sun candidate weight is multiplied
-    /// by max(0.05, h), h = the pixel's sun visibility estimate of the previous frame read through
-    /// the motion vector (an 8-bit per-pixel history pair kept by the renderer, exponential average
-    /// over the frames where the pixel traced a sun ray); the bounce vertices use the cell hint when
-    /// --nee-cell-visibility is on, else 1. A selection hint only: unbiased (docs/LIGHT_NEE.md
-    /// section 10.4).
-    #[arg(long)]
-    nee_pixel_visibility: bool,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -2170,7 +2162,6 @@ fn main() -> anyhow::Result<()> {
             debug_nee_no_shadow: args.debug_nee_no_shadow,
             nee_combine: args.nee_combine,
             nee_cell_visibility: args.nee_cell_visibility,
-            nee_pixel_visibility: args.nee_pixel_visibility,
         },
     };
     if !args.light_cells.is_power_of_two() || !(1024..=1048576).contains(&args.light_cells) {
