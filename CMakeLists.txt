@@ -33,6 +33,7 @@ endif()
 # The SDK's development DLLs (lib/Windows_x86_64/dev) carry an on-screen watermark and the debug
 # overlay (CTRL+ALT+F12). For integration work only; they must never ship.
 option(CAELIX_DLSS_DEV_DLL "Copy the NGX development DLLs (debug overlay) instead of the release DLLs" OFF)
+option(CAELIX_SHADER_DEBUG_INFO "Compile the shaders with DXC -Zi (source + line info for Nsight; same code)" OFF)
 
 find_package(Vulkan REQUIRED)   # headers only; loader goes through volk later
 include(cmake/Dependencies.cmake)

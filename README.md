@@ -255,6 +255,13 @@ file is used instead of the embedded array (logged at info level as
 `shader <name> loaded from <path>`), so a shader can be changed without
 rebuilding the library.
 
+Profiling: configure with `-DCAELIX_SHADER_DEBUG_INFO=ON` to compile every kernel with DXC `-Zi`
+(the HLSL source and line markers in the SPIR-V), so Nsight maps SASS, samples and live registers to
+source lines. The code is the same: `caelix_path_trace` keeps its register count and occupancy (Nsight
+GPU Trace, 2026-10-22). Only the `.spv` grows (about 2x). Default `OFF`. DXC 1.8 crashes with `-Zi` on
+the depfile command and with `-fspv-debug=vulkan*` at `-O3`, so the option adds `-Zi` to the compile
+command only.
+
 Frame contract: call `caelix_scene_flush` once per frame with a command buffer
 in the recording state, a strictly increasing `frame_number` (1 or higher), and
 `safe_frame_number` = the newest frame that has completed on the GPU (0 = none).

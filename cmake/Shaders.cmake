@@ -36,6 +36,15 @@ function(caelix_add_shaders target out_var)
     # NRD.hlsli + NRDConfig.hlsli (cmake/Dependencies.cmake). DXC predefines
     # __hlsl_dx_compiler, which NRD.hlsli uses to select its DXC branch.
     -I ${CAELIX_NRD_SHADER_INCLUDE_DIR})
+  # CAELIX_SHADER_DEBUG_INFO: embed the HLSL source and line markers (DXC -Zi: OpSource + OpLine), so
+  # Nsight maps SASS, samples and live registers to source lines. -O3 stays: the register count is
+  # the same as without it (measured on caelix_path_trace, 2026-10-22). The richer formats
+  # (-fspv-debug=vulkan, vulkan-with-source) crash DXC 1.8 at -O3, and so does -Zi on the depfile
+  # command (-MF): the flag goes on the compile command only.
+  set(dxc_compile_flags)
+  if(CAELIX_SHADER_DEBUG_INFO)
+    list(APPEND dxc_compile_flags -Zi)
+  endif()
 
   set(spv_files)
   set(embed_list)
@@ -59,7 +68,7 @@ function(caelix_add_shaders target out_var)
     add_custom_command(
       OUTPUT ${spv}
       COMMAND ${CAELIX_DXC} ${dxc_flags} -Fo ${spv} -MF ${depfile} ${source}
-      COMMAND ${CAELIX_DXC} ${dxc_flags} -Fo ${spv} ${source}
+      COMMAND ${CAELIX_DXC} ${dxc_flags} ${dxc_compile_flags} -Fo ${spv} ${source}
       DEPENDS ${source}
       DEPFILE ${depfile}
       COMMENT "DXC ${name}.hlsl -> ${name}.spv"
