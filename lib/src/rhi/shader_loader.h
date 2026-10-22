@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -14,5 +15,8 @@ namespace caelix {
 // error log) when the file cannot be read, is not SPIR-V, or no embedded array
 // exists.
 std::vector<uint32_t> LoadShader(std::string_view name);
+
+// The value of an environment variable, or an empty string when it is not set.
+std::string GetEnv(const char* variable);
 
 }  // namespace caelix

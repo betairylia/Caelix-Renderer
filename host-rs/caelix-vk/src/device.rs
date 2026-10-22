@@ -325,7 +325,16 @@ pub(crate) fn create_device(
     optional_extensions: &[CString],
 ) -> Result<(ash::Device, vk::Queue), Error> {
     let features = host_features(&requirements.features);
-    let extension_names = device_extensions(requirements, optional_extensions);
+    let mut extension_names = device_extensions(requirements, optional_extensions);
+    // Diagnostics: CAELIX_PIPELINE_STATS enables VK_KHR_pipeline_executable_properties when the device
+    // offers it, so the library logs the driver's statistics (register count, ...) of its pipelines.
+    let stats_extension = CString::from(ash::khr::pipeline_executable_properties::NAME);
+    let pipeline_stats = std::env::var_os("CAELIX_PIPELINE_STATS").is_some()
+        && !supported_optional_extensions(instance, selected.physical_device, vec![stats_extension.clone()])?
+            .is_empty();
+    if pipeline_stats && !extension_names.contains(&stats_extension) {
+        extension_names.push(stats_extension);
+    }
     let extension_ptrs: Vec<*const c_char> = extension_names.iter().map(|n| n.as_ptr()).collect();
 
     let priorities = [1.0f32];
@@ -347,6 +356,8 @@ pub(crate) fn create_device(
     let mut acceleration_structure =
         vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
     let mut ray_query = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+    let mut executable_properties =
+        vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
     let core = vk::PhysicalDeviceFeatures::default()
         .shader_int64(features.shader_int64)
         .shader_storage_image_write_without_format(features.storage_image_write_without_format)
@@ -360,6 +371,9 @@ pub(crate) fn create_device(
     }
     if features.ray_query {
         features2 = features2.push_next(&mut ray_query);
+    }
+    if pipeline_stats {
+        features2 = features2.push_next(&mut executable_properties);
     }
 
     let create_info = vk::DeviceCreateInfo::default()

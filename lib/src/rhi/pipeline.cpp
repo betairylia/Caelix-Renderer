@@ -2,10 +2,85 @@
 
 #include "core/log.h"
 #include "rhi/gpu_buffer.h"
+#include "rhi/shader_loader.h"
 
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace caelix {
+namespace {
+
+// Diagnostics: with the environment variable CAELIX_PIPELINE_STATS set and the host's device created
+// with VK_KHR_pipeline_executable_properties (feature pipelineExecutableInfo; the Rust host does that
+// under the same variable), every compute pipeline is created with CAPTURE_STATISTICS and its driver
+// statistics (register count, ...) are logged at info level. The function pointer is null when the
+// extension is not enabled, and then nothing changes.
+bool PipelineStatsEnabled()
+{
+    static const bool enabled = !GetEnv("CAELIX_PIPELINE_STATS").empty();
+    return enabled && vkGetPipelineExecutableStatisticsKHR != nullptr &&
+           vkGetPipelineExecutablePropertiesKHR != nullptr;
+}
+
+void LogPipelineStats(VkDevice device, VkPipeline pipeline, const char* name)
+{
+    VkPipelineInfoKHR info{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    info.pipeline = pipeline;
+    uint32_t count = 0;
+    if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, nullptr) != VK_SUCCESS)
+    {
+        return;
+    }
+    std::vector<VkPipelineExecutablePropertiesKHR> executables(
+        count, VkPipelineExecutablePropertiesKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+    if (vkGetPipelineExecutablePropertiesKHR(device, &info, &count, executables.data()) != VK_SUCCESS)
+    {
+        return;
+    }
+    for (uint32_t e = 0; e < count; ++e)
+    {
+        VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+        executable.pipeline = pipeline;
+        executable.executableIndex = e;
+        uint32_t stat_count = 0;
+        if (vkGetPipelineExecutableStatisticsKHR(device, &executable, &stat_count, nullptr) != VK_SUCCESS)
+        {
+            continue;
+        }
+        std::vector<VkPipelineExecutableStatisticKHR> stats(
+            stat_count, VkPipelineExecutableStatisticKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+        if (vkGetPipelineExecutableStatisticsKHR(device, &executable, &stat_count, stats.data()) != VK_SUCCESS)
+        {
+            continue;
+        }
+        std::string line;
+        for (const VkPipelineExecutableStatisticKHR& stat : stats)
+        {
+            line += line.empty() ? "" : ", ";
+            line += stat.name;
+            line += " = ";
+            switch (stat.format)
+            {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+                line += stat.value.b32 ? "true" : "false";
+                break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+                line += std::to_string(stat.value.i64);
+                break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+                line += std::to_string(stat.value.u64);
+                break;
+            default:
+                line += std::to_string(stat.value.f64);
+                break;
+            }
+        }
+        CAELIX_LOGI("pipeline stats %s [%s]: %s", name, executables[e].name, line.c_str());
+    }
+}
+
+}  // namespace
 
 ComputePipeline::ComputePipeline(VkDevice device, std::span<const uint32_t> spirv,
                                  uint32_t push_bytes, const char* name,
@@ -44,6 +119,11 @@ ComputePipeline::ComputePipeline(VkDevice device, std::span<const uint32_t> spir
     pipeline_info.stage.module = module;
     pipeline_info.stage.pName = "main";
     pipeline_info.layout = layout_;
+    const bool stats = PipelineStatsEnabled();
+    if (stats)
+    {
+        pipeline_info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
     result =
         vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_);
     vkDestroyShaderModule(device_, module, nullptr);
@@ -54,6 +134,10 @@ ComputePipeline::ComputePipeline(VkDevice device, std::span<const uint32_t> spir
         layout_ = VK_NULL_HANDLE;
         CAELIX_LOGE("vkCreateComputePipelines failed for %s: %d", name, static_cast<int>(result));
         throw VulkanError("vkCreateComputePipelines failed", result);
+    }
+    if (stats)
+    {
+        LogPipelineStats(device_, pipeline_, name);
     }
 }
 

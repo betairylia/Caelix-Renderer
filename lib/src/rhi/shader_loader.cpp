@@ -14,25 +14,6 @@ namespace {
 
 constexpr uint32_t kSpirvMagic = 0x07230203u;
 
-// The value of an environment variable, or an empty string.
-std::string GetEnv(const char* variable)
-{
-#if defined(_MSC_VER)
-    char* value = nullptr;
-    size_t length = 0;
-    if (_dupenv_s(&value, &length, variable) != 0 || value == nullptr)
-    {
-        return {};
-    }
-    std::string result(value);
-    std::free(value);
-    return result;
-#else
-    const char* value = std::getenv(variable);
-    return value != nullptr ? std::string(value) : std::string();
-#endif
-}
-
 [[noreturn]] void Fail(const std::string& message)
 {
     CAELIX_LOGE("%s", message.c_str());
@@ -51,6 +32,24 @@ std::span<const uint32_t> FindEmbeddedShader(std::string_view name)
         }
     }
     return {};
+}
+
+std::string GetEnv(const char* variable)
+{
+#if defined(_MSC_VER)
+    char* value = nullptr;
+    size_t length = 0;
+    if (_dupenv_s(&value, &length, variable) != 0 || value == nullptr)
+    {
+        return {};
+    }
+    std::string result(value);
+    std::free(value);
+    return result;
+#else
+    const char* value = std::getenv(variable);
+    return value != nullptr ? std::string(value) : std::string();
+#endif
 }
 
 std::vector<uint32_t> LoadShader(std::string_view name)

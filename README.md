@@ -1265,6 +1265,14 @@ to disable them for a run.
 
 - `CAELIX_SHADER_DIR`: directory with `<name>.spv` files that replace the
   embedded kernels at scene creation (see "Shaders").
+- `CAELIX_PIPELINE_STATS` (any value): diagnostics. The Rust host enables
+  `VK_KHR_pipeline_executable_properties` (feature `pipelineExecutableInfo`) when the device offers
+  it, and the library then creates its compute pipelines with `CAPTURE_STATISTICS` and logs the
+  driver's statistics at info level, one line per kernel:
+  `pipeline stats caelix_path_trace [CS]: Register Count = 255, Binary Size = ..., Local Memory Size = ...`.
+  This is the register count of the code that runs; an Nsight capture can show a different
+  compile. On NVIDIA driver 610.88 "Local Memory Size" carries bit 36 as a flag: the spill size in
+  bytes is the value minus 2^36. Without the extension (another host) nothing changes.
 - `CAELIX_LIB_DIR`: directory that contains `caelix_renderer.lib` and
   `caelix_renderer.dll`. Default: `<repo>/build/bin/Release`. The Rust host
   links the Release build only.
