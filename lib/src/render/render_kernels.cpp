@@ -92,22 +92,26 @@ RenderKernels::RenderKernels(Device& device)
         const VkDescriptorType encode_types[kEncodeBindingCount] = {
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
         encode_layout_ = CreateSetLayout(vk_device, kEncodeBindingCount, encode_types);
+        // Frame set: binding 0 the frame slot's FrameConstants (uniform buffer), set kFrameSetIndex of
+        // every kernel below. A uniform buffer is read-only, so the compiler may re-read a field
+        // where it is used instead of keeping the whole struct live in registers across the traces
+        // (as it did for the struct loaded through a buffer device address).
+        static_assert(kFrameSetIndex == 1 && kFrameConstantsBinding == 0,
+                      "the pipelines below put their own set at 0 and the frame set at 1");
+        const VkDescriptorType frame_types[1] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
+        frame_layout_ = CreateSetLayout(vk_device, 1, frame_types);
 
-        const std::vector<uint32_t> trace_spirv = LoadShader("caelix_path_trace");
-        trace_ = ComputePipeline(vk_device, trace_spirv, sizeof(TracePush), "caelix_path_trace",
-                                 trace_layout_);
-        const std::vector<uint32_t> composite_spirv = LoadShader("caelix_composite");
-        composite_ = ComputePipeline(vk_device, composite_spirv, sizeof(TracePush), "caelix_composite",
-                                     composite_layout_);
-        const std::vector<uint32_t> resolve_spirv = LoadShader("caelix_cross_resolve");
-        cross_resolve_ = ComputePipeline(vk_device, resolve_spirv, sizeof(TracePush),
-                                         "caelix_cross_resolve", composite_layout_);
-        const std::vector<uint32_t> sky_sh_spirv = LoadShader("caelix_sky_sh");
-        sky_sh_ = ComputePipeline(vk_device, sky_sh_spirv, sizeof(TracePush), "caelix_sky_sh",
-                                  sky_layout_);
-        const std::vector<uint32_t> encode_spirv = LoadShader("caelix_upscale_encode");
-        upscale_encode_ = ComputePipeline(vk_device, encode_spirv, sizeof(TracePush), "caelix_upscale_encode",
-                                          encode_layout_);
+        // No push constants: everything per frame is in the frame constants.
+        const auto create = [&](const char* name, VkDescriptorSetLayout own_layout) {
+            const std::vector<uint32_t> spirv = LoadShader(name);
+            const VkDescriptorSetLayout layouts[2] = {own_layout, frame_layout_};
+            return ComputePipeline(vk_device, spirv, 0, name, layouts);
+        };
+        trace_ = create("caelix_path_trace", trace_layout_);
+        composite_ = create("caelix_composite", composite_layout_);
+        cross_resolve_ = create("caelix_cross_resolve", composite_layout_);
+        sky_sh_ = create("caelix_sky_sh", sky_layout_);
+        upscale_encode_ = create("caelix_upscale_encode", encode_layout_);
 
         // The sky sampler: trilinear, clamp to edge (a cube view samples across faces anyway),
         // every mip (the kernels clamp the lod to sky_max_lod).
@@ -148,7 +152,7 @@ RenderKernels::RenderKernels(Device& device)
             vkDestroySampler(vk_device, sky_sampler_, nullptr);
         }
         for (const VkDescriptorSetLayout layout :
-             {trace_layout_, composite_layout_, sky_layout_, encode_layout_})
+             {trace_layout_, composite_layout_, sky_layout_, encode_layout_, frame_layout_})
         {
             if (layout != VK_NULL_HANDLE)
             {
@@ -189,6 +193,10 @@ RenderKernels::~RenderKernels()
     if (encode_layout_ != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorSetLayout(device, encode_layout_, nullptr);
+    }
+    if (frame_layout_ != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(device, frame_layout_, nullptr);
     }
     if (sky_sampler_ != VK_NULL_HANDLE)
     {

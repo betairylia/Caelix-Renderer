@@ -13,7 +13,10 @@
 namespace caelix {
 
 // Descriptor bindings of the kernel sets, shared by the set layouts (RenderKernels)
-// and the descriptor writes (Renderer).
+// and the descriptor writes (Renderer). Each of the five frame-constant kernels binds its
+// own set below as set 0 and the frame set (binding kFrameConstantsBinding = the frame
+// slot's FrameConstants as a uniform buffer, render/frame_constants.h) as set
+// kFrameSetIndex.
 //
 // Trace set: binding 0 the TLAS, bindings 1..6 the host targets, bindings 7..18 the
 // internal targets of the lighting modes (Renderer::Internal order up to
@@ -73,10 +76,11 @@ struct NrdKernels
 // The immutable GPU objects of the render kernels, created once per adopted device
 // and borrowed by every Renderer and NrdExecutor of that device:
 // - the descriptor set layouts of the trace set, the composite set (also used by the
-//   cross resolve kernel), the sky SH set (binding 0 the cubemap, 1 the sampler) and the
-//   encode set, every binding PARTIALLY_BOUND;
+//   cross resolve kernel), the sky SH set (binding 0 the cubemap, 1 the sampler), the
+//   encode set and the frame set (one uniform buffer), every binding PARTIALLY_BOUND;
 // - the compute pipelines caelix_path_trace, caelix_composite, caelix_cross_resolve,
-//   caelix_sky_sh and caelix_upscale_encode (push constant TracePush);
+//   caelix_sky_sh and caelix_upscale_encode (set 0 their own set, set kFrameSetIndex the
+//   frame set; no push constants);
 // - the sky sampler (linear, mipmapped, clamp to edge) and the fallback sky cube (1 x 1
 //   RGBA8), bound in every sky binding when the host gives no cubemap. The first render
 //   call on the device moves the cube from UNDEFINED to GENERAL (TakeFallbackSkyInit);
@@ -107,6 +111,10 @@ public:
     VkDescriptorSetLayout encode_layout() const
     {
         return encode_layout_;
+    }
+    VkDescriptorSetLayout frame_layout() const
+    {
+        return frame_layout_;
     }
     const ComputePipeline& trace() const
     {
@@ -161,6 +169,7 @@ private:
     VkDescriptorSetLayout composite_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout sky_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout encode_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout frame_layout_ = VK_NULL_HANDLE;  // the frame constants (uniform buffer)
     ComputePipeline trace_;                   // shaders/render/caelix_path_trace.hlsl, trace set
     ComputePipeline composite_;               // shaders/render/caelix_composite.hlsl, composite set
     ComputePipeline cross_resolve_;           // shaders/render/caelix_cross_resolve.hlsl, composite set

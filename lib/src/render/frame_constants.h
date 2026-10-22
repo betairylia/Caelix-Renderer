@@ -5,10 +5,15 @@
 namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
-// together. One per render call, in a host-visible buffer; its device address is
-// the only push constant of the trace and composite kernels. 544 bytes. Every field sits at an offset
-// that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
-// std430 and scalar layout rules give the same offsets.
+// together. One per render call, in the frame slot's host-visible buffer, which the five
+// frame-constant kernels (caelix_path_trace, caelix_composite, caelix_cross_resolve, caelix_sky_sh,
+// caelix_upscale_encode) read as a uniform buffer: the frame set (set kFrameSetIndex, binding
+// kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 544 bytes.
+// Layout rule: the uniform block has DXC's default constant buffer layout, which gives these C
+// offsets only while every field sits at an offset that is a multiple of its size (float4 at 16,
+// uint64_t and uint2 at 8), no vector crosses a 16-byte row and every array element is 16 bytes (an
+// array of scalars or 2-vectors would get a 16-byte stride). The test caelix_frame_layout_test
+// (tests/frame_layout_test.cpp) reads the compiled kernels and fails when a member offset differs.
 struct FrameConstants
 {
     float position[4];                  //   0  camera position, w unused
@@ -125,11 +130,10 @@ constexpr uint32_t kTargetMotion = 1u << 4;
 constexpr uint32_t kTargetViewZ = 1u << 5;
 constexpr uint32_t kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
 
-// Push constants of the trace and composite kernels: the address of the frame's FrameConstants.
-struct TracePush
-{
-    uint64_t frame_constants;
-};
-static_assert(sizeof(TracePush) == 8);
+// The frame set: one descriptor set layout with one binding, the frame slot's FrameConstants as a
+// uniform buffer (range sizeof(FrameConstants), offset 0). Bound as set kFrameSetIndex by the five
+// frame-constant kernels (each keeps its own set 0); they have no push constants.
+constexpr uint32_t kFrameSetIndex = 1;
+constexpr uint32_t kFrameConstantsBinding = 0;
 
 }  // namespace caelix

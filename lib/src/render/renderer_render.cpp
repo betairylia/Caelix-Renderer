@@ -651,7 +651,14 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         }
         before.Record(cmd);
     }
-    const TracePush push{slot->constants.address()};
+    // Every kernel below binds its own set as set 0 and the slot's frame set (the frame constants,
+    // written to the slot's buffer before the submit) as set kFrameSetIndex = 1.
+    static_assert(kFrameSetIndex == 1);
+    const auto bind_sets = [&](const ComputePipeline& kernel, VkDescriptorSet own_set) {
+        const VkDescriptorSet sets[2] = {own_set, slot->frame_set};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline());
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.layout(), 0, 2, sets, 0, nullptr);
+    };
 
     const uint32_t groups_x = (width + kWorkgroupSize - 1) / kWorkgroupSize;
     const uint32_t groups_y = (height + kWorkgroupSize - 1) / kWorkgroupSize;
@@ -660,11 +667,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     // barrier orders that write before the trace's reads. Inside the trace timestamps.
     if (sky)
     {
-        const ComputePipeline& sky_sh = kernels_.sky_sh();
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sky_sh.pipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sky_sh.layout(), 0, 1,
-                                &slot->sky_set, 0, nullptr);
-        vkCmdPushConstants(cmd, sky_sh.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        bind_sets(kernels_.sky_sh(), slot->sky_set);
         vkCmdDispatch(cmd, 1, 1, 1);
         Barriers sh_written;
         sh_written.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
@@ -672,11 +675,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         sh_written.Record(cmd);
     }
     // Trace.
-    const ComputePipeline& trace = kernels_.trace();
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace.pipeline());
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, trace.layout(), 0, 1, &slot->set,
-                            0, nullptr);
-    vkCmdPushConstants(cmd, trace.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    bind_sets(kernels_.trace(), slot->set);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
     timer_.End(cmd);
 
@@ -736,29 +735,19 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         between.Record(cmd);
-        const ComputePipeline& composite_kernel = kernels_.composite();
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, composite_kernel.pipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, composite_kernel.layout(), 0, 1,
-                                &slot->composite_set, 0, nullptr);
-        vkCmdPushConstants(cmd, composite_kernel.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
-                           &push);
+        bind_sets(kernels_.composite(), slot->composite_set);
         composite_timer_.Begin(cmd, frame.frame_number, safe);
         vkCmdDispatch(cmd, groups_x, groups_y, 1);
         if (cross_resolve)
         {
             // The composite wrote the linear colour into the resolve image; the cross resolve
             // reads it (and the neighbours' checkerboard flags) and writes the host target.
-            // Same descriptor set and push constant; its time is part of composite_ms.
+            // Same descriptor sets; its time is part of composite_ms.
             Barriers resolve;
             resolve.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
             resolve.Record(cmd);
-            const ComputePipeline& resolve_kernel = kernels_.cross_resolve();
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_kernel.pipeline());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_kernel.layout(), 0, 1,
-                                    &slot->composite_set, 0, nullptr);
-            vkCmdPushConstants(cmd, resolve_kernel.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
-                               &push);
+            bind_sets(kernels_.cross_resolve(), slot->composite_set);
             vkCmdDispatch(cmd, groups_x, groups_y, 1);
         }
         composite_timer_.End(cmd);
@@ -828,12 +817,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                     evaluated ? upscale_out_.view() : internal_[kInternalUpscaleIn].view());
         write_image(slot->encode_set, 2, internal_[kInternalAlbedo].view());
         vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
-        const ComputePipeline& encode = kernels_.upscale_encode();
         // NGX changed the command buffer state: everything is bound again.
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, encode.pipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, encode.layout(), 0, 1, &slot->encode_set, 0,
-                                nullptr);
-        vkCmdPushConstants(cmd, encode.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        bind_sets(kernels_.upscale_encode(), slot->encode_set);
         vkCmdDispatch(cmd, (output_width + kWorkgroupSize - 1) / kWorkgroupSize,
                       (output_height + kWorkgroupSize - 1) / kWorkgroupSize, 1);
         if (timed)

@@ -1,7 +1,12 @@
-// Per-frame constants of the trace and composite kernels. Mirrors
-// lib/src/render/frame_constants.h; change both together. The kernel's only push constant is the device address of
-// one CaelixFrameConstants (544 bytes). Every field sits at an offset that is a multiple of its
-// size, so std430 and scalar layout rules give the same offsets.
+// Per-frame constants of the trace, composite, cross resolve, sky SH and upscale encode kernels.
+// Mirrors lib/src/render/frame_constants.h; change both together. 544 bytes, read as the uniform
+// buffer g_frame (common/caelix_frame_ubo.hlsl: set 1, binding 0).
+// Layout rule: the uniform block gets DXC's default constant buffer layout, which gives the C
+// offsets only while every field sits at an offset that is a multiple of its size, no vector
+// crosses a 16-byte row and every array element is 16 bytes (an array of scalars or 2-vectors
+// would get a 16-byte stride). The test caelix_frame_layout_test (tests/frame_layout_test.cpp)
+// reads the uniform block of the five compiled kernels and fails on any member offset or array
+// stride that differs from the C layout: run ctest after every change of this struct.
 #ifndef CAELIX_FRAME_HLSL
 #define CAELIX_FRAME_HLSL
 
@@ -72,11 +77,6 @@ struct CaelixFrameConstants
     uint2 upscale_src_size;         // 528  size of the encode kernel's source image
     uint upscaler;                  // 536  kUpscaler*: 2 = the trace writes the RR guide images
     uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear) -> 544
-};
-
-struct CaelixTracePush
-{
-    uint64_t frame_constants;  // device address of a CaelixFrameConstants
 };
 
 // CaelixDebugView

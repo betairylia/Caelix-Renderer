@@ -11,8 +11,8 @@
 // sky cubemap (sampled image: the host's cubemap or the renderer's fallback cube) and
 // binding 11 its sampler, declared by render/caelix_shading.hlsl through
 // CAELIX_SKY_BINDING_IMAGE / _SAMPLER, which this file defines: include it BEFORE
-// caelix_shading.hlsl. The push constant is the device address of the frame constants
-// (same block as the trace).
+// caelix_shading.hlsl. The frame constants are the uniform buffer g_frame (set 1, binding 0,
+// common/caelix_frame_ubo.hlsl; same block as the trace); no push constants.
 #ifndef CAELIX_COMPOSITE_SET_HLSL
 #define CAELIX_COMPOSITE_SET_HLSL
 
@@ -21,9 +21,9 @@
 
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_frame.hlsl"
+#include "common/caelix_frame_ubo.hlsl"
 #include "render/caelix_output.hlsl"
 
-CAELIX_PUSH_CONSTANTS(CaelixTracePush, g_push);
 CAELIX_BINDING(0, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_color;
 CAELIX_BINDING(1, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_albedo;
 CAELIX_BINDING(2, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_deterministic;

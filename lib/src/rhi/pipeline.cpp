@@ -84,7 +84,7 @@ void LogPipelineStats(VkDevice device, VkPipeline pipeline, const char* name)
 
 ComputePipeline::ComputePipeline(VkDevice device, std::span<const uint32_t> spirv,
                                  uint32_t push_bytes, const char* name,
-                                 VkDescriptorSetLayout set_layout)
+                                 std::span<const VkDescriptorSetLayout> set_layouts)
     : device_(device), push_bytes_(push_bytes)
 {
     VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -102,8 +102,8 @@ ComputePipeline::ComputePipeline(VkDevice device, std::span<const uint32_t> spir
     VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layout_info.pushConstantRangeCount = push_bytes_ > 0 ? 1u : 0u;
     layout_info.pPushConstantRanges = &range;
-    layout_info.setLayoutCount = set_layout != VK_NULL_HANDLE ? 1u : 0u;
-    layout_info.pSetLayouts = &set_layout;
+    layout_info.setLayoutCount = static_cast<uint32_t>(set_layouts.size());
+    layout_info.pSetLayouts = set_layouts.data();
     result = vkCreatePipelineLayout(device_, &layout_info, nullptr, &layout_);
     if (result != VK_SUCCESS)
     {

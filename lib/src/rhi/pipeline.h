@@ -6,11 +6,12 @@
 
 namespace caelix {
 
-// A compute pipeline whose inputs are push constants and, optionally, one
-// descriptor set: the kernels read and write every buffer through buffer device
-// addresses, so only resources that have no address (acceleration structures,
-// images) need a descriptor set. Move-only; the destructor destroys the pipeline
-// and its layout (not the descriptor set layout, which the caller owns). The
+// A compute pipeline whose inputs are push constants and, optionally, descriptor
+// sets: the kernels read and write most buffers through buffer device addresses, so
+// mainly resources that have no address (acceleration structures, images) and the
+// uniform buffer of the frame constants need a descriptor set. Move-only; the
+// destructor destroys the pipeline and its layout (not the descriptor set layouts,
+// which the caller owns). The
 // caller is responsible for GPU lifetime: destroy it only when no pending GPU
 // work uses it.
 class ComputePipeline
@@ -18,12 +19,12 @@ class ComputePipeline
 public:
     ComputePipeline() = default;
     // Creates the shader module (entry point "main"), the layout with one push
-    // constant range of `push_bytes` (compute stage) and, when `set_layout` is not
-    // null, that descriptor set layout as set 0, and the pipeline. The module is
-    // only needed for pipeline creation and is destroyed right after it.
-    // Throws VulkanError.
+    // constant range of `push_bytes` (compute stage; none when 0) and the descriptor
+    // set layouts `set_layouts` (set_layouts[i] is set i; may be empty), and the
+    // pipeline. The module is only needed for pipeline creation and is destroyed right
+    // after it. Throws VulkanError.
     ComputePipeline(VkDevice device, std::span<const uint32_t> spirv, uint32_t push_bytes,
-                    const char* name, VkDescriptorSetLayout set_layout = VK_NULL_HANDLE);
+                    const char* name, std::span<const VkDescriptorSetLayout> set_layouts = {});
     ~ComputePipeline();
     ComputePipeline(ComputePipeline&& other) noexcept;
     ComputePipeline& operator=(ComputePipeline&& other) noexcept;

@@ -73,18 +73,20 @@ void Renderer::AddSlot()
     const VkDevice device = device_.device();
     auto slot = std::make_unique<FrameSlot>();
     slot->index = static_cast<uint32_t>(slots_.size());
-    // Four sets: trace, composite, sky SH (each has one sampled image and one sampler) and the
-    // upscale encode set (storage images only).
-    const VkDescriptorPoolSize sizes[4] = {
+    // Five sets: trace, composite, sky SH (each has one sampled image and one sampler), the
+    // upscale encode set (storage images only) and the frame set (one uniform buffer).
+    constexpr uint32_t kSetCount = 5;
+    const VkDescriptorPoolSize sizes[5] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
          kTargetCount + kTraceInternalCount + kCompositeStorageCount + kEncodeBindingCount},
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 3},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
     };
     VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pool_info.maxSets = 4;
-    pool_info.poolSizeCount = 4;
+    pool_info.maxSets = kSetCount;
+    pool_info.poolSizeCount = static_cast<uint32_t>(std::size(sizes));
     pool_info.pPoolSizes = sizes;
     VkResult result = vkCreateDescriptorPool(device, &pool_info, nullptr, &slot->pool);
     if (result != VK_SUCCESS)
@@ -96,12 +98,13 @@ void Renderer::AddSlot()
     // Pushed now so that the destructor destroys the pool if a later call throws.
     slots_.push_back(std::move(slot));
     FrameSlot& added = *slots_.back();
-    const VkDescriptorSetLayout layouts[4] = {kernels_.trace_layout(), kernels_.composite_layout(),
-                                              kernels_.sky_layout(), kernels_.encode_layout()};
-    VkDescriptorSet sets[4] = {};
+    const VkDescriptorSetLayout layouts[kSetCount] = {kernels_.trace_layout(), kernels_.composite_layout(),
+                                                      kernels_.sky_layout(), kernels_.encode_layout(),
+                                                      kernels_.frame_layout()};
+    VkDescriptorSet sets[kSetCount] = {};
     VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     set_info.descriptorPool = added.pool;
-    set_info.descriptorSetCount = 4;
+    set_info.descriptorSetCount = kSetCount;
     set_info.pSetLayouts = layouts;
     result = vkAllocateDescriptorSets(device, &set_info, sets);
     if (result != VK_SUCCESS)
@@ -113,14 +116,23 @@ void Renderer::AddSlot()
     added.composite_set = sets[1];
     added.sky_set = sets[2];
     added.encode_set = sets[3];
+    added.frame_set = sets[4];
     VmaAllocationCreateInfo allocation_info{};
     allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
     allocation_info.flags =
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    // Read only as the uniform buffer of the frame set (no device address).
     added.constants = GpuBuffer(device_.allocator(), device, sizeof(FrameConstants),
-                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                allocation_info, true);
+                                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, allocation_info, false);
+    // The slot keeps its constants buffer for its whole life, so the frame set is written once.
+    const VkDescriptorBufferInfo constants_info{added.constants.buffer(), 0, sizeof(FrameConstants)};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = added.frame_set;
+    write.dstBinding = kFrameConstantsBinding;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    write.pBufferInfo = &constants_info;
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
 
 Renderer::FrameSlot* Renderer::AcquireSlot(uint64_t frame, uint64_t safe_frame)

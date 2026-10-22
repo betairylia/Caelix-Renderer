@@ -19,16 +19,16 @@
 // band's cosine-lobe factor A_l (pi, 2 pi / 3, pi / 4), so E(n) = sum c_i Y_i(n).
 //
 // Descriptors: set 0 binding 0 the cubemap (TextureCube, a sampled image), binding 1
-// its sampler (linear, mipmapped, clamp to edge). The push constant is the device
-// address of the frame constants (same block as the trace).
+// its sampler (linear, mipmapped, clamp to edge). The frame constants are the uniform buffer
+// g_frame (set 1, binding 0, common/caelix_frame_ubo.hlsl; same block as the trace); no push
+// constants.
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_frame.hlsl"
+#include "common/caelix_frame_ubo.hlsl"
 // The sky bindings of this kernel's set (caelix_shading.hlsl declares them).
 #define CAELIX_SKY_BINDING_IMAGE 0
 #define CAELIX_SKY_BINDING_SAMPLER 1
 #include "render/caelix_shading.hlsl"
-
-CAELIX_PUSH_CONSTANTS(CaelixTracePush, g_push);
 
 static const uint kShThreads = 256;
 static const uint kShFaceSize = 32;
@@ -80,7 +80,7 @@ float3 WorkgroupSum(uint thread, float3 value)
 [numthreads(256, 1, 1)]
 void main(uint3 thread_id : SV_DispatchThreadID)
 {
-    const CaelixFrameConstants fc = CAELIX_LOAD_STRUCT(CaelixFrameConstants, g_push.frame_constants, 16);
+    const CaelixFrameConstants fc = g_frame;
     const uint thread = thread_id.x;
 
     float3 sums[9];

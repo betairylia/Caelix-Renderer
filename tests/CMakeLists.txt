@@ -64,3 +64,20 @@ target_compile_definitions(caelix_material_test PRIVATE
 # cost at 1920x1080. The GPU cases skip themselves when the build (CAELIX_DLSS=OFF) or the machine
 # has no DLSS.
 caelix_add_gpu_test(caelix_dlss_test dlss_test.cpp)
+
+# The frame constants' uniform block in the five compiled frame-constant kernels against the C layout of
+# lib/src/render/frame_constants.h (no GPU: parses the .spv files of the build's shader folder). Fails
+# when a member offset or an array stride of DXC's constant buffer layout differs from the C struct.
+add_executable(caelix_frame_layout_test frame_layout_test.cpp)
+if(MSVC)
+  target_compile_options(caelix_frame_layout_test PRIVATE /W4)
+else()
+  target_compile_options(caelix_frame_layout_test PRIVATE -Wall -Wextra)
+endif()
+target_include_directories(caelix_frame_layout_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/src)
+target_compile_definitions(caelix_frame_layout_test PRIVATE
+  CAELIX_SHADER_SPV_DIR="${CMAKE_BINARY_DIR}/shaders")
+target_link_libraries(caelix_frame_layout_test PRIVATE Catch2::Catch2WithMain)
+# The .spv files are outputs of the caelix_renderer build (cmake/Shaders.cmake).
+add_dependencies(caelix_frame_layout_test caelix_renderer)
+add_test(NAME caelix_frame_layout_test COMMAND caelix_frame_layout_test)

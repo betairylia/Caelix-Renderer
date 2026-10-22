@@ -129,6 +129,7 @@ private:
         VkDescriptorSet composite_set = VK_NULL_HANDLE;  // composite
         VkDescriptorSet sky_set = VK_NULL_HANDLE;        // sky SH kernel
         VkDescriptorSet encode_set = VK_NULL_HANDLE;     // upscale encode kernel
+        VkDescriptorSet frame_set = VK_NULL_HANDLE;      // frame set: `constants` as a uniform buffer
         GpuBuffer constants;                             // host-visible, mapped, one FrameConstants
     };
     // A target's 2D storage view, or a sky cubemap's cube sampled view (cube = true, all

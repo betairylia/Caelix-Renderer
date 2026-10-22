@@ -47,7 +47,7 @@ relative to `lib/src/` (`#include "rhi/device.h"`).
 
 The HLSL is in `shaders/`, the include root of DXC (`#include "common/caelix_platform.hlsl"`):
 
-- `shaders/common/`: the platform header, the record and table layouts, the frame constants, the block decode, the material table lookup (`caelix_material.hlsl`).
+- `shaders/common/`: the platform header, the record and table layouts, the frame constants and their uniform buffer declaration (`caelix_frame_ubo.hlsl`), the block decode, the material table lookup (`caelix_material.hlsl`).
 - `shaders/scene/`: the finalize kernel.
 - `shaders/render/`: the trace and composite kernels, the brick DDA, the shading helpers.
 
@@ -262,6 +262,17 @@ GPU Trace, 2026-10-22). Only the `.spv` grows (about 2x). Default `OFF`. DXC 1.8
 the depfile command and with `-fspv-debug=vulkan*` at `-O3`, so the option adds `-Zi` to the compile
 command only.
 
+Specialization hook (measurements only): `caelix_path_trace.hlsl` has `SpecializeFrameConstants`,
+which replaces frame constant fields by constants when a `CAELIX_SPEC_*` macro is defined (DXC `-D`),
+so the compiler removes the code they select: `CAELIX_SPEC_NO_RR_GUIDES` (no DLSS RR guides),
+`CAELIX_SPEC_NO_PRIMARY_MODE` (a primary-mode frame renders as path trace; `lighting` is then
+`true`), `CAELIX_SPEC_PT_ONLY` (path trace mode, debug view 0), `CAELIX_SPEC_NO_FOG`,
+`CAELIX_SPEC_NO_SKY_CUBEMAP`, `CAELIX_SPEC_FLAGS_MASK=<bits>` (keeps only those render flags) and
+`CAELIX_SPEC_BOUNCES_TRANSPARENT=<n>`. A kernel built with them is valid only for frames whose
+options match. The build defines none: the default SPIR-V is byte-identical to the source without
+the hook. `Claude/regstat.py` (outside the repo) compiles the kernel with them and loads it through
+`CAELIX_SHADER_DIR` with `CAELIX_PIPELINE_STATS` to read the register count.
+
 Frame contract: call `caelix_scene_flush` once per frame with a command buffer
 in the recording state, a strictly increasing `frame_number` (1 or higher), and
 `safe_frame_number` = the newest frame that has completed on the GPU (0 = none).
@@ -331,30 +342,43 @@ flush builds the TLAS that the render binds.
   0); `CaelixTraceBrickPrimitiveCore` takes the brick origin in entity-local
   block coordinates as a parameter instead of deriving it from word 0 and the
   render group macros; `half` = float, `UNITY_BRANCH` -> `CAELIX_BRANCH`.
-- Inputs: one descriptor set (binding 0 the TLAS, bindings 1..6 the colour,
+- Inputs: two descriptor sets and no push constants. Set 0 is the kernel's own set: for the
+  trace kernel binding 0 the TLAS, bindings 1..6 the colour,
   albedo, normal, depth, motion and view_z targets as storage images without a
-  format qualifier, bindings 7..13 the internal targets of the lighting modes
-  with fixed formats, binding 14 the sky cubemap as a sampled image and 15 its
-  sampler) and one push constant, the device address of a 528-byte
-  `CaelixFrameConstants` block (`shaders/common/caelix_frame.hlsl`,
-  `lib/src/render/frame_constants.h`): camera, target size, the addresses of the page
+  format qualifier, bindings 7..18 the internal targets of the lighting modes
+  with fixed formats, binding 19 the sky cubemap as a sampled image and 20 its
+  sampler (`lib/src/render/render_kernels.h`). Set 1 is the frame set, shared by the five
+  frame-constant kernels (`caelix_path_trace`, `caelix_composite`, `caelix_cross_resolve`,
+  `caelix_sky_sh`, `caelix_upscale_encode`): binding 0 the frame slot's 544-byte
+  `CaelixFrameConstants` block as a uniform buffer (`g_frame`, `shaders/common/caelix_frame_ubo.hlsl`,
+  `shaders/common/caelix_frame.hlsl`, `lib/src/render/frame_constants.h`; `kFrameSetIndex`).
+  A uniform buffer is read-only, so the compiler re-reads a field where it is used instead of
+  keeping the struct live in registers across the traces, as it did for the struct loaded through
+  a buffer device address (registers on the RTX 5080, driver 610.88: trace 128 -> 96, composite
+  40 -> 22, cross resolve 40 -> 34, sky SH 48 -> 45, encode 29 -> 18; trace -0.8 .. -1.5 ms at
+  2560x1440, `Artifacts/main-ubo-20261022`). Its layout is DXC's default constant buffer layout,
+  which gives the C offsets only while every field sits at a multiple of its size, no vector
+  crosses a 16-byte row and every array element is 16 bytes; `caelix_frame_layout_test` checks
+  the compiled kernels. The block holds the camera, target size, the addresses of the page
   table, slot tables, group infos, entity infos and the material table, the record layout, group
   shift, encoding, view, flags, sun and sky, the rows of the host projection,
   the previous render call's camera, the present-target mask, the miss values,
   `has_prev_camera` / `has_tlas`, and the lighting parameters (mode, bounces,
   seed, accumulation count, exposure, sun and sky, sRGB output, `t_max`, fog,
   emission scale, sky cubemap parameters and the SH buffer address). The
-  composite kernel has its own set (binding 0 the colour target, bindings 1..8
-  internal targets, 9 the sky cubemap, 10 its sampler) and the same push
-  constant. Every binding is `PARTIALLY_BOUND`
+  composite and cross resolve kernels share set 0 (binding 0 the colour target, bindings 1..9
+  internal targets and the upscale input, 10 the sky cubemap, 11 its sampler), the sky SH kernel
+  has the cubemap and its sampler, the encode kernel three storage images; each binds the frame
+  set as set 1. Every binding is `PARTIALLY_BOUND`
   (`VkDescriptorSetLayoutBindingFlagsCreateInfo`): a render call writes only the
   TLAS (when the scene has one) and the present targets, and the kernel touches
   a binding only when its bit is set. Absent targets and a scene without a TLAS
   therefore need no dummy descriptors. The sky bindings are written every call
   (the host's cubemap or a 1 x 1 fallback cube that is never sampled).
-- Per-frame resources: a ring of slots (three descriptor sets: trace, composite,
-  sky SH; + host-visible constants buffer), 3 at first, grown up to 8 when a
-  slot's frame is not safe yet.
+- Per-frame resources: a ring of slots (five descriptor sets: trace, composite,
+  sky SH, encode and the frame set; + a host-visible constants buffer with `UNIFORM_BUFFER` usage,
+  which the slot's frame set points at, written once when the slot is created), 3 at first, grown
+  up to 8 when a slot's frame is not safe yet.
 - Image views: one per target image and one cube view per sky cubemap, cached
   (16; the least recently used view is destroyed once its frame is safe).
   `caelix_renderer_release_target_views` destroys all of them; call it before the host destroys target images (a new
@@ -842,6 +866,15 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   differ and nothing is flagged. On the slab (the second interface still
   random) the mean of 128 checkerboard frames is within 0.02 % of the
   stochastic reference.
+- `caelix_frame_layout_test`: no GPU. Reads `build/shaders/<kernel>.spv` of the five
+  frame-constant kernels, parses the SPIR-V binary (the Uniform variable whose struct is decorated
+  `Block`; member `Offset`, `ArrayStride`, `MatrixStride`, `DescriptorSet` / `Binding`), recomputes
+  the C natural layout of the same member sequence and fails on the first member whose offset
+  differs (printing the member index, its name and both offsets), on a stride that is not the
+  element size, on a block that does not end at `sizeof(FrameConstants)` (544) or that is not at
+  set 1, binding 0. Run it after every change of `CaelixFrameConstants`: DXC's constant buffer
+  layout moves a vector that crosses a 16-byte row (`float2` at 476 goes to 480) and gives an array
+  of scalars a 16-byte stride, without any compile error.
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 

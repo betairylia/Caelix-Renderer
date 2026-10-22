@@ -55,7 +55,8 @@
 //                   one of the lobe the path sampled (diffuse or specular), not always a
 //                   specular segment.
 //
-// Inputs: the push constant is the device address of the frame constants; the
+// Inputs: the frame constants are the uniform buffer g_frame (common/caelix_frame_ubo.hlsl: set 1,
+// binding 0; no push constants); the
 // scene's tables (page table, slot rows, group infos, entity infos) are read by
 // caelix_scene_trace.hlsl. The descriptors are the TLAS (binding 0, declared by
 // caelix_scene_trace.hlsl), the six host targets (bindings 1..6, no format
@@ -75,6 +76,8 @@
 #include "common/caelix_block.hlsl"
 #include "render/caelix_scene_trace.hlsl"
 #include "common/caelix_material.hlsl"
+// The frame constants (g_frame, set 1).
+#include "common/caelix_frame_ubo.hlsl"
 // The sky cubemap and its sampler (caelix_shading.hlsl declares them).
 #define CAELIX_SKY_BINDING_IMAGE 19
 #define CAELIX_SKY_BINDING_SAMPLER 20
@@ -83,7 +86,6 @@
 // NRDConfig.hlsli next to it fixes the encodings NRD was built with.
 #include "NRD.hlsli"
 
-CAELIX_PUSH_CONSTANTS(CaelixTracePush, g_push);
 CAELIX_BINDING(1, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_color;
 CAELIX_BINDING(2, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_albedo;
 CAELIX_BINDING(3, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_normal;
@@ -399,10 +401,50 @@ float3 MaterialViewColor(uint block)
     return any(m.emission > 0.0f) ? lerp(m.albedo, float3(1.0f, 1.0f, 1.0f), 0.5f) : m.albedo;
 }
 
+// Compile-time specialization (measurements: register counts, Claude/regstat.py): each macro, when
+// defined (DXC -D), replaces a frame constant field by a constant, so the compiler removes the code
+// that the field selects at run time. A kernel built with them is valid only for frames whose
+// options match the forced values; the build defines none of them (the SPIR-V without any is the
+// same as without this function). CAELIX_SPEC_NO_RR_GUIDES: no DLSS RR guides (upscaler none).
+// CAELIX_SPEC_NO_PRIMARY_MODE: a primary-mode frame renders as path trace (the path trace and
+// reference modes stay apart; main sets `lighting` to true), unlike CAELIX_SPEC_PT_ONLY, which
+// forces the path trace mode and debug view 0. CAELIX_SPEC_NO_FOG: fog density 0. CAELIX_SPEC_NO_SKY_CUBEMAP:
+// the procedural sky. CAELIX_SPEC_FLAGS_MASK keeps only the given kRenderFlag* bits;
+// CAELIX_SPEC_BOUNCES_TRANSPARENT forces the delta chain budget.
+void SpecializeFrameConstants(inout CaelixFrameConstants fc)
+{
+#ifdef CAELIX_SPEC_NO_PRIMARY_MODE
+    if (fc.mode == kModePrimary)
+    {
+        fc.mode = kModePathTrace;
+    }
+#endif
+#ifdef CAELIX_SPEC_NO_RR_GUIDES
+    fc.upscaler = kUpscalerNone;
+#endif
+#ifdef CAELIX_SPEC_PT_ONLY
+    fc.mode = kModePathTrace;
+    fc.debug_view = 0u;
+#endif
+#ifdef CAELIX_SPEC_NO_FOG
+    fc.fog_color.w = 0.0f;
+#endif
+#ifdef CAELIX_SPEC_NO_SKY_CUBEMAP
+    fc.sky_cubemap = 0u;
+#endif
+#ifdef CAELIX_SPEC_FLAGS_MASK
+    fc.flags &= uint(CAELIX_SPEC_FLAGS_MASK);
+#endif
+#ifdef CAELIX_SPEC_BOUNCES_TRANSPARENT
+    fc.bounce_count_transparent = uint(CAELIX_SPEC_BOUNCES_TRANSPARENT);
+#endif
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 thread_id : SV_DispatchThreadID)
 {
-    const CaelixFrameConstants fc = CAELIX_LOAD_STRUCT(CaelixFrameConstants, g_push.frame_constants, 16);
+    CaelixFrameConstants fc = g_frame;
+    SpecializeFrameConstants(fc);
     if (any(thread_id.xy >= fc.size))
     {
         return;
@@ -421,7 +463,13 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     const TraceResult primary = TraceScene(fc, ray);
     const bool hit = primary.hit;
     const uint targets = fc.target_mask;
+#ifdef CAELIX_SPEC_NO_PRIMARY_MODE
+    // SpecializeFrameConstants mapped the primary mode to the path trace mode. DXC does not derive
+    // fc.mode != kModePrimary from that, so the fold is stated here.
+    const bool lighting = true;
+#else
     const bool lighting = fc.mode != kModePrimary;
+#endif
     // The host targets' pixel (kRenderFlagFlipY mirrors the rows).
     const uint2 out_pixel = CaelixOutputPixel(fc, thread_id.xy);
     const bool flip_y = (fc.flags & kRenderFlagFlipY) != 0u;

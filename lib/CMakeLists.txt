@@ -105,6 +105,7 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_record.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_block.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_frame.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_frame_ubo.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_material.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_finalize.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_brick_trace.hlsl

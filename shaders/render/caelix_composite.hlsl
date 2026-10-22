@@ -52,7 +52,7 @@ static const float kMotionViewRange = 32.0f;
 [numthreads(8, 8, 1)]
 void main(uint3 thread_id : SV_DispatchThreadID)
 {
-    const CaelixFrameConstants fc = CAELIX_LOAD_STRUCT(CaelixFrameConstants, g_push.frame_constants, 16);
+    const CaelixFrameConstants fc = g_frame;
     if (any(thread_id.xy >= fc.size))
     {
         return;
