@@ -151,7 +151,7 @@ float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout
     shadow.Direction = L;
     shadow.TMin = 0.0f;
     shadow.TMax = kRayTMax;
-    if (TraceShadow(fc, shadow))
+    if ((fc.gi_flags & kGiFlagDebugNeeNoShadow) == 0u && TraceShadow(fc, shadow))
     {
         return float3(0.0f, 0.0f, 0.0f);
     }

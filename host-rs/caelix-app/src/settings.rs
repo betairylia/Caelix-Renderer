@@ -298,6 +298,9 @@ pub struct GiSettings {
     pub light_candidates: u32,
     /// World units per pixel below which a vertex uses 32-voxel cells (else 128-voxel cells).
     pub light_footprint: f32,
+    /// TIMING ONLY (biased): the sun NEE and the light NEE skip their shadow rays
+    /// (`CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW`).
+    pub debug_nee_no_shadow: bool,
 }
 
 impl Default for GiSettings {
@@ -327,6 +330,7 @@ impl Default for GiSettings {
             light_nee_candidates: 2,
             light_candidates: 16,
             light_footprint: 0.25,
+            debug_nee_no_shadow: false,
         }
     }
 }
@@ -367,6 +371,9 @@ impl GiSettings {
             if self.light_cell_temporal {
                 flags |= CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
             }
+        }
+        if self.debug_nee_no_shadow {
+            flags |= CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW;
         }
         flags
     }

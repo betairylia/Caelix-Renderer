@@ -853,7 +853,7 @@ float3 LightNextEventResampled(CaelixFrameConstants fc, float3 x_r, float3 n_r, 
     shadow.Direction = kept_w;
     shadow.TMin = 0.0f;
     shadow.TMax = kept_distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
-    if (shadow.TMax > 0.0f && TraceShadow(fc, shadow))
+    if (shadow.TMax > 0.0f && (fc.gi_flags & kGiFlagDebugNeeNoShadow) == 0u && TraceShadow(fc, shadow))
     {
         return float3(0.0f, 0.0f, 0.0f);
     }
@@ -967,7 +967,7 @@ float3 LightNextEvent(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint grou
     shadow.Direction = w;
     shadow.TMin = 0.0f;
     shadow.TMax = distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
-    if (shadow.TMax > 0.0f && TraceShadow(fc, shadow))
+    if (shadow.TMax > 0.0f && (fc.gi_flags & kGiFlagDebugNeeNoShadow) == 0u && TraceShadow(fc, shadow))
     {
         return float3(0.0f, 0.0f, 0.0f);
     }

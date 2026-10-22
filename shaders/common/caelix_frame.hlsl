@@ -142,6 +142,7 @@ static const uint kGiFlagLightMis = 1u << 7;
 static const uint kGiFlagLightCellTemporal = 1u << 8;
 static const uint kGiFlagLightCellOriented = 1u << 9;
 static const uint kGiFlagPairwiseMis = 1u << 10;
+static const uint kGiFlagDebugNeeNoShadow = 1u << 11;  // timing only: NEE without shadow rays (biased)
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

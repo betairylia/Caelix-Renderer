@@ -468,6 +468,10 @@ struct Args {
     /// cells, else 128-voxel cells.
     #[arg(long, value_name = "F", default_value_t = 0.25)]
     light_footprint: f32,
+    /// TIMING ONLY (biased image): the sun NEE and the light NEE skip their shadow rays, so the
+    /// trace time shows the cost of the NEE sampling without the rays.
+    #[arg(long)]
+    debug_nee_no_shadow: bool,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -2109,6 +2113,7 @@ fn main() -> anyhow::Result<()> {
             light_nee_candidates: args.light_nee_candidates,
             light_candidates: args.light_candidates,
             light_footprint: args.light_footprint,
+            debug_nee_no_shadow: args.debug_nee_no_shadow,
         },
     };
     if !args.light_cells.is_power_of_two() || !(1024..=1048576).contains(&args.light_cells) {

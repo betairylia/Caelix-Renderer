@@ -1188,6 +1188,9 @@ typedef enum CaelixGiMethod
                                                  instead of 1/M or the Z-count (VISIBILITY and UNBIASED are then
                                                  ignored). Bounds the reconnection Jacobian's outliers
                                                  (docs/GI_EXPERIMENTS.md, "Pairwise MIS") */
+#define CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW (1u << 11) /* TIMING ONLY (biased: every NEE sample counts as
+                                                 visible): the sun NEE and the light NEE skip their shadow
+                                                 ray. Measures the cost of the NEE sampling without the rays */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the

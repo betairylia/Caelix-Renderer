@@ -653,7 +653,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                                                             CAELIX_GI_FLAG_LIGHT_CELL_JITTER |
                                                             CAELIX_GI_FLAG_LIGHT_MIS |
                                                             CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
-                                                            CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED));
+                                                            CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED |
+                                                            CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW));
     if (!lighting)
     {
         constants.gi_flags &= ~static_cast<uint32_t>(CAELIX_GI_FLAG_LIGHT_NEE);

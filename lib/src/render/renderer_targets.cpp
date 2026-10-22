@@ -364,7 +364,8 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
                                      CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_DIFFUSE_ONLY |
                                      CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_JITTER |
                                      CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
-                                     CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED | CAELIX_GI_FLAG_PAIRWISE_MIS;
+                                     CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED | CAELIX_GI_FLAG_PAIRWISE_MIS |
+                                     CAELIX_GI_FLAG_DEBUG_NEE_NO_SHADOW;
     if (options.method > CAELIX_GI_RESTIR)
     {
         CAELIX_LOGE("%s: unknown method %u", kFunction, options.method);
