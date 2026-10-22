@@ -163,7 +163,7 @@ clock.
 ### 3.4 Layout
 
 A cell is `64 + 8 R` bytes (`LightCellBytes`), R = `light_cell_reservoirs` (a power of two in
-1 .. 256, library default 8: 128 B):
+1 .. 64, library default 8: 128 B):
 
 | offset | field | meaning |
 | --- | --- | --- |
@@ -206,18 +206,18 @@ The cell table is one storage buffer descriptor (trace set binding 21) and the k
 with 32-bit byte offsets. `caelix_renderer_set_gi_options` therefore rejects (logged,
 `CAELIX_ERROR_INVALID_ARGUMENT`) options whose table, `capacity x (64 + 8 R) + 16` bytes with the
 defaults for zero fields, is larger than the device's `maxStorageBufferRange`
-(`Device::max_storage_buffer_range`, read at adoption). The largest table, 2^20 cells of 256
-reservoirs, is 2.2 GB.
+(`Device::max_storage_buffer_range`, read at adoption). The largest table, 2^20 cells of 64
+reservoirs, is 2^20 x (64 + 8 x 64) + 16 bytes = 576 MiB.
 
 ## 4. Fill (`caelix_light_cells`)
 
 ### 4.1 Candidates and target
 
 The fill runs before the trace (and before the sky SH kernel) when light NEE is on and the scene has
-a table; its time is `CaelixGiStats::light_fill_ms`. Workgroups of 256 threads hold 256 / R cells,
+a table; its time is `CaelixGiStats::light_fill_ms`. Workgroups of 64 threads hold 64 / R cells,
 R threads per cell; thread `r = thread % R` owns reservoir r. The dispatch is
-`min(1024, G) x max(1, G / 1024)` with `G = capacity x R / 256` workgroups (at least 4 and exact,
-because both are powers of two), slot = `(y * 1024 + x) * (256 / R) + thread / R`. A skipped, evicted
+`min(1024, G) x max(1, G / 1024)` with `G = capacity x R / 64` workgroups (at least 16 and exact,
+because both are powers of two), slot = `(y * 1024 + x) * (64 / R) + thread / R`. A skipped, evicted
 or out-of-range slot only clears its threads' `active` flag, so every thread reaches the one
 barrier. Without a usable table the cell's reservoirs and normalisations are cleared.
 
@@ -444,11 +444,11 @@ kept option by default (owner decision, 2026-10-22).
 | `CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL` (bit 8) | off | on | `--light-no-cell-temporal` |
 | `CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED` (bit 9) | off | on | `--light-no-cell-oriented` |
 | `light_cell_capacity` | 65536 (1024 .. 2^20, power of two) | 262144 | `--light-cells` |
-| `light_cell_reservoirs` | 8 (1 .. 256, power of two) | 64 | `--light-cell-reservoirs` |
+| `light_cell_reservoirs` | 8 (1 .. 64, power of two) | 64 | `--light-cell-reservoirs` |
 | `light_candidates` | 8 (1 .. 64) | 16 | `--light-candidates` |
 | `light_level_footprint` | 0.25 | 0.25 | `--light-footprint` |
 | `light_temporal_frames` | 20 (1 .. 1024) | 128 | `--light-temporal-frames` |
-| `light_nee_candidates` | 1 (1 .. 32) | 4 | `--light-nee-candidates` |
+| `light_nee_candidates` | 1 (1 .. 32) | 2 | `--light-nee-candidates` |
 | `CaelixLightOptions::min_emission` | 20.0 | 0 (library) | `--light-min-emission` |
 | `CaelixLightOptions::max_bricks` | 65536 | 65536 | `--light-max-bricks` |
 | `CaelixLightOptions::nee_min_distance` | 8.0 | 0 (library) | `--light-nee-distance` |
@@ -484,10 +484,12 @@ have the full tables):
 - `firefly-split/` (rootfall): the remaining salt comes from rare large samples of far small lamps
   whose share in a cell is tiny (bounce hits under MIS and the NEE); resampling, oriented cells and
   the variants tested change it by less than 10 %.
-- The 32 / 128-voxel cells and the tunable reservoir count (up to 256) are not measured on the bench
+- The 32 / 128-voxel cells and the tunable reservoir count (up to 64) are not measured on the bench
   scenes yet. `tests/trace_test.cpp` checks every light NEE mode against a 4096-frame path tracer
   reference in a closed box (mean ratio within 3 %, block PSNR above 30 dB), the last case with every
-  option at once and 256 reservoirs per cell.
+  option at once and 64 reservoirs per cell.
+  R up to 256 with 256-thread groups was tried on 2026-10-22 (fill 9-10 ms at R 256 on bistro) and
+  reverted to 64-thread groups.
 
 ## 9. Removed paths
 

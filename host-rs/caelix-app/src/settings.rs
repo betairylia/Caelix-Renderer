@@ -273,7 +273,7 @@ pub struct GiSettings {
     pub light_nee: bool,
     /// Light cells (a power of two, 1024..1048576).
     pub light_cells: u32,
-    /// Light NEE: reservoirs per light cell (a power of two, 1..256; a cell is 64 + 8 x this bytes).
+    /// Light NEE: reservoirs per light cell (a power of two, 1..64; a cell is 64 + 8 x this bytes).
     pub light_cell_reservoirs: u32,
     /// Light NEE: look the cell up at a point jittered by up to half a cell per vertex
     /// (`CAELIX_GI_FLAG_LIGHT_CELL_JITTER`): the per-cell flicker becomes per-pixel noise.
@@ -324,7 +324,7 @@ impl Default for GiSettings {
             light_mis: true,
             light_cell_temporal: true,
             light_temporal_frames: 128,
-            light_nee_candidates: 4,
+            light_nee_candidates: 2,
             light_candidates: 16,
             light_footprint: 0.25,
         }

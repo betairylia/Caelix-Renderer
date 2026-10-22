@@ -428,9 +428,9 @@ CaelixResult Renderer::SetGiOptions(const CaelixGiOptions& options)
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     if (options.light_cell_reservoirs != 0 &&
-        (!std::has_single_bit(options.light_cell_reservoirs) || options.light_cell_reservoirs > 256))
+        (!std::has_single_bit(options.light_cell_reservoirs) || options.light_cell_reservoirs > 64))
     {
-        CAELIX_LOGE("%s: light_cell_reservoirs %u must be 0 or a power of two in 1 .. 256", kFunction,
+        CAELIX_LOGE("%s: light_cell_reservoirs %u must be 0 or a power of two in 1 .. 64", kFunction,
                     options.light_cell_reservoirs);
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }

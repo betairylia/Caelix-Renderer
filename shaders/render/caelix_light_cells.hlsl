@@ -1,9 +1,9 @@
 // Light cell fill kernel (docs/LIGHT_NEE.md section 4): refills the R reservoirs
-// (R = fc.light_cell_reservoirs, a power of two in 1 .. 256) of every live light cell
+// (R = fc.light_cell_reservoirs, a power of two in 1 .. 64) of every live light cell
 // (render/caelix_light_sample.hlsl) from the scene's light table before the trace.
 //
-// 256 / R cells per workgroup of 256 threads, R threads per cell (dispatch min(1024, G) x max(1, G / 1024)
-// with G = capacity x R / 256 workgroups: slot = (y * 1024 + x) * (256 / R) + thread / R); thread
+// 64 / R cells per workgroup of 64 threads, R threads per cell (dispatch min(1024, G) x max(1, G / 1024)
+// with G = capacity x R / 64 workgroups: slot = (y * 1024 + x) * (64 / R) + thread / R); thread
 // r = thread % R owns reservoir r of its cell. An empty slot (key_lo 0) is skipped. A cell not looked
 // up for 64 frames is evicted (key 0, reservoirs empty). Without a light table or with an empty one the
 // reservoirs are emptied. The cells of a workgroup are independent: a skipped, evicted or
@@ -77,11 +77,11 @@
 #include "render/caelix_shading.hlsl"
 #include "render/caelix_light_sample.hlsl"
 
-// Workgroups per dispatch row (the dispatch is min(1024, G) x max(1, G / 1024), G = capacity x R / 256).
+// Workgroups per dispatch row (the dispatch is min(1024, G) x max(1, G / 1024), G = capacity x R / 64).
 static const uint kLightCellGroupsPerRow = 1024;
-// Threads per workgroup: 256 / R cells x R threads (R = fc.light_cell_reservoirs, a power of two in
-// 1 .. 256, so the cells fill the workgroup exactly).
-static const uint kLightCellGroupThreads = 256;
+// Threads per workgroup: 64 / R cells x R threads (R = fc.light_cell_reservoirs, a power of two in
+// 1 .. 64, so the cells fill the workgroup exactly).
+static const uint kLightCellGroupThreads = 64;
 
 // Per thread: w_sum / K of its fresh candidates, or its dedicated draw w_c with temporal reuse; 0 for
 // a thread whose cell is not filled. Thread r = 0 of each cell averages the cell's R into C_cur.
@@ -126,7 +126,7 @@ float LightCellTargetOf(CaelixFrameConstants fc, uint64_t table, uint count, uin
                                      : 0.0f;
 }
 
-[numthreads(256, 1, 1)]
+[numthreads(64, 1, 1)]
 void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
 {
     const CaelixFrameConstants fc = CAELIX_LOAD_STRUCT(CaelixFrameConstants, g_push.frame_constants, 16);

@@ -99,7 +99,7 @@ struct FrameConstants
     uint64_t light_indices;             // 648  Scene::light_indices_address(): brick -> light entry map, 0 = none
     uint32_t light_temporal_frames;     // 656  LIGHT_CELL_TEMPORAL: frames of history the fill keeps (0 = none this frame)
     uint32_t light_nee_candidates;      // 660  LIGHT_NEE: candidates per diffuse vertex (1 .. 32; 1 = no resampling)
-    uint32_t light_cell_reservoirs;     // 664  LIGHT_NEE: reservoirs per light cell (a power of two in 1 .. 256)
+    uint32_t light_cell_reservoirs;     // 664  LIGHT_NEE: reservoirs per light cell (a power of two in 1 .. 64)
     uint32_t pad_668;                   // 668
 };
 static_assert(sizeof(FrameConstants) == 672);

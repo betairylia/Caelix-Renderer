@@ -1232,7 +1232,7 @@ typedef struct CaelixGiOptions
                                       the exact target at the vertex before the one shadow ray
                                       (docs/LIGHT_NEE.md section 5.3); 1 = no resampling; 1 .. 32 */
     uint32_t light_cell_reservoirs; /* 0 = 8; LIGHT_NEE: reservoirs per light cell, a power of two in
-                                       1 .. 256. A cell is 64 + 8 x this bytes (128 at 8); a change
+                                       1 .. 64. A cell is 64 + 8 x this bytes (128 at 8); a change
                                        recreates the cell table (history dropped) */
 } CaelixGiOptions;
 
@@ -1249,7 +1249,7 @@ typedef struct CaelixGiOptions
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,
    light_candidates > 64, light_temporal_frames > 1024, light_nee_candidates > 32, a
-   light_cell_reservoirs that is not 0 or a power of two in 1 .. 256, a cell table (with the defaults
+   light_cell_reservoirs that is not 0 or a power of two in 1 .. 64, a cell table (with the defaults
    for zero fields) above the device's maxStorageBufferRange
    -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);

@@ -660,7 +660,7 @@ counted). `caelix_scene_set_light_options` / `caelix_scene_get_light_stats` set
 and read it. With `CAELIX_GI_FLAG_LIGHT_NEE` (either GI method) the renderer owns
 a hash table of light cells (keyed by entity, level, cell coordinate and, with
 `CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED`, receiver face; 64 + 8 x R bytes per cell,
-R = 1 .. 256 reservoirs), refilled by `caelix_light_cells` before every trace
+R = 1 .. 64 reservoirs), refilled by `caelix_light_cells` before every trace
 (optionally with temporal reuse, `CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL`); every
 diffuse vertex with a next segment samples a brick from its (optionally
 jittered) cell, a point on an open emitting face in it, resamples
@@ -899,11 +899,11 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   3 % and a 16x16 block PSNR above 30 dB: one light voxel with and without MIS,
   four light bricks with temporal cell reuse, with 8 candidates per vertex,
   with oriented and jittered cells and 2 reservoirs, and with every option at
-  once and 256 reservoirs per cell; covered and border faces are never sampled;
+  once and 64 reservoirs per cell; covered and border faces are never sampled;
   a dropped brick keeps its emission; one path tracer frame without the flag is
   bit-identical on a scene whose table has entries and one whose table is
   empty; the light cells (1024) are created, filled and timed, and a 1 spp
-  frame is lit; option validation (reservoir counts 128 and 256 accepted, 3
+  frame is lit; option validation (reservoir counts 64 accepted, 3, 128
   and 512 rejected).
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
@@ -1072,13 +1072,13 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   (the near-field split in world units, 0 = the library default 8: light
   points closer than this are left to the BSDF path). Light cell options:
   `--light-cells <N>` (a power of two, 1024..1048576, default 262144),
-  `--light-cell-reservoirs <N>` (a power of two, 1..256, default 64; a cell is
+  `--light-cell-reservoirs <N>` (a power of two, 1..64, default 64; a cell is
   64 + 8 x N bytes), `--light-candidates <N>` (candidates per cell reservoir,
   1..64, default 16), `--light-footprint <F>` (world units per pixel below
   which a vertex uses 32-voxel cells, else 128-voxel cells; default 0.25),
   `--light-temporal-frames <N>` (history of the temporal cell reuse, 1..1024,
   default 128) and `--light-nee-candidates <N>` (candidates per diffuse
-  vertex, 1..32, default 4). Opt-outs: `--light-no-cell-jitter`,
+  vertex, 1..32, default 2). Opt-outs: `--light-no-cell-jitter`,
   `--light-no-cell-oriented`, `--light-no-cell-temporal` and `--light-no-mis`.
   The debug UI's GI section has the same controls, and the stats show the
   light fill time, the cell memory, the cell usage counters and the light

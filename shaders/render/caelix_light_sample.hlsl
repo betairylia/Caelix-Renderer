@@ -5,7 +5,7 @@
 // LightListCanSample).
 //
 // Light cells: a hash table of fc.light_cell_capacity cells in g_light_cells (trace set binding
-// 21), 64 + 8 R bytes each (R = fc.light_cell_reservoirs reservoirs, a power of two in 1 .. 256,
+// 21), 64 + 8 R bytes each (R = fc.light_cell_reservoirs reservoirs, a power of two in 1 .. 64,
 // default 8; 128 B at R 8; LightCellBytes):
 //   0    uint key_lo, key_hi    the 64-bit fingerprint of (entity, level, coordinate, face); key_lo 0 = empty
 //   8    uint touched_frame     fc.frame_counter of the newest lookup
@@ -129,7 +129,7 @@ uint2 LightCellKey(uint entity, uint level, int3 coord, uint face)
     return uint2(lo != 0u ? lo : 1u, uint(h >> 32));
 }
 
-// The reservoirs per cell R (fc.light_cell_reservoirs, a power of two in 1 .. 256). A cell is
+// The reservoirs per cell R (fc.light_cell_reservoirs, a power of two in 1 .. 64). A cell is
 // 64 + 8 R bytes: the header and R x 8 B reservoirs.
 uint LightCellBytes(CaelixFrameConstants fc)
 {

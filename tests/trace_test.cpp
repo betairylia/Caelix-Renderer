@@ -4018,16 +4018,19 @@ TEST_CASE("cells fill and sample")
     bad.light_nee_candidates = 32;
     REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
     bad.light_nee_candidates = 0;
-    // Reservoirs per cell (docs/LIGHT_NEE.md section 3.4): 0 (= 8) or a power of two in 1 .. 256.
+    // Reservoirs per cell (docs/LIGHT_NEE.md section 3.4): 0 (= 8) or a power of two in 1 .. 64.
     bad.light_cell_reservoirs = 3;  // not a power of two
     ExpectLibraryErrors(1, [&] {
         REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
     });
-    bad.light_cell_reservoirs = 512;
-    ExpectLibraryErrors(1, [&] {
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-    for (const uint32_t reservoirs : {128u, 256u, 1u, 0u})
+    for (const uint32_t reservoirs : {128u, 512u})
+    {
+        bad.light_cell_reservoirs = reservoirs;
+        ExpectLibraryErrors(1, [&] {
+            REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+    }
+    for (const uint32_t reservoirs : {64u, 1u, 0u})
     {
         bad.light_cell_reservoirs = reservoirs;
         REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
@@ -4085,10 +4088,10 @@ TEST_CASE("cells fill and sample")
     CloseRig(rig);
 }
 
-TEST_CASE("light NEE with 256 reservoirs per cell is unbiased")
+TEST_CASE("light NEE with 64 reservoirs per cell is unbiased")
 {
     // The four lights of the temporal test with every kept light NEE option at once (docs/LIGHT_NEE.md
-    // section 7): 256 reservoirs per cell (one cell per fill workgroup of 256 threads), oriented and
+    // section 7): 64 reservoirs per cell (one cell per fill workgroup of 64 threads), oriented and
     // jittered cells, temporal reuse, MIS and 4 candidates per vertex. 4096 cells are enough for the
     // box (fewer than 100 live cells) and keep the fill short.
     Rig rig;
@@ -4115,19 +4118,19 @@ TEST_CASE("light NEE with 256 reservoirs per cell is unbiased")
     gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED |
                CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL | CAELIX_GI_FLAG_LIGHT_MIS;
     gi.light_cell_capacity = 4096;
-    gi.light_cell_reservoirs = 256;
+    gi.light_cell_reservoirs = 64;
     gi.light_nee_candidates = 4;
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
     const std::vector<float> image = LightReference(rig, renderer, set, camera, 1024, 200000);
     CaelixGiStats stats{};
     caelix_renderer_get_gi_stats(renderer, &stats);
     const LightComparison c = CompareLight(pt, image, kBoxSize);
-    std::printf("4 lights, 256 reservoirs, oriented + jittered + temporal cells, MIS, 4 candidates per vertex vs "
+    std::printf("4 lights, 64 reservoirs, oriented + jittered + temporal cells, MIS, 4 candidates per vertex vs "
                 "path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 block PSNR %.2f dB, pixel PSNR %.2f dB (live "
                 "cells %u, fill %.4f ms)\n",
                 c.test_mean, c.ref_mean, c.ratio, c.block_psnr, PixelPsnr(pt, image, kBoxSize),
                 stats.light_cells_live, stats.light_fill_ms);
-    CHECK(stats.light_cell_bytes == 4096ull * (64ull + 8ull * 256ull) + 16ull);
+    CHECK(stats.light_cell_bytes == 4096ull * (64ull + 8ull * 64ull) + 16ull);
     CHECK(stats.light_cells_live > 0);
     CHECK(stats.light_cell_lookups_failed == 0);
     CHECK(c.ref_mean > 0.01);

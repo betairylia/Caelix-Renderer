@@ -70,9 +70,9 @@ bool IsUnormFormat(VkFormat format)
     }
 }
 
-// [numthreads(256, 1, 1)] in caelix_light_cells.hlsl: 256 / R cells per workgroup, R threads per cell
+// [numthreads(64, 1, 1)] in caelix_light_cells.hlsl: 64 / R cells per workgroup, R threads per cell
 // (R = the reservoirs per cell), at most 1024 workgroups per dispatch row.
-constexpr uint32_t kLightCellGroupThreads = 256;
+constexpr uint32_t kLightCellGroupThreads = 64;
 constexpr uint32_t kLightCellGroupsPerRow = 1024;
 
 // The barriers of one vkCmdPipelineBarrier2: image barriers (any layout -> GENERAL; mip 0,
@@ -814,8 +814,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fill.pipeline());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fill.layout(), 0, 1, &slot->set, 0, nullptr);
         vkCmdPushConstants(cmd, fill.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        // capacity x R / 256 workgroups (the capacity is a power of two >= 1024 and R a power of two
-        // in 1 .. 256, so at least 4 and exact): one row when there are at most 1024, else rows of 1024.
+        // capacity x R / 64 workgroups (the capacity is a power of two >= 1024 and R a power of two
+        // in 1 .. 64, so at least 16 and exact): one row when there are at most 1024, else rows of 1024.
         const uint32_t fill_groups = light_cell_capacity_ * light_cell_reservoirs_ / kLightCellGroupThreads;
         const uint32_t fill_groups_x = std::min(fill_groups, kLightCellGroupsPerRow);
         vkCmdDispatch(cmd, fill_groups_x, fill_groups / fill_groups_x, 1);

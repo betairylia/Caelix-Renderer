@@ -97,7 +97,7 @@ struct CaelixFrameConstants
     uint64_t light_indices;         // 648  the scene's brick -> light entry map (u32 per AABB row: index + 1), 0 = none
     uint light_temporal_frames;     // 656  kGiFlagLightCellTemporal: frames of history the cell fill keeps (0 = none this frame)
     uint light_nee_candidates;      // 660  kGiFlagLightNee: light candidates per diffuse vertex (1 .. 32; 1 = no resampling)
-    uint light_cell_reservoirs;     // 664  kGiFlagLightNee: reservoirs per light cell, a power of two in 1 .. 256
+    uint light_cell_reservoirs;     // 664  kGiFlagLightNee: reservoirs per light cell, a power of two in 1 .. 64
     uint pad_668;                   // 668  -> 672
 };
 

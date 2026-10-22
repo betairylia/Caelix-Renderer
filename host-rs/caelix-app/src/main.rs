@@ -433,8 +433,8 @@ struct Args {
     /// --light-cell-reservoirs bytes each).
     #[arg(long, value_name = "N", default_value_t = 262144)]
     light_cells: u32,
-    /// Light NEE: reservoirs per light cell (a power of two, 1..256; a cell is 64 + 8 x N bytes).
-    #[arg(long, value_name = "N", default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=256))]
+    /// Light NEE: reservoirs per light cell (a power of two, 1..64; a cell is 64 + 8 x N bytes).
+    #[arg(long, value_name = "N", default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=64))]
     light_cell_reservoirs: u32,
     /// Light NEE: candidates per cell reservoir and frame (1..64).
     #[arg(long, value_name = "N", default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
@@ -462,7 +462,7 @@ struct Args {
     light_temporal_frames: u32,
     /// Light NEE: light candidates per diffuse vertex, resampled by the exact target at the vertex
     /// before the one shadow ray (docs/LIGHT_NEE.md section 5.3); 1 = no resampling (1..32).
-    #[arg(long, value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=32))]
+    #[arg(long, value_name = "N", default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=32))]
     light_nee_candidates: u32,
     /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 32-voxel
     /// cells, else 128-voxel cells.
@@ -2115,7 +2115,7 @@ fn main() -> anyhow::Result<()> {
         bail!("--light-cells {} must be a power of two in 1024..1048576", args.light_cells);
     }
     if !args.light_cell_reservoirs.is_power_of_two() {
-        bail!("--light-cell-reservoirs {} must be a power of two in 1..256", args.light_cell_reservoirs);
+        bail!("--light-cell-reservoirs {} must be a power of two in 1..64", args.light_cell_reservoirs);
     }
     if !args.light_footprint.is_finite() || args.light_footprint < 0.0 {
         bail!("--light-footprint {} must be a finite value >= 0", args.light_footprint);

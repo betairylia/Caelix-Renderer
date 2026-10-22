@@ -617,7 +617,7 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
                 ComboBox::from_id_salt("gi_light_cell_reservoirs")
                     .selected_text(gi.light_cell_reservoirs.to_string())
                     .show_ui(ui, |ui| {
-                        for shift in 0..=8 {
+                        for shift in 0..=6 {
                             let reservoirs = 1u32 << shift;
                             ui.selectable_value(&mut gi.light_cell_reservoirs, reservoirs, reservoirs.to_string());
                         }
