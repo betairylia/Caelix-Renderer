@@ -244,6 +244,7 @@ CaelixResult Device::Adopt(const CaelixDeviceAdoptDesc& desc, std::unique_ptr<De
     as_properties.pNext = nullptr;
     device->as_properties_ = as_properties;
     device->timestamp_period_ns_ = properties.properties.limits.timestampPeriod;
+    device->max_storage_buffer_range_ = properties.properties.limits.maxStorageBufferRange;
 
     // Timestamps of the graphics queue (GPU timings). 0 valid bits = no timestamp support.
     uint32_t family_count = 0;

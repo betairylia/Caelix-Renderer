@@ -5,7 +5,7 @@
 // distance |x_s - x_v| normalized for roughness 1 at the pixel's view z; t_max for a sky sample),
 // so NRD, the composite and the reference accumulation read it unchanged. An invalid reservoir
 // or W = 0 writes 0 (NRD's "no sample").
-// kGiFlagLightNee (docs/LIGHT_LIST.md): the trace kernel left the primary vertex's light NEE in
+// kGiFlagLightNee (docs/LIGHT_NEE.md section 5): the trace kernel left the primary vertex's light NEE in
 // the diffuse target, unpacked; it is added to the reservoir's contribution before the packing (an
 // invalid reservoir then packs the NEE alone with hit distance 0).
 //

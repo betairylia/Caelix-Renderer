@@ -1,4 +1,4 @@
-// Light table compact kernel (docs/LIGHT_LIST.md section 1.2, entry layout docs/LIGHT_FACES.md):
+// Light table compact kernel (docs/LIGHT_NEE.md section 2.2, entry layout section 2.3):
 // turns the light words of every render group into the 448-byte entries of the scene's light table
 // (common/caelix_light.hlsl).
 //
@@ -17,7 +17,7 @@
 // capacity counts in `dropped` instead. The entry's total also goes to cdf[index], which
 // caelix_light_scan turns into the prefix sum.
 //
-// The brick -> entry map (docs/LIGHT_MIS.md section 2): every dense id below the high water gets
+// The brick -> entry map (docs/LIGHT_NEE.md section 2.7): every dense id below the high water gets
 // light_indices[aabb_row_base + id] = entry index + 1, or 0 when it has no entry (light word 0, not
 // resident, a total of 0, dropped beyond the capacity). Writing every id, not only the ones with a
 // light word, leaves no stale index of an earlier rebuild behind; ids above the high water are never
@@ -237,7 +237,7 @@ uint CompactBrick(uint group, uint id, int3 coord, uint entity, uint slot_row_ba
 
     // 24 x 16 B of face masks (face-major, two slices per store), then the 64 bytes of the header
     // part: the six weights, total, group, id, entity, origin, the two extent words and the pad.
-    // The extent of a face (docs/LIGHT_FACES.md section 1): the rows along the face's axis that hold
+    // The extent of a face (docs/LIGHT_NEE.md section 2.3): the rows along the face's axis that hold
     // a voxel of its mask as 8 bits (x: the bytes of the slice words folded with OR; y: one bit per
     // nonzero byte, low half rows 0..3, high half 4..7; z: one bit per nonzero slice), then the
     // lowest row for a +a face, the highest for a -a face, 0xFF when the mask is empty.

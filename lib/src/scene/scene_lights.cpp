@@ -1,4 +1,4 @@
-// The light list (docs/LIGHT_LIST.md): options and stats, the light words' capacity, the light
+// The light list (docs/LIGHT_NEE.md section 2): options and stats, the light words' capacity, the light
 // table's allocation and its rebuild (shaders/scene/caelix_light_compact.hlsl and
 // caelix_light_scan.hlsl) inside Scene::Flush.
 #include "scene/scene.h"
@@ -15,11 +15,10 @@ namespace caelix {
 namespace {
 
 // CaelixLightOptions defaults (a zero field takes them). 20 = luminance of a packed emissive voxel
-// of strength 2 (64 x albedo) with an albedo luminance of 0.3125 (see the "As built" section of
-// docs/LIGHT_LIST.md).
+// of strength 2 (64 x albedo) with an albedo luminance of 0.3125 (docs/LIGHT_NEE.md section 2.5).
 constexpr float kDefaultMinEmission = 20.0f;
 constexpr uint32_t kDefaultLightMaxBricks = 65536;
-// The near-field split (docs/LIGHT_LIST.md "Near field"): 8 voxels, validated on bistro and Cornell.
+// The near-field split (docs/LIGHT_NEE.md section 2.6): 8 voxels, validated on bistro and Cornell.
 constexpr float kDefaultNeeMinDistance = 8.0f;
 constexpr uint32_t kMaxLightMaxBricks = 1u << 20;
 // The header's count, dropped, capacity and pad: one readback slot.

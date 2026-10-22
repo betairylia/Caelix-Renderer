@@ -412,11 +412,11 @@ struct Args {
     /// ReSTIR GI: a reused reservoir's visible point must lie within F * view depth of the pixel's.
     #[arg(long, value_name = "F", default_value_t = 0.1)]
     gi_depth_threshold: f32,
-    /// Both GI methods: next-event estimation on the scene's light list (emissive voxels whose
-    /// emission luminance is at least --light-min-emission) at every diffuse vertex
-    /// (docs/LIGHT_LIST.md).
+    /// Both GI methods: no next-event estimation on the scene's light list. By default every
+    /// diffuse vertex samples the list lights (emissive voxels whose emission luminance is at least
+    /// --light-min-emission) through the light cells (docs/LIGHT_NEE.md).
     #[arg(long)]
-    gi_light_nee: bool,
+    gi_no_light_nee: bool,
     /// The scene's list-light threshold: luminance of a material's emission (0 = the library's
     /// default, 20: packed strength 2 with a bright albedo, every bright strength 3).
     #[arg(long, value_name = "F", default_value_t = 0.0)]
@@ -429,65 +429,45 @@ struct Args {
     /// points closer than this are left to the BSDF path.
     #[arg(long, value_name = "F", default_value_t = 0.0)]
     light_nee_distance: f32,
-    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 64 + 24 x
+    /// Light NEE: light cells of the renderer (a power of two, 1024..1048576; 64 + 8 x
     /// --light-cell-reservoirs bytes each).
-    #[arg(long, value_name = "N", default_value_t = 65536)]
+    #[arg(long, value_name = "N", default_value_t = 262144)]
     light_cells: u32,
-    /// Light NEE: reservoirs (and push ring entries) per light cell (a power of two, 1..64; a cell
-    /// is 64 + 24 x N bytes, 256 at 8).
-    #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64))]
+    /// Light NEE: reservoirs per light cell (a power of two, 1..256; a cell is 64 + 8 x N bytes).
+    #[arg(long, value_name = "N", default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=256))]
     light_cell_reservoirs: u32,
     /// Light NEE: candidates per cell reservoir and frame (1..64).
-    #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=64))]
+    #[arg(long, value_name = "N", default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
     light_candidates: u32,
     /// Light NEE: look every vertex's light cell up at the hit point itself instead of a point
     /// jittered by up to half a cell (the jitter turns the per-cell flicker into per-pixel noise).
     #[arg(long)]
     light_no_cell_jitter: bool,
-    /// Light NEE: oriented light cells (docs/LIGHT_LIST.md section 2.7): the cell key also holds the
-    /// receiver's face (the axis of its world normal), and the fill's target and the MIS proxy get
-    /// the receiver orientation term.
+    /// Light NEE: unoriented light cells. By default the cell key also holds the receiver's face (the
+    /// axis of its world normal), and the fill's target and the MIS proxy get the receiver
+    /// orientation term (docs/LIGHT_NEE.md section 4.2).
     #[arg(long)]
-    light_cell_oriented: bool,
-    /// Light NEE: no MIS between the light NEE and the diffuse bounce (docs/LIGHT_MIS.md): a
-    /// list-light hit after a light NEE vertex is skipped instead (the step 1 rule).
+    light_no_cell_oriented: bool,
+    /// Light NEE: no MIS between the light NEE and the diffuse bounce (docs/LIGHT_NEE.md section 6):
+    /// a list-light hit after a light NEE vertex is skipped instead.
     #[arg(long)]
     light_no_mis: bool,
-    /// Light NEE: temporal reuse in the light cell fill (each cell reservoir merges its previous
-    /// frame's reservoir, history capped by --light-temporal-frames); assumes a static scene.
+    /// Light NEE: no temporal reuse in the light cell fill. By default each cell reservoir merges its
+    /// previous frame's reservoir (history capped by --light-temporal-frames; assumes a static scene).
     #[arg(long)]
-    light_cell_temporal: bool,
-    /// Light NEE with --light-cell-temporal: frames of history behind a cell reservoir (1..1024).
-    #[arg(long, value_name = "N", default_value_t = 20,
+    light_no_cell_temporal: bool,
+    /// Light NEE with temporal reuse: frames of history behind a cell reservoir (1..1024).
+    #[arg(long, value_name = "N", default_value_t = 128,
           value_parser = clap::value_parser!(u32).range(1..=1024))]
     light_temporal_frames: u32,
-    /// Light NEE: every vertex that sampled a light cell pushes its light sample and its shadow ray
-    /// result into the cell; the next fill merges the pushes (voxel-face samples enter the cells).
-    #[arg(long)]
-    light_cell_push: bool,
-    /// Light NEE with --light-cell-push: the confidence (M) of a pushed sample in the cell fill.
-    #[arg(long, value_name = "F", default_value_t = 8.0)]
-    light_push_confidence: f32,
     /// Light NEE: light candidates per diffuse vertex, resampled by the exact target at the vertex
-    /// before the one shadow ray (docs/LIGHT_LIST.md section 2.6); 1 = no resampling (1..32).
-    /// Default 1 (--light-cell-push needs 1).
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=32))]
-    light_nee_candidates: Option<u32>,
-    /// Light NEE with MIS: the vertex form of the MIS proxy density (the voxel-face weight times the
-    /// receiver's own geometry term over the cell's normalisation; docs/LIGHT_MIS.md "Vertex proxy").
-    #[arg(long)]
-    light_proxy_vertex: bool,
+    /// before the one shadow ray (docs/LIGHT_NEE.md section 5.3); 1 = no resampling (1..32).
+    #[arg(long, value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=32))]
+    light_nee_candidates: u32,
     /// Light NEE: a vertex whose pixel footprint (world units per pixel) is below F uses 32-voxel
     /// cells, else 128-voxel cells.
     #[arg(long, value_name = "F", default_value_t = 0.25)]
     light_footprint: f32,
-    /// Both GI methods, with --gi-light-nee: per-pixel ReSTIR DI on the light list at the primary
-    /// surface (docs/RESTIR_DI.md); the --gi-* reuse options apply to it.
-    #[arg(long)]
-    gi_restir_di: bool,
-    /// ReSTIR DI: initial light candidates per pixel (1..32).
-    #[arg(long, value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=32))]
-    gi_di_candidates: u32,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -1247,7 +1227,7 @@ impl App {
                         let light = light_stats(state.scene);
                         println!(
                             "light: bricks={} dropped={} table_bytes={} cell_bytes={} \
-                             cells live/active/inserted/failed={}/{}/{}/{} pushes/dropped={}/{}",
+                             cells live/active/inserted/failed={}/{}/{}/{}",
                             light.bricks,
                             light.bricks_dropped,
                             light.table_bytes,
@@ -1255,9 +1235,7 @@ impl App {
                             gi.light_cells_live,
                             gi.light_cells_active,
                             gi.light_cells_inserted,
-                            gi.light_cell_lookups_failed,
-                            gi.light_cell_pushes,
-                            gi.light_cell_pushes_dropped
+                            gi.light_cell_lookups_failed
                         );
                         self.screenshot = Screenshot::Done;
                         if self.args.exit_after_screenshot {
@@ -2120,43 +2098,24 @@ fn main() -> anyhow::Result<()> {
             spatial_passes: args.gi_spatial_passes,
             spatial_radius: args.gi_radius,
             depth_threshold: args.gi_depth_threshold,
-            light_nee: args.gi_light_nee,
+            light_nee: !args.gi_no_light_nee,
             light_cells: args.light_cells,
             light_cell_reservoirs: args.light_cell_reservoirs,
             light_cell_jitter: !args.light_no_cell_jitter,
-            light_cell_oriented: args.light_cell_oriented,
+            light_cell_oriented: !args.light_no_cell_oriented,
             light_mis: !args.light_no_mis,
-            light_cell_temporal: args.light_cell_temporal,
+            light_cell_temporal: !args.light_no_cell_temporal,
             light_temporal_frames: args.light_temporal_frames,
-            light_cell_push: args.light_cell_push,
-            light_push_confidence: args.light_push_confidence,
-            light_nee_candidates: args.light_nee_candidates.unwrap_or(1),
-            light_proxy_vertex: args.light_proxy_vertex,
+            light_nee_candidates: args.light_nee_candidates,
             light_candidates: args.light_candidates,
             light_footprint: args.light_footprint,
-            restir_di: args.gi_restir_di,
-            di_candidates: args.gi_di_candidates,
         },
     };
-    if args.gi_restir_di && !args.gi_light_nee {
-        bail!("--gi-restir-di needs --gi-light-nee");
-    }
     if !args.light_cells.is_power_of_two() || !(1024..=1048576).contains(&args.light_cells) {
         bail!("--light-cells {} must be a power of two in 1024..1048576", args.light_cells);
     }
     if !args.light_cell_reservoirs.is_power_of_two() {
-        bail!("--light-cell-reservoirs {} must be a power of two in 1..64", args.light_cell_reservoirs);
-    }
-    if let Some(candidates) = args.light_nee_candidates {
-        if args.light_cell_push && candidates >= 2 {
-            bail!(
-                "--light-cell-push needs one light NEE candidate per vertex (--light-nee-candidates 1, \
-                 got {candidates}): the push ring takes the vertex's own sample, not a resampled one"
-            );
-        }
-    }
-    if !(0.0..=1024.0).contains(&args.light_push_confidence) {
-        bail!("--light-push-confidence {} must be in 0..1024", args.light_push_confidence);
+        bail!("--light-cell-reservoirs {} must be a power of two in 1..256", args.light_cell_reservoirs);
     }
     if !args.light_footprint.is_finite() || args.light_footprint < 0.0 {
         bail!("--light-footprint {} must be a finite value >= 0", args.light_footprint);

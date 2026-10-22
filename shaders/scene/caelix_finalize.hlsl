@@ -9,7 +9,7 @@
 //   - occupied = alive && payload value != 0, packed into micro occupancy words,
 //     the coarse byte and the tight bounds of the header,
 //   - the brick's AABB row (entity-local block coordinates; NaN when empty),
-//   - the brick's light word (docs/LIGHT_LIST.md): asuint of the luminance sum of
+//   - the brick's light word (docs/LIGHT_NEE.md section 2.1): asuint of the luminance sum of
 //     its occupied voxels whose material is a list light (luminance of the
 //     emission >= min_emission, common/caelix_light.hlsl), 0 when there is none.
 //

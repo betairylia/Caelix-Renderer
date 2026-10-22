@@ -70,26 +70,11 @@ extern "C" {
    caelix_upscaler_query), the extension lists (caelix_upscaler_instance_extensions,
    caelix_upscaler_device_extensions), the jitter helpers (caelix_upscaler_jitter_phases,
    caelix_jitter_halton) and CaelixUpscalerInfo with caelix_renderer_get_upscaler_info, also without
-   a bump. The GI experiment step added CaelixGiMethod, CAELIX_GI_FLAG_*, CaelixGiOptions,
-   caelix_renderer_set_gi_options, CaelixGiStats and caelix_renderer_get_gi_stats (no existing struct
-   changed), also without a bump. The light list step (docs/LIGHT_LIST.md) added CaelixLightOptions,
-   caelix_scene_set_light_options, CaelixLightStats, caelix_scene_get_light_stats and
-   CAELIX_GI_FLAG_LIGHT_NEE, and appended the light cell fields to the experimental CaelixGiOptions
-   (32 -> 48 bytes) and CaelixGiStats (16 -> 32 bytes), also without a bump. The ReSTIR DI step
-   (docs/RESTIR_DI.md) added CAELIX_GI_FLAG_RESTIR_DI and renamed CaelixGiOptions::light_reserved to
-   di_candidates (same size). The light cell jitter added CAELIX_GI_FLAG_LIGHT_CELL_JITTER. The light MIS step
-   (docs/LIGHT_MIS.md) added CAELIX_GI_FLAG_LIGHT_MIS (no struct changed). The light cell temporal reuse
-   added CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL and appended light_temporal_frames to CaelixGiOptions
-   (48 -> 52 bytes). The light cell usage counters appended four uint32 fields to CaelixGiStats
-   (32 -> 48 bytes). The light cell push-back added CAELIX_GI_FLAG_LIGHT_CELL_PUSH, appended
-   light_push_confidence to CaelixGiOptions (52 -> 56 bytes) and two uint32 fields to CaelixGiStats
-   (48 -> 56 bytes). The per-vertex resampling of the light NEE appended light_nee_candidates to
-   CaelixGiOptions (56 -> 60 bytes) and added CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX. The oriented light cells
-   added CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED and shrank a light cell to 256 bytes (8 reservoirs,
-   CaelixGiStats::light_cell_bytes changes accordingly). The light cell size step (2026-10-22) made a
-   level 0 cell 32 voxels (128 at level 1) and appended light_cell_reservoirs to CaelixGiOptions
-   (60 -> 64 bytes; the cell is 64 + 24 x reservoirs bytes). The pairwise MIS step added
-   CAELIX_GI_FLAG_PAIRWISE_MIS (no struct changed). A host built against
+   a bump. The GI experiments added CaelixGiMethod, CAELIX_GI_FLAG_*, CaelixGiOptions,
+   caelix_renderer_set_gi_options, CaelixGiStats, caelix_renderer_get_gi_stats, CaelixLightOptions,
+   caelix_scene_set_light_options, CaelixLightStats and caelix_scene_get_light_stats (no struct of
+   the earlier ABI changed), also without a bump. They are experimental: their layout and their flag
+   bits can change without notice (docs/GI_EXPERIMENTS.md, docs/LIGHT_NEE.md). A host built against
    an older version-2 header must be rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -524,15 +509,15 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
                                                   CaelixMaterial* out);
 
 /* ---------------------------------------------------------------------------
- * Light list (experimental, docs/LIGHT_LIST.md)
+ * Light list (experimental, docs/LIGHT_NEE.md section 2)
  *
  * A material is a "list light" when the luminance of its emission (0.2126 r + 0.7152 g + 0.0722 b,
  * before CaelixRenderOptions::emission_scale) is >= min_emission. The finalize kernel writes one
  * light word per brick (the luminance sum of its alive list-light voxels), and every flush that
  * finalized bricks or freed brick ids rebuilds the scene's light table: one 448-byte entry per brick
  * with list lights (per face direction a mask of the voxels whose face is open and its weight, the
- * brick's origin; docs/LIGHT_FACES.md) and a CDF over their weights. Renderers with CAELIX_GI_FLAG_LIGHT_NEE sample it. Bricks beyond max_bricks
- * are dropped (counted, never an error). */
+ * brick's origin) and a CDF over their weights. Renderers with CAELIX_GI_FLAG_LIGHT_NEE sample it.
+ * Bricks beyond max_bricks are dropped (counted, never an error). */
 typedef struct CaelixLightOptions
 {
     float min_emission;  /* 0 = 20.0: list light when luminance(material.emission) >= this (packed
@@ -543,7 +528,7 @@ typedef struct CaelixLightOptions
                                left to the BSDF path (its hits of list lights closer than this keep
                                their emission). Area sampling with 1/d^2 makes the near field an
                                extremely heavy-tailed NEE estimate (bistro lost 14 % after 512
-                               frames); the split is unbiased. ReSTIR DI applies the same split. */
+                               frames); the split is unbiased. */
     uint32_t reserved;
 } CaelixLightOptions;
 
@@ -562,7 +547,7 @@ typedef struct CaelixLightStats
                                 (read back from the GPU; 0 before the first one) */
     uint32_t bricks_dropped; /* bricks with list lights beyond max_bricks in that rebuild */
     uint64_t table_bytes;    /* GPU size of the light table (64 + 452 bytes per max_bricks entry) plus
-                                the light words (4 bytes per AABB row) */
+                                the light words and the brick -> entry map (4 + 4 bytes per AABB row) */
     uint64_t rebuilds;       /* flushes that rebuilt the table so far */
 } CaelixLightStats;
 
@@ -1165,65 +1150,44 @@ typedef enum CaelixGiMethod
     CAELIX_GI_RESTIR = 1      /* screen-space ReSTIR GI on the first diffuse bounce */
 } CaelixGiMethod;
 
-#define CAELIX_GI_FLAG_TEMPORAL (1u << 0)     /* temporal reuse (previous frame's reservoir) */
-#define CAELIX_GI_FLAG_SPATIAL (1u << 1)      /* spatial reuse */
+#define CAELIX_GI_FLAG_TEMPORAL (1u << 0)     /* ReSTIR GI: temporal reuse (previous frame's reservoir) */
+#define CAELIX_GI_FLAG_SPATIAL (1u << 1)      /* ReSTIR GI: spatial reuse */
 #define CAELIX_GI_FLAG_VISIBILITY (1u << 2)   /* ReSTIR GI: a shadow ray per reused neighbour sample (occluded ->
-                                                 weight 0). ReSTIR DI ignores it (its shade pass traces the ray) */
-#define CAELIX_GI_FLAG_UNBIASED (1u << 3)     /* Z-count MIS instead of 1/M. ReSTIR GI: implies VISIBILITY rays
-                                                 per neighbour. ReSTIR DI: Z by target support in the SPATIAL
-                                                 pass only (the temporal pass is 1/M in every mode), no rays;
-                                                 recommended for DI (1/M loses ~10 % where the supports differ:
-                                                 horizon, near-field split) */
+                                                 weight 0) */
+#define CAELIX_GI_FLAG_UNBIASED (1u << 3)     /* ReSTIR GI: Z-count MIS instead of 1/M (implies VISIBILITY rays per
+                                                 neighbour) */
 #define CAELIX_GI_FLAG_DIFFUSE_ONLY (1u << 4) /* force the Lambert lobe at every vertex */
 #define CAELIX_GI_FLAG_LIGHT_NEE (1u << 5)    /* next-event estimation on the scene's light list at every
-                                                 diffuse vertex (docs/LIGHT_LIST.md): world-space reservoirs
-                                                 (light cells) of light samples, brick-level or (with
-                                                 LIGHT_CELL_PUSH) voxel-face; both methods */
-#define CAELIX_GI_FLAG_RESTIR_DI (1u << 6)    /* per-pixel ReSTIR DI on the light list at the primary
-                                                 surface (docs/RESTIR_DI.md); needs LIGHT_NEE; both methods */
-#define CAELIX_GI_FLAG_LIGHT_CELL_JITTER (1u << 7) /* light NEE: each vertex looks its light cell up at a point
+                                                 diffuse vertex through the renderer's light cells
+                                                 (world-space reservoirs of brick-level light samples;
+                                                 docs/LIGHT_NEE.md); both methods */
+#define CAELIX_GI_FLAG_LIGHT_CELL_JITTER (1u << 6) /* light NEE: each vertex looks its light cell up at a point
                                                  jittered by up to half a cell, so that neighbouring pixels read
                                                  different cells (the per-cell flicker becomes per-pixel noise;
-                                                 docs/LIGHT_LIST.md section 2.5). Unbiased. */
-#define CAELIX_GI_FLAG_LIGHT_MIS (1u << 8)    /* with LIGHT_NEE: MIS (balance heuristic) between the light NEE and
-                                                 the diffuse bounce (docs/LIGHT_MIS.md); without it a list-light
-                                                 hit after a light NEE vertex is skipped. With RESTIR_DI the DI
-                                                 at the primary surface takes part as the NEE strategy (not with
-                                                 CAELIX_GI_RESTIR) */
-#define CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL (1u << 9) /* with LIGHT_NEE: the cell fill merges each reservoir's
+                                                 docs/LIGHT_NEE.md section 5.1). Unbiased. */
+#define CAELIX_GI_FLAG_LIGHT_MIS (1u << 7)    /* with LIGHT_NEE: MIS (balance heuristic) between the light NEE and
+                                                 the diffuse bounce (docs/LIGHT_NEE.md section 6); without it a
+                                                 list-light hit after a light NEE vertex is skipped */
+#define CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL (1u << 8) /* with LIGHT_NEE: the cell fill merges each reservoir's
                                                  previous frame reservoir as temporal history (M-capped by
                                                  light_temporal_frames) and estimates the cell normalisation
                                                  from dedicated draws accumulated over frames
-                                                 (docs/LIGHT_LIST.md section 2.2). Assumes a static scene (no
+                                                 (docs/LIGHT_NEE.md section 4.3). Assumes a static scene (no
                                                  scene edits, no entity motion); the history is dropped when
                                                  the light table was rebuilt or reset is set */
-#define CAELIX_GI_FLAG_LIGHT_CELL_PUSH (1u << 10) /* with LIGHT_NEE: every vertex that sampled a light cell
-                                                 pushes its light sample and its shadow ray result into
-                                                 the cell; the next fill merges the pushes (confidence
-                                                 light_push_confidence, an occluded sample with a lower
-                                                 target), so voxel-face samples enter the cells
-                                                 (docs/LIGHT_LIST.md section 2.2). Unbiased. Needs
-                                                 light_nee_candidates 1 */
-#define CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX (1u << 11) /* with LIGHT_MIS: the MIS proxy density of the light NEE
-                                                 at a vertex with a light cell is the vertex form (the
-                                                 voxel-face weight times the receiver's own geometry
-                                                 term over the cell's normalisation) instead of the cell
-                                                 form (docs/LIGHT_MIS.md "Vertex proxy"). Unbiased: both
-                                                 strategies evaluate the same proxy */
-#define CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED (1u << 12) /* with LIGHT_NEE: the light cell key also holds the
+#define CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED (1u << 9) /* with LIGHT_NEE: the light cell key also holds the
                                                  receiver's face (the axis of its world normal, 6 values),
                                                  so a spatial cell splits into up to 6 oriented cells; the
-                                                 fill's target and the MIS proxy's cell form get the
-                                                 receiver orientation term (floor 0.1, never 0)
-                                                 (docs/LIGHT_LIST.md section 2.7). Unbiased */
-#define CAELIX_GI_FLAG_PAIRWISE_MIS (1u << 13) /* ReSTIR GI: pairwise MIS (balance heuristic between each spatial
+                                                 fill's target and the MIS proxy get the receiver
+                                                 orientation term (floor 0.1, never 0)
+                                                 (docs/LIGHT_NEE.md section 4.2). Unbiased */
+#define CAELIX_GI_FLAG_PAIRWISE_MIS (1u << 10) /* ReSTIR GI: pairwise MIS (balance heuristic between each spatial
                                                  neighbour and the pixel's own sample, with visibility in both
                                                  densities: two shadow rays per accepted neighbour) in the
                                                  spatial pass and the balance heuristic in the temporal pass,
                                                  instead of 1/M or the Z-count (VISIBILITY and UNBIASED are then
-                                                 ignored by ReSTIR GI; ReSTIR DI ignores this flag). Bounds the
-                                                 reconnection Jacobian's outliers (docs/GI_EXPERIMENTS.md,
-                                                 "Pairwise MIS") */
+                                                 ignored). Bounds the reconnection Jacobian's outliers
+                                                 (docs/GI_EXPERIMENTS.md, "Pairwise MIS") */
 
 /* The GI options of one renderer. ReSTIR GI (CAELIX_GI_RESTIR) runs in the lighting modes when
    bounce_count >= 1: the trace kernel stores one initial sample per pixel (the first bounce of the
@@ -1232,23 +1196,17 @@ typedef enum CaelixGiMethod
    at every vertex, ignores sun NEE and the fog on the GI path, and writes no specular radiance.
    CAELIX_GI_FLAG_PAIRWISE_MIS weights its temporal and spatial reuse with the balance heuristic
    (pairwise MIS with two shadow rays per spatial neighbour) instead of 1/M or the Z-count.
-   CAELIX_GI_FLAG_LIGHT_NEE (either method): every diffuse vertex that has a next segment samples one
-   point on a list light (an emissive voxel face whose material is a list light of the scene, see
-   CaelixLightOptions) through the renderer's light cells (world-space reservoirs keyed by entity,
-   level and cell coordinate, refilled before every trace) and traces a shadow ray; a segment that
-   leaves such a vertex no longer counts the emission of a list light it hits when the NEE can
-   sample that point (a brick the table dropped keeps its emission). With CAELIX_GI_FLAG_LIGHT_MIS
-   the NEE and such a hit are combined by multiple importance sampling instead (balance heuristic
-   over a proxy of the NEE density and the cosine density of the diffuse bounce); the primary
-   vertex keeps the exclusive rule with ReSTIR GI. The light_* fields size the cells.
-   CAELIX_GI_FLAG_RESTIR_DI (with LIGHT_NEE, either method, bounce_count >= 1): the primary vertex's
-   one-sample light NEE is replaced by per-pixel ReSTIR DI: di_candidates initial light points per
-   pixel, then temporal and spatial reuse with the TEMPORAL, SPATIAL, VISIBILITY and UNBIASED flags
-   and the reuse fields above, and one shadow ray per pixel; the result is added to the diffuse
-   radiance (after ReSTIR GI's). The bounce vertices keep the one-sample light NEE. With
-   CAELIX_GI_FLAG_LIGHT_MIS and CAELIX_GI_PATH_TRACE the DI takes part in the MIS: its target and its
-   contribution carry the NEE's balance heuristic weight at the pixel's primary surface, and the
-   first bounce segment counts a list-light hit with the bounce's weight. */
+   CAELIX_GI_FLAG_LIGHT_NEE (either method; docs/LIGHT_NEE.md): every diffuse vertex that has a next
+   segment samples one point on a list light (an emissive voxel face whose material is a list light
+   of the scene, see CaelixLightOptions) through the renderer's light cells (world-space reservoirs
+   keyed by entity, level, cell coordinate and, with CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED, receiver
+   face, refilled before every trace; light_nee_candidates of them resampled at the vertex) and traces
+   a shadow ray; a segment that leaves such a vertex no longer counts the emission of a list light it
+   hits when the NEE can sample that point (a brick the table dropped keeps its emission). With
+   CAELIX_GI_FLAG_LIGHT_MIS the NEE and such a hit are combined by multiple importance sampling
+   instead (balance heuristic over a proxy of the NEE density and the cosine density of the diffuse
+   bounce); the primary vertex keeps the exclusive rule with ReSTIR GI. The light_* fields size the
+   cells. */
 typedef struct CaelixGiOptions
 {
     uint32_t method;          /* CaelixGiMethod */
@@ -1259,25 +1217,23 @@ typedef struct CaelixGiOptions
     float spatial_radius;     /* pixels, 0 = 30 */
     float depth_threshold;    /* 0 = 0.1: |x_v(q) - x_v(r)| must be below threshold * view_z(r) */
     uint32_t reset;           /* 1 = drop the reservoir history with the next render */
-    uint32_t light_cell_capacity; /* 0 = 65536 light cells; else a power of two in 1024 .. 1048576
-                                     (64 + 24 x light_cell_reservoirs bytes per cell) */
+    uint32_t light_cell_capacity; /* 0 = 65536 light cells; else a power of two in 1024 .. 1048576. A
+                                     cell is 64 + 8 x light_cell_reservoirs bytes, and the cell table
+                                     (capacity x cell bytes + 16 bytes of usage counters) must fit in
+                                     the device's maxStorageBufferRange */
     uint32_t light_candidates;    /* 0 = 8; 1 .. 64 candidates per cell reservoir and frame */
     float light_level_footprint;  /* 0 = 0.25: a vertex whose pixel footprint (world units per pixel at
                                      its camera distance) is below this uses 32-voxel cells, else
                                      128-voxel cells */
-    uint32_t di_candidates;       /* 0 = 4; 1 .. 32 initial light candidates per pixel (RESTIR_DI) */
     uint32_t light_temporal_frames; /* 0 = 20; LIGHT_CELL_TEMPORAL: the history behind a cell reservoir is
                                        clamped to this many frames (x light_candidates candidates) before
                                        the merge; 1 .. 1024 */
-    float light_push_confidence; /* 0 = 8; LIGHT_CELL_PUSH: the confidence (M) of a pushed sample in the
-                                    cell fill; finite, 0 .. 1024 */
     uint32_t light_nee_candidates; /* 0 = 1; LIGHT_NEE: light candidates per diffuse vertex, resampled by
                                       the exact target at the vertex before the one shadow ray
-                                      (docs/LIGHT_LIST.md section 2.6); 1 = no resampling (one
-                                      sample, the earlier NEE); 1 .. 32. LIGHT_CELL_PUSH needs 1 */
-    uint32_t light_cell_reservoirs; /* 0 = 8; LIGHT_NEE: reservoirs per light cell (the push ring has as many
-                                       entries); a power of two in 1 .. 64. A cell is 64 + 24 x this bytes
-                                       (256 at 8); a change recreates the cell table (history dropped) */
+                                      (docs/LIGHT_NEE.md section 5.3); 1 = no resampling; 1 .. 32 */
+    uint32_t light_cell_reservoirs; /* 0 = 8; LIGHT_NEE: reservoirs per light cell, a power of two in
+                                       1 .. 256. A cell is 64 + 8 x this bytes (128 at 8); a change
+                                       recreates the cell table (history dropped) */
 } CaelixGiOptions;
 
 /* Sets the GI options of the renderer; they apply from the next render on and stay until the next
@@ -1285,42 +1241,34 @@ typedef struct CaelixGiOptions
    them). CAELIX_MODE_REFERENCE accumulates the chosen method's output, so a biased method converges
    to its biased image (that is how the bias is measured). A new method or new flags also drop the
    reservoir history. With CAELIX_GI_PATH_TRACE and without CAELIX_GI_FLAG_DIFFUSE_ONLY the image is
-   the path tracer's, bit for bit. The reservoir buffers (4 x 48 bytes per pixel) are allocated at
-   the first ReSTIR render and kept until the renderer is destroyed (recreated on a size change);
-   the DI reservoir buffers (4 x 48 bytes per pixel) likewise at the first render with
-   CAELIX_GI_FLAG_RESTIR_DI. The DI history is also dropped when the scene's light table was rebuilt
-   since the renderer's previous render.
-   The light cells (light_cell_capacity x (64 + 24 x light_cell_reservoirs) bytes + 32) are allocated
-   at the first render with CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity or the reservoir
-   count changes.
+   the path tracer's, bit for bit. The ReSTIR GI reservoir buffers (4 x 48 bytes per pixel) are
+   allocated at the first ReSTIR render and kept until the renderer is destroyed (recreated on a size
+   change). The light cells (light_cell_capacity x (64 + 8 x light_cell_reservoirs) bytes + 16) are
+   allocated at the first render with CAELIX_GI_FLAG_LIGHT_NEE and recreated when the capacity or the
+   reservoir count changes.
    Validation: unknown method or flags, spatial_samples > 8, spatial_passes > 2, non-finite or negative
    floats, a light_cell_capacity that is not 0 or a power of two in 1024 .. 1048576,
-   light_candidates > 64, CAELIX_GI_FLAG_RESTIR_DI without CAELIX_GI_FLAG_LIGHT_NEE, di_candidates > 32,
-   light_temporal_frames > 1024, a light_push_confidence that is not finite or not in 0 .. 1024,
-   light_nee_candidates > 32, CAELIX_GI_FLAG_LIGHT_CELL_PUSH with an effective light_nee_candidates
-   >= 2, a light_cell_reservoirs that is not 0 or a power of two in 1 .. 64
+   light_candidates > 64, light_temporal_frames > 1024, light_nee_candidates > 32, a
+   light_cell_reservoirs that is not 0 or a power of two in 1 .. 256, a cell table (with the defaults
+   for zero fields) above the device's maxStorageBufferRange
    -> CAELIX_ERROR_INVALID_ARGUMENT (logged; the previous options stay). */
 CAELIX_API CaelixResult caelix_renderer_set_gi_options(CaelixRenderer* renderer, const CaelixGiOptions* options);
 
 typedef struct CaelixGiStats
 {
-    float gi_ms;              /* GPU time of the GI and DI reuse passes (temporal + spatial + shade) of the
+    float gi_ms;              /* GPU time of the ReSTIR GI reuse passes (temporal + spatial + shade) of the
                                  frame of CaelixGpuTimings (0 when that frame ran no reuse pass) */
-    uint64_t reservoir_bytes; /* bytes of the GI and DI reservoir buffers currently allocated */
+    uint64_t reservoir_bytes; /* bytes of the ReSTIR GI reservoir buffers currently allocated */
     uint64_t light_cell_bytes; /* bytes of the light cell table currently allocated */
     float light_fill_ms;       /* GPU time of the light cell fill of the frame of CaelixGpuTimings (0 when
                                   that frame ran no fill) */
     /* The light cell usage counters of the frame of CaelixGpuTimings (all 0 when that frame ran no
-       light NEE). light_cell_bytes includes their 32 bytes at the tail of the cell table. */
+       light NEE). light_cell_bytes includes their 16 bytes at the tail of the cell table. */
     uint32_t light_cells_live;          /* cells with a key after this frame's eviction */
     uint32_t light_cells_active;        /* of those, looked up by the previous frame's trace */
     uint32_t light_cells_inserted;      /* cells inserted by this frame's lookups */
     uint32_t light_cell_lookups_failed; /* lookups that found neither the key nor a free slot in 8 probes
                                            (the table is full around there) */
-    uint32_t light_cell_pushes;         /* LIGHT_CELL_PUSH: pushes of the previous frame's trace that got a
-                                           ring entry (counted by this frame's fill) */
-    uint32_t light_cell_pushes_dropped; /* LIGHT_CELL_PUSH: pushes of the previous frame's trace beyond the
-                                           light_cell_reservoirs ring entries of their cell */
 } CaelixGiStats;
 
 /* Fills *out; a null argument is ignored. */

@@ -329,7 +329,7 @@ flush builds the TLAS that the render binds.
   format qualifier, bindings 7..13 the internal targets of the lighting modes
   with fixed formats, binding 14 the sky cubemap as a sampled image and 15 its
   sampler) and one push constant (`CaelixTracePush`, 16 bytes: the device address
-  of a 608-byte `CaelixFrameConstants` block and the spatial pass index of the
+  of a 672-byte `CaelixFrameConstants` block and the spatial pass index of the
   ReSTIR GI spatial kernel) (`shaders/common/caelix_frame.hlsl`,
   `lib/src/render/frame_constants.h`): camera, target size, the addresses of the page
   table, slot tables, group infos, entity infos and the material table, the record layout, group
@@ -338,7 +338,8 @@ flush builds the TLAS that the render binds.
   `has_prev_camera` / `has_tlas`, and the lighting parameters (mode, bounces,
   seed, accumulation count, exposure, sun and sky, sRGB output, `t_max`, fog,
   emission scale, sky cubemap parameters and the SH buffer address, the ReSTIR
-  GI reservoir addresses and options). The
+  GI reservoir addresses and options, the light list and light cell addresses
+  and options). The
   composite kernel has its own set (binding 0 the colour target, bindings 1..8
   internal targets, 9 the sky cubemap, 10 its sampler) and the same push
   constant. Every binding is `PARTIALLY_BOUND`
@@ -644,26 +645,30 @@ measurement protocol and results: `docs/GI_EXPERIMENTS.md`. The host flags are
 `--gi` and `--gi-*` (see "Running the host"), the debug UI has a GI section in
 the Render window.
 
-### Light list and light NEE (step 1)
+### Light list and light NEE
 
-Emissive voxels whose material is a "list light" (luminance of the emission,
-before `emission_scale`, at least `CaelixLightOptions::min_emission`, default
-20) are sampled by next-event estimation (`docs/LIGHT_LIST.md`). The finalize
-kernel writes one light word per AABB row (the luminance sum of the brick's
-alive list-light voxels, a separate buffer), and every flush that finalized
-bricks, freed ids or moved AABB ranges rebuilds the scene's light table
-(`caelix_light_compact` + `caelix_light_scan`: one 128-byte entry per brick
-with list lights, plus a CDF; capacity `max_bricks`, default 65536, bricks
-beyond it are dropped and counted). `caelix_scene_set_light_options` /
-`caelix_scene_get_light_stats` set and read it. With
-`CAELIX_GI_FLAG_LIGHT_NEE` (either GI method) the renderer owns a hash table of
-light cells (world-space ReGIR reservoirs keyed by entity, level and cell
-coordinate; 288 bytes per cell, 65536 by default), refilled by
-`caelix_light_cells` before every trace; every diffuse vertex with a next
-segment samples a brick from its cell (or the global CDF), a voxel face point
-in it, and traces one shadow ray; the segment that leaves such a vertex no
-longer counts the emission of a list light it hits.
-`CaelixGiStats::light_cell_bytes` and `light_fill_ms` report the cells.
+Many-lights direct light: RIS + next-event estimation on a coarse world-space
+grid of light cells (`docs/LIGHT_NEE.md`, the "as built" description). Emissive
+voxels whose material is a "list light" (luminance of the emission, before
+`emission_scale`, at least `CaelixLightOptions::min_emission`, default 20) enter
+the scene's light table: the finalize kernel writes one light word per AABB row,
+and every flush that finalized bricks, freed ids or moved AABB ranges rebuilds
+the table (`caelix_light_compact` + `caelix_light_scan`: one 448-byte entry per
+brick with list lights, with per-face masks of the open emitting faces, plus a
+CDF; capacity `max_bricks`, default 65536, bricks beyond it are dropped and
+counted). `caelix_scene_set_light_options` / `caelix_scene_get_light_stats` set
+and read it. With `CAELIX_GI_FLAG_LIGHT_NEE` (either GI method) the renderer owns
+a hash table of light cells (keyed by entity, level, cell coordinate and, with
+`CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED`, receiver face; 64 + 8 x R bytes per cell,
+R = 1 .. 256 reservoirs), refilled by `caelix_light_cells` before every trace
+(optionally with temporal reuse, `CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL`); every
+diffuse vertex with a next segment samples a brick from its (optionally
+jittered) cell, a point on an open emitting face in it, resamples
+`light_nee_candidates` such candidates and traces one shadow ray, combined with
+the BSDF path by MIS (`CAELIX_GI_FLAG_LIGHT_MIS`). `CaelixGiStats` reports the
+cell memory, the fill time and the cell usage counters. The library is opt-in
+(no light NEE without `caelix_renderer_set_gi_options`); the Rust host turns it
+on by default.
 
 ### Render targets and G-buffer mode
 
@@ -886,15 +891,20 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   (1/M weights: -3.2 %; unbiased Z weights: -1.0 %, the temporal reuse has no
   visibility ray); after switching back the path tracer image is bit-identical
   with and without `CAELIX_GI_FLAG_DIFFUSE_ONLY` (packed materials are diffuse).
-- `caelix_trace_test`, light list cases (`docs/LIGHT_LIST.md`): the light table
+- `caelix_trace_test`, light list cases (`docs/LIGHT_NEE.md`): the light table
   of a two-brick scene has one entry (none above every emission, also when the
   threshold is set before the upload; one dropped with a capacity of one);
-  light NEE in a closed 24^3 box lit by one strength-3 voxel matches the plain
-  path tracer's mean (1024 vs 4096 reference frames, 128x128, 4 bounces: ratio
-  1.0095 against a path tracer noise floor of 1.0060, 16x16 block PSNR
-  45.8 dB); one path tracer frame without the flag is bit-identical on a scene
-  whose table has entries and one whose table is empty; the light cells (1024)
-  are created, filled and timed, and a 1 spp frame is lit; option validation.
+  light NEE in a closed 24^3 box (128x128, 4 bounces, 1024 frames against a
+  4096-frame plain path tracer reference) matches the reference's mean within
+  3 % and a 16x16 block PSNR above 30 dB: one light voxel with and without MIS,
+  four light bricks with temporal cell reuse, with 8 candidates per vertex,
+  with oriented and jittered cells and 2 reservoirs, and with every option at
+  once and 256 reservoirs per cell; covered and border faces are never sampled;
+  a dropped brick keeps its emission; one path tracer frame without the flag is
+  bit-identical on a scene whose table has entries and one whose table is
+  empty; the light cells (1024) are created, filled and timed, and a 1 spp
+  frame is lit; option validation (reservoir counts 128 and 256 accepted, 3
+  and 512 rejected).
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -1053,32 +1063,26 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   prints `timings: trace_ms=... gi_ms=... light_ms=... denoise_ms=...
   composite_ms=... upscale_ms=...` and `light: bricks=... dropped=...
   table_bytes=... cell_bytes=...` on stdout when the PNG is written.
-- `--gi-light-nee`: both GI methods, next-event estimation on the scene's light
-  list at every diffuse vertex (`CAELIX_GI_FLAG_LIGHT_NEE`, see "Light list
-  and light NEE"). Scene options (set once, before the world loads):
-  `--light-min-emission <F>` (list-light threshold on the emission luminance;
-  0 = the library default 20), `--light-max-bricks <N>` (light table
-  capacity, 1..1048576, default 65536) and `--light-nee-distance <F>` (the
-  near-field split in world units, 0 = the library default 8: light points
-  closer than this are left to the BSDF path). Light cell options:
-  `--light-cells <N>` (a power of two, 1024..1048576, default 65536),
-  `--light-cell-reservoirs <N>` (a power of two, 1..64, default 8;
-  reservoirs and push entries per cell, 64 + 24 x N bytes per cell),
-  `--light-candidates <N>` (1..64, default 8) and `--light-footprint <F>`
-  (world units per pixel below which a vertex uses 32-voxel cells, else
-  128-voxel cells; default 0.25). The debug UI's GI section has the same
-  controls and the GPU times show the light fill, the cell memory and the
-  light table's bricks and drops.
-- `--gi-restir-di`: needs `--gi-light-nee`; both GI methods, per-pixel ReSTIR
-  DI on the light list at the primary surface (`CAELIX_GI_FLAG_RESTIR_DI`,
-  docs/RESTIR_DI.md): the primary vertex's one-sample light NEE is replaced by
-  a reservoir with temporal and spatial reuse and one shadow ray per pixel.
-  The ReSTIR GI reuse options above (`--gi-no-temporal`, `--gi-no-spatial`,
-  `--gi-visibility`, `--gi-unbiased`, `--gi-m-cap`, `--gi-spatial-*`,
-  `--gi-radius`, `--gi-depth-threshold`) apply to it as well.
-  `--gi-di-candidates <N>` (1..32, default 4): initial light candidates per
-  pixel. The GI section of the debug UI has a "ReSTIR DI" checkbox and a "DI
-  candidates" slider; `gi_ms` includes the DI passes.
+- Light NEE (both GI methods, on by default; `CAELIX_GI_FLAG_LIGHT_NEE`, see
+  "Light list and light NEE" and docs/LIGHT_NEE.md section 7):
+  `--gi-no-light-nee` turns it off. Scene options (set once, before the world
+  loads): `--light-min-emission <F>` (list-light threshold on the emission
+  luminance; 0 = the library default 20), `--light-max-bricks <N>` (light
+  table capacity, 1..1048576, default 65536) and `--light-nee-distance <F>`
+  (the near-field split in world units, 0 = the library default 8: light
+  points closer than this are left to the BSDF path). Light cell options:
+  `--light-cells <N>` (a power of two, 1024..1048576, default 262144),
+  `--light-cell-reservoirs <N>` (a power of two, 1..256, default 64; a cell is
+  64 + 8 x N bytes), `--light-candidates <N>` (candidates per cell reservoir,
+  1..64, default 16), `--light-footprint <F>` (world units per pixel below
+  which a vertex uses 32-voxel cells, else 128-voxel cells; default 0.25),
+  `--light-temporal-frames <N>` (history of the temporal cell reuse, 1..1024,
+  default 128) and `--light-nee-candidates <N>` (candidates per diffuse
+  vertex, 1..32, default 4). Opt-outs: `--light-no-cell-jitter`,
+  `--light-no-cell-oriented`, `--light-no-cell-temporal` and `--light-no-mis`.
+  The debug UI's GI section has the same controls, and the stats show the
+  light fill time, the cell memory, the cell usage counters and the light
+  table's bricks and drops.
 
 ### Test entity and brick edits
 
@@ -1238,7 +1242,9 @@ host runs it after the frame, because the dialog blocks the thread.
   per unit) and colour; the materials' emission scale (logarithmic, 0..64);
   the GI section: method, ReSTIR GI M cap (1..64), spatial samples (1..8),
   spatial passes (1..2), radius (1..100 px), depth threshold (logarithmic,
-  0.01..1), temporal / spatial reuse, visibility rays, unbiased; "Reset
+  0.01..1), temporal / spatial reuse, visibility rays, unbiased, and the
+  light NEE controls (cells, reservoirs, candidates, footprint, temporal frames,
+  NEE candidates, jitter, oriented cells, temporal reuse, MIS); "Reset
   history" drops the reservoir history once. A GI change restarts the
   reference accumulation. "Reset accumulation" sets `reset_accumulation` for one frame (reference and
   NRD history); in reference mode the accumulated frame count is shown.

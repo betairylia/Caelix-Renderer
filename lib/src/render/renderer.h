@@ -21,17 +21,23 @@ namespace caelix {
 class Scene;
 class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 
-// The light cell layout (render/caelix_light_sample.hlsl): LightCellBytes(reservoirs) per cell (a 64-byte
-// header, `reservoirs` x 8 B reservoirs and as many 16 B push entries), then the usage counters (live,
-// active, inserted, failed, pushed, push_dropped: six uints and 8 bytes of padding) at the buffer's tail.
+// The light cell layout (render/caelix_light_sample.hlsl, docs/LIGHT_NEE.md section 3.4):
+// LightCellBytes(reservoirs) per cell (a 64-byte header and `reservoirs` x 8 B reservoirs), then the
+// usage counters (live, active, inserted, failed: four uints) at the buffer's tail.
 constexpr VkDeviceSize kLightCellHeaderBytes = 64;
 constexpr VkDeviceSize kLightCellReservoirBytes = 8;
-constexpr VkDeviceSize kLightCellPushBytes = 16;
 constexpr VkDeviceSize LightCellBytes(uint32_t reservoirs)
 {
-    return kLightCellHeaderBytes + (kLightCellReservoirBytes + kLightCellPushBytes) * reservoirs;
+    return kLightCellHeaderBytes + kLightCellReservoirBytes * reservoirs;
 }
-constexpr VkDeviceSize kLightCellCounterBytes = 32;
+constexpr VkDeviceSize kLightCellCounterBytes = 16;
+// CaelixGiOptions light defaults (a zero field takes them; docs/LIGHT_NEE.md section 7).
+constexpr uint32_t kDefaultLightCellCapacity = 65536;
+constexpr uint32_t kDefaultLightCandidates = 8;
+constexpr float kDefaultLightLevelFootprint = 0.25f;
+constexpr uint32_t kDefaultLightTemporalFrames = 20;
+constexpr uint32_t kDefaultLightNeeCandidates = 1;
+constexpr uint32_t kDefaultLightCellReservoirs = 8;
 // Readback slots of the light cell counters (slot = frame_number % kLightCounterSlots).
 constexpr uint32_t kLightCounterSlots = 8;
 
@@ -76,7 +82,7 @@ constexpr uint32_t kLightCounterSlots = 8;
 // executor is created at the first denoised render and recreated (history lost)
 // when the size changes, the old one is destroyed once its last frame is safe.
 // Per-frame resources
-// live in a ring of slots (four descriptor sets + 720-byte constants buffer); a
+// live in a ring of slots (four descriptor sets + 672-byte constants buffer); a
 // slot is reused only when its frame is safe. The camera of each successful
 // render call is kept as the previous camera of the next one (motion targets). A
 // renderer renders at most once per frame number (last_frame_).
@@ -91,11 +97,11 @@ constexpr uint32_t kLightCounterSlots = 8;
 // final one becomes prev. Created at the first ReSTIR render, recreated (old ones retired
 // until safe) when the render size changes, kept while another method runs.
 //
-// Light NEE (CAELIX_GI_FLAG_LIGHT_NEE, lighting modes; docs/LIGHT_LIST.md): the renderer owns the
-// light cells (CaelixGiOptions::light_cell_capacity x 256 bytes + 32 bytes of usage counters, trace
-// set binding 21; the counters are reset before the fill and read back after the trace), created and
-// zero-filled at the first render with the flag, recreated (the old buffer retired until safe) when
-// the capacity changes, kept while the flag is off. When the scene has a light table, the light cell
+// Light NEE (CAELIX_GI_FLAG_LIGHT_NEE, lighting modes; docs/LIGHT_NEE.md): the renderer owns the
+// light cells (CaelixGiOptions::light_cell_capacity x LightCellBytes(light_cell_reservoirs) + 16 bytes
+// of usage counters, trace set binding 21; the counters are reset before the fill and read back after
+// the trace), created and zero-filled at the first render with the flag, recreated (the old buffer
+// retired until safe) when the capacity or the reservoir count changes, kept while the flag is off. When the scene has a light table, the light cell
 // fill (caelix_light_cells, trace set, TracePush) runs before the sky SH kernel and the trace, with
 // its own timer (CaelixGiStats::light_fill_ms); a compute -> compute barrier orders its writes before
 // the trace, which reads the reservoirs and inserts new cells. frame_counter_ (the render count) is
@@ -103,16 +109,6 @@ constexpr uint32_t kLightCounterSlots = 8;
 // fill (FrameConstants::light_temporal_frames > 0); the history is dropped (0 for one fill) when the
 // scene rebuilt its light table since the previous fill (light_cell_rebuilds_) or after a reset
 // (light_cell_reset_).
-//
-// ReSTIR DI (CAELIX_GI_FLAG_RESTIR_DI with LIGHT_NEE, lighting modes with bounces and a light
-// table; docs/RESTIR_DI.md): the trace kernel stores one initial DI reservoir per pixel, then
-// caelix_restir_di_temporal, up to two caelix_restir_di_spatial passes and caelix_restir_di_shade run
-// after the ReSTIR GI passes (when those run) and before NRD / the composite; the shade pass adds
-// the direct light of the list lights to the diffuse radiance target. Four DI reservoir buffers
-// (48 bytes per pixel each), rotated, created, retired and resized as the GI buffers (di_*). The DI
-// history is also dropped when the scene's light table was rebuilt since this renderer's previous
-// render (CaelixLightStats::rebuilds changed: entry indices may have moved). gi_timer_ brackets
-// the GI and the DI passes.
 //
 // Internal targets (lighting modes only): created at the first lighting render,
 // recreated when the host target size changes (the old images are destroyed once
@@ -269,8 +265,6 @@ private:
     // ones are retired until `frame` is safe and the history is dropped. Returns true when it
     // created them.
     bool EnsureGiBuffers(uint32_t width, uint32_t height, uint64_t frame);
-    // The same for the ReSTIR DI reservoir buffers (48 bytes per pixel).
-    bool EnsureDiBuffers(uint32_t width, uint32_t height, uint64_t frame);
     // Creates the light cells when they are missing or of another capacity or reservoir count; the
     // old buffer is retired until `frame` is safe. A new buffer is zero-filled by the next render
     // (light_cells_need_clear_).
@@ -279,11 +273,6 @@ private:
     uint64_t GiAddress(GiBuffer which) const
     {
         return gi_buffers_[gi_index_[which]].address();
-    }
-    // The device address of DI reservoir buffer `which` (same roles) under the DI rotation.
-    uint64_t DiAddress(GiBuffer which) const
-    {
-        return di_buffers_[di_index_[which]].address();
     }
     // Destroys retired internal targets, reservoir buffers, NRD executors and upscalers whose
     // frame is <= safe_frame.
@@ -366,24 +355,14 @@ private:
     uint64_t gi_reservoir_bytes_ = 0;    // bytes of gi_buffers_
     uint64_t gi_last_frame_ = 0;         // the last frame that used gi_buffers_
     std::vector<RetiredGiBuffers> retired_gi_;
-    GpuTimer gi_timer_;                  // temporal + spatial + shade dispatches (GI and DI)
-    // ReSTIR DI (CAELIX_GI_FLAG_RESTIR_DI): the same roles as the GI buffers, 48 bytes per pixel.
-    bool di_history_valid_ = false;      // the buffer at di_index_[kGiPrev] holds the previous frame's DI reservoirs
-    GiBuffers di_buffers_;               // created at the first ReSTIR DI render
-    std::array<uint32_t, kGiBufferCount> di_index_{kGiInitial, kGiPrev, kGiTemp, kGiOut};
-    uint32_t di_width_ = 0;
-    uint32_t di_height_ = 0;
-    uint64_t di_reservoir_bytes_ = 0;
-    uint64_t di_last_frame_ = 0;         // the last frame that used di_buffers_
-    uint64_t di_light_rebuilds_ = 0;     // CaelixLightStats::rebuilds at the previous ReSTIR DI render
-    std::vector<RetiredGiBuffers> retired_di_;
+    GpuTimer gi_timer_;                  // temporal + spatial + shade dispatches
     // Light NEE (CAELIX_GI_FLAG_LIGHT_NEE).
-    GpuBuffer light_cells_;                  // capacity x LightCellBytes(reservoirs) + 32 bytes of usage
+    GpuBuffer light_cells_;                  // capacity x LightCellBytes(reservoirs) + 16 bytes of usage
                                              // counters (render/caelix_light_sample.hlsl)
     uint32_t light_cell_capacity_ = 0;       // cells of light_cells_
     uint32_t light_cell_reservoirs_ = 0;     // reservoirs per cell of light_cells_
     // The usage counters of the light cells, copied after the trace of each light NEE frame into
-    // slot frame_number % kLightCounterSlots (32 bytes each; persistently mapped), and the frame of
+    // slot frame_number % kLightCounterSlots (16 bytes each; persistently mapped), and the frame of
     // each slot (0 = none). Created and retired with light_cells_.
     GpuBuffer light_counter_readback_;
     std::array<uint64_t, kLightCounterSlots> light_counter_frames_{};

@@ -1,4 +1,4 @@
-// Light table scan kernel (docs/LIGHT_LIST.md, section 1.2): after caelix_light_compact, turns
+// Light table scan kernel (docs/LIGHT_NEE.md section 2.2): after caelix_light_compact, turns
 // cdf[0 .. count) of the scene's light table (common/caelix_light.hlsl) into the inclusive prefix
 // sum of the entries' total weights, in place.
 //

@@ -176,9 +176,9 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
     scene->instances_ =
         GrowableBuffer(allocator, vk_device, kInstancesInitialBytes,
                        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
-    // One light word per AABB row (docs/LIGHT_LIST.md).
+    // One light word per AABB row (docs/LIGHT_NEE.md section 2.1).
     scene->light_words_ = GrowableBuffer(allocator, vk_device, kAabbInitialRows * sizeof(uint32_t));
-    // The brick -> light table entry map, managed like the light words (docs/LIGHT_MIS.md).
+    // The brick -> light table entry map, managed like the light words (docs/LIGHT_NEE.md section 2.7).
     scene->light_indices_ = GrowableBuffer(allocator, vk_device, kAabbInitialRows * sizeof(uint32_t));
     const std::vector<uint32_t> finalize_spirv = LoadShader("caelix_finalize");
     scene->finalize_ = ComputePipeline(vk_device, finalize_spirv, sizeof(FinalizePush),

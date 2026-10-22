@@ -269,54 +269,39 @@ pub struct GiSettings {
     /// Fraction of the view depth.
     pub depth_threshold: f32,
     /// Both methods: next-event estimation on the scene's light list (`CAELIX_GI_FLAG_LIGHT_NEE`,
-    /// docs/LIGHT_LIST.md).
+    /// docs/LIGHT_NEE.md).
     pub light_nee: bool,
     /// Light cells (a power of two, 1024..1048576).
     pub light_cells: u32,
-    /// Light NEE: reservoirs (and push ring entries) per light cell (a power of two, 1..64; a cell is
-    /// 64 + 24 x this bytes).
+    /// Light NEE: reservoirs per light cell (a power of two, 1..256; a cell is 64 + 8 x this bytes).
     pub light_cell_reservoirs: u32,
     /// Light NEE: look the cell up at a point jittered by up to half a cell per vertex
     /// (`CAELIX_GI_FLAG_LIGHT_CELL_JITTER`): the per-cell flicker becomes per-pixel noise.
     pub light_cell_jitter: bool,
     /// Light NEE: the light cell key also holds the receiver's face (the axis of its world normal),
     /// and the fill's target and the MIS proxy get the receiver orientation term
-    /// (`CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED`, docs/LIGHT_LIST.md section 2.7).
+    /// (`CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED`, docs/LIGHT_NEE.md section 4.2).
     pub light_cell_oriented: bool,
     /// Light NEE: MIS between the light NEE and the diffuse bounce (`CAELIX_GI_FLAG_LIGHT_MIS`,
-    /// docs/LIGHT_MIS.md); off: a list-light hit after a light NEE vertex is skipped.
+    /// docs/LIGHT_NEE.md section 6); off: a list-light hit after a light NEE vertex is skipped.
     pub light_mis: bool,
     /// Light NEE: temporal reuse in the light cell fill (`CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL`,
-    /// docs/LIGHT_LIST.md section 2.2): each cell reservoir merges its previous frame's reservoir;
+    /// docs/LIGHT_NEE.md section 4.3): each cell reservoir merges its previous frame's reservoir;
     /// assumes a static scene.
     pub light_cell_temporal: bool,
     /// Light NEE with `light_cell_temporal`: frames of history behind a cell reservoir (1..1024).
     pub light_temporal_frames: u32,
-    /// Light NEE: every vertex that sampled a light cell pushes its light sample and its shadow ray
-    /// result into the cell; the next fill merges the pushes (`CAELIX_GI_FLAG_LIGHT_CELL_PUSH`,
-    /// docs/LIGHT_LIST.md section 2.2).
-    pub light_cell_push: bool,
-    /// Light NEE with `light_cell_push`: the confidence (M) of a pushed sample in the fill.
-    pub light_push_confidence: f32,
     /// Light NEE: light candidates per diffuse vertex, resampled by the exact target before the one
-    /// shadow ray (docs/LIGHT_LIST.md section 2.6); 1 = no resampling (1..32). `light_cell_push`
-    /// needs 1 (the library rejects the push with more).
+    /// shadow ray (docs/LIGHT_NEE.md section 5.3); 1 = no resampling (1..32).
     pub light_nee_candidates: u32,
-    /// Light NEE with `light_mis`: the vertex form of the MIS proxy density
-    /// (`CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX`, docs/LIGHT_MIS.md "Vertex proxy").
-    pub light_proxy_vertex: bool,
     /// Candidates per cell reservoir and frame (1..64).
     pub light_candidates: u32,
     /// World units per pixel below which a vertex uses 32-voxel cells (else 128-voxel cells).
     pub light_footprint: f32,
-    /// Both methods, with `light_nee`: per-pixel ReSTIR DI on the light list at the primary surface
-    /// (`CAELIX_GI_FLAG_RESTIR_DI`, docs/RESTIR_DI.md); it uses the reuse settings above.
-    pub restir_di: bool,
-    /// ReSTIR DI: initial light candidates per pixel (1..32).
-    pub di_candidates: u32,
 }
 
 impl Default for GiSettings {
+    /// The command-line defaults (docs/LIGHT_NEE.md section 7: light NEE with every kept option on).
     fn default() -> Self {
         Self {
             method: GiMethod::Pt,
@@ -331,22 +316,17 @@ impl Default for GiSettings {
             spatial_passes: 1,
             spatial_radius: 30.0,
             depth_threshold: 0.1,
-            light_nee: false,
-            light_cells: 65536,
-            light_cell_reservoirs: 8,
+            light_nee: true,
+            light_cells: 262144,
+            light_cell_reservoirs: 64,
             light_cell_jitter: true,
-            light_cell_oriented: false,
+            light_cell_oriented: true,
             light_mis: true,
-            light_cell_temporal: false,
-            light_temporal_frames: 20,
-            light_cell_push: false,
-            light_push_confidence: 8.0,
-            light_nee_candidates: 1,
-            light_proxy_vertex: false,
-            light_candidates: 8,
+            light_cell_temporal: true,
+            light_temporal_frames: 128,
+            light_nee_candidates: 4,
+            light_candidates: 16,
             light_footprint: 0.25,
-            restir_di: false,
-            di_candidates: 4,
         }
     }
 }
@@ -383,19 +363,9 @@ impl GiSettings {
             }
             if self.light_mis {
                 flags |= CAELIX_GI_FLAG_LIGHT_MIS;
-                if self.light_proxy_vertex {
-                    flags |= CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX;
-                }
             }
             if self.light_cell_temporal {
                 flags |= CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
-            }
-            if self.light_cell_push {
-                flags |= CAELIX_GI_FLAG_LIGHT_CELL_PUSH;
-            }
-            // RESTIR_DI needs LIGHT_NEE (the library rejects it alone).
-            if self.restir_di {
-                flags |= CAELIX_GI_FLAG_RESTIR_DI;
             }
         }
         flags
@@ -415,9 +385,7 @@ impl GiSettings {
             light_cell_capacity: self.light_cells,
             light_candidates: self.light_candidates,
             light_level_footprint: self.light_footprint,
-            di_candidates: self.di_candidates,
             light_temporal_frames: self.light_temporal_frames,
-            light_push_confidence: self.light_push_confidence,
             light_nee_candidates: self.light_nee_candidates,
             light_cell_reservoirs: self.light_cell_reservoirs,
         }

@@ -1,4 +1,4 @@
-// The scene's light list (docs/LIGHT_LIST.md, entry layout docs/LIGHT_FACES.md): the list-light
+// The scene's light list (docs/LIGHT_NEE.md section 2, entry layout section 2.3): the list-light
 // rule and the layout of the light table and its entries. Mirrors lib/src/scene/gpu_structs.h
 // (LightTableHeader, LightEntry); change both together.
 //

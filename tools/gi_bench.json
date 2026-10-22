@@ -35,7 +35,7 @@
       "pose": "-1847.4,800.9,-1051.3,18.500,91.300",
       "fov": 60,
       "extra": ["--sky-zenith", "0,0,0", "--sky-horizon", "0,0,0", "--sky-ground", "0,0,0"],
-      "reference": "--mode ref --accumulate 8192 --gi pt --gi-light-nee --light-cell-temporal --light-nee-candidates 1"
+      "reference": "--mode ref --accumulate 8192 --gi pt --light-no-cell-temporal --light-nee-candidates 1"
     },
     {
       "name": "shroom",

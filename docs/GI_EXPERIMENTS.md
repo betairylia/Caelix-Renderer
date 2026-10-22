@@ -1,4 +1,13 @@
-# GI experiments (branch `gi-experiments`, started 2026-10-20)
+# GI experiments: screen-space ReSTIR GI (branch `light-nee-experiments`)
+
+Started 2026-10-20 on the branch `gi-experiments`. This document describes the ReSTIR GI method
+(`CAELIX_GI_RESTIR`) that the code still has. The full history of the GI experiments (the light
+list steps, ReSTIR DI, the push-back of shadow ray results, ball lights, the vertex MIS proxy) is
+in the verbatim copies in `F:/RP_Games/Caelix-family/Artifacts/gi-experiments-20261020/docs/`
+(this file as of tag `light-nee-cleanup-base` among them). The direct light of emissive voxels
+that was kept, RIS + NEE on a light list through world-space light cells, is described in
+`docs/LIGHT_NEE.md`; ReSTIR GI can run together with it (the light NEE flags apply to both GI
+methods).
 
 Goal: pick a global-illumination direction for the native renderer by measuring candidates against
 the 1 spp path tracer, in the Rust host, diffuse only, no sun NEE, no denoiser. The question the
@@ -43,6 +52,10 @@ Owner decisions (2026-10-20):
   for the multi-bounce tail. That split is the target shape for phase 2.
 - Brick keys are entity-local: a moving entity carries its cache, no cell-size tuning, and the dirty
   brick list can age exactly the cells an edit touched (fits the "no scene version counter" rule).
+- Owner decision 2026-10-21: the premise "no light list" was reversed. The light list and the
+  light NEE (`docs/LIGHT_NEE.md`) carry the direct light of emissive voxels; ReSTIR GI stays as an
+  experimental GI method. ReSTIR DI on the light list was built and removed again on 2026-10-22
+  (`docs/LIGHT_NEE.md` section 9).
 - Patents: NVIDIA holds patents on ReSTIR, AMD on spatial hashing of world-space reservoirs.
   Irrelevant for the experiment; the owner decides for a shipped game.
 
@@ -66,6 +79,9 @@ Sources: [RTXDI ReSTIR GI](https://github.com/NVIDIAGameWorks/RTXDI/blob/main/do
   = the same value the path tracer adds on a miss). Black sky in the emissive tests.
 
 ### ABI (addition, no struct of the existing ABI changes)
+
+The phase 1 design below; the current declarations (with the light NEE fields and flags) are in
+`include/caelix/caelix.h`.
 
 The Unity C# bridge compares struct sizes with the plugin, so `CaelixRenderOptions` stays as it is.
 New in `include/caelix/caelix.h`:
@@ -189,7 +205,8 @@ rays, internal targets), the frame constants as the push constant, and `TracePus
 struct. Barriers: a compute -> compute memory barrier (storage write -> storage read) between every
 pass. GPU timer `gi_timer_` around passes 2..4 -> `CaelixGiStats::gi_ms`.
 
-Frame constants (internal, both mirrors) grow from 544 to 608 bytes:
+Frame constants (internal, both mirrors) grow from 544 to 608 bytes (672 bytes today, with the
+light NEE fields after them):
 
 ```
 uint64_t gi_initial, gi_prev, gi_temp, gi_out;   // 544, 552, 560, 568  reservoir buffer addresses
@@ -330,8 +347,8 @@ tests), but the weights must carry visibility consistently: without visibility t
 into occluded corners, with visibility on one side only the image is too dark there. Pairwise MIS
 (Bitterli, PhD thesis 2022; Lin et al. 2022, GRIS section 7) with visibility in both densities is the fix.
 
-Flag `CAELIX_GI_FLAG_PAIRWISE_MIS` (bit 9, ReSTIR GI only; it overrides `VISIBILITY` and
-`UNBIASED` for ReSTIR GI, ReSTIR DI ignores it). Host default for `--gi restir`: on
+Flag `CAELIX_GI_FLAG_PAIRWISE_MIS` (bit 10, ReSTIR GI only; it overrides `VISIBILITY` and
+`UNBIASED`). Host default for `--gi restir`: on
 (`--gi-no-pairwise` and the debug UI checkbox "pairwise MIS (2 rays per neighbour)" turn it off).
 
 Notation: receiver r = this pixel with visible point x_v, face normal n_v, own sample Y_c with
@@ -404,7 +421,10 @@ Fixture test (`caelix_trace_test`, 256 frames): max ratio error 0.0066 (noise fl
 Z-count (2.1 / 5.7 ms) and 2 to 5x the 1/M weights (1.3 / 1.2 ms): two shadow rays per accepted
 neighbour. The temporal balance heuristic is untested under camera motion (equal to 1/M at rest).
 
-## Phase 2 (planned): brick-keyed world-space reservoirs
+## Phase 2 (planned, not built): brick-keyed world-space reservoirs
+
+The light cells of `docs/LIGHT_NEE.md` are a world-space hash of light reservoirs for the direct
+light only; this phase (world-space GI reservoirs) was not started.
 
 Sketch, to be designed after phase 1 numbers exist: hash cells keyed by (entity id, level,
 quantized local position, face index), level chosen by projected footprint (voxel face when the

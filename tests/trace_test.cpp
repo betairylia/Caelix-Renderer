@@ -3016,7 +3016,7 @@ TEST_CASE("ReSTIR GI: set_gi_options validation")
     };
     CaelixGiOptions bad = GiOptions(2, 0);  // unknown method
     expect_invalid(bad);
-    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 31);  // unknown flag (bits 0 .. 9 are defined)
+    bad = GiOptions(CAELIX_GI_RESTIR, 1u << 31);  // unknown flag (bits 0 .. 10 are defined)
     expect_invalid(bad);
     bad = GiOptions(CAELIX_GI_RESTIR, CAELIX_GI_FLAG_SPATIAL);
     bad.spatial_samples = 9;
@@ -3142,7 +3142,7 @@ TEST_CASE("ReSTIR GI: without reuse it matches the path tracer; with reuse its b
 }
 
 // ---------------------------------------------------------------------------
-// Light list (docs/LIGHT_LIST.md): the scene's light table, next-event estimation on list lights
+// Light list (docs/LIGHT_NEE.md): the scene's light table, next-event estimation on list lights
 // (CAELIX_GI_FLAG_LIGHT_NEE) against the plain path tracer, the path tracer without the flag, and
 // the renderer's light cells.
 
@@ -3444,13 +3444,6 @@ double PixelRmse(const std::vector<float>& ref, const std::vector<float>& test, 
     return std::sqrt(squared / (3.0 * size * size));
 }
 
-std::vector<float> ColorPixels(const Target& color)
-{
-    std::vector<float> image(static_cast<size_t>(color.width) * color.height * 4);
-    std::memcpy(image.data(), color.bytes.data(), image.size() * sizeof(float));
-    return image;
-}
-
 }  // namespace
 
 TEST_CASE("light NEE with MIS is unbiased")
@@ -3519,7 +3512,7 @@ TEST_CASE("light NEE with temporal cell reuse is unbiased")
     const std::vector<float> temporal = LightReference(rig, renderer, set, camera, 1024, 200000);
     CaelixGiStats stats{};
     caelix_renderer_get_gi_stats(renderer, &stats);
-    CHECK(stats.light_cell_bytes == 65536ull * 256ull + 32ull);  // the cells and the usage counters
+    CHECK(stats.light_cell_bytes == 65536ull * 128ull + 16ull);  // the cells and the usage counters
     const LightComparison c = CompareLight(pt, temporal, kBoxSize);
     std::printf("4 lights, light NEE + MIS + temporal cells vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 "
                 "block PSNR %.2f dB\n",
@@ -3545,13 +3538,10 @@ TEST_CASE("light NEE with temporal cell reuse is unbiased")
     CloseRig(rig);
 }
 
-TEST_CASE("light NEE with cell push-back is unbiased")
+TEST_CASE("light NEE with per-vertex resampling is unbiased")
 {
-    // The four lights of the temporal test, with the vertices' light samples and shadow ray results
-    // pushed back into the cells (CAELIX_GI_FLAG_LIGHT_CELL_PUSH). The box has little partial
-    // occlusion of a light, so the bias of the rejected variants (merge only visible pushes, halve the
-    // history's confidence on an occluded observation; docs/LIGHT_LIST.md section 2.2) would hardly
-    // show here; the bench on bistro and shroom is the real check.
+    // The four lights of the temporal test (docs/LIGHT_NEE.md section 5.3): 8 candidates per diffuse
+    // vertex resampled by the exact target (times w_nee), one shadow ray.
     Rig rig;
     OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
     EnableLights(rig.scene);
@@ -3570,115 +3560,25 @@ TEST_CASE("light NEE with cell push-back is unbiased")
     set.t[kColor] = &color;
     const CaelixCamera camera = LightBoxCamera();
 
-    CaelixGiOptions bad{};
-    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_PUSH;
-    bad.light_push_confidence = 1025.0f;
-    ExpectLibraryErrors(1, [&] {
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-    bad.light_push_confidence = -1.0f;
-    ExpectLibraryErrors(1, [&] {
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-    // Per-vertex resampling (docs/LIGHT_LIST.md section 2.6): at most 32 candidates, and the push
-    // needs one candidate per vertex (0 counts as the default 4).
-    bad.light_push_confidence = 0.0f;
-    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE;
-    bad.light_nee_candidates = 33;
-    ExpectLibraryErrors(1, [&] {
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-    bad.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_PUSH;
-    bad.light_nee_candidates = 4;
-    ExpectLibraryErrors(1, [&] {
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-    bad.light_nee_candidates = 0;  // 0 = 1: no resampling, so the push is accepted
-    REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
-    bad.light_nee_candidates = 1;
-    REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
-
     CaelixGiOptions gi{};
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
     const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
-    // The default capacity, history (20 frames) and push confidence (8); one light NEE candidate per
-    // vertex (the push needs it).
-    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL |
-               CAELIX_GI_FLAG_LIGHT_CELL_PUSH;
-    gi.light_nee_candidates = 1;
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
+    gi.light_nee_candidates = 8;
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
-    const std::vector<float> pushed = LightReference(rig, renderer, set, camera, 1024, 200000);
-    CaelixGiStats stats{};
-    caelix_renderer_get_gi_stats(renderer, &stats);
-    const LightComparison c = CompareLight(pt, pushed, kBoxSize);
-    std::printf("4 lights, light NEE + MIS + temporal cells + push-back vs path tracer: mean %.5f vs %.5f, ratio "
-                "%.4f, 16x16 block PSNR %.2f dB (pushes %u, dropped %u, live cells %u)\n",
-                c.test_mean, c.ref_mean, c.ratio, c.block_psnr, stats.light_cell_pushes,
-                stats.light_cell_pushes_dropped, stats.light_cells_live);
+    const std::vector<float> resampled = LightReference(rig, renderer, set, camera, 1024, 200000);
+    const LightComparison c = CompareLight(pt, resampled, kBoxSize);
+    std::printf("4 lights, light NEE + MIS + temporal cells, 8 candidates per vertex vs path tracer: mean %.5f vs "
+                "%.5f, ratio %.4f, 16x16 block PSNR %.2f dB, pixel PSNR %.2f dB\n",
+                c.test_mean, c.ref_mean, c.ratio, c.block_psnr, PixelPsnr(pt, resampled, kBoxSize));
     CHECK(c.ref_mean > 0.01);
     CHECK(c.ratio > 0.97);
     CHECK(c.ratio < 1.03);
-    // 28 dB since the 32-voxel cells (docs/LIGHT_LIST.md section 2.8): the box fits in one cell, so 8
-    // live cells replace 42 and ~30 pushes per frame land instead of ~239 (block PSNR 32 .. 34 dB,
-    // once 29.5, against 35 .. 37 before); the ratio check above is the unbiasedness test.
-    CHECK(c.block_psnr > 28.0);
-    CHECK(stats.light_cell_pushes > 0);
-
-    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
-    caelix_renderer_release_target_views(renderer);
-    caelix_renderer_destroy(renderer);
-    DestroyTarget(rig.gpu, color);
-    CloseRig(rig);
-}
-
-TEST_CASE("light NEE with per-vertex resampling is unbiased")
-{
-    // The four lights of the temporal test (docs/LIGHT_LIST.md section 2.6): 8 candidates per diffuse
-    // vertex resampled by the exact target (times w_nee), one shadow ray; with the vertex MIS proxy
-    // (docs/LIGHT_MIS.md "Vertex proxy") and without it.
-    Rig rig;
-    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
-    EnableLights(rig.scene);
-    World world = LightBoxWalls();
-    FillBox(world, 4, kBoxInterior, 4, 4, kBoxInterior, 4, kWhiteEmitter512);
-    FillBox(world, 20, kBoxInterior, 20, 20, kBoxInterior, 20, kWhiteEmitter512);
-    FillBox(world, 4, kBoxInterior, 20, 4, kBoxInterior, 20, kWhiteEmitter512);
-    FillBox(world, 12, kBoxInterior, 12, 12, kBoxInterior, 12, kWhiteEmitter512);
-    Upload(rig, world, KeysOf(world));
-    DrainBuilds(rig);
-    REQUIRE(LightStats(rig.scene).bricks == 4);
-    CaelixRenderer* renderer = nullptr;
-    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
-    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
-    TargetSet set;
-    set.t[kColor] = &color;
-    const CaelixCamera camera = LightBoxCamera();
-
-    CaelixGiOptions gi{};
+    CHECK(c.block_psnr > 30.0);
+    // The same with one candidate per vertex: the resampling changes the image.
+    gi.light_nee_candidates = 1;
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
-    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
-    constexpr uint32_t kFlags =
-        CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS | CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL;
-    const uint32_t modes[2] = {kFlags | CAELIX_GI_FLAG_LIGHT_PROXY_VERTEX, kFlags};
-    const char* names[2] = {"vertex proxy", "cell proxy"};
-    std::vector<float> images[2];
-    for (int m = 0; m < 2; ++m)
-    {
-        gi.flags = modes[m];
-        gi.light_nee_candidates = 8;
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
-        images[m] = LightReference(rig, renderer, set, camera, 1024, 200000);
-        const LightComparison c = CompareLight(pt, images[m], kBoxSize);
-        std::printf("4 lights, light NEE + MIS + temporal cells, 8 candidates per vertex, %s vs path tracer: mean "
-                    "%.5f vs %.5f, ratio %.4f, 16x16 block PSNR %.2f dB, pixel PSNR %.2f dB\n",
-                    names[m], c.test_mean, c.ref_mean, c.ratio, c.block_psnr, PixelPsnr(pt, images[m], kBoxSize));
-        CHECK(c.ref_mean > 0.01);
-        CHECK(c.ratio > 0.97);
-        CHECK(c.ratio < 1.03);
-        CHECK(c.block_psnr > 30.0);
-    }
-    // The vertex proxy changes the MIS weights, so the images differ.
-    CHECK(images[0] != images[1]);
+    CHECK(LightReference(rig, renderer, set, camera, 1024, 200000) != resampled);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);
@@ -3689,12 +3589,12 @@ TEST_CASE("light NEE with per-vertex resampling is unbiased")
 
 TEST_CASE("light NEE with oriented cells is unbiased")
 {
-    // The four lights of the temporal test (docs/LIGHT_LIST.md section 2.7): the light cell key holds
+    // The four lights of the temporal test (docs/LIGHT_NEE.md section 4.2): the light cell key holds
     // the receiver's face, and the fill's target and the MIS proxy's cell form carry the receiver
     // orientation term (floor 0.1). The ceiling's receivers face down while the lights sit in the
     // ceiling plane, so their cells weigh every light near the floor. With and without the jittered
     // lookup (a jittered receiver reads a cell of its own face but another position). The last mode
-    // runs unoriented jittered cells with 2 reservoirs per cell (docs/LIGHT_LIST.md section 2.8).
+    // runs unoriented jittered cells with 2 reservoirs per cell (docs/LIGHT_NEE.md section 3.4).
     Rig rig;
     OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
     EnableLights(rig.scene);
@@ -3740,9 +3640,9 @@ TEST_CASE("light NEE with oriented cells is unbiased")
                     "16x16 block PSNR %.2f dB, pixel PSNR %.2f dB (live cells %u)\n",
                     names[m], c.test_mean, c.ref_mean, c.ratio, c.block_psnr, PixelPsnr(pt, images[m], kBoxSize),
                     stats.light_cells_live);
-        // The cells (64 + 24 R bytes each) and the usage counters.
+        // The cells (64 + 8 R bytes each) and the usage counters.
         const uint64_t r = reservoirs[m] != 0 ? reservoirs[m] : 8;
-        CHECK(stats.light_cell_bytes == 65536ull * (64ull + 24ull * r) + 32ull);
+        CHECK(stats.light_cell_bytes == 65536ull * (64ull + 8ull * r) + 16ull);
         CHECK(c.ref_mean > 0.01);
         CHECK(c.ratio > 0.97);
         CHECK(c.ratio < 1.03);
@@ -3774,16 +3674,11 @@ TEST_CASE("MIS on a large emitter")
     CaelixGiOptions gi{};
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
     const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
-    // Modes 3 and 4: ReSTIR DI (unbiased reuse) without and with MIS; with it the DI is the NEE
-    // strategy at the primary vertex (docs/LIGHT_MIS.md section 5), and the panel gives both
-    // strategies weight there.
-    constexpr uint32_t kDi = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL |
-                             CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED;
-    const uint32_t modes[4] = {CAELIX_GI_FLAG_LIGHT_NEE, CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS, kDi,
-                               kDi | CAELIX_GI_FLAG_LIGHT_MIS};
-    const char* names[4] = {"light NEE", "light NEE + MIS", "ReSTIR DI", "ReSTIR DI + MIS"};
-    double rmse[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int m = 0; m < 4; ++m)
+    // The panel gives both strategies weight under MIS.
+    const uint32_t modes[2] = {CAELIX_GI_FLAG_LIGHT_NEE, CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_MIS};
+    const char* names[2] = {"light NEE", "light NEE + MIS"};
+    double rmse[2] = {0.0, 0.0};
+    for (int m = 0; m < 2; ++m)
     {
         gi.flags = modes[m];
         REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
@@ -3799,9 +3694,8 @@ TEST_CASE("MIS on a large emitter")
         CHECK(c.ratio > 0.97);
         CHECK(c.ratio < 1.03);
     }
-    std::printf("panel: 64-frame RMSE without MIS %.5f, with MIS %.5f (ratio %.3f); ReSTIR DI without MIS %.5f, "
-                "with MIS %.5f (ratio %.3f)\n",
-                rmse[0], rmse[1], rmse[1] / rmse[0], rmse[2], rmse[3], rmse[3] / rmse[2]);
+    std::printf("panel: 64-frame RMSE without MIS %.5f, with MIS %.5f (ratio %.3f)\n", rmse[0], rmse[1],
+                rmse[1] / rmse[0]);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);
@@ -3812,7 +3706,7 @@ TEST_CASE("MIS on a large emitter")
 
 TEST_CASE("closed faces are never sampled")
 {
-    // docs/LIGHT_FACES.md section 5: the light box's ceiling voxel has one open face (-Y). Step 1
+    // docs/LIGHT_NEE.md section 5.4: the light box's ceiling voxel has one open face (-Y). Step 1
     // chose among the 1..3 axis faces that point to the receiver without knowing which were covered,
     // so two of three samples of a floor receiver hit the ceiling from inside (60 % of the pixels
     // lit at 1 spp). With the per-face masks the covered faces have no voxel and weight 0, so only
@@ -3870,7 +3764,7 @@ TEST_CASE("closed faces are never sampled")
 
 TEST_CASE("border faces use the mask extent")
 {
-    // docs/LIGHT_FACES.md section 3 ("As built", face extents): a box of height 32 with the single
+    // docs/LIGHT_NEE.md section 5.4 (face extents): a box of height 32 with the single
     // light voxel at (12, 31, 12), the top row of the brick y 24..31, under the ceiling at y = 32
     // (the next brick). Its +Y face lies on the brick border, so the compact kernel counts it open,
     // but the ceiling covers it. Step 4's brick-slab rule made +Y a candidate for every receiver in
@@ -3934,7 +3828,7 @@ TEST_CASE("border faces use the mask extent")
 
 TEST_CASE("faces weigh the brick")
 {
-    // docs/LIGHT_FACES.md section 5: the panel box of "MIS on a large emitter" with a grey slab on
+    // docs/LIGHT_NEE.md section 2.3: the panel box of "MIS on a large emitter" with a grey slab on
     // top of the panel (y = 25, the same brick), so the panel's +Y faces are covered: the brick's
     // weight sits in its -Y face set (64 voxels) and in the side faces of the panel's border rows
     // (open on the brick border). The light NEE with MIS, whose proxy reads the face weights, must
@@ -3995,7 +3889,7 @@ TEST_CASE("dropped bricks keep their emission")
 {
     // Two single-voxel lights in two ceiling bricks and a table capacity of one brick: the table
     // drops one of them, the light NEE never samples it, and the BSDF path must keep its emission
-    // (docs/LIGHT_MIS.md section 2: the brick -> entry map has no entry for it).
+    // (docs/LIGHT_NEE.md section 6.3: the brick -> entry map has no entry for it).
     Rig rig;
     OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
     CaelixLightOptions options{};
@@ -4116,17 +4010,28 @@ TEST_CASE("cells fill and sample")
     });
     bad.light_temporal_frames = 0;
     bad.flags = CAELIX_GI_FLAG_LIGHT_NEE;
-    // Reservoirs per cell (docs/LIGHT_LIST.md section 2.8): 0 (= 8) or a power of two in 1 .. 64.
+    // Per-vertex resampling (docs/LIGHT_NEE.md section 5.3): at most 32 candidates.
+    bad.light_nee_candidates = 33;
+    ExpectLibraryErrors(1, [&] {
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+    bad.light_nee_candidates = 32;
+    REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
+    bad.light_nee_candidates = 0;
+    // Reservoirs per cell (docs/LIGHT_NEE.md section 3.4): 0 (= 8) or a power of two in 1 .. 256.
     bad.light_cell_reservoirs = 3;  // not a power of two
     ExpectLibraryErrors(1, [&] {
         REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
     });
-    bad.light_cell_reservoirs = 128;
+    bad.light_cell_reservoirs = 512;
     ExpectLibraryErrors(1, [&] {
         REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
     });
-    bad.light_cell_reservoirs = 0;
-    REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
+    for (const uint32_t reservoirs : {128u, 256u, 1u, 0u})
+    {
+        bad.light_cell_reservoirs = reservoirs;
+        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_OK);
+    }
 
     CaelixGiOptions gi{};
     gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
@@ -4150,13 +4055,12 @@ TEST_CASE("cells fill and sample")
     std::printf("light cells: %llu bytes, fill %.4f ms (frame %llu), trace %.4f ms\n",
                 static_cast<unsigned long long>(stats.light_cell_bytes), stats.light_fill_ms,
                 static_cast<unsigned long long>(timings.frame_number), timings.trace_ms);
-    CHECK(stats.light_cell_bytes == 1024ull * 256ull + 32ull);  // the cells and the usage counters
+    CHECK(stats.light_cell_bytes == 1024ull * 128ull + 16ull);  // the cells and the usage counters
     CHECK(timings.frame_number != 0);
     CHECK(stats.light_fill_ms > 0.0f);
     // The usage counters of the same frame: some cells live, never more than the capacity.
-    std::printf("light cells: live %u, active %u, inserted %u, lookups failed %u, pushes %u, pushes dropped %u\n",
-                stats.light_cells_live, stats.light_cells_active, stats.light_cells_inserted,
-                stats.light_cell_lookups_failed, stats.light_cell_pushes, stats.light_cell_pushes_dropped);
+    std::printf("light cells: live %u, active %u, inserted %u, lookups failed %u\n", stats.light_cells_live,
+                stats.light_cells_active, stats.light_cells_inserted, stats.light_cell_lookups_failed);
     CHECK(stats.light_cells_live > 0);
     CHECK(stats.light_cells_live <= 1024);
 
@@ -4181,12 +4085,23 @@ TEST_CASE("cells fill and sample")
     CloseRig(rig);
 }
 
-TEST_CASE("ReSTIR DI unbiased")
+TEST_CASE("light NEE with 256 reservoirs per cell is unbiased")
 {
+    // The four lights of the temporal test with every kept light NEE option at once (docs/LIGHT_NEE.md
+    // section 7): 256 reservoirs per cell (one cell per fill workgroup of 256 threads), oriented and
+    // jittered cells, temporal reuse, MIS and 4 candidates per vertex. 4096 cells are enough for the
+    // box (fewer than 100 live cells) and keep the fill short.
     Rig rig;
     OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
-    UploadLightBox(rig);
-    REQUIRE(LightStats(rig.scene).bricks == 1);
+    EnableLights(rig.scene);
+    World world = LightBoxWalls();
+    FillBox(world, 4, kBoxInterior, 4, 4, kBoxInterior, 4, kWhiteEmitter512);
+    FillBox(world, 20, kBoxInterior, 20, 20, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 4, kBoxInterior, 20, 4, kBoxInterior, 20, kWhiteEmitter512);
+    FillBox(world, 12, kBoxInterior, 12, 12, kBoxInterior, 12, kWhiteEmitter512);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    REQUIRE(LightStats(rig.scene).bricks == 4);
     CaelixRenderer* renderer = nullptr;
     REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
     Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
@@ -4195,132 +4110,34 @@ TEST_CASE("ReSTIR DI unbiased")
     const CaelixCamera camera = LightBoxCamera();
 
     CaelixGiOptions gi{};
-    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
-    const std::vector<float> nee = LightReference(rig, renderer, set, camera, 1024, 200000);
-    // The noise floor (reported only): light NEE against itself with other seeds.
-    const std::vector<float> nee2 = LightReference(rig, renderer, set, camera, 1024, 700000);
-    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL |
-               CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED;
+    const std::vector<float> pt = LightReference(rig, renderer, set, camera, 4096, 100000);
+    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_LIGHT_CELL_JITTER | CAELIX_GI_FLAG_LIGHT_CELL_ORIENTED |
+               CAELIX_GI_FLAG_LIGHT_CELL_TEMPORAL | CAELIX_GI_FLAG_LIGHT_MIS;
+    gi.light_cell_capacity = 4096;
+    gi.light_cell_reservoirs = 256;
+    gi.light_nee_candidates = 4;
     REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
-    const std::vector<float> di = LightReference(rig, renderer, set, camera, 1024, 400000);
+    const std::vector<float> image = LightReference(rig, renderer, set, camera, 1024, 200000);
     CaelixGiStats stats{};
     caelix_renderer_get_gi_stats(renderer, &stats);
-    // The same with the MIS of docs/LIGHT_MIS.md section 5 (the DI is the NEE strategy at the
-    // primary vertex, the first bounce segment the BSDF strategy).
-    gi.flags |= CAELIX_GI_FLAG_LIGHT_MIS;
-    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
-    const std::vector<float> di_mis = LightReference(rig, renderer, set, camera, 1024, 900000);
-
-    const LightComparison c = CompareLight(nee, di, kBoxSize);
-    const double psnr = PixelPsnr(nee, di, kBoxSize);
-    const double floor_psnr = PixelPsnr(nee, nee2, kBoxSize);
-    const LightComparison floor_c = CompareLight(nee, nee2, kBoxSize);
-    std::printf("ReSTIR DI (unbiased) vs light NEE, 1024 frames each: mean %.5f vs %.5f, ratio %.4f, "
-                "16x16 block PSNR %.2f dB, pixel PSNR %.2f dB; light NEE vs light NEE: ratio %.4f, pixel PSNR "
-                "%.2f dB; reservoir bytes %llu, gi %.4f ms\n",
-                c.test_mean, c.ref_mean, c.ratio, c.block_psnr, psnr, floor_c.ratio, floor_psnr,
-                static_cast<unsigned long long>(stats.reservoir_bytes), stats.gi_ms);
-    CHECK(stats.reservoir_bytes == 4ull * 48ull * kBoxSize * kBoxSize);
+    const LightComparison c = CompareLight(pt, image, kBoxSize);
+    std::printf("4 lights, 256 reservoirs, oriented + jittered + temporal cells, MIS, 4 candidates per vertex vs "
+                "path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 block PSNR %.2f dB, pixel PSNR %.2f dB (live "
+                "cells %u, fill %.4f ms)\n",
+                c.test_mean, c.ref_mean, c.ratio, c.block_psnr, PixelPsnr(pt, image, kBoxSize),
+                stats.light_cells_live, stats.light_fill_ms);
+    CHECK(stats.light_cell_bytes == 4096ull * (64ull + 8ull * 256ull) + 16ull);
+    CHECK(stats.light_cells_live > 0);
+    CHECK(stats.light_cell_lookups_failed == 0);
     CHECK(c.ref_mean > 0.01);
     CHECK(c.ratio > 0.97);
     CHECK(c.ratio < 1.03);
-    CHECK(psnr > 30.0);
-
-    const LightComparison c_mis = CompareLight(nee, di_mis, kBoxSize);
-    const double psnr_mis = PixelPsnr(nee, di_mis, kBoxSize);
-    std::printf("ReSTIR DI + MIS (unbiased) vs light NEE, 1024 frames each: mean %.5f vs %.5f, ratio %.4f, "
-                "16x16 block PSNR %.2f dB, pixel PSNR %.2f dB\n",
-                c_mis.test_mean, c_mis.ref_mean, c_mis.ratio, c_mis.block_psnr, psnr_mis);
-    CHECK(c_mis.ratio > 0.97);
-    CHECK(c_mis.ratio < 1.03);
-    CHECK(psnr_mis > 30.0);
+    CHECK(c.block_psnr > 30.0);
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);
     caelix_renderer_destroy(renderer);
     DestroyTarget(rig.gpu, color);
-    CloseRig(rig);
-}
-
-TEST_CASE("ReSTIR DI lowers the error")
-{
-    Rig rig;
-    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
-    UploadLightBox(rig);
-    CaelixRenderer* renderer = nullptr;
-    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
-    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kBoxSize, kBoxSize);
-    TargetSet set;
-    set.t[kColor] = &color;
-    const CaelixCamera camera = LightBoxCamera();
-
-    CaelixGiOptions gi{};
-    gi.flags = CAELIX_GI_FLAG_LIGHT_NEE;
-    REQUIRE(caelix_renderer_set_gi_options(renderer, &gi) == CAELIX_OK);
-    const std::vector<float> reference = LightReference(rig, renderer, set, camera, 1024, 500000);
-
-    // One path trace frame after 64 warm-up frames (the same seeds for each variant).
-    const auto single_frame_rmse = [&](uint32_t flags) {
-        CaelixGiOptions options{};
-        options.flags = flags;
-        options.reset = 1;
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &options) == CAELIX_OK);
-        for (uint32_t i = 0; i <= 64; ++i)
-        {
-            Render(rig, renderer, set, camera, GlassOptions(CAELIX_MODE_PATH_TRACE, 4, 0, 600000 + i), i == 64);
-        }
-        return PixelRmse(reference, ColorPixels(color), kBoxSize);
-    };
-    const double nee = single_frame_rmse(CAELIX_GI_FLAG_LIGHT_NEE);
-    const double di = single_frame_rmse(CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI |
-                                        CAELIX_GI_FLAG_TEMPORAL | CAELIX_GI_FLAG_SPATIAL);
-    const double di_unbiased =
-        single_frame_rmse(CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL |
-                          CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED);
-    const double di_mis =
-        single_frame_rmse(CAELIX_GI_FLAG_LIGHT_NEE | CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL |
-                          CAELIX_GI_FLAG_SPATIAL | CAELIX_GI_FLAG_UNBIASED | CAELIX_GI_FLAG_LIGHT_MIS);
-    std::printf("single frame RMSE against the 1024-frame light NEE reference: light NEE %.5f, ReSTIR DI %.5f "
-                "(%.3fx), ReSTIR DI unbiased %.5f (%.3fx), ReSTIR DI unbiased + MIS %.5f (%.3fx)\n",
-                nee, di, di / nee, di_unbiased, di_unbiased / nee, di_mis, di_mis / nee);
-    CHECK(di < nee);
-    CHECK(di_unbiased < nee);
-
-    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
-    caelix_renderer_release_target_views(renderer);
-    caelix_renderer_destroy(renderer);
-    DestroyTarget(rig.gpu, color);
-    CloseRig(rig);
-}
-
-TEST_CASE("RESTIR_DI needs LIGHT_NEE")
-{
-    Rig rig;
-    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
-    CaelixRenderer* renderer = nullptr;
-    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
-
-    CaelixGiOptions bad{};
-    bad.flags = CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_TEMPORAL;
-    ExpectLibraryErrors(1, [&] {
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-    bad.method = CAELIX_GI_RESTIR;
-    ExpectLibraryErrors(1, [&] {
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-    bad.method = CAELIX_GI_PATH_TRACE;
-    bad.flags = CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_LIGHT_NEE;
-    bad.di_candidates = 33;
-    ExpectLibraryErrors(1, [&] {
-        REQUIRE(caelix_renderer_set_gi_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
-    });
-    CaelixGiOptions good{};
-    good.flags = CAELIX_GI_FLAG_RESTIR_DI | CAELIX_GI_FLAG_LIGHT_NEE;
-    good.di_candidates = 32;
-    CHECK(caelix_renderer_set_gi_options(renderer, &good) == CAELIX_OK);
-
-    caelix_renderer_destroy(renderer);
     CloseRig(rig);
 }

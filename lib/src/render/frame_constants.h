@@ -6,7 +6,7 @@ namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
 // together. One per render call, in a host-visible buffer; its device address is
-// the only push constant of the trace and composite kernels. 720 bytes. Every field sits at an offset
+// the only push constant of the trace and composite kernels. 672 bytes. Every field sits at an offset
 // that is a multiple of its size (float4 at 16, uint64_t and uint2 at 8), so
 // std430 and scalar layout rules give the same offsets.
 struct FrameConstants
@@ -87,7 +87,7 @@ struct FrameConstants
     uint32_t gi_spatial_passes;         // 596
     uint32_t gi_history_valid;          // 600  1 = gi_prev holds last frame's reservoirs of this renderer
     float gi_depth_threshold;           // 604
-    // Light list (docs/LIGHT_LIST.md); addresses 0 = none.
+    // Light list and light NEE (docs/LIGHT_NEE.md); addresses 0 = none.
     uint64_t light_table;               // 608  Scene::light_table_address()
     uint64_t light_cells;               // 616  the renderer's light cells; 0 without CAELIX_GI_FLAG_LIGHT_NEE
     uint32_t light_cell_capacity;       // 624  cells (a power of two)
@@ -96,22 +96,13 @@ struct FrameConstants
     float light_min_emission;           // 636  Scene::light_min_emission()
     uint32_t frame_counter;             // 640  the renderer's render count (1, 2, ...)
     float light_nee_min_distance;       // 644  Scene::light_nee_min_distance(): the near-field split of the light NEE
-    // ReSTIR DI (CAELIX_GI_FLAG_RESTIR_DI, docs/RESTIR_DI.md); every address 0 unless gi_flags has it.
-    uint64_t di_initial;                // 648  DI reservoir buffer written by the trace kernel
-    uint64_t di_prev;                   // 656  previous frame's final DI reservoirs
-    uint64_t di_temp;                   // 664  temporal output / spatial ping-pong
-    uint64_t di_out;                    // 672  spatial ping-pong
-    uint32_t di_candidates;             // 680  initial candidates per pixel (1 .. 32)
-    uint32_t di_history_valid;          // 684  1 = di_prev holds last frame's DI reservoirs of this renderer
-    uint64_t light_indices;             // 688  Scene::light_indices_address(): brick -> light entry map, 0 = none
-    uint32_t light_temporal_frames;     // 696  LIGHT_CELL_TEMPORAL: frames of history the fill keeps (0 = none this frame)
-    float light_push_confidence;        // 700  LIGHT_CELL_PUSH: the confidence (M) of a pushed sample in the cell fill; 0 without the flag
-    uint32_t light_nee_candidates;      // 704  LIGHT_NEE: candidates per diffuse vertex (1 .. 32; 1 = no resampling)
-    uint32_t light_cell_reservoirs;     // 708  LIGHT_NEE: reservoirs (and push entries) per light cell (a power of two in 1 .. 64)
-    uint32_t pad_712;                   // 712
-    uint32_t pad_716;                   // 716
+    uint64_t light_indices;             // 648  Scene::light_indices_address(): brick -> light entry map, 0 = none
+    uint32_t light_temporal_frames;     // 656  LIGHT_CELL_TEMPORAL: frames of history the fill keeps (0 = none this frame)
+    uint32_t light_nee_candidates;      // 660  LIGHT_NEE: candidates per diffuse vertex (1 .. 32; 1 = no resampling)
+    uint32_t light_cell_reservoirs;     // 664  LIGHT_NEE: reservoirs per light cell (a power of two in 1 .. 256)
+    uint32_t pad_668;                   // 668
 };
-static_assert(sizeof(FrameConstants) == 720);
+static_assert(sizeof(FrameConstants) == 672);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -156,15 +147,11 @@ static_assert(offsetof(FrameConstants, light_cells) == 616);
 static_assert(offsetof(FrameConstants, light_cell_capacity) == 624);
 static_assert(offsetof(FrameConstants, light_min_emission) == 636);
 static_assert(offsetof(FrameConstants, frame_counter) == 640);
-static_assert(offsetof(FrameConstants, di_initial) == 648);
-static_assert(offsetof(FrameConstants, di_out) == 672);
-static_assert(offsetof(FrameConstants, di_candidates) == 680);
-static_assert(offsetof(FrameConstants, di_history_valid) == 684);
-static_assert(offsetof(FrameConstants, light_indices) == 688);
-static_assert(offsetof(FrameConstants, light_temporal_frames) == 696);
-static_assert(offsetof(FrameConstants, light_push_confidence) == 700);
-static_assert(offsetof(FrameConstants, light_nee_candidates) == 704);
-static_assert(offsetof(FrameConstants, light_cell_reservoirs) == 708);
+static_assert(offsetof(FrameConstants, light_nee_min_distance) == 644);
+static_assert(offsetof(FrameConstants, light_indices) == 648);
+static_assert(offsetof(FrameConstants, light_temporal_frames) == 656);
+static_assert(offsetof(FrameConstants, light_nee_candidates) == 660);
+static_assert(offsetof(FrameConstants, light_cell_reservoirs) == 664);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

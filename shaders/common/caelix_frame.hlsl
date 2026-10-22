@@ -1,6 +1,6 @@
 // Per-frame constants of the trace and composite kernels. Mirrors
 // lib/src/render/frame_constants.h; change both together. The kernel's only push constant is the device address of
-// one CaelixFrameConstants (720 bytes). Every field sits at an offset that is a multiple of its
+// one CaelixFrameConstants (672 bytes). Every field sits at an offset that is a multiple of its
 // size, so std430 and scalar layout rules give the same offsets.
 #ifndef CAELIX_FRAME_HLSL
 #define CAELIX_FRAME_HLSL
@@ -85,29 +85,20 @@ struct CaelixFrameConstants
     uint gi_spatial_passes;         // 596
     uint gi_history_valid;          // 600  1 = gi_prev holds last frame's reservoirs of this renderer
     float gi_depth_threshold;       // 604
-    // Light list (docs/LIGHT_LIST.md, render/caelix_light_sample.hlsl); addresses 0 = none.
+    // Light list and light NEE (docs/LIGHT_NEE.md, render/caelix_light_sample.hlsl); addresses 0 = none.
     uint64_t light_table;           // 608  the scene's light table (common/caelix_light.hlsl)
     uint64_t light_cells;           // 616  the renderer's light cells (also trace set binding 21); 0 without kGiFlagLightNee
     uint light_cell_capacity;       // 624  cells (a power of two)
     uint light_candidates;          // 628  K: candidates per cell reservoir
-    float light_level_footprint;    // 632  world units per pixel: below -> level 0 (8-voxel cells), else level 1
+    float light_level_footprint;    // 632  world units per pixel: below -> level 0 (32-voxel cells), else level 1 (128-voxel cells)
     float light_min_emission;       // 636  the scene's threshold: list light when luminance(emission) >= it
     uint frame_counter;             // 640  the renderer's render count (1, 2, ...): cell touch and eviction
     float light_nee_min_distance;   // 644  the near-field split of the light NEE (world units)
-    // ReSTIR DI (render/caelix_restir_di.hlsl); every address 0 unless gi_flags has kGiFlagRestirDi.
-    uint64_t di_initial;            // 648  DI reservoir buffer written by the trace kernel
-    uint64_t di_prev;               // 656  previous frame's final DI reservoirs
-    uint64_t di_temp;               // 664  temporal output / spatial ping-pong
-    uint64_t di_out;                // 672  spatial ping-pong
-    uint di_candidates;             // 680  initial candidates per pixel (1 .. 32)
-    uint di_history_valid;          // 684  1 = di_prev holds last frame's DI reservoirs of this renderer
-    uint64_t light_indices;         // 688  the scene's brick -> light entry map (u32 per AABB row: index + 1), 0 = none
-    uint light_temporal_frames;     // 696  kGiFlagLightCellTemporal: frames of history the cell fill keeps (0 = none this frame)
-    float light_push_confidence;    // 700  kGiFlagLightCellPush: the confidence (M) of a pushed sample in the cell fill; 0 without
-    uint light_nee_candidates;      // 704  kGiFlagLightNee: light candidates per diffuse vertex (1 .. 32; 1 = no resampling)
-    uint light_cell_reservoirs;     // 708  kGiFlagLightNee: reservoirs (and push entries) per light cell, a power of two in 1 .. 64
-    uint pad_712;                   // 712
-    uint pad_716;                   // 716  -> 720
+    uint64_t light_indices;         // 648  the scene's brick -> light entry map (u32 per AABB row: index + 1), 0 = none
+    uint light_temporal_frames;     // 656  kGiFlagLightCellTemporal: frames of history the cell fill keeps (0 = none this frame)
+    uint light_nee_candidates;      // 660  kGiFlagLightNee: light candidates per diffuse vertex (1 .. 32; 1 = no resampling)
+    uint light_cell_reservoirs;     // 664  kGiFlagLightNee: reservoirs per light cell, a power of two in 1 .. 256
+    uint pad_668;                   // 668  -> 672
 };
 
 struct CaelixTracePush
@@ -146,14 +137,11 @@ static const uint kGiFlagVisibility = 1u << 2;
 static const uint kGiFlagUnbiased = 1u << 3;
 static const uint kGiFlagDiffuseOnly = 1u << 4;
 static const uint kGiFlagLightNee = 1u << 5;
-static const uint kGiFlagRestirDi = 1u << 6;
-static const uint kGiFlagLightCellJitter = 1u << 7;
-static const uint kGiFlagLightMis = 1u << 8;
-static const uint kGiFlagLightCellTemporal = 1u << 9;
-static const uint kGiFlagLightCellPush = 1u << 10;
-static const uint kGiFlagLightProxyVertex = 1u << 11;
-static const uint kGiFlagLightCellOriented = 1u << 12;
-static const uint kGiFlagPairwiseMis = 1u << 13;
+static const uint kGiFlagLightCellJitter = 1u << 6;
+static const uint kGiFlagLightMis = 1u << 7;
+static const uint kGiFlagLightCellTemporal = 1u << 8;
+static const uint kGiFlagLightCellOriented = 1u << 9;
+static const uint kGiFlagPairwiseMis = 1u << 10;
 
 // CaelixRenderMode
 static const uint kModePrimary = 0;

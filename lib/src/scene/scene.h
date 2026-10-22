@@ -135,7 +135,7 @@ public:
     CaelixResult SetGlassPalette(const CaelixMaterial* entries, uint32_t count);
     CaelixResult SetMaterialEntries(const CaelixMaterialEntry* entries, uint32_t count);
     CaelixResult GetMaterial(uint32_t code, CaelixMaterial& out) const;
-    // Light list (scene_lights.cpp, docs/LIGHT_LIST.md).
+    // Light list (scene_lights.cpp, docs/LIGHT_NEE.md section 2).
     CaelixResult SetLightOptions(const CaelixLightOptions& options);
     void GetLightStats(CaelixLightStats& out) const;
 
@@ -196,7 +196,7 @@ public:
         return light_table_built_ ? light_table_.buffer.address() : 0;
     }
     // The brick -> light table entry map (u32 per AABB row: entry index + 1, 0 = no entry;
-    // docs/LIGHT_MIS.md section 2) under the same condition as light_table_address().
+    // docs/LIGHT_NEE.md section 2.7) under the same condition as light_table_address().
     VkDeviceAddress light_indices_address() const
     {
         return light_table_built_ ? light_indices_.address() : 0;
@@ -448,10 +448,10 @@ private:
     uint64_t pending_bricks_ = 0;
     uint64_t finalized_bricks_total_ = 0;
 
-    // Light list (docs/LIGHT_LIST.md).
+    // Light list (docs/LIGHT_NEE.md section 2).
     GrowableBuffer light_words_;              // u32 per AABB row: asuint(luminance sum), 0 = no list light
     GrowableBuffer light_indices_;            // u32 per AABB row: entry index + 1, 0 = none (written by the
-                                              // compact kernel; docs/LIGHT_MIS.md section 2)
+                                              // compact kernel; docs/LIGHT_NEE.md section 2.7)
     std::vector<VkBufferCopy> light_moves_;   // inside light_words_ and light_indices_, mirrors aabb_moves_
                                               // (4 B rows)
     VkDeviceSize zero_word_offset_ = 0;       // a zero u32 in the ring next to the NaN row

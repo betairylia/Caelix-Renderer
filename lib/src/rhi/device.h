@@ -58,6 +58,12 @@ public:
     {
         return timestamp_period_ns_;
     }
+    // VkPhysicalDeviceLimits::maxStorageBufferRange: the largest range of a storage buffer
+    // descriptor in bytes (queried at adoption).
+    uint32_t max_storage_buffer_range() const
+    {
+        return max_storage_buffer_range_;
+    }
     // timestampValidBits of the graphics queue family; 0 = no timestamps.
     uint32_t timestamp_valid_bits() const
     {
@@ -76,6 +82,7 @@ private:
     VkPhysicalDeviceAccelerationStructurePropertiesKHR as_properties_{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
     float timestamp_period_ns_ = 1.0f;
+    uint32_t max_storage_buffer_range_ = 0;
     uint32_t timestamp_valid_bits_ = 0;
 };
 

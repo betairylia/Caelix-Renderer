@@ -380,8 +380,6 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, light_cells: u32, demo: bool) 
                 ("light cells active", stats.gi.light_cells_active.to_string()),
                 ("light cell inserts", stats.gi.light_cells_inserted.to_string()),
                 ("light cell misses", stats.gi.light_cell_lookups_failed.to_string()),
-                ("light cell pushes", stats.gi.light_cell_pushes.to_string()),
-                ("light cell pushes dropped", stats.gi.light_cell_pushes_dropped.to_string()),
                 ("light bricks", stats.light.bricks.to_string()),
                 ("light dropped", stats.light.bricks_dropped.to_string()),
                 ("denoise", format!("{:.2} ms", t.denoise_ms)),
@@ -569,8 +567,8 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
 
     CollapsingHeader::new("GI").default_open(demo).show(ui, |ui| {
         let gi = &mut settings.gi;
-        // The reuse settings serve ReSTIR GI and ReSTIR DI.
-        let restir = lighting && (gi.method == GiMethod::Restir || (gi.light_nee && gi.restir_di));
+        // The reuse settings serve ReSTIR GI.
+        let restir = lighting && gi.method == GiMethod::Restir;
         Grid::new("render_gi").num_columns(2).show(ui, |ui| {
             ui.label("method");
             ui.add_enabled_ui(lighting, |ui| {
@@ -619,15 +617,15 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
                 ComboBox::from_id_salt("gi_light_cell_reservoirs")
                     .selected_text(gi.light_cell_reservoirs.to_string())
                     .show_ui(ui, |ui| {
-                        for shift in 0..=6 {
+                        for shift in 0..=8 {
                             let reservoirs = 1u32 << shift;
                             ui.selectable_value(&mut gi.light_cell_reservoirs, reservoirs, reservoirs.to_string());
                         }
                     })
                     .response
                     .on_hover_text(
-                        "Reservoirs and push ring entries per light cell; a cell is 64 + 24 x this bytes. A change \
-                         recreates the cell table",
+                        "Reservoirs per light cell; a cell is 64 + 8 x this bytes. A change recreates the cell \
+                         table",
                     );
             });
             ui.end_row();
@@ -647,23 +645,9 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             );
             ui.end_row();
 
-            ui.label("light push confidence");
-            ui.add_enabled(
-                light && gi.light_cell_push,
-                Slider::new(&mut gi.light_push_confidence, 0.5..=256.0).logarithmic(true),
-            );
-            ui.end_row();
-
             ui.label("light NEE candidates");
-            ui.add_enabled(light && !gi.light_cell_push, Slider::new(&mut gi.light_nee_candidates, 1..=32))
-                .on_hover_text(
-                    "Candidates per diffuse vertex, resampled before the one shadow ray; 1 = no resampling. \
-                     The cell push-back needs 1",
-                );
-            ui.end_row();
-
-            ui.label("DI candidates");
-            ui.add_enabled(light && gi.restir_di, Slider::new(&mut gi.di_candidates, 1..=32));
+            ui.add_enabled(light, Slider::new(&mut gi.light_nee_candidates, 1..=32))
+                .on_hover_text("Candidates per diffuse vertex, resampled before the one shadow ray; 1 = no resampling");
             ui.end_row();
         });
         ui.add_enabled(lighting, egui::Checkbox::new(&mut gi.light_nee, "light NEE (light list)"));
@@ -688,37 +672,12 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             "Each cell reservoir merges its previous frame's reservoir (history capped by the light temporal frames); \
              assumes a static scene",
         );
-        if ui
-            .add_enabled(
-                lighting && gi.light_nee,
-                egui::Checkbox::new(&mut gi.light_cell_push, "push shadow ray results into light cells"),
-            )
-            .on_hover_text(
-                "Every vertex that sampled a light cell pushes its light sample and its shadow ray result into the \
-                 cell; the next fill merges them (an occluded sample with a lower target). Sets the light NEE \
-                 candidates to 1 (the push needs the vertex's own sample)",
-            )
-            .changed()
-            && gi.light_cell_push
-        {
-            gi.light_nee_candidates = 1;
-        }
         ui.add_enabled(
             lighting && gi.light_nee,
             egui::Checkbox::new(&mut gi.light_mis, "MIS light NEE / diffuse bounce"),
         )
-        .on_hover_text("Balance heuristic between the light NEE and the BSDF hit of a list light (docs/LIGHT_MIS.md)");
-        ui.add_enabled(
-            lighting && gi.light_nee && gi.light_mis,
-            egui::Checkbox::new(&mut gi.light_proxy_vertex, "vertex MIS proxy"),
-        )
         .on_hover_text(
-            "The MIS proxy density at a vertex with a light cell: the voxel-face weight times the receiver's own \
-             geometry term over the cell's normalisation, instead of the cell form (docs/LIGHT_MIS.md)",
-        );
-        ui.add_enabled(
-            lighting && gi.light_nee,
-            egui::Checkbox::new(&mut gi.restir_di, "ReSTIR DI (light list, primary surface)"),
+            "Balance heuristic between the light NEE and the BSDF hit of a list light (docs/LIGHT_NEE.md section 6)",
         );
         ui.add_enabled(
             lighting && gi.method == GiMethod::Pt,

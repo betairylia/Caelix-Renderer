@@ -56,7 +56,7 @@ struct FinalizePush
     uint64_t entity_infos;
     uint64_t group_grids;
     uint64_t aabb_pool;
-    uint64_t light_words;  // u32 per AABB row: the light word (docs/LIGHT_LIST.md)
+    uint64_t light_words;  // u32 per AABB row: the light word (docs/LIGHT_NEE.md section 2.1)
     uint64_t materials;    // the material table (CaelixMaterial by block code)
     uint32_t dirty_count;
     uint32_t records_per_page_shift;
@@ -68,7 +68,7 @@ struct FinalizePush
 static_assert(sizeof(FinalizePush) == 104);
 static_assert(sizeof(FinalizePush) <= 128);  // the guaranteed minimum maxPushConstantsSize
 
-// The scene's light table (docs/LIGHT_LIST.md, shaders/common/caelix_light.hlsl): a 64-byte
+// The scene's light table (docs/LIGHT_NEE.md section 2.2, shaders/common/caelix_light.hlsl): a 64-byte
 // header, max_bricks LightEntry rows, then max_bricks floats of the CDF.
 struct LightTableHeader
 {
@@ -81,7 +81,7 @@ struct LightTableHeader
 };
 static_assert(sizeof(LightTableHeader) == 64);
 
-// One brick with list lights (docs/LIGHT_FACES.md). 448 bytes. Voxel v = x | y << 3 | z << 6;
+// One brick with list lights (docs/LIGHT_NEE.md section 2.3). 448 bytes. Voxel v = x | y << 3 | z << 6;
 // face f is +X 0, -X 1, +Y 2, -Y 3, +Z 4, -Z 5; word z of a face mask is the z slice.
 struct LightEntry
 {

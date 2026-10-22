@@ -23,71 +23,38 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import image_metrics  # noqa: E402
 
 RUNS = {
-    "reference": "--mode ref --accumulate 2048 --gi pt",
-    "restir_converged": "--mode ref --accumulate 512 --gi restir",
-    "pt": "--mode pt --no-denoise --warmup 64 --gi pt",
-    # Since the pairwise MIS step `--gi restir` uses the pairwise MIS by default, so "restir" and
-    # "restir_converged" measure it; the *_nopairwise runs and the variants below keep the 1/M or
-    # Z-count weights they measured before (--gi-no-pairwise).
-    "restir": "--mode pt --no-denoise --warmup 64 --gi restir",
-    "restir_nopairwise": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-pairwise",
-    "restir_nopairwise_converged": "--mode ref --accumulate 512 --gi restir --gi-no-pairwise",
-    "restir_visibility": "--mode pt --no-denoise --warmup 64 --gi restir --gi-visibility --gi-no-pairwise",
-    "restir_unbiased": "--mode pt --no-denoise --warmup 64 --gi restir --gi-unbiased --gi-no-pairwise",
-    "restir_temporal_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-spatial --gi-no-pairwise",
-    "restir_spatial_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-temporal --gi-no-pairwise",
-    # Light list (docs/LIGHT_LIST.md): next-event estimation on list lights.
-    "pt_nee": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee",
-    "pt_nee_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee",
-    "pt_nee_nomis": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-no-mis",
-    "pt_nee_nomis_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-no-mis",
-    # Per-pixel ReSTIR DI on the light list (docs/RESTIR_DI.md).
-    "di": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di",
-    "di_unbiased": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di --gi-unbiased",
-    "di_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --gi-restir-di",
-    # Temporal reuse in the light cell fill (docs/LIGHT_LIST.md section 2.2; static scenes).
-    "pt_nee_temporal": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal",
-    "pt_nee_temporal_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal",
-    "di_temporal": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di --light-cell-temporal",
-    # Push-back of shadow ray results into the light cells (docs/LIGHT_LIST.md section 2.2).
-    "pt_nee_push": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal --light-cell-push",
-    "pt_nee_push_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal --light-cell-push",
-    "di_push": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --gi-restir-di --light-cell-temporal "
-    "--light-cell-push",
-    "di_push_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --gi-restir-di --light-cell-temporal "
-    "--light-cell-push",
-    # Per-vertex resampling of the light NEE (docs/LIGHT_LIST.md section 2.6) and the vertex MIS
-    # proxy (docs/LIGHT_MIS.md "Vertex proxy").
-    "pt_nee_rs1": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-nee-candidates 1",
-    "pt_nee_rs4": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-nee-candidates 4",
-    "pt_nee_rs4_vp": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-nee-candidates 4 --light-proxy-vertex",
-    "pt_nee_rs16_vp": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-nee-candidates 16 --light-proxy-vertex",
-    "pt_nee_rs1_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-nee-candidates 1",
-    "pt_nee_rs4_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-nee-candidates 4",
-    "pt_nee_rs4_vp_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-nee-candidates 4 --light-proxy-vertex",
-    "pt_nee_rs16_vp_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-nee-candidates 16 --light-proxy-vertex",
-    # Oriented light cells (docs/LIGHT_LIST.md section 2.7); since then a cell holds 8 reservoirs, so
-    # pt_nee_rs1 and pt_nee_rs1_conv are the unoriented 8-reservoir runs.
-    "pt_nee_or": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-cell-oriented",
-    "pt_nee_or_k32": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-cell-oriented --light-candidates 32",
-    "pt_nee_or_rs4": "--mode pt --no-denoise --warmup 64 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-cell-oriented --light-nee-candidates 4",
-    "pt_nee_or_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-cell-oriented",
-    "pt_nee_or_k32_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-cell-oriented --light-candidates 32",
-    "pt_nee_or_rs4_conv": "--mode ref --accumulate 512 --gi pt --gi-light-nee --light-cell-temporal "
-    "--light-cell-oriented --light-nee-candidates 4",
+    # The host's light NEE defaults (docs/LIGHT_NEE.md section 7): light NEE on in both GI methods,
+    # 262144 cells of 64 reservoirs, 16 candidates per reservoir, oriented and jittered cells,
+    # temporal reuse over 128 frames, MIS, 4 candidates per vertex. --gi-no-light-nee turns it off.
+    # The reference is the plain path tracer; a scene's own "reference" may replace it.
+    "reference": "--mode ref --accumulate 2048 --gi pt --gi-no-light-nee",
+    "pt": "--mode pt --no-denoise --warmup 64 --gi pt --gi-no-light-nee",
+    # Light NEE with the defaults, and with one default turned off per pair of runs.
+    "pt_nee": "--mode pt --no-denoise --warmup 64 --gi pt",
+    "pt_nee_conv": "--mode ref --accumulate 512 --gi pt",
+    "pt_nee_nomis": "--mode pt --no-denoise --warmup 64 --gi pt --light-no-mis",
+    "pt_nee_nomis_conv": "--mode ref --accumulate 512 --gi pt --light-no-mis",
+    "pt_nee_notemporal": "--mode pt --no-denoise --warmup 64 --gi pt --light-no-cell-temporal",
+    "pt_nee_notemporal_conv": "--mode ref --accumulate 512 --gi pt --light-no-cell-temporal",
+    "pt_nee_rs1": "--mode pt --no-denoise --warmup 64 --gi pt --light-nee-candidates 1",
+    "pt_nee_rs1_conv": "--mode ref --accumulate 512 --gi pt --light-nee-candidates 1",
+    # ReSTIR GI (docs/GI_EXPERIMENTS.md) without light NEE, as measured before: "restir" and
+    # "restir_converged" use the pairwise MIS (the default of --gi restir), the *_nopairwise runs and
+    # the variants below the 1/M or Z-count weights (--gi-no-pairwise).
+    "restir": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-light-nee",
+    "restir_converged": "--mode ref --accumulate 512 --gi restir --gi-no-light-nee",
+    "restir_nopairwise": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-pairwise --gi-no-light-nee",
+    "restir_nopairwise_converged": "--mode ref --accumulate 512 --gi restir --gi-no-pairwise --gi-no-light-nee",
+    "restir_visibility": "--mode pt --no-denoise --warmup 64 --gi restir --gi-visibility --gi-no-pairwise "
+    "--gi-no-light-nee",
+    "restir_unbiased": "--mode pt --no-denoise --warmup 64 --gi restir --gi-unbiased --gi-no-pairwise "
+    "--gi-no-light-nee",
+    "restir_temporal_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-spatial --gi-no-pairwise "
+    "--gi-no-light-nee",
+    "restir_spatial_only": "--mode pt --no-denoise --warmup 64 --gi restir --gi-no-temporal --gi-no-pairwise "
+    "--gi-no-light-nee",
+    # ReSTIR GI with the default light NEE.
+    "restir_nee": "--mode pt --no-denoise --warmup 64 --gi restir",
 }
 
 TIMINGS_RE = re.compile(r"timings:((?:\s+\w+=[-+0-9.eE]+)+)")
