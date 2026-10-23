@@ -66,6 +66,9 @@ void CaelixSpirvAtomicStore(CaelixPointerU32 pointer, uint scope, uint semantics
 uint CaelixSpirvAtomicAdd(CaelixPointerU32 pointer, uint scope, uint semantics, uint value);
 [[vk::ext_instruction(/* OpAtomicOr */ 241)]]
 uint CaelixSpirvAtomicOr(CaelixPointerU32 pointer, uint scope, uint semantics, uint value);
+[[vk::ext_instruction(/* OpAtomicCompareExchange */ 230)]]
+uint CaelixSpirvAtomicCompareExchange(CaelixPointerU32 pointer, uint scope, uint equal_semantics,
+                                      uint unequal_semantics, uint value, uint comparator);
 // Scope Device = 1; semantics AcquireRelease (0x8) | UniformMemory (0x40) = 0x48.
 #define CAELIX_ATOMIC_ADD_U32(addr, v) CaelixSpirvAtomicAdd(CaelixAddressToPointerU32(addr), 1u, 0u, v)
 #define CAELIX_ATOMIC_ADD_ACQ_REL_U32(addr, v) \
@@ -73,5 +76,15 @@ uint CaelixSpirvAtomicOr(CaelixPointerU32 pointer, uint scope, uint semantics, u
 #define CAELIX_ATOMIC_OR_U32(addr, v) CaelixSpirvAtomicOr(CaelixAddressToPointerU32(addr), 1u, 0u, v)
 #define CAELIX_ATOMIC_LOAD_U32(addr) CaelixSpirvAtomicLoad(CaelixAddressToPointerU32(addr), 1u, 0u)
 #define CAELIX_ATOMIC_STORE_U32(addr, v) CaelixSpirvAtomicStore(CaelixAddressToPointerU32(addr), 1u, 0u, v)
+// Publication of data from one invocation to others in the same dispatch (common/caelix_hash_table.hlsl):
+// the writer's RELEASE store (semantics Release 0x4 | UniformMemory 0x40) orders its earlier writes
+// before the word; a reader's ACQUIRE load (Acquire 0x2 | UniformMemory 0x40) that sees the word orders
+// its later reads after it. The compare-exchange is relaxed and returns the value it found (it stored
+// `v` only when that value equals `compare`).
+#define CAELIX_ATOMIC_LOAD_ACQUIRE_U32(addr) CaelixSpirvAtomicLoad(CaelixAddressToPointerU32(addr), 1u, 0x42u)
+#define CAELIX_ATOMIC_STORE_RELEASE_U32(addr, v) \
+    CaelixSpirvAtomicStore(CaelixAddressToPointerU32(addr), 1u, 0x44u, v)
+#define CAELIX_ATOMIC_CAS_U32(addr, compare, v) \
+    CaelixSpirvAtomicCompareExchange(CaelixAddressToPointerU32(addr), 1u, 0u, 0u, v, compare)
 
 #endif  // CAELIX_PLATFORM_HLSL

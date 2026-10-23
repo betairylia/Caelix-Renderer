@@ -3,7 +3,8 @@
 # caelix_add_shaders(<target> <out_var> SOURCES <file.hlsl>...)
 # caelix_compile_shaders(<out_var> SOURCES <file.hlsl>...)
 #
-# Every source that defines `main(` is a compute kernel: DXC compiles it to
+# Every source that defines `main(` is a compute kernel (or carries the marker CAELIX_KERNEL_VARIANT: a
+# kernel variant that defines macros and includes another kernel's source): DXC compiles it to
 # <build>/shaders/<name>.spv, where <name> is the file name without extension and
 # without its folder (shaders/scene/caelix_finalize.hlsl -> caelix_finalize). The
 # names are the keys of LoadShader and of CAELIX_SHADER_DIR overrides, so they stay
@@ -67,7 +68,7 @@ function(caelix_compile_shaders out_var)
   foreach(source IN LISTS ARG_SOURCES)
     get_filename_component(source ${source} ABSOLUTE)
     file(READ ${source} text)
-    if(NOT text MATCHES "void[ \t\r\n]+main[ \t\r\n]*\\(")
+    if(NOT text MATCHES "void[ \t\r\n]+main[ \t\r\n]*\\(" AND NOT text MATCHES "CAELIX_KERNEL_VARIANT")
       continue()  # an include file
     endif()
     get_filename_component(name ${source} NAME_WE)

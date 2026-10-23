@@ -108,6 +108,7 @@ RenderKernels::RenderKernels(Device& device)
             return ComputePipeline(vk_device, spirv, 0, name, layouts);
         };
         trace_ = create("caelix_path_trace", trace_layout_);
+        trace_no_light_nee_ = create("caelix_path_trace_no_light_nee", trace_layout_);
         composite_ = create("caelix_composite", composite_layout_);
         cross_resolve_ = create("caelix_cross_resolve", composite_layout_);
         sky_sh_ = create("caelix_sky_sh", sky_layout_);
@@ -143,6 +144,7 @@ RenderKernels::RenderKernels(Device& device)
         // The destructor does not run for a constructor that throws: release the raw handles
         // here (the pipelines and the image destroy themselves).
         trace_ = ComputePipeline();
+        trace_no_light_nee_ = ComputePipeline();
         composite_ = ComputePipeline();
         cross_resolve_ = ComputePipeline();
         sky_sh_ = ComputePipeline();
@@ -161,8 +163,8 @@ RenderKernels::RenderKernels(Device& device)
         }
         throw;
     }
-    CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_composite, caelix_cross_resolve, "
-                "caelix_sky_sh, caelix_upscale_encode");
+    CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_path_trace_no_light_nee, "
+                "caelix_composite, caelix_cross_resolve, caelix_sky_sh, caelix_upscale_encode");
 }
 
 RenderKernels::~RenderKernels()
@@ -174,6 +176,7 @@ RenderKernels::~RenderKernels()
         nrd_.reset();
     }
     trace_ = ComputePipeline();
+    trace_no_light_nee_ = ComputePipeline();
     composite_ = ComputePipeline();
     cross_resolve_ = ComputePipeline();
     sky_sh_ = ComputePipeline();

@@ -116,9 +116,15 @@ public:
     {
         return frame_layout_;
     }
+    // The trace kernel with the light NEE (frames that run it) and its variant without it (every other
+    // frame; shaders/render/caelix_path_trace_no_light_nee.hlsl).
     const ComputePipeline& trace() const
     {
         return trace_;
+    }
+    const ComputePipeline& trace_no_light_nee() const
+    {
+        return trace_no_light_nee_;
     }
     const ComputePipeline& composite() const
     {
@@ -171,6 +177,7 @@ private:
     VkDescriptorSetLayout encode_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout frame_layout_ = VK_NULL_HANDLE;  // the frame constants (uniform buffer)
     ComputePipeline trace_;                   // shaders/render/caelix_path_trace.hlsl, trace set
+    ComputePipeline trace_no_light_nee_;      // caelix_path_trace_no_light_nee.hlsl, trace set
     ComputePipeline composite_;               // shaders/render/caelix_composite.hlsl, composite set
     ComputePipeline cross_resolve_;           // shaders/render/caelix_cross_resolve.hlsl, composite set
     ComputePipeline sky_sh_;                  // shaders/render/caelix_sky_sh.hlsl, sky set

@@ -106,7 +106,7 @@ static const uint kLtPassFlagTreeShift = 1;  // bit kLtPassFlagTreeShift + t: on
 // | staged, and clears.
 static const uint kLtRowBlockOffset = 0;  // units in the current heap buffer
 static const uint kLtRowBlockUnits = 4;   // 0 = no block
-static const uint kLtRowGeneration = 8;   // +1 at every rebuild or release of the block
+static const uint kLtRowGeneration = 8;   // life << kLtGenerationLifeShift | version (LtNext*)
 static const uint kLtRowGpuFlags = 12;    // kLtGpuLightChanged
 static const uint kLtRowCpuFlags = 16;    // kLtCpu*: the merge of the staged flags (cleared by the build)
 static const uint kLtRowBricks = 20;      // light bricks | dropped light bricks << kLtRowDroppedShift
@@ -114,6 +114,25 @@ static const uint kLtRowLightFaces = 24;
 static const uint kLtGroupRowBytes = 32;
 static const uint kLtRowBricksMask = 0xFFFFu;
 static const uint kLtRowDroppedShift = 16;
+
+// The row's 32-bit generation: the group index's life (bumped when the index is released, so a
+// reference into an earlier life never matches) in the high bits, the block version (bumped at every
+// rebuild within one life, wrapping at 2^16) in the low bits. Macros: a new static const here would
+// reorder the SPIR-V constants of every kernel that includes this header (docs/LIGHT_TREE.md section 8).
+#define kLtGenerationLifeShift 16
+#define kLtGenerationVersionMask 0xFFFFu
+
+// The generation of a released group's row: the next life, version 0.
+uint LtNextLife(uint generation)
+{
+    return ((generation >> kLtGenerationLifeShift) + 1u) << kLtGenerationLifeShift;
+}
+
+// The generation of a rebuilt group's row: the same life, the next version.
+uint LtNextVersion(uint generation)
+{
+    return (generation & ~kLtGenerationVersionMask) | ((generation + 1u) & kLtGenerationVersionMask);
+}
 
 static const uint kLtGpuLightChanged = 1u;  // the finalize kernel saw a light change in the group
 static const uint kLtCpuRebuild = 1u;       // rebuild the block (bricks removed)

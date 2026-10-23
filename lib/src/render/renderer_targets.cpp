@@ -307,6 +307,9 @@ void Renderer::FreeRetired(uint64_t safe_frame)
     std::erase_if(retired_upscalers_, [safe_frame](const RetiredUpscaler& retired) {
         return retired.frame <= safe_frame;
     });
+    std::erase_if(retired_light_cells_, [safe_frame](const RetiredLightCells& retired) {
+        return retired.frame <= safe_frame;
+    });
 }
 
 void Renderer::GetTimings(CaelixGpuTimings& out) const

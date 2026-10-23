@@ -107,6 +107,9 @@ struct Entity
     bool transform_changed = false;
     // CAELIX_ENTITY_STATIC or CAELIX_ENTITY_DYNAMIC (caelix_scene_set_entity_motion).
     uint32_t motion = CAELIX_ENTITY_STATIC;
+    // +1 every time AddEntity hands this id out again (EntityInfo::life): GPU keys that hold the id
+    // and its life (the renderer's light cells) never match a later entity of the same id.
+    uint32_t life = 0;
 };
 
 class Scene

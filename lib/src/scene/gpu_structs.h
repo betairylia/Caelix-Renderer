@@ -73,7 +73,8 @@ struct EntityInfo
     int32_t grid_min[3];   // group coordinate of grid cell (0, 0, 0)
     uint32_t grid_base;    // first u32 cell of the group grid
     int32_t grid_dims[3];  // cells per axis, powers of two; 0 = no grid
-    uint32_t pad;
+    uint32_t life;         // +1 every time the id is handed out again (Scene::AddEntity): keys that hold
+                           // (id, life) never match a later entity of the same id (light cells)
     // Object-to-world rows (3x4, row-major: rotation | position) of the current
     // transform, then of the previous frame's transform. prev differs from cur for
     // exactly one flush after a transform change.
@@ -83,6 +84,7 @@ struct EntityInfo
 constexpr uint32_t kEntityInfoGridMin = 0;
 constexpr uint32_t kEntityInfoGridBase = 12;
 constexpr uint32_t kEntityInfoGridDims = 16;
+constexpr uint32_t kEntityInfoLife = 28;
 constexpr uint32_t kEntityInfoCurRow0 = 32;
 constexpr uint32_t kEntityInfoCurRow1 = 48;
 constexpr uint32_t kEntityInfoCurRow2 = 64;
@@ -93,6 +95,7 @@ constexpr uint32_t kEntityInfoBytes = 128;
 static_assert(offsetof(EntityInfo, grid_min) == kEntityInfoGridMin);
 static_assert(offsetof(EntityInfo, grid_base) == kEntityInfoGridBase);
 static_assert(offsetof(EntityInfo, grid_dims) == kEntityInfoGridDims);
+static_assert(offsetof(EntityInfo, life) == kEntityInfoLife);
 static_assert(offsetof(EntityInfo, cur_rows) == kEntityInfoCurRow0);
 static_assert(offsetof(EntityInfo, cur_rows) + sizeof(EntityInfo::cur_rows[0]) == kEntityInfoCurRow1);
 static_assert(offsetof(EntityInfo, cur_rows) + 2 * sizeof(EntityInfo::cur_rows[0]) == kEntityInfoCurRow2);

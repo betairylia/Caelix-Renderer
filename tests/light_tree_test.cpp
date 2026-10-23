@@ -9,6 +9,7 @@
 //     entity moved and rotated, an entity removed) with the generation rule, record copies, heap
 //     growth from a tiny heap, the packed encoding;
 //   - [.bench]: draws, the group pass and the BVH builds at about 10k, 54k and 1M light bricks.
+#include "test_kernels.h"
 #include "test_scenes.h"
 
 #include "scene/gpu_structs.h"
@@ -94,145 +95,18 @@ uint32_t Part1By2(uint32_t v)
 // ---------------------------------------------------------------------------
 // Host-visible buffers with a device address, and the probe kernel
 
-uint32_t FindMemoryType(test::Gpu& gpu, uint32_t type_bits, VkMemoryPropertyFlags wanted)
-{
-    VkPhysicalDeviceMemoryProperties properties{};
-    vkGetPhysicalDeviceMemoryProperties(gpu.device.physical_device.physical_device, &properties);
-    uint32_t type = UINT32_MAX;
-    for (uint32_t i = 0; i < properties.memoryTypeCount && type == UINT32_MAX; ++i)
-    {
-        if ((type_bits & (1u << i)) != 0 && (properties.memoryTypes[i].propertyFlags & wanted) == wanted)
-        {
-            type = i;
-        }
-    }
-    REQUIRE(type != UINT32_MAX);
-    return type;
-}
+// The shared helpers (test_kernels.h); kernels load from this build's shader folder.
+using test::CreateHostBuffer;
+using test::DestroyHostBuffer;
+using test::HostBuffer;
 
-struct HostBuffer
-{
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkDeviceAddress address = 0;
-    uint8_t* data = nullptr;
-    VkDeviceSize size = 0;
-};
-
-HostBuffer CreateHostBuffer(test::Gpu& gpu, VkDeviceSize size)
-{
-    const VkDevice device = gpu.device.device;
-    HostBuffer out;
-    out.size = std::max<VkDeviceSize>(16, (size + 15) & ~VkDeviceSize{15});
-    VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    buffer_info.size = out.size;
-    buffer_info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    REQUIRE(vkCreateBuffer(device, &buffer_info, nullptr, &out.buffer) == VK_SUCCESS);
-    VkMemoryRequirements requirements{};
-    vkGetBufferMemoryRequirements(device, out.buffer, &requirements);
-    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-    VkMemoryAllocateInfo allocate_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocate_info.pNext = &flags_info;
-    allocate_info.allocationSize = requirements.size;
-    allocate_info.memoryTypeIndex =
-        FindMemoryType(gpu, requirements.memoryTypeBits,
-                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    REQUIRE(vkAllocateMemory(device, &allocate_info, nullptr, &out.memory) == VK_SUCCESS);
-    REQUIRE(vkBindBufferMemory(device, out.buffer, out.memory, 0) == VK_SUCCESS);
-    void* mapped = nullptr;
-    REQUIRE(vkMapMemory(device, out.memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS);
-    out.data = static_cast<uint8_t*>(mapped);
-    VkBufferDeviceAddressInfo address_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-    address_info.buffer = out.buffer;
-    out.address = vkGetBufferDeviceAddress(device, &address_info);
-    return out;
-}
-
-void DestroyHostBuffer(test::Gpu& gpu, HostBuffer& buffer)
-{
-    if (buffer.buffer != VK_NULL_HANDLE)
-    {
-        vkUnmapMemory(gpu.device.device, buffer.memory);
-        vkDestroyBuffer(gpu.device.device, buffer.buffer, nullptr);
-        vkFreeMemory(gpu.device.device, buffer.memory, nullptr);
-    }
-    buffer = HostBuffer{};
-}
-
-// A compute kernel of the build's shader folder (CAELIX_TEST_SHADER_DIR/<name>.spv) with push
-// constants only: the probe kernel and the library's own kernels.
-class ComputeKernel
+class ComputeKernel : public test::ComputeKernel
 {
 public:
     ComputeKernel(test::Gpu& gpu, const char* name, uint32_t push_bytes)
-        : gpu_(gpu), push_bytes_(push_bytes)
+        : test::ComputeKernel(gpu, CAELIX_TEST_SHADER_DIR, name, push_bytes)
     {
-        const std::string path = std::string(CAELIX_TEST_SHADER_DIR) + "/" + name + ".spv";
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        REQUIRE(file.good());
-        const std::streamsize bytes = file.tellg();
-        std::vector<uint32_t> words(static_cast<size_t>(bytes) / 4);
-        file.seekg(0);
-        file.read(reinterpret_cast<char*>(words.data()), bytes);
-        const VkDevice device = gpu.device.device;
-        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module_info.codeSize = words.size() * 4;
-        module_info.pCode = words.data();
-        VkShaderModule module = VK_NULL_HANDLE;
-        REQUIRE(vkCreateShaderModule(device, &module_info, nullptr, &module) == VK_SUCCESS);
-        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes};
-        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout_info.pushConstantRangeCount = 1;
-        layout_info.pPushConstantRanges = &range;
-        REQUIRE(vkCreatePipelineLayout(device, &layout_info, nullptr, &layout_) == VK_SUCCESS);
-        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipeline_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipeline_info.stage.module = module;
-        pipeline_info.stage.pName = "main";
-        pipeline_info.layout = layout_;
-        REQUIRE(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_) ==
-                VK_SUCCESS);
-        vkDestroyShaderModule(device, module, nullptr);
     }
-    ~ComputeKernel()
-    {
-        vkDestroyPipeline(gpu_.device.device, pipeline_, nullptr);
-        vkDestroyPipelineLayout(gpu_.device.device, layout_, nullptr);
-    }
-    ComputeKernel(const ComputeKernel&) = delete;
-    ComputeKernel& operator=(const ComputeKernel&) = delete;
-
-    // The dispatch alone.
-    void Record(VkCommandBuffer cmd, const void* push, uint32_t groups) const
-    {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
-        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes_, push);
-        vkCmdDispatch(cmd, groups, 1, 1);
-    }
-    // The dispatch, then compute writes -> compute and host reads.
-    void Dispatch(VkCommandBuffer cmd, const void* push, uint32_t groups) const
-    {
-        Record(cmd, push, groups);
-        VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                VK_ACCESS_2_HOST_READ_BIT;
-        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        dependency.memoryBarrierCount = 1;
-        dependency.pMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(cmd, &dependency);
-    }
-
-private:
-    test::Gpu& gpu_;
-    uint32_t push_bytes_;
-    VkPipelineLayout layout_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
 };
 
 // Push constants of tests/shaders/caelix_light_tree_probe.hlsl (the same member names).

@@ -155,11 +155,12 @@ struct EntityInfo
     float4 prev_row1;
     float4 prev_row2;
 };
-// (grid_min, grid_base) at kEntityInfoGridMin, (grid_dims, pad) at kEntityInfoGridDims, the
+// (grid_min, grid_base) at kEntityInfoGridMin, (grid_dims, life) at kEntityInfoGridDims, the
 // rows at kEntityInfoCurRow0 .. 2 and kEntityInfoPrevRow0 .. 2.
 #define kEntityInfoGridMin 0
 #define kEntityInfoGridBase 12
 #define kEntityInfoGridDims 16
+#define kEntityInfoLife 28  // u32: +1 every time the entity id is handed out again
 #define kEntityInfoCurRow0 32
 #define kEntityInfoCurRow1 48
 #define kEntityInfoCurRow2 64

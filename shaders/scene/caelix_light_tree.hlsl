@@ -30,7 +30,13 @@ struct LightTree
     uint64_t heap;     // the current heap buffer
     uint64_t headers;  // tree header 0 (tree t at + t * kLtTreeHeaderBytes)
     uint group_shift;
+    uint trees;        // tree selector: bit k = tree k is drawn and evaluated (LightTreeSelect)
 };
+
+// Tree selectors (LightTree::trees): bit k = tree k (CAELIX_ENTITY_STATIC 0, CAELIX_ENTITY_DYNAMIC 1).
+static const uint kLtSelectStatic = 1u;
+static const uint kLtSelectDynamic = 2u;
+static const uint kLtSelectBoth = 3u;  // LightTreeOpen's default
 
 // A light brick: its group, its index entry in the group's block (the brick's Morton rank) and the
 // group's block generation when the reference was made. The reference stays valid while the group
@@ -73,11 +79,11 @@ float LightTreeRandomFloat(inout uint rng)
 // Importance of a box of emitters (section 5.1), the one function behind sampling and pdf
 // evaluation.
 
-// The exact maximum of the emitter cosine of each face family over a box [lo, hi] of emitters.
-void LightTreeEmitterCosines(float3 x, float3 lo, float3 hi, out float c[6])
+// The exact maximum of the emitter cosine of each face family over the box D = [d_lo, d_hi] of the
+// difference vectors x - y (x the receiver, y the emitter): a point receiver gives D = [x - hi, x - lo],
+// a box receiver R gives D = [R.lo - hi, R.hi - lo].
+void LtEmitterCosines(float3 d_lo, float3 d_hi, out float c[6])
 {
-    const float3 d_lo = x - hi;
-    const float3 d_hi = x - lo;
     const float3 closest = clamp(float3(0.0f, 0.0f, 0.0f), d_lo, d_hi);
     const float3 closest2 = closest * closest;
     const float all2 = closest2.x + closest2.y + closest2.z;
@@ -90,10 +96,25 @@ void LightTreeEmitterCosines(float3 x, float3 lo, float3 hi, out float c[6])
     }
 }
 
-float LightTreeImportance(float3 x, float3 n, float3 lo, float3 hi, float face[6])
+// The exact maximum of the emitter cosine of each face family over a box [lo, hi] of emitters.
+void LightTreeEmitterCosines(float3 x, float3 lo, float3 hi, out float c[6])
+{
+    LtEmitterCosines(x - hi, x - lo, c);
+}
+
+// The importance of a summary (box [lo, hi], face sums) for the receiver box [r_lo, r_hi] with unit
+// normal n (0: no surface), docs/LIGHT_TREE.md section 5.1 and docs/LIGHT_NEE.md section 5. One
+// implementation for both receivers: `is_point` (a constant at every call site, r_lo = r_hi = x) keeps
+// the point form's code exactly as it was before the box form existed (the compiler removes the box
+// terms). With a box: the emitter cosines over D = [r_lo - hi, r_hi - lo]; the receiver term
+// cr = min(1, m / dmin) with m = n . (c_B - c_R) + |n| . (h_B + h_R) (the maximum of n . (y - x) over
+// both boxes) and dmin the distance between the boxes; the distance term
+// max(|c_R - c_B|^2, max(1, (|h_R| + |h_B|)^2)). Every term is a bound over all receiver points of the
+// box, so I > 0 whenever a light face below the summary can reach one of them.
+float LtImportance(float3 r_lo, float3 r_hi, bool is_point, float3 n, float3 lo, float3 hi, float face[6])
 {
     float c[6];
-    LightTreeEmitterCosines(x, lo, hi, c);
+    LtEmitterCosines(r_lo - hi, r_hi - lo, c);
     float e = 0.0f;
     CAELIX_UNROLL
     for (uint f = 0; f < 6; ++f)
@@ -106,20 +127,42 @@ float LightTreeImportance(float3 x, float3 n, float3 lo, float3 hi, float face[6
     }
     const float3 centre = 0.5f * (lo + hi);
     const float3 half_size = 0.5f * (hi - lo);
+    const float3 r_centre = is_point ? r_lo : 0.5f * (r_lo + r_hi);
     float cr = 1.0f;
     if (any(n != 0.0f))
     {
-        const float m = dot(n, centre - x) + dot(abs(n), half_size);
+        float m = dot(n, centre - r_centre) + dot(abs(n), half_size);
+        if (!is_point)
+        {
+            m += dot(abs(n), 0.5f * (r_hi - r_lo));
+        }
         if (m <= 0.0f)
         {
             return 0.0f;
         }
-        const float dmin = length(max(max(lo - x, x - hi), float3(0.0f, 0.0f, 0.0f)));
+        const float dmin = length(max(max(lo - r_hi, r_lo - hi), float3(0.0f, 0.0f, 0.0f)));
         cr = dmin > 0.0f ? min(1.0f, m / dmin) : 1.0f;
     }
-    const float3 to_centre = x - centre;
-    const float d2 = max(dot(to_centre, to_centre), max(1.0f, dot(half_size, half_size)));
+    const float3 to_centre = r_centre - centre;
+    float extent2 = dot(half_size, half_size);
+    if (!is_point)
+    {
+        const float extent = length(half_size) + length(0.5f * (r_hi - r_lo));
+        extent2 = extent * extent;
+    }
+    const float d2 = max(dot(to_centre, to_centre), max(1.0f, extent2));
     return e * cr / d2;
+}
+
+float LightTreeImportance(float3 x, float3 n, float3 lo, float3 hi, float face[6])
+{
+    return LtImportance(x, x, true, n, lo, hi, face);
+}
+
+// The importance for every receiver point of the box [r_lo, r_hi] with the normal n.
+float LightTreeImportanceBox(float3 r_lo, float3 r_hi, float3 n, float3 lo, float3 hi, float face[6])
+{
+    return LtImportance(r_lo, r_hi, false, n, lo, hi, face);
 }
 
 // The running draw over a node's children: a weighted reservoir by importance and one by power
@@ -199,6 +242,7 @@ bool LightTreeOpen(uint64_t descriptor, out LightTree tree)
     tree.heap = 0;
     tree.headers = 0;
     tree.group_shift = 0;
+    tree.trees = kLtSelectBoth;
     if (descriptor == 0)
     {
         return false;
@@ -219,11 +263,37 @@ bool LightTreeOpen(uint64_t descriptor, out LightTree tree)
     return power > 0.0f;
 }
 
-// The root summary of tree k (power 0 for an empty tree).
+// Restricts the draws and the pdfs of `t` to the trees of `trees` (kLtSelect*): an unselected tree
+// counts as empty (importance and power 0), so every pdf is the one of a draw over the selected trees.
+void LightTreeSelect(inout LightTree t, uint trees)
+{
+    t.trees = trees;
+}
+
+// The tree's view without LightTreeOpen's check for lights (which loads both root summaries): for a
+// caller that already holds a brick reference of the tree (a light cell's reservoir, a light face it
+// found). `descriptor` must not be 0.
+LightTree LightTreeView(uint64_t descriptor)
+{
+    LightTree tree;
+    tree.descriptor = descriptor;
+    tree.group_shift = LtDescriptorU32(descriptor, kLtDescGroupShift);
+    tree.headers = LtDescriptorU64(descriptor, kLtDescTreeHeaders);
+    const uint current = CAELIX_LOAD_U32(LtDescriptorU64(descriptor, kLtDescControl) + kLtCtlCurrent) & 1u;
+    tree.heap = LtDescriptorU64(descriptor, current != 0 ? kLtDescHeap1 : kLtDescHeap0);
+    tree.trees = kLtSelectBoth;
+    return tree;
+}
+
+// The root summary of tree k (power 0 for an empty or unselected tree; root kLtNone then).
 LtSummary LtTreeSummary(LightTree t, uint k, out uint root)
 {
     const uint64_t header = t.headers + uint64_t(k) * kLtTreeHeaderBytes;
     root = CAELIX_LOAD_U32(header + kLtHdrRoot);
+    if (((t.trees >> k) & 1u) == 0u)
+    {
+        root = kLtNone;
+    }
     if (root == kLtNone)
     {
         return LtEmptySummary();
@@ -309,15 +379,48 @@ void LtFamilyWeights(LtRecord r, float3 x, out float w[6], out float sum)
 // ---------------------------------------------------------------------------
 // The BVHs
 
+// A receiver of the walk: the box [lo, hi] (a point: lo = hi) and the unit normal n (0: no surface).
+// Every walk function takes `is_point` as a constant at its call site (the point and box forms of
+// LtImportance).
+struct LtReceiver
+{
+    float3 lo;
+    float3 hi;
+    float3 n;
+};
+
+LtReceiver LtPointReceiver(float3 x, float3 n)
+{
+    LtReceiver r;
+    r.lo = x;
+    r.hi = x;
+    r.n = n;
+    return r;
+}
+
+LtReceiver LtBoxReceiver(float3 box_lo, float3 box_hi, float3 n)
+{
+    LtReceiver r;
+    r.lo = box_lo;
+    r.hi = box_hi;
+    r.n = n;
+    return r;
+}
+
+float LtReceiverImportance(LtReceiver r, bool is_point, float3 lo, float3 hi, float face[6])
+{
+    return LtImportance(r.lo, r.hi, is_point, r.n, lo, hi, face);
+}
+
 // Draws a tree (kLtNone when both are empty) and multiplies pdf by its probability.
-uint LtChooseTree(LightTree t, float3 x, float3 n, inout uint rng, inout float pdf, out uint root)
+uint LtChooseTreeR(LightTree t, LtReceiver r, bool is_point, inout uint rng, inout float pdf, out uint root)
 {
     LtPick pick = LtPickBegin();
     uint roots[2];
     for (uint k = 0; k < kLtTrees; ++k)
     {
         const LtSummary s = LtTreeSummary(t, k, roots[k]);
-        LtPickAdd(pick, LightTreeImportance(x, n, s.lo, s.hi, s.face), LtPower(s.face), k,
+        LtPickAdd(pick, LtReceiverImportance(r, is_point, s.lo, s.hi, s.face), LtPower(s.face), k,
                   LightTreeRandomFloat(rng));
     }
     float probability;
@@ -330,7 +433,7 @@ uint LtChooseTree(LightTree t, float3 x, float3 n, inout uint rng, inout float p
     return k;
 }
 
-float LtTreeProbability(LightTree t, float3 x, float3 n, uint target)
+float LtTreeProbabilityR(LightTree t, LtReceiver r, bool is_point, uint target)
 {
     float sum_i = 0.0f;
     float sum_p = 0.0f;
@@ -340,7 +443,7 @@ float LtTreeProbability(LightTree t, float3 x, float3 n, uint target)
     {
         uint root;
         const LtSummary s = LtTreeSummary(t, k, root);
-        const float importance = LightTreeImportance(x, n, s.lo, s.hi, s.face);
+        const float importance = LtReceiverImportance(r, is_point, s.lo, s.hi, s.face);
         const float power = LtPower(s.face);
         sum_i += importance > 0.0f ? importance : 0.0f;
         sum_p += power > 0.0f ? power : 0.0f;
@@ -353,9 +456,13 @@ float LtTreeProbability(LightTree t, float3 x, float3 n, uint target)
     return LtPickProbability(sum_i, sum_p, importance_t, power_t);
 }
 
-// Draws a leaf of tree k from its root. kLtNone when it fails.
-uint LtChooseLeaf(LightTree t, uint k, uint root, float3 x, float3 n, inout uint rng, inout float pdf)
+// Draws a leaf of tree k from its root. kLtNone when it fails. `leaf_importance` receives the
+// importance of the drawn leaf's summary for the receiver (the inline slot summary of its parent node,
+// a copy of the leaf's own summary; 0 when the draw fell back to the power).
+uint LtChooseLeafR(LightTree t, uint k, uint root, LtReceiver r, bool is_point, inout uint rng,
+                   inout float pdf, out float leaf_importance)
 {
+    leaf_importance = 0.0f;
     uint node = root;
     for (uint depth = 0; depth < 64; ++depth)
     {
@@ -365,6 +472,11 @@ uint LtChooseLeaf(LightTree t, uint k, uint root, float3 x, float3 n, inout uint
         if (LtNodeChildCount(children) == 1)
         {
             chosen = children.x;  // the build fills the slots from 0
+            if (!is_point && (chosen & kLtChildLeafBit) != 0)
+            {
+                const LtSummary slot = LtNodeSlot(address, 0);
+                leaf_importance = LtReceiverImportance(r, is_point, slot.lo, slot.hi, slot.face);
+            }
         }
         else
         {
@@ -376,8 +488,8 @@ uint LtChooseLeaf(LightTree t, uint k, uint root, float3 x, float3 n, inout uint
                     continue;
                 }
                 const LtSummary slot = LtNodeSlot(address, s);
-                LtPickAdd(pick, LightTreeImportance(x, n, slot.lo, slot.hi, slot.face), LtPower(slot.face), s,
-                          LightTreeRandomFloat(rng));
+                const float importance = LtReceiverImportance(r, is_point, slot.lo, slot.hi, slot.face);
+                LtPickAdd(pick, importance, LtPower(slot.face), s, LightTreeRandomFloat(rng));
             }
             float probability;
             const uint s = LtPickEnd(pick, probability);
@@ -387,6 +499,7 @@ uint LtChooseLeaf(LightTree t, uint k, uint root, float3 x, float3 n, inout uint
             }
             pdf *= probability;
             chosen = children[s];
+            leaf_importance = pick.sum_i > 0.0f ? pick.weight_i : 0.0f;
         }
         if ((chosen & kLtChildLeafBit) != 0)
         {
@@ -398,7 +511,7 @@ uint LtChooseLeaf(LightTree t, uint k, uint root, float3 x, float3 n, inout uint
 }
 
 // The probability of slot `slot` of a node.
-float LtSlotProbability(uint64_t address, float3 x, float3 n, uint slot)
+float LtSlotProbabilityR(uint64_t address, LtReceiver r, bool is_point, uint slot)
 {
     const uint4 children = CAELIX_LOAD_U32x4(address + kLtNodeChild);
     if (LtNodeChildCount(children) == 1)
@@ -416,7 +529,7 @@ float LtSlotProbability(uint64_t address, float3 x, float3 n, uint slot)
             continue;
         }
         const LtSummary summary = LtNodeSlot(address, s);
-        const float importance = LightTreeImportance(x, n, summary.lo, summary.hi, summary.face);
+        const float importance = LtReceiverImportance(r, is_point, summary.lo, summary.hi, summary.face);
         const float power = LtPower(summary.face);
         sum_i += importance > 0.0f ? importance : 0.0f;
         sum_p += power > 0.0f ? power : 0.0f;
@@ -430,7 +543,7 @@ float LtSlotProbability(uint64_t address, float3 x, float3 n, uint slot)
 }
 
 // The probability of reaching `leaf` of tree k (walk up the parent links), 0 for an empty tree.
-float LtLeafProbability(LightTree t, uint k, uint leaf, float3 x, float3 n)
+float LtLeafProbabilityR(LightTree t, uint k, uint leaf, LtReceiver r, bool is_point)
 {
     uint root;
     LtTreeSummary(t, k, root);
@@ -445,11 +558,11 @@ float LtLeafProbability(LightTree t, uint k, uint leaf, float3 x, float3 n)
     for (uint depth = 0; depth < 64; ++depth)
     {
         const uint64_t address = LtNodeAddress(t, k, node);
-        probability *= LtSlotProbability(address, x, n, slot);
+        probability *= LtSlotProbabilityR(address, r, is_point, slot);
         const uint2 up = CAELIX_LOAD_U32x2(address + kLtNodeParent);  // parent, parent_slot
         if (up.x == kLtNone)
         {
-            return probability * LtTreeProbability(t, x, n, k);
+            return probability * LtTreeProbabilityR(t, r, is_point, k);
         }
         node = up.x;
         slot = up.y;
@@ -459,7 +572,7 @@ float LtLeafProbability(LightTree t, uint k, uint leaf, float3 x, float3 n)
 
 // The probability of the brick at index entry `entry` of the group's block, through its leaf; 0 when
 // it has none.
-float LtBrickProbability(LightTree t, float3 x, float3 n, uint64_t block, uint group, uint entry)
+float LtBrickProbabilityR(LightTree t, LtReceiver r, bool is_point, uint64_t block, uint group, uint entry)
 {
     const uint bvh_leaf =
         CAELIX_LOAD_U32(block + kLtBlockIndexOffset + uint64_t(entry) * kLtIndexEntryBytes + kLtIndexBvhLeaf);
@@ -474,7 +587,40 @@ float LtBrickProbability(LightTree t, float3 x, float3 n, uint64_t block, uint g
     {
         return 0.0f;
     }
-    return LtLeafProbability(t, k, leaf, x, n);
+    return LtLeafProbabilityR(t, k, leaf, r, is_point);
+}
+
+// The leaf word (bvh_leaf: tree << kLtBvhLeafTreeShift | leaf) of the brick at index entry `entry` of
+// the group's block when that leaf points back at (group, entry), else kLtNone (no leaf: dropped, or
+// the tree has not been gathered since the block was rebuilt).
+uint LtBrickLeaf(LightTree t, uint64_t block, uint group, uint entry)
+{
+    const uint bvh_leaf =
+        CAELIX_LOAD_U32(block + kLtBlockIndexOffset + uint64_t(entry) * kLtIndexEntryBytes + kLtIndexBvhLeaf);
+    if (bvh_leaf == kLtNone)
+    {
+        return kLtNone;
+    }
+    const uint2 owner = CAELIX_LOAD_U32x2(
+        LtLeafAddress(t, bvh_leaf >> kLtBvhLeafTreeShift, bvh_leaf & kLtBvhLeafIndexMask) + kLtLeafGroup);
+    return owner.x == group && owner.y == entry ? bvh_leaf : kLtNone;
+}
+
+// The point forms (the receiver x with the normal n).
+uint LtChooseTree(LightTree t, float3 x, float3 n, inout uint rng, inout float pdf, out uint root)
+{
+    return LtChooseTreeR(t, LtPointReceiver(x, n), true, rng, pdf, root);
+}
+
+uint LtChooseLeaf(LightTree t, uint k, uint root, float3 x, float3 n, inout uint rng, inout float pdf)
+{
+    float leaf_importance;
+    return LtChooseLeafR(t, k, root, LtPointReceiver(x, n), true, rng, pdf, leaf_importance);
+}
+
+float LtBrickProbability(LightTree t, float3 x, float3 n, uint64_t block, uint group, uint entry)
+{
+    return LtBrickProbabilityR(t, LtPointReceiver(x, n), true, block, group, entry);
 }
 
 // ---------------------------------------------------------------------------
@@ -629,35 +775,110 @@ float LightTreeBrickPdf(LightTree t, float3 x, float3 n, LightBrickRef brick)
     return LtBrickProbability(t, x, n, t.heap + uint64_t(row.x) * kLtUnitBytes, brick.group, brick.entry);
 }
 
-float LightTreePointPdf(LightTree t, float3 x, float3 n, uint group, uint3 voxel_in_group, uint face,
-                        uint block_value)
+// The draw of a brick for every receiver point of the box [box_lo, box_hi] with the normal n (the
+// light cells' fill, docs/LIGHT_NEE.md section 3.4): as LightTreeSampleBrick with the box importance
+// (LightTreeImportanceBox) at every choice. `pdf_brick` includes the tree choice; `leaf` = the drawn
+// leaf as tree << kLtBvhLeafTreeShift | leaf index; `importance` = the box importance of the leaf's
+// summary (the fill's RIS target; 0 when the draw fell back to the power).
+bool LightTreeSampleBrickBox(LightTree t, float3 box_lo, float3 box_hi, float3 n, inout uint rng,
+                             out LightBrickRef brick, out float pdf_brick, out uint leaf,
+                             out float importance)
 {
-    // Not a light voxel: 0 without a lookup.
+    brick.group = kLtNone;
+    brick.entry = kLtNone;
+    brick.generation = 0;
+    pdf_brick = 1.0f;
+    leaf = kLtNone;
+    importance = 0.0f;
+    const LtReceiver r = LtBoxReceiver(box_lo, box_hi, n);
+    uint root;
+    const uint k = LtChooseTreeR(t, r, false, rng, pdf_brick, root);
+    if (k == kLtNone)
+    {
+        return false;
+    }
+    const uint index = LtChooseLeafR(t, k, root, r, false, rng, pdf_brick, importance);
+    if (index == kLtNone)
+    {
+        importance = 0.0f;
+        return false;
+    }
+    const uint2 owner = CAELIX_LOAD_U32x2(LtLeafAddress(t, k, index) + kLtLeafGroup);  // group, entry
+    brick.group = owner.x;
+    brick.entry = owner.y;
+    brick.generation = LtGroupRow(t, owner.x).z;
+    leaf = (k << kLtBvhLeafTreeShift) | index;
+    return true;
+}
+
+// The probability that LightTreeSampleBrickBox draws `brick` for the box receiver; 0 when the
+// reference is stale or the brick has no leaf.
+float LightTreeBrickPdfBox(LightTree t, float3 box_lo, float3 box_hi, float3 n, LightBrickRef brick)
+{
+    if (!LightBrickRefValid(t, brick))
+    {
+        return 0.0f;
+    }
+    const uint4 row = LtGroupRow(t, brick.group);
+    const uint64_t block = t.heap + uint64_t(row.x) * kLtUnitBytes;
+    return LtBrickProbabilityR(t, LtBoxReceiver(box_lo, box_hi, n), false, block, brick.group, brick.entry);
+}
+
+// The box importance of a brick's leaf summary, read from the leaf array (0 when the brick has no leaf
+// of its own: dropped, or not gathered since its block was rebuilt): the fill's target for the brick,
+// evaluated in the same way by both sides of the light NEE's MIS (docs/LIGHT_NEE.md section 6).
+// `brick` must be valid (LightBrickRefValid).
+float LightTreeLeafImportanceBox(LightTree t, LightBrickRef brick, float3 box_lo, float3 box_hi, float3 n)
+{
+    const uint4 row = LtGroupRow(t, brick.group);
+    const uint leaf = LtBrickLeaf(t, t.heap + uint64_t(row.x) * kLtUnitBytes, brick.group, brick.entry);
+    if (leaf == kLtNone)
+    {
+        return 0.0f;
+    }
+    const LtSummary s =
+        LtLoadSummary(LtLeafAddress(t, leaf >> kLtBvhLeafTreeShift, leaf & kLtBvhLeafIndexMask));
+    return LightTreeImportanceBox(box_lo, box_hi, n, s.lo, s.hi, s.face);
+}
+
+// Whether face `face` of the voxel `voxel_in_group` (group-local) of `group`, with the raw block value
+// `block_value`, is a light face of the tree: a light material code, a brick with an index entry in the
+// group's block, the voxel in that face family of the brick's record. Then `brick` names the brick
+// (generation = the row's), `leaf` is its leaf word (LtBrickLeaf; kLtNone when the brick has no leaf:
+// no draw can reach it) and `in_brick` = P(face | brick, x) / face_count, the factor of the in-brick
+// draw (LightBrickSamplePoint) for the receiver x. The BSDF side of the light NEE's MIS and
+// LightTreePointPdf call it.
+bool LightTreeFindLightFace(LightTree t, float3 x, uint group, uint3 voxel_in_group, uint face,
+                            uint block_value, out LightBrickRef brick, out uint leaf, out float in_brick)
+{
+    brick.group = group;
+    brick.entry = kLtNone;
+    brick.generation = 0;
+    leaf = kLtNone;
+    in_brick = 0.0f;
+    // Not a light voxel: no lookup.
     const uint encoding = LtDescriptorU32(t.descriptor, kLtDescEncoding);
     const uint code = BlockMaterialCode(block_value & 0xFFFFu, encoding);
     const uint64_t light_codes = LtDescriptorU64(t.descriptor, kLtDescLightCodes);
     const uint code_word = CAELIX_LOAD_U32(light_codes + uint64_t(code >> 5) * 4);
     if (((code_word >> (code & 31)) & 1u) == 0 || face > 5)
     {
-        return 0.0f;
+        return false;
     }
     const uint4 row = LtGroupRow(t, group);
     if (row.y == 0)
     {
-        return 0.0f;
+        return false;
     }
     const uint64_t block = t.heap + uint64_t(row.x) * kLtUnitBytes;
     const uint entry_index =
         LtFindIndexEntry(block, CAELIX_LOAD_U32(block), LtMorton(voxel_in_group / kBrickEdge), t.group_shift);
     if (entry_index == kLtNone)
     {
-        return 0.0f;
+        return false;
     }
-    const float brick_pdf = LtBrickProbability(t, x, n, block, group, entry_index);
-    if (brick_pdf <= 0.0f)
-    {
-        return 0.0f;
-    }
+    brick.entry = entry_index;
+    brick.generation = row.z;
     const LtRecord record = LtLoadEntryRecord(block, entry_index);
     LtFrame frame;
     const float3 origin = LtGroupFrame(t, group, frame);
@@ -668,7 +889,7 @@ float LightTreePointPdf(LightTree t, float3 x, float3 n, uint group, uint3 voxel
     const uint count = LtFamilyCount(record, face);
     if (sum <= 0.0f || w[face] <= 0.0f || count == 0)
     {
-        return 0.0f;
+        return false;
     }
     // The family's entries are sorted by voxel index: binary search.
     uint first = 0;
@@ -701,7 +922,28 @@ float LightTreePointPdf(LightTree t, float3 x, float3 n, uint group, uint3 voxel
             b = mid;
         }
     }
-    return found ? brick_pdf * (w[face] / sum) / float(count) : 0.0f;
+    if (!found)
+    {
+        return false;
+    }
+    in_brick = (w[face] / sum) / float(count);
+    leaf = LtBrickLeaf(t, block, group, entry_index);
+    return true;
+}
+
+float LightTreePointPdf(LightTree t, float3 x, float3 n, uint group, uint3 voxel_in_group, uint face,
+                        uint block_value)
+{
+    LightBrickRef brick;
+    uint leaf;
+    float in_brick;
+    if (!LightTreeFindLightFace(t, x, group, voxel_in_group, face, block_value, brick, leaf, in_brick))
+    {
+        return 0.0f;
+    }
+    const uint4 row = LtGroupRow(t, group);
+    const uint64_t block = t.heap + uint64_t(row.x) * kLtUnitBytes;
+    return LtBrickProbability(t, x, n, block, group, brick.entry) * in_brick;
 }
 
 #endif  // CAELIX_LIGHT_TREE_HLSL

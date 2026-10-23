@@ -18,6 +18,8 @@
 // from the C layout when a vector crosses a 16-byte row or an array element is not 16 bytes; such a
 // change of CaelixFrameConstants fails here.
 #include "render/frame_constants.h"
+#include "render/light_cells_layout.h"
+#include "rhi/hash_table_layout.h"
 #include "scene/gpu_structs.h"
 #include "scene/light_tree_layout.h"
 #include "scene/material_table.h"
@@ -359,8 +361,8 @@ std::vector<std::string> CheckKernel(const std::string& name)
 
 TEST_CASE("frame constants: the uniform block of every frame-constant kernel has the C layout")
 {
-    const char* const kernels[] = {"caelix_path_trace", "caelix_composite", "caelix_cross_resolve",
-                                   "caelix_sky_sh", "caelix_upscale_encode"};
+    const char* const kernels[] = {"caelix_path_trace", "caelix_path_trace_no_light_nee", "caelix_composite",
+                                   "caelix_cross_resolve", "caelix_sky_sh", "caelix_upscale_encode"};
     for (const char* kernel : kernels)
     {
         const std::vector<std::string> errors = CheckKernel(kernel);
@@ -501,7 +503,28 @@ TEST_CASE("push constants: the scene and light tree kernels have the C++ layouts
         CAELIX_FIELD(LightSortPush, gate_address), CAELIX_FIELD(LightSortPush, shift),
         CAELIX_FIELD(LightSortPush, block_count),
     };
+    const std::vector<Field> hash = {
+        CAELIX_FIELD(HashPush, keys),             CAELIX_FIELD(HashPush, stack),
+        CAELIX_FIELD(HashPush, counters),         CAELIX_FIELD(HashPush, payloads),
+        CAELIX_FIELD(HashPush, active),           CAELIX_FIELD(HashPush, dispatch),
+        CAELIX_FIELD(HashPush, key_mask),         CAELIX_FIELD(HashPush, payload_capacity),
+        CAELIX_FIELD(HashPush, payload_stride),   CAELIX_FIELD(HashPush, key_words),
+        CAELIX_FIELD(HashPush, frame),            CAELIX_FIELD(HashPush, max_age),
+        CAELIX_FIELD(HashPush, items_per_group),  CAELIX_FIELD(HashPush, pad),
+    };
+    const std::vector<Field> fill = {
+        CAELIX_FIELD(LightCellFillPush, payloads),   CAELIX_FIELD(LightCellFillPush, active),
+        CAELIX_FIELD(LightCellFillPush, dispatch),   CAELIX_FIELD(LightCellFillPush, counters),
+        CAELIX_FIELD(LightCellFillPush, light_tree), CAELIX_FIELD(LightCellFillPush, frame_seed),
+        CAELIX_FIELD(LightCellFillPush, mode),       CAELIX_FIELD(LightCellFillPush, candidates),
+        CAELIX_FIELD(LightCellFillPush, pad),
+    };
     const std::vector<std::pair<const char*, const std::vector<Field>*>> kernels = {
+        {"caelix_light_cell_fill", &fill},
+        {"caelix_hash_init", &hash},
+        {"caelix_hash_begin", &hash},
+        {"caelix_hash_maintain", &hash},
+        {"caelix_hash_finish", &hash},
         {"caelix_finalize", &finalize},
         {"caelix_light_tree_size", &group},
         {"caelix_light_tree_scan", &group},
@@ -778,6 +801,7 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kEntityInfoGridMin),
         CAELIX_CONSTANT(kEntityInfoGridBase),
         CAELIX_CONSTANT(kEntityInfoGridDims),
+        CAELIX_CONSTANT(kEntityInfoLife),
         CAELIX_CONSTANT(kEntityInfoCurRow0),
         CAELIX_CONSTANT(kEntityInfoCurRow1),
         CAELIX_CONSTANT(kEntityInfoCurRow2),
@@ -868,6 +892,8 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kLtGroupRowBytes),
         CAELIX_CONSTANT(kLtRowBricksMask),
         CAELIX_CONSTANT(kLtRowDroppedShift),
+        CAELIX_CONSTANT(kLtGenerationLifeShift),
+        CAELIX_CONSTANT(kLtGenerationVersionMask),
         CAELIX_CONSTANT(kLtGpuLightChanged),
         CAELIX_CONSTANT(kLtCpuRebuild),
         CAELIX_CONSTANT(kLtCpuReleased),
@@ -929,13 +955,94 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kLtSortDigits),
         CAELIX_CONSTANT(kLtSortPasses),
         CAELIX_CONSTANT(kLtSortBlock),
+        // shaders/common/caelix_hash_table.hlsl: lib/src/rhi/hash_table_layout.h
+        CAELIX_CONSTANT(kHashNone),
+        CAELIX_CONSTANT(kHashProbes),
+        CAELIX_CONSTANT(kHashKeySlotsPerPayload),
+        CAELIX_CONSTANT(kHashSlotKeyLo),
+        CAELIX_CONSTANT(kHashSlotKeyHi),
+        CAELIX_CONSTANT(kHashSlotPayload),
+        CAELIX_CONSTANT(kHashSlotBytes),
+        CAELIX_CONSTANT(kHashPayloadState),
+        CAELIX_CONSTANT(kHashPayloadTouched),
+        CAELIX_CONSTANT(kHashPayloadKey),
+        CAELIX_CONSTANT(kHashMaxKeyWords),
+        CAELIX_CONSTANT(kHashStateFree),
+        CAELIX_CONSTANT(kHashStateUninitialised),
+        CAELIX_CONSTANT(kHashStateReady),
+        CAELIX_CONSTANT(kHashStackTop),
+        CAELIX_CONSTANT(kHashStackEntries),
+        CAELIX_CONSTANT(kHashCounterLive),
+        CAELIX_CONSTANT(kHashCounterActive),
+        CAELIX_CONSTANT(kHashCounterInserted),
+        CAELIX_CONSTANT(kHashCounterPending),
+        CAELIX_CONSTANT(kHashCounterFailedSlot),
+        CAELIX_CONSTANT(kHashCounterFailedPayload),
+        CAELIX_CONSTANT(kHashCounterEvicted),
+        CAELIX_CONSTANT(kHashCounterRebuildDropped),
+        CAELIX_CONSTANT(kHashCounterUser),
+        CAELIX_CONSTANT(kHashCounterUserWords),
+        CAELIX_CONSTANT(kHashCounterBytes),
+        CAELIX_CONSTANT(kHashDispatchX),
+        CAELIX_CONSTANT(kHashDispatchY),
+        CAELIX_CONSTANT(kHashDispatchZ),
+        CAELIX_CONSTANT(kHashDispatchCount),
+        CAELIX_CONSTANT(kHashDispatchBytes),
+        CAELIX_CONSTANT(kHashDispatchRowGroups),
+        CAELIX_CONSTANT(kHashThreads),
+        CAELIX_CONSTANT(kHashMaxPayloads),
+        CAELIX_CONSTANT(kHashHit),
+        CAELIX_CONSTANT(kHashInserted),
+        CAELIX_CONSTANT(kHashPending),
+        CAELIX_CONSTANT(kHashFullWindow),
+        CAELIX_CONSTANT(kHashNoPayload),
+        CAELIX_CONSTANT(kHashEmptyEntry),
+        CAELIX_CONSTANT(kHashMissing),
+        // shaders/common/caelix_light_cells_layout.hlsl: lib/src/render/light_cells_layout.h
+        CAELIX_CONSTANT(kLightCellReservoirCount),
+        CAELIX_CONSTANT(kLightCellReservoirBytes),
+        CAELIX_CONSTANT(kLcState),
+        CAELIX_CONSTANT(kLcTouched),
+        CAELIX_CONSTANT(kLcEntity),
+        CAELIX_CONSTANT(kLcLife),
+        CAELIX_CONSTANT(kLcCoord),
+        CAELIX_CONSTANT(kLcLevel),
+        CAELIX_CONSTANT(kLcFace),
+        CAELIX_CONSTANT(kLcFills),
+        CAELIX_CONSTANT(kLcNorm),
+        CAELIX_CONSTANT(kLcNormCount),
+        CAELIX_CONSTANT(kLcSunTests),
+        CAELIX_CONSTANT(kLcSunVisible),
+        CAELIX_CONSTANT(kLightCellHeaderBytes),
+        CAELIX_CONSTANT(kLightCellKeyWords),
+        CAELIX_CONSTANT(kLcResGroup),
+        CAELIX_CONSTANT(kLcResEntry),
+        CAELIX_CONSTANT(kLcResWeight),
+        CAELIX_CONSTANT(kLcResGeneration),
+        CAELIX_CONSTANT(kLightCellNoGroup),
+        CAELIX_CONSTANT(kLcReservoirs),
+        CAELIX_CONSTANT(kLightCellBytes),
+        CAELIX_CONSTANT(kLightCellBaseShift),
+        CAELIX_CONSTANT(kLightCellLevelShift),
+        CAELIX_CONSTANT(kLightCellLevels),
+        CAELIX_CONSTANT(kLightCellBoxMarginVoxels),
+        CAELIX_CONSTANT(kLightCellNormalisationFills),
+        CAELIX_CONSTANT(kLightCellSunDecayShift),
+        CAELIX_CONSTANT(kLightCellRotation),
+        CAELIX_CONSTANT(kLightCellFillThreads),
+        CAELIX_CONSTANT(kLcCounterFreshDraws),
+        CAELIX_CONSTANT(kLcCounterNormDraws),
+        CAELIX_CONSTANT(kLcCounterStaleRefreshed),
+        CAELIX_CONSTANT(kLightCellModeOff),
+        CAELIX_CONSTANT(kLightCellModeRotate),
     };
 #undef CAELIX_CONSTANT
     std::map<std::string, uint64_t> known;
     std::vector<std::string> errors;
     size_t checked = 0;
     for (const char* file : {"common/caelix_record.hlsl", "common/caelix_material.hlsl",
-                             "common/caelix_light_tree_layout.hlsl"})
+                             "common/caelix_light_tree_layout.hlsl", "common/caelix_hash_table.hlsl",
+                             "common/caelix_light_cells_layout.hlsl"})
     {
         for (const auto& [name, value] : HlslConstants(file, known, errors))
         {

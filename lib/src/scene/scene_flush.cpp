@@ -278,6 +278,7 @@ bool Scene::StageEntity(CaelixEntityId id, Entity& entity)
             info.grid_dims[a] = entity.grid_dims[a];
         }
         info.grid_base = entity.grid_range.offset;
+        info.life = entity.life;
         std::memcpy(info.cur_rows, entity.cur_rows, sizeof(info.cur_rows));
         std::memcpy(info.prev_rows, entity.prev_rows, sizeof(info.prev_rows));
         std::memcpy(span.data, &info, sizeof(info));

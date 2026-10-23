@@ -112,7 +112,8 @@ A group holds at most 4096 light bricks (`kLtMaxLightBricksPerGroup`); with `gro
 ```
 0   uint block_offset   units in the current heap buffer
 4   uint block_units    0 = no block
-8   uint generation     +1 at every rebuild or release of the group's block
+8   uint generation     (life << 16) | version: life +1 when the group index is released, version +1
+                        at every rebuild within one life (wraps at 2^16; LtNextLife, LtNextVersion)
 12  uint gpu_flags      kLtGpuLightChanged: the finalize kernel saw a light change in the group
                         (atomic or)
 16  uint cpu_flags      GPU-owned merge of the CPU's staged flags: kLtCpuRebuild, kLtCpuReleased,
@@ -241,7 +242,7 @@ whose light staging fit (else everything waits for the next flush).
      buffer (`1 - current`); the total; `pass_result` = no change (nothing flagged), ok (total <=
      capacity) or failed.
    - `build` (one workgroup of 256 per group; returns at once unless ok): released -> the row is
-     cleared (generation + 1); flagged -> the block is rebuilt (generation + 1); otherwise the block
+     cleared (next life); flagged -> the block is rebuilt (next version); otherwise the block
      is copied to its new offset. Every processed group writes its row and clears its flags.
    - `commit` (one workgroup): ok -> `current = 1 - current`, totals for the stats, passes + 1;
      failed -> passes + 1, failed_passes + 1.
@@ -262,7 +263,7 @@ whose light staging fit (else everything waits for the next flush).
       lane `l` owns voxels `[l k, (l + 1) k)`, so each family comes out sorted by voxel) and writes at
       most the finalize kernel's count of entries (they differ only while a neighbour's change waits
       for its finalization, which marks the record stale again).
-   4. The row: offset, units, counts, generation + 1.
+   4. The row: offset, units, counts, the next version of the generation.
 3. **Gather and build per tree**, recorded for a tree when the CPU asks for it (an entity of the
    tree moved, an entity changed its motion or was removed, a group of the tree's entities was
    released, a capacity grew) or when a group pass is recorded. The first kernel (`begin`) decides on
@@ -369,6 +370,37 @@ float LightTreeRandomFloat(inout uint rng); // [0, 1)
 `rng` is a PCG state owned by the caller; the API consumes a variable number of steps. A brick
 reference stays valid while its group is not rebuilt (`LightBrickRefValid`).
 
+Additions for the light NEE (docs/LIGHT_NEE.md section 5, 2026-10-24):
+
+```hlsl
+float LightTreeImportanceBox(float3 r_lo, float3 r_hi, float3 n, float3 lo, float3 hi, float face[6]);
+bool LightTreeSampleBrickBox(LightTree t, float3 box_lo, float3 box_hi, float3 n, inout uint rng,
+                             out LightBrickRef brick, out float pdf_brick, out uint leaf,
+                             out float importance);  // leaf = tree << 31 | index; importance = the
+                                                     // box importance of the leaf's summary
+float LightTreeBrickPdfBox(LightTree t, float3 box_lo, float3 box_hi, float3 n, LightBrickRef brick);
+float LightTreeLeafImportanceBox(LightTree t, LightBrickRef brick, float3 box_lo, float3 box_hi,
+                                 float3 n);           // from the leaf array; 0 without a leaf
+bool LightTreeFindLightFace(LightTree t, float3 x, uint group, uint3 voxel_in_group, uint face,
+                            uint block_value, out LightBrickRef brick, out uint leaf,
+                            out float in_brick);      // in_brick = P(face | brick, x) / face_count
+void LightTreeSelect(inout LightTree t, uint trees);  // kLtSelectStatic / Dynamic / Both (default)
+LightTree LightTreeView(uint64_t descriptor);         // LightTreeOpen without its check for lights
+```
+
+The box receiver uses the importance of section 5.1 with the receiver box R in place of the point:
+the emitter cosines over D = [R.lo - hi, R.hi - lo]; `m = n . (c_B - c_R) + |n| . (h_B + h_R)` (the
+maximum of n . (y - x) over both boxes) and `dmin` the distance between the boxes; the distance term
+`max(|c_R - c_B|^2, max(1, (|h_R| + |h_B|)^2))`. Every term is a bound over the receiver points of the
+box, so a light face that can reach one of them has a positive importance at every node above it.
+One implementation (`LtImportance` with a constant `is_point`) serves both receivers, and the walk
+functions take the receiver as `LtReceiver` (box) with the same constant; the point functions keep
+their signatures. The light tree probe's SPIR-V is not byte-identical to the one before (ids, the
+order of constants and local variables, one swapped block pair), with the same instructions; no
+library kernel includes this file. LightTreePointPdf is LightTreeFindLightFace times the brick
+probability. The selector makes an unselected tree count as empty (importance and power 0), so the
+pdfs are those of draws over the selected trees.
+
 Draw: the tree by the importance of the two root summaries, then down the 4-wide nodes by the
 importance of the inline slots, to a leaf; the leaf gives the group and the index entry, the entry
 the record. The face family, the voxel and the point use the record in the entity-local frame
@@ -440,7 +472,9 @@ CaelixResult caelix_scene_set_entity_motion(CaelixScene*, CaelixEntityId, uint32
 ```
 
 Disabling releases the tree's buffers once the last flushed frame is safe; enabling again starts
-from scratch (every resident brick is finalized again). Entity motion is a general entity flag;
+from scratch (every resident brick is finalized again). EntityInfo word 7 (`kEntityInfoLife`, the
+former pad) holds the entity's life: +1 every time `caelix_scene_add_entity` hands its id out again
+(the light cells key on it). Entity motion is a general entity flag;
 today only the light tree reads it. Renderer: `FrameConstants::light_tree` (offset 544; the struct is
 560 bytes). No render kernel uses it in this step.
 

@@ -341,6 +341,10 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     denoise_timer_.Resolve(safe);
     upscale_timer_.Resolve(safe);
     FreeRetired(safe);
+    if (light_cells_ != nullptr)
+    {
+        light_cells_->Resolve(safe, light_nee_settings_);
+    }
 
     // Internal targets of the lighting modes and the NRD executor (before anything is
     // recorded: the allocations can throw).
@@ -349,6 +353,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     {
         restart_accumulation = true;
     }
+    // The light cells (light NEE in the lighting modes with a light tree; the allocation can throw).
+    LightCells* const light_cells = EnsureLightCells(lighting, frame.frame_number);
     bool nrd_error = false;
     NrdExecutor* denoiser = nullptr;
     if (options.mode == CAELIX_MODE_PATH_TRACE && options.denoise != 0 && composite && !nrd_failed_ &&
@@ -663,6 +669,27 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
 
     const uint32_t groups_x = (width + kWorkgroupSize - 1) / kWorkgroupSize;
     const uint32_t groups_y = (height + kWorkgroupSize - 1) / kWorkgroupSize;
+    // Light cells (docs/LIGHT_NEE.md section 7): the maintenance and the fill before the trace (their own
+    // timers, outside trace_ms), with the frame constants of the trace's lookups.
+    if (light_cells != nullptr)
+    {
+        const LightCells::Settings& s = light_nee_settings_;
+        light_cells->Record(cmd, scene_.light_tree_address(), s, options.frame_seed, frame.frame_number,
+                            safe);
+        uint32_t light_flags = kLightNeeLookup;
+        light_flags |= (s.flags & CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY) == 0 ? kLightNeeContribute : 0u;
+        light_flags |= (s.flags & CAELIX_LIGHT_NEE_FLAG_NO_JITTER) == 0 ? kLightNeeJitter : 0u;
+        light_flags |= (s.flags & CAELIX_LIGHT_NEE_FLAG_NO_MIS) == 0 ? kLightNeeMis : 0u;
+        light_flags |= (s.flags & CAELIX_LIGHT_NEE_FLAG_NO_SUN_HINT) == 0 ? kLightNeeSunHint : 0u;
+        constants.light_nee_flags = light_flags;
+        constants.light_frame = light_cells->light_frame();
+        constants.light_cells = light_cells->payloads_address();
+        constants.light_cell_keys = light_cells->table().keys_address();
+        constants.light_cell_stack = light_cells->table().stack_address();
+        constants.light_cell_counters = light_cells->table().counters_address();
+        constants.light_cell_mask = light_cells->table().key_mask();
+        constants.light_footprint = light_cells->footprint(s);
+    }
     timer_.Begin(cmd, frame.frame_number, safe);
     // Sky SH (host cubemap): one workgroup projects the cubemap into sky_sh_buffer_; the
     // barrier orders that write before the trace's reads. Inside the trace timestamps.
@@ -675,10 +702,15 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         sh_written.Record(cmd);
     }
-    // Trace.
-    bind_sets(kernels_.trace(), slot->set);
+    // Trace (the variant without the light NEE code when this frame runs none).
+    bind_sets(light_cells != nullptr ? kernels_.trace() : kernels_.trace_no_light_nee(), slot->set);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
     timer_.End(cmd);
+    if (light_cells != nullptr)
+    {
+        // The counters of the maintenance, the fill and the trace's lookups.
+        light_cells->RecordReadback(cmd, frame.frame_number);
+    }
 
     // NRD (path trace mode with denoising). Its first dispatch waits for the trace's
     // writes, its last barrier orders its outputs before the composite.

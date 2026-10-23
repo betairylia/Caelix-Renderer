@@ -1,7 +1,7 @@
 # Light NEE on `main` (spec, 2026-10-24)
 
-Status: approved by the owner (2026-10-24) after two external reviews (GPT Astra, Fable); being
-implemented. Base: the light tree (`docs/LIGHT_TREE.md`, commit `6c6cbbf`).
+Status: approved by the owner (2026-10-24) after two external reviews (GPT Astra, Fable); implemented
+2026-10-24 (section 11 is the truth for the code where it differs). Base: the light tree (`docs/LIGHT_TREE.md`, commit `6c6cbbf`).
 Reference implementation: branch `light-nee-experiments` (`docs/LIGHT_NEE.md` there; "old" below).
 Owner goals (`docs/human_wrote/Caelix-Renderer Towards A Million Stars.md`): a raw signal with low
 spatial and temporal correlation, the denoiser/upscaler carries the rest; no visibility reuse yet; the
@@ -106,6 +106,7 @@ enough to the target that fresh draws give low-variance weights.
   at once whatever its turn. Each reservoir is still a valid contribution weight of the frame it was drawn
   in; between refreshes a moving light lags by at most 4 frames (accepted).
 - The default mode is chosen by the fill bench: "off" if its fill time is acceptable, else "rotate".
+  Chosen: "rotate" (section 11.3).
 - **Identity**: a reservoir stores the group, its index entry and the group's 32-bit generation
   `(group life << 16) | group version` (life bumped when the group index is released, version at every
   rebuild within one life). A mismatch means the entry may point at another brick: the fill refreshes the
@@ -280,3 +281,149 @@ stay bit-identical).
 
 No temporal reuse in the cells (modes off and rotate); M by the rootfall rule; the history caps, the
 re-find by brick position and the confidence bookkeeping of the reviews are therefore not built.
+
+## 11. As built (2026-10-24)
+
+Implemented on `main` (working tree on top of `4fe9f59`). This section is the truth for the code where
+it differs from sections 1-10. Measurements, commands and images:
+`F:/RP_Games/Caelix-family/Artifacts/light-nee-main-20261024/README.md`.
+
+### 11.1 Files
+
+- Hash table: `lib/src/rhi/hash_table.{h,cpp}`, `lib/src/rhi/hash_table_layout.h`,
+  `shaders/common/caelix_hash_table.hlsl` (the device API), `shaders/hash/caelix_hash_{kernels,init,begin,
+  maintain,finish}.hlsl` (the maintenance kernels).
+- Light cells: `lib/src/render/light_cells.{h,cpp}`, `lib/src/render/light_cells_layout.h`,
+  `shaders/common/caelix_light_cells_layout.hlsl`, `shaders/render/caelix_light_cells.hlsl` (cell rule,
+  region, MIS weight, proxy), `shaders/render/caelix_light_cell_fill.hlsl`; renderer side
+  `lib/src/render/renderer_light.cpp` (options, lifetime, stats) and `renderer_render.cpp`.
+- Trace: `shaders/render/caelix_path_trace.hlsl` (LightCellAtVertex, LampCandidate, SunCandidate,
+  NextEventAtVertex, CountSunRay, LampHitWeight) and the kernel variant
+  `shaders/render/caelix_path_trace_no_light_nee.hlsl`.
+- Light tree additions: `shaders/scene/caelix_light_tree.hlsl`, the generation split in
+  `caelix_light_tree_build.hlsl` and the layout headers; entity life in `gpu_structs.h`,
+  `caelix_record.hlsl`, `Scene::AddEntity`, `Scene::StageEntity`.
+- ABI: `CaelixLightNeeOptions`, `caelix_renderer_set_light_nee_options`, `CaelixLightNeeStats`,
+  `caelix_renderer_get_light_nee_stats` (no version bump). Rust host: `--no-light-nee`, `--light-*`,
+  `--screenshot-frame`, the Stats window's "Light NEE" section, `light_nee:` on `timings_avg:`.
+- Tests: `tests/hash_table_test.cpp` + `tests/shaders/caelix_hash_probe.hlsl`, `tests/light_nee_test.cpp`
+  + `tests/shaders/caelix_light_nee_probe.hlsl`, the "light NEE" cases at the end of
+  `tests/trace_test.cpp`, `tests/test_kernels.{h,cpp}` (shared probe helpers), `frame_layout_test.cpp`
+  (the new push blocks and layout headers), `abi_c99.c`.
+
+### 11.2 Differences from the spec
+
+1. **Rotate mode packs 4 cells into a fill workgroup.** With 64 threads per cell (thread r owns
+   reservoir r, section 3.4) the rotate mode drew a quarter of the reservoirs but cost as much as mode
+   "off" (rootfall 1440p: 1.16 vs 1.25 ms at M = 1): a wave costs its instructions whatever the share
+   of active lanes. Mode "rotate" now runs 4 cells per workgroup, 16 threads per cell, thread j owns the
+   reservoirs 4j .. 4j + 3 of which exactly one is due by the rotation (stale ones are refreshed too).
+   Mode "off" keeps one cell per workgroup, thread r = reservoir r. The hash table's maintenance takes
+   `items_per_group` per call (1 or 4).
+2. **An empty reservoir is not stale.** With M = 2 a refresh can end empty (both candidates have target
+   0). Refreshing empty reservoirs out of turn in mode "rotate" would make them rarer than the
+   resampling makes them: a bias upward. Stale = a generation mismatch (or a new cell).
+3. **The lamp candidate stays live; only the sun candidate is replayed.** Replaying the lamp candidate
+   (a second LightBrickSamplePoint and proxy) cost 1.5 ms at 2560x1440 on rootfall and more spill
+   (48 vs 16 bytes); keeping its 7 values over the cheap sun draw does not.
+4. **A trace kernel without light NEE.** With the light NEE code in the kernel (128 registers instead of
+   96), a frame without light NEE traced 20 % slower (rootfall 1440p 9.9 vs 8.2 ms). The build compiles
+   `caelix_path_trace_no_light_nee` (CAELIX_SPEC_NO_LIGHT_NEE: `light_nee_flags` 0 at compile time,
+   96 registers, 48 bytes of spill as before) and the renderer binds it for every frame that runs no
+   light NEE. A kernel variant source carries the marker CAELIX_KERNEL_VARIANT (cmake/Shaders.cmake).
+5. **Receiver box margin.** The region is the cell inflated by half a cell plus 1 voxel
+   (`kLightCellBoxMarginVoxels`): the receiver lies 0.248 voxels below the cell point, so half a cell
+   alone does not hold every receiver of a jittered lookup.
+6. **Options as opt-outs.** `CaelixLightNeeOptions::flags` holds opt-outs (`NO_JITTER`, `NO_MIS`,
+   `NO_SUN_HINT`, `NO_CONTROLLER`), so 0 is the designed configuration, plus the measurement flag
+   `LOOKUP_ONLY` (cells looked up, inserted and filled, no lamp NEE: the fill bench). The capacity
+   field is `cell_capacity` (1024 .. 2^21).
+7. **FrameConstants** grew to 608 bytes (light_nee_flags, light_frame, the cell, key, stack and counter
+   addresses, the key mask, the footprint). The composite, cross resolve, sky SH and upscale encode
+   kernels change only in the uniform block's struct type (member decorations and names): their
+   function bodies are identical to before (checked by comparing the disassembly modulo id numbering).
+8. **Light tree.** `LightTreeView` (LightTreeOpen without the check for lights) serves the trace's
+   lookups; `LightTreeFindLightFace` serves the BSDF side and LightTreePointPdf; the tree selector is a
+   field of `LightTree` (`LightTreeSelect`). The light tree probe's SPIR-V is not byte-identical to the
+   one before the box form (id numbering, the order of constants and local variables, one swapped block
+   pair; the same instructions); no library kernel includes caelix_light_tree.hlsl.
+9. **Light NEE runs in both lighting modes** (path trace and reference) and restarts its cells when the
+   scene's light tree is recreated (a new tree's generations start over).
+10. **Counters.** The hash table counts `rebuild_dropped` (keys whose window was full at the rebuild)
+    apart from the lookups' `failed_slot`; `stale_refreshed` counts every refresh out of turn (stale
+    and new cells).
+
+### 11.3 Fill bench and the defaults
+
+Light NEE in lookup-only mode (`--light-lookup-only`: cells looked up, inserted and filled, no lamp
+NEE), host defaults otherwise, 2560x1440, 100-frame means, dark sky for rootfall and bistro (folder
+`fill-bench/` of the artifacts; the first, uncompacted rotate run in `fill-bench-v1-uncompacted/`):
+
+| scene (active cells) | off, M 1 | off, M 2 | rotate, M 1 | rotate, M 2 | maintenance |
+|---|---|---|---|---|---|
+| rootfall (42 808) | 1.39 ms | 2.29 ms | 0.61 ms | 1.03 ms (1.04, 1.05 in two repeats) | 0.059 ms |
+| bistro 8192 (32 112) | 1.20 ms | 2.21 ms | 0.52 ms | 0.86 ms | 0.059 ms |
+| crimson-crown (14 257) | 0.52 ms | 0.77 ms | 0.24 ms | 0.39 ms | 0.055 ms |
+
+Fresh draws per frame on rootfall: 2.74 M (off, M 1), 0.69 M (rotate, M 1); normalisation draws = the
+active cells. Rootfall pose: the first keyframe of `rootfall.packed.street1.sequence.json`,
+`-21.961,270.802,-933.939,-3.500,44.000`.
+
+**Decision by the owner's rule:** fill(off, M 1) = 1.39 ms >= 1 ms on rootfall -> mode **rotate**;
+fill(rotate, M 2) = 1.03 .. 1.05 ms >= 1 ms -> **M = 1**. The library's 0 values and the Rust host use
+rotate and M = 1. (M = 2 adds little here anyway: the box draw's proposal already follows the leaf
+importance, which is the RIS target.) The temporal cost of rotate is in 11.4.
+
+### 11.4 Measurements
+
+Rust host, RTX 5080, driver 610.88, 100-frame means of the trace dispatch, one GPU job at a time; the
+light NEE at its defaults (rotate, M 1, jitter, MIS, sun hint), the host's 4 bounces, no sun (sky only;
+dark sky for rootfall, bistro and shroom). "off" = `--no-light-nee` (the trace kernel variant without
+light NEE).
+
+| scene | 2560x1440 on / off | 1920x1080 on / off | fill, maintenance (1440p) | live / active cells (1440p) |
+|---|---|---|---|---|
+| rootfall | 20.46 / 8.27 ms | 11.73 / 4.86 ms | 0.61, 0.060 ms | 61 531 / 42 951 |
+| bistro 8192 | 21.55 / 8.09 ms | 11.84 / 4.75 ms | 0.55, 0.060 ms | 60 050 / 32 016 |
+| crimson-crown | 26.95 / 10.88 ms | 15.31 / 6.60 ms | 0.24, 0.053 ms | 22 958 / 14 187 |
+| emberdeep | 12.65 / 4.22 ms | 6.95 / 2.45 ms | 0.15, 0.048 ms | 6 946 / 5 243 |
+| shroom | 19.29 / 6.79 ms | 10.80 / 4.16 ms | 0.83, 0.062 ms | 80 655 / 50 097 |
+
+The "off" runs trace no shadow ray at all (no sun); with light NEE every diffuse vertex traces one. On
+rootfall 1440p: lookups alone 10.9 ms, NEE without its shadow ray 12.8 ms, with it 20.3 ms (shadow rays
+about 7.5 ms). In the configuration of the old branch's measurements (2 bounces, the sun 2e4 with sun
+NEE, no denoiser, default sky): bistro 13.28 ms on / 8.20 off, emberdeep 10.14 / 5.83 (old branch after
+its register work: 13.4 and 10.3 ms with light NEE).
+
+Light NEE off against the binary before this work (rootfall 1440p, two runs each): 8.21 / 8.28 ms vs
+8.26 / 8.18 ms. Registers (CAELIX_PIPELINE_STATS): trace with light NEE 128 + 16 bytes of spill (also
+with the lookups alone), the variant without light NEE 96 + 48 bytes (as before), fill 80, hash kernels
+16 .. 19.
+
+Bias on real scenes: 1024-frame references with light NEE off vs on: mean ratio 1.005 rootfall, 0.999
+bistro, 1.000 emberdeep (block PSNR 56 .. 62 dB).
+
+Temporal behaviour on crimson-crown (256 consecutive frames, 1920x1080, exposure 4, the method and
+regions of `Artifacts/light-flicker-crimson-20261023`, reference = 1024 frames with light NEE):
+
+| variant | wall lag-1 autocorrelation (left, right, centre) | wall std of the 32-frame window mean / ref (white noise would give) |
+|---|---|---|
+| raw, rotate | 0.75, 0.69, 0.80 | 0.037, 0.035, 0.036 (0.016, 0.012, 0.016) |
+| raw, off | -0.08, -0.04, -0.06 | 0.016, 0.012, 0.013 (0.016, 0.013, 0.015) |
+| NRD, rotate | 0.996, 0.989, 0.994 | std(m_t) / ref 0.020, 0.009, 0.014 |
+| NRD, off | 0.990, 0.993, 0.992 | std(m_t) / ref 0.009, 0.005, 0.012 |
+
+The old branch (128-frame cell history): raw lag-1 0.94 .. 0.98, NRD std(m_t) / ref 0.03 .. 0.15. Mode
+"off" gives white per-frame noise; "rotate" keeps a 4-frame memory (lag-1 about 0.75, lag-4 about 0.1)
+and about twice the slow wall drift after NRD of "off".
+
+### 11.5 Tests
+
+All 11 ctests pass with 0 validation and 0 library errors: `caelix_hash_table_test` (5 cases),
+`caelix_light_nee_test` (3 cases: cell regions, support, MIS), the two "light NEE" cases of
+`caelix_trace_test` (unbiased against the path tracer: four option sets, lamps alone and with the sun
+through an opening and glass, ratios 0.998 .. 0.999 against a path tracer floor of 0.998, block PSNR
+39.3 .. 40.5 dB against the floor's 37.6 dB; lifecycle), `caelix_frame_layout_test` (the new push blocks,
+the 608-byte uniform block of six kernels, 260+ named constants), `caelix_light_tree_test` and the rest
+unchanged. Not built: the dynamic response curves of section 8 (a lamp switched on, removed, moved; a
+receiver entity rotated).

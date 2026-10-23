@@ -915,4 +915,32 @@ CAELIX_API CaelixResult caelix_renderer_get_upscaler_info(const CaelixRenderer* 
     return CAELIX_OK;
 }
 
+CAELIX_API CaelixResult caelix_renderer_set_light_nee_options(CaelixRenderer* renderer,
+                                                              const CaelixLightNeeOptions* options)
+{
+    constexpr const char* kFunction = "caelix_renderer_set_light_nee_options";
+    if (renderer == nullptr || renderer->impl == nullptr || options == nullptr)
+    {
+        CAELIX_LOGE("%s: null argument", kFunction);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    try
+    {
+        return renderer->impl->SetLightNeeOptions(*options);
+    }
+    catch (...)
+    {
+        return TranslateException(kFunction);
+    }
+}
+
+CAELIX_API void caelix_renderer_get_light_nee_stats(const CaelixRenderer* renderer, CaelixLightNeeStats* out)
+{
+    if (renderer == nullptr || renderer->impl == nullptr || out == nullptr)
+    {
+        return;
+    }
+    renderer->impl->GetLightNeeStats(*out);
+}
+
 }  // extern "C"

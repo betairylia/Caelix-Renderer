@@ -209,6 +209,7 @@ CaelixResult Scene::AddEntity(const CaelixEntityDesc& desc, CaelixEntityId& out_
     {
         id = free_entities_.back();
         free_entities_.pop_back();
+        ++entities_[id].life;  // a new life of the id
     }
     else
     {

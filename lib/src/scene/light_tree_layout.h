@@ -219,7 +219,8 @@ struct GroupLightRow
 {
     uint32_t block_offset;  // kLtUnitBytes units in the current heap buffer
     uint32_t block_units;   // 0 = no block
-    uint32_t generation;    // +1 at every rebuild or release of the block
+    uint32_t generation;    // (life << kLtGenerationLifeShift) | version: life +1 at a release, version +1 at
+                            // a rebuild (wrapping at 2^16)
     uint32_t gpu_flags;     // kLtGpuLightChanged
     uint32_t cpu_flags;     // GPU-owned merge of the staged flags (kLtCpu*)
     uint32_t bricks;        // light bricks (kLtRowBricksMask) | dropped << kLtRowDroppedShift
@@ -244,6 +245,12 @@ static_assert(offsetof(GroupLightRow, light_faces) == kLtRowLightFaces);
 static_assert(sizeof(GroupLightRow) == kLtGroupRowBytes);
 constexpr uint32_t kLtRowBricksMask = 0xFFFFu;
 constexpr uint32_t kLtRowDroppedShift = 16;
+
+// GroupLightRow::generation: the group index's life (bumped when the index is released) in the high
+// bits, the block version (bumped at every rebuild within one life) in the low bits. A light brick
+// reference (group, entry, generation) is valid while both match.
+constexpr uint32_t kLtGenerationLifeShift = 16;
+constexpr uint32_t kLtGenerationVersionMask = 0xFFFFu;
 
 constexpr uint32_t kLtGpuLightChanged = 1u;  // the finalize kernel saw a light change in the group
 constexpr uint32_t kLtCpuRebuild = 1u;       // rebuild the block (bricks removed)

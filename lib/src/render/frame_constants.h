@@ -8,7 +8,7 @@ namespace caelix {
 // together. One per render call, in the frame slot's host-visible buffer, which the five
 // frame-constant kernels (caelix_path_trace, caelix_composite, caelix_cross_resolve, caelix_sky_sh,
 // caelix_upscale_encode) read as a uniform buffer: the frame set (set kFrameSetIndex, binding
-// kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 560 bytes.
+// kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 608 bytes.
 // Layout rule: the uniform block has DXC's default constant buffer layout, which gives these C
 // offsets only while every field sits at an offset that is a multiple of its size (float4 at 16,
 // uint64_t and uint2 at 8), no vector crosses a 16-byte row and every array element is 16 bytes (an
@@ -80,10 +80,18 @@ struct FrameConstants
     uint32_t upscaler;                  // 536  0 none, 1 DLSS SR, 2 DLSS RR (the trace writes the RR guides)
     uint32_t upscale;                   // 540  1 = the composite / cross resolve write upscale_in instead of the colour target
     uint64_t light_tree;                // 544  light tree descriptor (docs/LIGHT_TREE.md), 0 = no tree
-    uint32_t pad_552;                   // 552
-    uint32_t pad_556;                   // 556
+    uint32_t light_nee_flags;           // 552  kLightNee*: light cells and lamp NEE of this frame (0 = off)
+    uint32_t light_frame;               // 556  the light cells' frame counter (the touched word of a lookup)
+    uint64_t light_cells;               // 560  the cells (LightCells payloads), docs/LIGHT_NEE.md section 3
+    uint64_t light_cell_keys;           // 568  their hash table: key slots
+    uint64_t light_cell_stack;          // 576  free stack
+    uint64_t light_cell_counters;       // 584  counters (inserted, pending, failed)
+    uint32_t light_cell_mask;           // 592  key slots - 1
+    float light_footprint;              // 596  level-0 footprint threshold (world units per pixel)
+    uint32_t pad_600;                   // 600
+    uint32_t pad_604;                   // 604
 };
-static_assert(sizeof(FrameConstants) == 560);
+static_assert(sizeof(FrameConstants) == 608);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -119,6 +127,11 @@ static_assert(offsetof(FrameConstants, upscale_src_size) == 528);
 static_assert(offsetof(FrameConstants, upscaler) == 536);
 static_assert(offsetof(FrameConstants, upscale) == 540);
 static_assert(offsetof(FrameConstants, light_tree) == 544);
+static_assert(offsetof(FrameConstants, light_nee_flags) == 552);
+static_assert(offsetof(FrameConstants, light_cells) == 560);
+static_assert(offsetof(FrameConstants, light_cell_counters) == 584);
+static_assert(offsetof(FrameConstants, light_cell_mask) == 592);
+static_assert(offsetof(FrameConstants, light_footprint) == 596);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).
@@ -133,6 +146,16 @@ constexpr uint32_t kTargetDepth = 1u << 3;
 constexpr uint32_t kTargetMotion = 1u << 4;
 constexpr uint32_t kTargetViewZ = 1u << 5;
 constexpr uint32_t kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
+
+// FrameConstants::light_nee_flags (docs/LIGHT_NEE.md): kLightNeeLookup = the trace looks the light cell
+// of every diffuse NEE vertex up (and inserts it); kLightNeeContribute = it also runs the lamp NEE
+// with the sun / lamp selection; kLightNeeJitter / Mis / SunHint = the options' jittered lookup, MIS
+// and sun visibility hint.
+constexpr uint32_t kLightNeeLookup = 1u << 0;
+constexpr uint32_t kLightNeeContribute = 1u << 1;
+constexpr uint32_t kLightNeeJitter = 1u << 2;
+constexpr uint32_t kLightNeeMis = 1u << 3;
+constexpr uint32_t kLightNeeSunHint = 1u << 4;
 
 // The frame set: one descriptor set layout with one binding, the frame slot's FrameConstants as a
 // uniform buffer (range sizeof(FrameConstants), offset 0). Bound as set kFrameSetIndex by the five

@@ -2889,3 +2889,466 @@ TEST_CASE("sky cubemap, fog and emission scale")
     DestroyTarget(rig.gpu, color);
     CloseRig(rig);
 }
+
+// ---------------------------------------------------------------------------
+// Light NEE (docs/LIGHT_NEE.md): the lamp NEE with the sun / lamp choice and the MIS against the plain
+// path tracer in a closed box with lamps, a sun opening and glass.
+
+namespace {
+
+constexpr uint16_t kWhiteLamp = 0x4000u | (15u << 10) | (15u << 6) | (15u << 2) | 3u;  // rgb4 1, strength 3
+constexpr int32_t kLampBoxInterior = 24;
+constexpr uint32_t kLampBoxImage = 128;
+
+// A closed grey box around the interior [0, 24)^3 (walls 1 voxel thick) with: an opening of 6 x 6 in
+// the ceiling at x, z in [3, 8], its x <= 5 half covered by clear glass (the sun reaches the floor
+// directly and through the glass); a grey pillar; single-voxel lamps (strength 3) in the ceiling, in
+// the +X wall, in the floor and on top of the pillar (less than 8 units from parts of the pillar: the
+// near field), so the cells see lamps at every distance and from both sides.
+World LampBoxWorld()
+{
+    World world;
+    const int32_t lo = -1;
+    const int32_t hi = kLampBoxInterior;
+    FillBox(world, lo, lo, lo, hi, lo, hi, kGreyFloor);  // floor
+    FillBox(world, lo, hi, lo, hi, hi, hi, kGreyFloor);  // ceiling
+    FillBox(world, lo, lo, lo, lo, hi, hi, kGreyFloor);  // -X wall
+    FillBox(world, hi, lo, lo, hi, hi, hi, kGreyFloor);  // +X wall
+    FillBox(world, lo, lo, lo, hi, hi, lo, kGreyFloor);  // -Z wall
+    FillBox(world, lo, lo, hi, hi, hi, hi, kGreyFloor);  // +Z wall
+    FillBox(world, 3, hi, 3, 8, hi, 8, 0);               // the ceiling opening (air)
+    FillBox(world, 3, hi, 3, 5, hi, 8, kClearGlass);     // half of it glass
+    FillBox(world, 15, 0, 9, 17, 13, 11, kGreyFloor);    // the pillar
+    FillBox(world, 16, 14, 10, 16, 14, 10, kWhiteLamp);  // on the pillar
+    FillBox(world, 18, hi, 18, 18, hi, 18, kWhiteLamp);  // ceiling
+    FillBox(world, 10, hi, 20, 10, hi, 20, kWhiteLamp);  // ceiling
+    FillBox(world, hi, 6, 12, hi, 6, 12, kWhiteLamp);    // +X wall
+    FillBox(world, 6, lo, 18, 6, lo, 18, kWhiteLamp);    // floor
+    return world;
+}
+
+void UploadLampBox(Rig& rig)
+{
+    const CaelixLightOptions light{1, 0.0f, 0};  // the light tree with the default threshold
+    REQUIRE(caelix_scene_set_light_options(rig.scene, &light) == CAELIX_OK);
+    const World world = LampBoxWorld();
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    // The light tree is built at the flushes of the upload; one more flush settles the BVH.
+    FlushFrame(rig.gpu, rig.scene, rig.frames);
+}
+
+// Inside the box near the -Z wall, looking along +Z and a little down at the pillar and the floor.
+CaelixCamera LampBoxCamera()
+{
+    const double position[3] = {12.0, 14.0, 1.5};
+    const double forward[3] = {0.0, -0.35, 1.0};
+    return LookAlong(position, forward, std::tan(40.0 * 3.14159265358979323846 / 180.0));
+}
+
+// Reference mode, 4 bounces, 4 transparent bounces, black sky, the sun (`sun` x a 2-degree disk; 0 = no
+// sun) tilted into the opening, sun NEE on; the colour (the running mean) after `frames` frames.
+std::vector<float> LampBoxAccumulate(Rig& rig, CaelixRenderer* renderer, TargetSet& set, uint32_t frames,
+                                     uint32_t seed0, float sun_radiance)
+{
+    const CaelixCamera camera = LampBoxCamera();
+    for (uint32_t i = 0; i < frames; ++i)
+    {
+        CaelixRenderOptions options = GlassOptions(CAELIX_MODE_REFERENCE, 4, 4, seed0 + i);
+        options.reset_accumulation = i == 0 ? 1u : 0u;
+        options.flags = CAELIX_RENDER_FLAG_SUN_NEE;
+        const double sun[3] = {0.0, 1.0, -0.4};  // the opening lights the floor around z = 15, in view
+        const double length = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+        for (int a = 0; a < 3; ++a)
+        {
+            options.sun_dir[a] = static_cast<float>(sun[a] / length);
+        }
+        options.sun_radiance[0] = options.sun_radiance[1] = options.sun_radiance[2] = sun_radiance;
+        options.sun_angular_radius =
+            static_cast<float>(kNeeSunRadiusDegrees * 3.14159265358979323846 / 180.0);
+        Render(rig, renderer, set, camera, options, i + 1 == frames);
+    }
+    const Target& color = *set.t[kColor];
+    std::vector<float> image(static_cast<size_t>(color.width) * color.height * 4);
+    std::memcpy(image.data(), color.bytes.data(), image.size() * sizeof(float));
+    return image;
+}
+
+// Mean linear brightness (rgb mean over the pixels that do not see a lamp directly), their ratio, and
+// the PSNR of 16 x 16 block means (both clamped to [0, 1], peak 1): the block means compare the light
+// distribution, the per-pixel noise of the path tracer at a few thousand frames is far above the test's
+// tolerance. A pixel whose reference is above kDirectLamp in a channel sees a lamp (emission 512): its
+// primary emission is deterministic, equal in both images, and would dominate the means.
+constexpr float kDirectLamp = 32.0f;
+
+struct LightComparison
+{
+    double ref_mean = 0.0;
+    double test_mean = 0.0;
+    double ratio = 0.0;
+    double block_psnr = 0.0;
+};
+
+LightComparison CompareLight(const std::vector<float>& ref, const std::vector<float>& test, uint32_t size)
+{
+    constexpr uint32_t kBlock = 16;
+    LightComparison c;
+    double squared = 0.0;
+    double values = 0.0;
+    uint32_t blocks = 0;
+    for (uint32_t by = 0; by < size; by += kBlock)
+    {
+        for (uint32_t bx = 0; bx < size; bx += kBlock)
+        {
+            double r_block[3] = {0.0, 0.0, 0.0};
+            double t_block[3] = {0.0, 0.0, 0.0};
+            uint32_t used = 0;
+            for (uint32_t y = by; y < by + kBlock; ++y)
+            {
+                for (uint32_t x = bx; x < bx + kBlock; ++x)
+                {
+                    const size_t p = (static_cast<size_t>(y) * size + x) * 4;
+                    if (ref[p] > kDirectLamp || ref[p + 1] > kDirectLamp || ref[p + 2] > kDirectLamp)
+                    {
+                        continue;
+                    }
+                    ++used;
+                    for (int ch = 0; ch < 3; ++ch)
+                    {
+                        r_block[ch] += ref[p + ch];
+                        t_block[ch] += test[p + ch];
+                    }
+                }
+            }
+            if (used == 0)
+            {
+                continue;
+            }
+            for (int ch = 0; ch < 3; ++ch)
+            {
+                c.ref_mean += r_block[ch];
+                c.test_mean += t_block[ch];
+                const double d =
+                    std::clamp(t_block[ch] / used, 0.0, 1.0) - std::clamp(r_block[ch] / used, 0.0, 1.0);
+                squared += d * d;
+            }
+            values += 3.0 * used;
+            ++blocks;
+        }
+    }
+    c.ref_mean /= values;
+    c.test_mean /= values;
+    c.ratio = c.test_mean / c.ref_mean;
+    const double mse = squared / (3.0 * blocks);
+    c.block_psnr = mse > 0.0 ? 10.0 * std::log10(1.0 / mse) : 99.0;
+    return c;
+}
+
+void SetLightNee(CaelixRenderer* renderer, uint32_t enabled, uint32_t flags, uint32_t mode = 0,
+                 uint32_t candidates = 0)
+{
+    CaelixLightNeeOptions options{};
+    options.enabled = enabled;
+    options.flags = flags;
+    options.reservoir_mode = mode;
+    options.candidates = candidates;
+    REQUIRE(caelix_renderer_set_light_nee_options(renderer, &options) == CAELIX_OK);
+}
+
+}  // namespace
+
+TEST_CASE("light NEE: unbiased against the path tracer (lamps, sun, glass)")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadLampBox(rig);
+    CaelixLightStats light{};
+    caelix_scene_get_light_stats(rig.scene, &light);
+    REQUIRE(light.light_bricks >= 4);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kLampBoxImage, kLampBoxImage);
+    TargetSet set;
+    set.t[kColor] = &color;
+
+    struct Variant
+    {
+        const char* name;
+        uint32_t flags;
+        uint32_t mode;
+        uint32_t candidates;
+    };
+    const Variant variants[] = {
+        {"defaults (rotate, M 1, jitter, MIS, sun hint)", 0, 0, 0},
+        {"no MIS (exclusive rule)", CAELIX_LIGHT_NEE_FLAG_NO_MIS, 0, 0},
+        {"mode off, M 2", 0, CAELIX_LIGHT_NEE_RESERVOIRS_OFF, 2},
+        {"rotate, M 2, no jitter, no sun hint",
+         CAELIX_LIGHT_NEE_FLAG_NO_JITTER | CAELIX_LIGHT_NEE_FLAG_NO_SUN_HINT,
+         CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE,
+         2},
+    };
+    // The lamps alone, then the lamps with the sun (the sun / lamp choice, the sun through glass).
+    for (const float sun : {0.0f, kNeeSunRadiance})
+    {
+        // The plain path tracer (the sun NEE only) finds the single-voxel lamps rarely: 4096 frames. The
+        // noise floor of that reference (reported only): the path tracer with other seeds.
+        SetLightNee(renderer, 0, 0);
+        const std::vector<float> pt = LampBoxAccumulate(rig, renderer, set, 4096, 100000, sun);
+        const LightComparison floor_c =
+            CompareLight(pt, LampBoxAccumulate(rig, renderer, set, 4096, 300000, sun), kLampBoxImage);
+        std::printf("sun %.0f: path tracer vs path tracer, other seeds: mean %.5f, ratio %.4f, 16x16 block "
+                    "PSNR %.2f dB\n",
+                    static_cast<double>(sun), floor_c.ref_mean, floor_c.ratio, floor_c.block_psnr);
+        for (const Variant& v : variants)
+        {
+            SetLightNee(renderer, 1, v.flags, v.mode, v.candidates);
+            const std::vector<float> nee = LampBoxAccumulate(rig, renderer, set, 1024, 200000, sun);
+            CaelixLightNeeStats stats{};
+            caelix_renderer_get_light_nee_stats(renderer, &stats);
+            const LightComparison c = CompareLight(pt, nee, kLampBoxImage);
+            std::printf("sun %.0f: light NEE %s vs path tracer: mean %.5f vs %.5f, ratio %.4f, 16x16 block "
+                        "PSNR %.2f dB (cells live %u, active %u, failed %u)\n",
+                        static_cast<double>(sun), v.name, c.test_mean, c.ref_mean, c.ratio, c.block_psnr,
+                        stats.live_cells, stats.active_cells, stats.failed_slot + stats.failed_payload);
+            INFO(v.name << ", sun " << sun);
+            CHECK(stats.running == 1);
+            CHECK(stats.live_cells > 0);
+            CHECK(c.ref_mean > 0.01);
+            CHECK(c.ratio > 0.97);
+            CHECK(c.ratio < 1.03);
+            CHECK(c.block_psnr > 30.0);
+        }
+    }
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+namespace {
+
+// 2000 random bricks scattered in a cube of 48 bricks (so the faces of many cells are seen), a lamp voxel
+// in about every sixth brick; `offset_x` shifts the keys.
+World LampBlobWorld(uint32_t seed, int32_t offset_x)
+{
+    std::mt19937 rng(seed);
+    World world;
+    for (int i = 0; i < 2000; ++i)
+    {
+        const Key key{static_cast<int32_t>(rng() % 48) - 24 + offset_x, static_cast<int32_t>(rng() % 48) - 24,
+                      static_cast<int32_t>(rng() % 48) - 24};
+        Brick brick = RandomBrick(rng);
+        if (rng() % 6 == 0)
+        {
+            brick[rng() % 512] = kWhiteLamp;
+        }
+        world.bricks[key] = brick;
+    }
+    return world;
+}
+
+bool Finite(const Target& color)
+{
+    for (uint32_t y = 0; y < color.height; ++y)
+    {
+        for (uint32_t x = 0; x < color.width; ++x)
+        {
+            for (uint32_t c = 0; c < 4; ++c)
+            {
+                if (!std::isfinite(color.F32(x, y, c)))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+CaelixLightNeeStats NeeStats(CaelixRenderer* renderer)
+{
+    CaelixLightNeeStats stats{};
+    caelix_renderer_get_light_nee_stats(renderer, &stats);
+    return stats;
+}
+
+}  // namespace
+
+TEST_CASE("light NEE: lifecycle (a full table, entity and group reuse, a paused renderer, options)")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    const CaelixLightOptions light{1, 0.0f, 0};
+    REQUIRE(caelix_scene_set_light_options(rig.scene, &light) == CAELIX_OK);
+    World world = LampBlobWorld(5, 0);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    constexpr uint32_t kImage = 256;
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kImage, kImage);
+    TargetSet set;
+    set.t[kColor] = &color;
+
+    // Argument checks: nothing changes on an invalid call.
+    const auto expect_invalid = [&](const CaelixLightNeeOptions& o) {
+        ExpectLibraryErrors(1, [&] {
+            REQUIRE(caelix_renderer_set_light_nee_options(renderer, &o) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+    };
+    CaelixLightNeeOptions bad{};
+    bad.enabled = 2;
+    expect_invalid(bad);
+    bad = CaelixLightNeeOptions{1, 100, 0.0f, 0, 0, 0, 0, 0};  // capacity below 1024
+    expect_invalid(bad);
+    bad = CaelixLightNeeOptions{1, 0, -1.0f, 0, 0, 0, 0, 0};
+    expect_invalid(bad);
+    bad = CaelixLightNeeOptions{1, 0, 0.0f, 3, 0, 0, 0, 0};
+    expect_invalid(bad);
+    bad = CaelixLightNeeOptions{1, 0, 0.0f, 0, 3, 0, 0, 0};
+    expect_invalid(bad);
+    bad = CaelixLightNeeOptions{1, 0, 0.0f, 0, 0, 0, 1u << 31, 0};
+    expect_invalid(bad);
+    REQUIRE(NeeStats(renderer).enabled == 0);
+
+    // The smallest table and a short age, so that it fills up and empties within the test.
+    constexpr uint32_t kMaxAge = 6;
+    CaelixLightNeeOptions options{};
+    options.enabled = 1;
+    options.cell_capacity = 1024;
+    options.max_age = kMaxAge;
+    options.footprint = 1000.0f;  // every vertex uses 32-voxel cells
+    REQUIRE(caelix_renderer_set_light_nee_options(renderer, &options) == CAELIX_OK);
+    const double towards[3] = {0.0, -0.3, 1.0};
+    const double away[3] = {0.0, 1.0, -0.2};
+    const double position[3] = {8.0, 40.0, -300.0};
+    const CaelixCamera look = LookAlong(position, towards, std::tan(35.0 * 3.14159265358979323846 / 180.0));
+    const CaelixCamera sky = LookAlong(position, away, std::tan(35.0 * 3.14159265358979323846 / 180.0));
+    uint32_t seed = 1;
+    // The inserts and evictions summed over the frames of the newest `frames` call.
+    uint64_t inserted_sum = 0;
+    uint64_t evicted_sum = 0;
+    const auto frames = [&](const CaelixCamera& camera, uint32_t count) {
+        CaelixLightNeeStats newest{};
+        inserted_sum = 0;
+        evicted_sum = 0;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            CaelixRenderOptions o = GlassOptions(CAELIX_MODE_PATH_TRACE, 4, 4, seed++);
+            o.flags = CAELIX_RENDER_FLAG_SUN_NEE;
+            o.sun_dir[1] = 1.0f;
+            o.sun_radiance[0] = o.sun_radiance[1] = o.sun_radiance[2] = 50.0f;
+            Render(rig, renderer, set, camera, o, i + 1 == count);
+            newest = NeeStats(renderer);
+            inserted_sum += newest.inserted;
+            evicted_sum += newest.evicted;
+        }
+        REQUIRE(Finite(color));
+        return newest;
+    };
+
+    // 1. A full table: inserts find no payload; the controller coarsens.
+    uint32_t failed = 0;
+    for (int i = 0; i < 12; ++i)
+    {
+        const CaelixLightNeeStats s = frames(look, 2);
+        failed = std::max(failed, s.failed_payload);
+        REQUIRE(s.running == 1);
+        REQUIRE(s.live_cells <= 1024);
+    }
+    CaelixLightNeeStats s = NeeStats(renderer);
+    std::printf("full table: live %u of %u, failed payload (max) %u, scale %.2f\n", s.live_cells,
+                s.cell_capacity, failed, static_cast<double>(s.controller_scale));
+    CHECK(failed > 0);
+    // 2. Recovery: looking at the sky, every cell ages out; looking back, cells are inserted again.
+    s = frames(sky, kMaxAge + 6);
+    CHECK(s.live_cells == 0);
+    const uint64_t evicted_on_sky = evicted_sum;
+    CHECK(evicted_on_sky >= 1024);
+    s = frames(look, 4);
+    CHECK(s.live_cells > 0);
+    CHECK(inserted_sum >= 1024);
+    std::printf("recovery: evicted %llu looking at the sky, then inserted %llu (live %u)\n",
+                static_cast<unsigned long long>(evicted_on_sky),
+                static_cast<unsigned long long>(inserted_sum), s.live_cells);
+
+    // 3. The entity removed and its id reused in the same flush (a new life: its old cells are never
+    // found again and age out), with other bricks.
+    REQUIRE(caelix_scene_remove_entity(rig.scene, rig.entity) == CAELIX_OK);
+    CaelixEntityDesc desc{};
+    desc.rotation[3] = 1.0f;
+    CaelixEntityId reused = CAELIX_INVALID_ENTITY;
+    REQUIRE(caelix_scene_add_entity(rig.scene, &desc, &reused) == CAELIX_OK);
+    REQUIRE(reused == rig.entity);
+    world = LampBlobWorld(6, 1);
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    s = frames(look, kMaxAge + 4);
+    CHECK(s.live_cells > 0);
+    // The cells of the old life are never looked up again: they age out and the new life's cells take
+    // their payloads.
+    CHECK(evicted_sum > 0);
+    CHECK(inserted_sum > 0);
+    std::printf("entity reuse: evicted %llu, inserted %llu over %u frames (live %u)\n",
+                static_cast<unsigned long long>(evicted_sum), static_cast<unsigned long long>(inserted_sum),
+                kMaxAge + 4, s.live_cells);
+
+    // 4. Groups released and re-created at once: every brick removed, other lamp bricks uploaded at the
+    // same keys in the next flush (new lives of the group indices: the reservoirs that name them are
+    // stale and refreshed out of turn).
+    std::vector<Key> keys = KeysOf(world);
+    Remove(rig, keys);
+    world = LampBlobWorld(7, 1);
+    for (const Key& key : keys)
+    {
+        if (world.bricks.count(key) == 0)
+        {
+            world.bricks[key] = Brick{};
+        }
+    }
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+    uint32_t stale = 0;
+    for (int i = 0; i < 6; ++i)
+    {
+        stale = std::max(stale, frames(look, 1).stale_refreshed);
+    }
+    std::printf("group reuse: stale reservoirs refreshed out of turn (max per frame) %u\n", stale);
+    CHECK(stale > 0);
+
+    // 5. A paused renderer: 24 flushes with moves and edits, no render; then rendering goes on.
+    for (int i = 0; i < 24; ++i)
+    {
+        const float p[3] = {static_cast<float>(i % 5), 0.0f, static_cast<float>(i % 3)};
+        const float q[4] = {0.0f, std::sin(0.05f * i), 0.0f, std::cos(0.05f * i)};
+        REQUIRE(caelix_scene_set_entity_transform(rig.scene, rig.entity, p, q) == CAELIX_OK);
+        if (i % 6 == 0)
+        {
+            std::vector<Key> some(keys.begin(), keys.begin() + std::min<size_t>(keys.size(), 20));
+            Remove(rig, some);
+        }
+        FlushFrame(rig.gpu, rig.scene, rig.frames);
+    }
+    DrainBuilds(rig);
+    s = frames(look, 6);
+    CHECK(s.live_cells > 0);
+    // 6. Disabled: the table is released once its frames are safe; enabled again it starts empty.
+    options.enabled = 0;
+    REQUIRE(caelix_renderer_set_light_nee_options(renderer, &options) == CAELIX_OK);
+    frames(look, 3);
+    CHECK(NeeStats(renderer).enabled == 0);
+    options.enabled = 1;
+    options.cell_capacity = 2048;
+    REQUIRE(caelix_renderer_set_light_nee_options(renderer, &options) == CAELIX_OK);
+    s = frames(look, 4);
+    CHECK(s.cell_capacity == 2048);
+    CHECK(s.live_cells > 0);
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}

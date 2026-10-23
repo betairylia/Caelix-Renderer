@@ -1,8 +1,8 @@
 // Light tree group pass, kernel 3 of 4 (docs/LIGHT_TREE.md section 3): one workgroup (256 threads)
 // per group index writes the group's block into the target heap buffer (1 - current) at
 // offsets[group], and its GroupLightRow. Returns at once unless the scan kernel decided kLtPassOk.
-//   released -> the row is cleared (generation + 1)
-//   flagged  -> the block is rebuilt (generation + 1):
+//   released -> the row is cleared (generation: the next life of the group index, LtNextLife)
+//   flagged  -> the block is rebuilt (generation: the next version of this life, LtNextVersion):
 //     1. the light brick scan (shared with the size kernel) gives every kept light brick its Morton
 //        rank (= its index entry) and its plan: its brick light record is recomputed (the stale
 //        bit, no old block, a fresh group, or no old entry at its position) or copied from the old
@@ -11,7 +11,7 @@
 //        record: a recomputed record resolves the six neighbour records, finds the open faces of
 //        its light voxels (two passes over the voxels: counts, then entries) and writes them; a
 //        copied record is copied as it is;
-//     3. the row: offset, units, counts, generation + 1, flags cleared.
+//     3. the row: offset, units, counts, the next version, flags cleared.
 //   otherwise -> the block is copied to its new offset, the row gets the new offset.
 // A recomputed record holds at most as many entries as the finalize kernel counted (record word 1):
 // the two can differ only while a neighbour's change waits for its finalization, and that
@@ -351,7 +351,7 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         if (t == 0)
         {
             // block_offset, block_units, generation, gpu_flags; cpu_flags, bricks, light_faces, pad
-            CAELIX_STORE_U32x4(row, uint4(0, 0, old_row.z + 1u, 0));
+            CAELIX_STORE_U32x4(row, uint4(0, 0, LtNextLife(old_row.z), 0));
             CAELIX_STORE_U32x4(row + kLtRowCpuFlags, uint4(0, 0, 0, 0));
         }
         return;
@@ -418,7 +418,7 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     if (t == 0)
     {
         // block_offset, block_units, generation, gpu_flags; cpu_flags, bricks, light_faces, pad
-        CAELIX_STORE_U32x4(row, uint4(units != 0 ? new_offset : 0u, units, old_row.z + 1u, 0u));
+        CAELIX_STORE_U32x4(row, uint4(units != 0 ? new_offset : 0u, units, LtNextVersion(old_row.z), 0u));
         const uint bricks = scan.bricks | (min(scan.dropped, kLtRowBricksMask) << kLtRowDroppedShift);
         CAELIX_STORE_U32x4(row + kLtRowCpuFlags, uint4(0u, bricks, gs_faces_written, 0u));
         if (gs_recomputed != 0)

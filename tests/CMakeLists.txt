@@ -13,7 +13,8 @@ endif()
 # Shared Vulkan setup of the GPU tests: a Vulkan 1.3 device (vk-bootstrap,
 # validation layers when installed), readback buffers, the frame loop; and the
 # synthetic scenes and the one-entity scene rig (test_scenes.h).
-add_library(caelix_test_device STATIC test_device.cpp test_device.h test_scenes.cpp test_scenes.h)
+add_library(caelix_test_device STATIC test_device.cpp test_device.h test_scenes.cpp test_scenes.h
+  test_kernels.cpp test_kernels.h)
 target_compile_definitions(caelix_test_device PUBLIC VK_NO_PROTOTYPES)
 target_link_libraries(caelix_test_device PUBLIC
   caelix_renderer
@@ -101,4 +102,31 @@ add_dependencies(caelix_light_tree_test caelix_light_tree_probe_shaders)
 # memory; the probe and the library kernels load from the build's shader folder.
 target_include_directories(caelix_light_tree_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/src)
 target_compile_definitions(caelix_light_tree_test PRIVATE
+  CAELIX_TEST_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
+
+# The reusable GPU hash table (docs/LIGHT_NEE.md section 2) against a CPU model: the library's
+# maintenance kernels (from ${CMAKE_BINARY_DIR}/shaders) and a probe kernel that runs the device API
+# from many threads (tests/shaders/caelix_hash_probe.hlsl): contention on one key and on many keys,
+# colliding home slots and equal key_lo, payload exhaustion, eviction, the key rebuild, the active list
+# and the indirect dispatch, the free stack over random frames.
+caelix_compile_shaders(hash_probe_spv
+  SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shaders/caelix_hash_probe.hlsl)
+add_custom_target(caelix_hash_probe_shaders DEPENDS ${hash_probe_spv})
+caelix_add_gpu_test(caelix_hash_table_test hash_table_test.cpp)
+add_dependencies(caelix_hash_table_test caelix_hash_probe_shaders)
+target_include_directories(caelix_hash_table_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/src)
+target_compile_definitions(caelix_hash_table_test PRIVATE
+  CAELIX_TEST_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
+
+# The light NEE's cells and light tree functions through a probe kernel (tests/shaders/
+# caelix_light_nee_probe.hlsl) on a scene with lamps on a plain and a rotated entity: every receiver that
+# reads a cell lies in its region (both levels, the jitter range and its edges); the box sampler's support
+# (every light face that can reach a receiver of a box has a positive box pdf and target); both MIS sides
+# see the same proxy and their weights sum to 1. (The image tests of the light NEE are in caelix_trace_test.)
+caelix_compile_shaders(light_nee_probe_spv
+  SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shaders/caelix_light_nee_probe.hlsl)
+add_custom_target(caelix_light_nee_probe_shaders DEPENDS ${light_nee_probe_spv})
+caelix_add_gpu_test(caelix_light_nee_test light_nee_test.cpp)
+add_dependencies(caelix_light_nee_test caelix_light_nee_probe_shaders)
+target_compile_definitions(caelix_light_nee_test PRIVATE
   CAELIX_TEST_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")

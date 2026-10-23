@@ -15,6 +15,9 @@ add_library(caelix_renderer SHARED
   src/rhi/gpu_image.h
   src/rhi/gpu_timer.cpp
   src/rhi/gpu_timer.h
+  src/rhi/hash_table.cpp
+  src/rhi/hash_table.h
+  src/rhi/hash_table_layout.h
   src/rhi/pipeline.cpp
   src/rhi/pipeline.h
   src/rhi/shader_loader.cpp
@@ -54,6 +57,9 @@ add_library(caelix_renderer SHARED
   src/render/dlss_upscaler.cpp
   src/render/dlss_upscaler.h
   src/render/frame_constants.h
+  src/render/light_cells.cpp
+  src/render/light_cells.h
+  src/render/light_cells_layout.h
   src/render/nrd_executor.cpp
   src/render/nrd_executor.h
   src/render/render_kernels.cpp
@@ -61,6 +67,7 @@ add_library(caelix_renderer SHARED
   src/render/renderer.h
   src/render/renderer_denoise.cpp
   src/render/renderer_internal.h
+  src/render/renderer_light.cpp
   src/render/renderer_render.cpp
   src/render/renderer_targets.cpp
   src/render/renderer_upscale.cpp
@@ -114,6 +121,12 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_frame_ubo.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_material.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_light_tree_layout.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_hash_table.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_kernels.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_init.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_begin.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_maintain.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_finish.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_scene_lookup.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_finalize.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_tree_group.hlsl
@@ -140,7 +153,11 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_brick_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_scene_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_light_cells_layout.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_cells.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_cell_fill.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace_no_light_nee.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_output.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite_set.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite.hlsl
