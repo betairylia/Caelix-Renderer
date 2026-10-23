@@ -8,7 +8,7 @@ namespace caelix {
 // together. One per render call, in the frame slot's host-visible buffer, which the five
 // frame-constant kernels (caelix_path_trace, caelix_composite, caelix_cross_resolve, caelix_sky_sh,
 // caelix_upscale_encode) read as a uniform buffer: the frame set (set kFrameSetIndex, binding
-// kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 544 bytes.
+// kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 560 bytes.
 // Layout rule: the uniform block has DXC's default constant buffer layout, which gives these C
 // offsets only while every field sits at an offset that is a multiple of its size (float4 at 16,
 // uint64_t and uint2 at 8), no vector crosses a 16-byte row and every array element is 16 bytes (an
@@ -79,8 +79,11 @@ struct FrameConstants
     uint32_t upscale_src_size[2];       // 528  size of the encode kernel's source (upscaler output, or size on the fallback)
     uint32_t upscaler;                  // 536  0 none, 1 DLSS SR, 2 DLSS RR (the trace writes the RR guides)
     uint32_t upscale;                   // 540  1 = the composite / cross resolve write upscale_in instead of the colour target
+    uint64_t light_tree;                // 544  light tree descriptor (docs/LIGHT_TREE.md), 0 = no tree
+    uint32_t pad_552;                   // 552
+    uint32_t pad_556;                   // 556
 };
-static_assert(sizeof(FrameConstants) == 544);
+static_assert(sizeof(FrameConstants) == 560);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -115,6 +118,7 @@ static_assert(offsetof(FrameConstants, output_size) == 520);
 static_assert(offsetof(FrameConstants, upscale_src_size) == 528);
 static_assert(offsetof(FrameConstants, upscaler) == 536);
 static_assert(offsetof(FrameConstants, upscale) == 540);
+static_assert(offsetof(FrameConstants, light_tree) == 544);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

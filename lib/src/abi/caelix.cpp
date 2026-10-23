@@ -37,6 +37,11 @@ static_assert(sizeof(CaelixGpuTimings) == 32);
 static_assert(sizeof(CaelixUpscalerQueryDesc) == 16);
 static_assert(sizeof(CaelixUpscalerQueryResult) == 40);
 static_assert(sizeof(CaelixUpscalerInfo) == 36);
+static_assert(sizeof(CaelixLightOptions) == 16);
+static_assert(sizeof(CaelixLightStats) == 104);
+static_assert(offsetof(CaelixLightStats, tree_leaves) == 72);
+static_assert(offsetof(CaelixLightStats, passes) == 48);
+static_assert(offsetof(CaelixLightStats, gpu_ms) == 64);
 
 // The opaque handle behind CaelixDevice*. Members are destroyed in reverse order: the NGX
 // runtime goes first (every renderer, and so every DLSS feature, is already destroyed), then
@@ -575,6 +580,66 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     return scene->impl->GetMaterial(code, *out);
+}
+
+CAELIX_API CaelixResult caelix_scene_set_entity_motion(CaelixScene* scene, CaelixEntityId entity,
+                                                       uint32_t motion)
+{
+    constexpr const char* kFunction = "caelix_scene_set_entity_motion";
+    caelix::Scene* impl = SceneFor(scene, kFunction);
+    if (impl == nullptr || !CheckEntity(*impl, entity, kFunction))
+    {
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    try
+    {
+        return impl->SetEntityMotion(entity, motion);
+    }
+    catch (...)
+    {
+        return TranslateException(kFunction);
+    }
+}
+
+CAELIX_API CaelixResult caelix_scene_set_light_options(CaelixScene* scene, const CaelixLightOptions* options)
+{
+    constexpr const char* kFunction = "caelix_scene_set_light_options";
+    caelix::Scene* impl = SceneFor(scene, kFunction);
+    if (impl == nullptr)
+    {
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    if (options == nullptr)
+    {
+        CAELIX_LOGE("%s: options is null", kFunction);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    try
+    {
+        return impl->SetLightOptions(*options);
+    }
+    catch (...)
+    {
+        return TranslateException(kFunction);
+    }
+}
+
+CAELIX_API void caelix_scene_get_light_stats(const CaelixScene* scene, CaelixLightStats* out)
+{
+    if (scene == nullptr || scene->impl == nullptr || out == nullptr)
+    {
+        return;
+    }
+    scene->impl->GetLightStats(*out);
+}
+
+CAELIX_API uint64_t caelix_scene_get_light_tree(const CaelixScene* scene)
+{
+    if (scene == nullptr || scene->impl == nullptr)
+    {
+        return 0;
+    }
+    return scene->impl->light_tree_address();
 }
 
 CAELIX_API CaelixResult caelix_renderer_create(CaelixDevice* device, CaelixScene* scene,

@@ -7,8 +7,6 @@
 namespace caelix {
 namespace {
 
-constexpr uint32_t kEncodingPacked = 0;
-
 // Checks entries [first, count). Logs the first invalid one.
 bool ValidEntries(const char* function, const CaelixMaterial* entries, uint32_t first,
                   uint32_t count)
@@ -45,6 +43,10 @@ CaelixResult Scene::SetMaterials(const CaelixMaterial* entries, uint32_t count)
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     materials_->Replace(entries, count);
+    if (light_ != nullptr)
+    {
+        light_->OnMaterialsChanged();
+    }
     return CAELIX_OK;
 }
 
@@ -73,6 +75,10 @@ CaelixResult Scene::SetGlassPalette(const CaelixMaterial* entries, uint32_t coun
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
     materials_->SetGlassPalette(entries, count);
+    if (light_ != nullptr)
+    {
+        light_->OnMaterialsChanged();
+    }
     return CAELIX_OK;
 }
 
@@ -107,6 +113,10 @@ CaelixResult Scene::SetMaterialEntries(const CaelixMaterialEntry* entries, uint3
     for (uint32_t i = 0; i < count; ++i)
     {
         materials_->Set(entries[i].code, entries[i].material);
+    }
+    if (light_ != nullptr)
+    {
+        light_->OnMaterialsChanged();
     }
     return CAELIX_OK;
 }

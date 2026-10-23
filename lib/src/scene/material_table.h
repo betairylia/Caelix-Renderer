@@ -2,12 +2,22 @@
 #include "caelix/caelix.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
 namespace caelix {
 
-static_assert(sizeof(CaelixMaterial) == 48, "CaelixMaterial is the 48-byte GPU table entry");
+// The GPU table entry is the C ABI struct; the kernels read it at these offsets
+// (shaders/common/caelix_material.hlsl).
+constexpr uint32_t kMaterialBytes = 48;
+constexpr uint32_t kMaterialAlbedo = 0;
+constexpr uint32_t kMaterialEmission = 16;
+constexpr uint32_t kMaterialIor = 32;
+static_assert(sizeof(CaelixMaterial) == kMaterialBytes, "CaelixMaterial is the 48-byte GPU table entry");
+static_assert(offsetof(CaelixMaterial, albedo) == kMaterialAlbedo);
+static_assert(offsetof(CaelixMaterial, emission) == kMaterialEmission);
+static_assert(offsetof(CaelixMaterial, ior) == kMaterialIor);
 
 // The CPU copy of a scene's material table: one CaelixMaterial per 16-bit block
 // code, the layout of the GPU buffer that the trace kernels read

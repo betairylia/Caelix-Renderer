@@ -2,6 +2,8 @@
 // caelix_scene_set_glass_palette).
 #include "scene/material_table.h"
 
+#include "scene/record_layout.h"
+
 #include <cmath>
 #include <cstring>
 
@@ -9,8 +11,6 @@ namespace caelix {
 namespace {
 
 #include "scene/glass_palette_default.inc"
-
-constexpr uint32_t kEncodingPacked = 0;
 
 // shaders/render/caelix_shading.hlsl HashU32 (the block-ID pastel colours).
 uint32_t HashU32(uint32_t value)
@@ -69,21 +69,16 @@ MaterialTable::MaterialTable(uint32_t encoding)
 
 uint32_t MaterialTable::CanonicalCode(uint32_t code) const
 {
-    code &= 0xFFFFu;
-    if (encoding_ == kEncodingPacked)
-    {
-        return (code & 0xC000u) != 0 ? code : (code & 0xFFu);
-    }
-    return (code & 0x8000u) != 0 ? code : (code & 0x1FFu);
+    return BlockMaterialCode(code & 0xFFFFu, encoding_);
 }
 
 CaelixMaterial MaterialTable::BuiltIn(uint32_t code) const
 {
     if (encoding_ == kEncodingPacked)
     {
-        if ((code & 0xC000u) == 0)
+        if ((code & kPackedOpaqueMask) == 0)
         {
-            return palette_[code & 0xFFu];
+            return palette_[code & kPackedIdMask];
         }
         if ((code & 0x8000u) != 0)
         {
@@ -103,12 +98,12 @@ CaelixMaterial MaterialTable::BuiltIn(uint32_t code) const
     }
     // Block-ID.
     float rgb[3];
-    if ((code & 0x8000u) != 0)
+    if ((code & kBlockIdOpaqueMask) != 0)
     {
         Pastel(HashU32(code & 0x7FFFu), rgb);
         return Opaque(rgb[0], rgb[1], rgb[2]);
     }
-    const uint32_t id = code & 0x1FFu;
+    const uint32_t id = code & kBlockIdIdMask;
     if (id == 0)
     {
         return kDefaultGlassPalette[0];  // air: the vacuum entry

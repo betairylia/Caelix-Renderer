@@ -18,8 +18,19 @@
 // Neighbour records are read while other workgroups of the same dispatch may
 // rewrite their payload words. That is benign: only face bits of transparent
 // voxels change, and raw() masks them off, so every read gives the same raw value.
+//
+// Light tree (push light_codes != 0): a light voxel (its material code is in the light code set)
+// counts its open faces (neighbour not opaque, the same neighbour values as above). The brick's total
+// goes into record word 1 at kLtRecordFaceCountShift (the tight bounds use bits 0..17). When the old
+// count (word 1 as the kernel found it: an upload that replaces a resident brick keeps word 1) or the
+// new count is non-zero, kLtRecordStaleBit and kLtGpuLightChanged in the group's
+// GroupLightRow::gpu_flags are set: the light tree's group pass recomputes the brick's light record
+// (and clears the stale bit) when it rebuilds the group's block. A set stale bit is kept.
+// light_codes == 0 skips all of it (word 1 bits 18..30 = 0).
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_record.hlsl"
+#include "common/caelix_light_tree_layout.hlsl"
+#include "scene/caelix_scene_lookup.hlsl"
 
 struct FinalizePush
 {
@@ -37,6 +48,8 @@ struct FinalizePush
     uint group_shift;
     uint encoding;  // kEncodingPacked or kEncodingBlockId
     uint pad;
+    uint64_t light_codes;  // 65536-bit light code set; 0 = no light tree
+    uint64_t light_group_rows;  // GroupLightRow by group index (light tree only)
 };
 
 CAELIX_PUSH_CONSTANTS(FinalizePush, g_push);
@@ -49,93 +62,39 @@ groupshared uint gs_slot_base;
 groupshared uint gs_reverse_base;
 groupshared uint gs_aabb_base;
 groupshared uint gs_id;
+groupshared uint gs_group;         // own group index
 groupshared uint gs_pos;           // group-local brick position
+groupshared uint gs_old_word1;     // record word 1 before this kernel
+groupshared uint gs_light_faces;   // open faces of light voxels in the brick
 groupshared uint gs_payload[256];  // own payload as uploaded/last finalized
 groupshared uint gs_occ[16];       // micro occupancy words
 groupshared int gs_min[3];
 groupshared int gs_max[3];
 
-uint64_t RecordAddress(uint record_index)
+SceneLookup Lookup()
 {
-    const uint page = record_index >> g_push.records_per_page_shift;
-    const uint slot = record_index & ((1u << g_push.records_per_page_shift) - 1u);
-    const uint64_t page_address = CAELIX_LOAD_U64(g_push.page_table + uint64_t(page) * 8);
-    return page_address + uint64_t(slot) * g_push.record_bytes;
+    SceneLookup s;
+    s.page_table = g_push.page_table;
+    s.slot_tables = g_push.slot_tables;
+    s.reverse_tables = g_push.reverse_tables;
+    s.group_infos = g_push.group_infos;
+    s.entity_infos = g_push.entity_infos;
+    s.group_grids = g_push.group_grids;
+    s.records_per_page_shift = g_push.records_per_page_shift;
+    s.record_bytes = g_push.record_bytes;
+    s.group_shift = g_push.group_shift;
+    return s;
 }
 
-// GroupInfo words 4 and 5: slot_row_base, reverse_base.
-uint2 LoadGroupBases(uint group_index)
-{
-    const uint4 w1 = CAELIX_LOAD_U32x4(g_push.group_infos + uint64_t(group_index) * 32 + 16);
-    return w1.xy;
-}
-
-int3 DirectionDelta(uint d)
-{
-    const int s = (d & 1) != 0 ? -1 : 1;
-    return d < 2 ? int3(s, 0, 0) : (d < 4 ? int3(0, s, 0) : int3(0, 0, s));
-}
-
-// The record address of the brick next to the own brick in direction d, or 0.
-uint64_t ResolveNeighbor(uint d)
-{
-    const uint shift = g_push.group_shift;
-    const int mask = int((1u << shift) - 1u);
-    const int3 own = int3(int(gs_pos) & mask, int(gs_pos >> shift) & mask,
-                          int(gs_pos >> (2 * shift)) & mask);
-    const int3 delta = DirectionDelta(d);
-    int3 n = own + delta;
-    uint slot_base = gs_slot_base;
-    uint reverse_base = gs_reverse_base;
-    CAELIX_BRANCH
-    if (any(n < 0) || any(n > mask))
-    {
-        // Another group of the same entity: look it up in the entity's group grid.
-        const int3 coord = gs_coord + delta;
-        const uint64_t entity_address = g_push.entity_infos + uint64_t(gs_entity) * kEntityInfoBytes;
-        const uint4 e0 = CAELIX_LOAD_U32x4(entity_address);
-        const uint4 e1 = CAELIX_LOAD_U32x4(entity_address + 16);
-        const int3 rel = coord - int3(e0.xyz);
-        const int3 dims = int3(e1.xyz);
-        if (any(rel < 0) || any(rel >= dims))
-        {
-            return 0;
-        }
-        const uint cell = uint(rel.x) + uint(dims.x) * (uint(rel.y) + uint(dims.y) * uint(rel.z));
-        const uint group = CAELIX_LOAD_U32(g_push.group_grids + (uint64_t(e0.w) + cell) * 4);
-        if (group == kNoGroup)
-        {
-            return 0;
-        }
-        const uint2 bases = LoadGroupBases(group);
-        slot_base = bases.x;
-        reverse_base = bases.y;
-        n &= mask;
-    }
-    const uint npos = uint(n.x) | (uint(n.y) << shift) | (uint(n.z) << (2 * shift));
-    const uint64_t entry = uint64_t(reverse_base) + npos;
-    const uint pair = CAELIX_LOAD_U32(g_push.reverse_tables + (entry >> 1) * 4);
-    const uint id = (entry & 1) != 0 ? (pair >> 16) : (pair & 0xFFFFu);
-    if (id == kNoBrickId)
-    {
-        return 0;
-    }
-    const uint4 row = CAELIX_LOAD_U32x4(g_push.slot_tables + (uint64_t(slot_base) + id) * kSlotRowBytes);
-    if (SlotRowState(row.x) != kSlotStateResident || row.z == kInvalidRecord)
-    {
-        return 0;
-    }
-    return RecordAddress(row.z);
-}
-
-// The 4 payload words of row (y, z) of a record; record 0 = absent = air.
+// The 4 payload words of row (y, z) of a record (two 8-byte loads: records are 8-byte aligned);
+// record 0 = absent = air.
 uint4 LoadRow(uint64_t record, uint y, uint z)
 {
     if (record == 0)
     {
         return uint4(0, 0, 0, 0);
     }
-    const uint64_t address = record + uint64_t(RecordPayloadWord(0, y, z)) * 4;
+    const uint64_t address = record + uint64_t(RecordPayloadWord(0, y, z)) * kRecordWordBytes;
     return uint4(CAELIX_LOAD_U32x2(address), CAELIX_LOAD_U32x2(address + 8));
 }
 
@@ -147,8 +106,7 @@ uint4 SharedRow(uint y, uint z)
 
 uint BlockOf(uint4 row, uint x)
 {
-    const uint word = row[x >> 1];
-    return (x & 1) != 0 ? (word >> 16) : (word & 0xFFFFu);
+    return PayloadPairBlock(row[x >> 1], x);
 }
 
 [numthreads(64, 1, 1)]
@@ -163,17 +121,17 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     const uint z = t >> 3;
 
     const bool packed = g_push.encoding == kEncodingPacked;
-    const uint opaque_mask = packed ? 0xC000u : 0x8000u;
-    const uint id_mask = packed ? 0x00FFu : 0x01FFu;
-    const uint face_shift = packed ? 8u : 9u;
+    const uint opaque_mask = packed ? kPackedOpaqueMask : kBlockIdOpaqueMask;
+    const uint id_mask = packed ? kPackedIdMask : kBlockIdIdMask;
+    const uint face_shift = packed ? kPackedFaceShift : kBlockIdFaceShift;
 
     // 1. Thread 0 resolves the dirty entry; threads 0..15 and 0..2 reset the accumulators.
     if (t == 0)
     {
-        const uint4 entry = CAELIX_LOAD_U32x4(g_push.dirty_list + uint64_t(group_id.x) * 16);
-        const uint64_t info = g_push.group_infos + uint64_t(entry.x) * 32;
-        const uint4 w0 = CAELIX_LOAD_U32x4(info);
-        const uint4 w1 = CAELIX_LOAD_U32x4(info + 16);
+        const uint4 entry = CAELIX_LOAD_U32x4(g_push.dirty_list + uint64_t(group_id.x) * kDirtyEntryBytes);
+        const uint64_t info = g_push.group_infos + uint64_t(entry.x) * kGroupInfoBytes;
+        const uint4 w0 = CAELIX_LOAD_U32x4(info);  // coord, entity (kGroupInfoCoord = 0)
+        const uint4 w1 = CAELIX_LOAD_U32x4(info + kGroupInfoSlotRowBase);
         gs_coord = int3(w0.xyz);
         gs_entity = w0.w;
         gs_slot_base = w1.x;
@@ -183,7 +141,10 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         const uint pos_state =
             CAELIX_LOAD_U32(g_push.slot_tables + (uint64_t(w1.x) + entry.y) * kSlotRowBytes);
         gs_pos = SlotRowPos(pos_state);
-        gs_record = RecordAddress(entry.z);
+        gs_group = entry.x;
+        gs_record = SceneRecordAddress(Lookup(), entry.z);
+        gs_old_word1 = CAELIX_LOAD_U32(gs_record + kRecordBoundsWord * kRecordWordBytes);
+        gs_light_faces = 0;
     }
     if (t < 16)
     {
@@ -199,9 +160,15 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     // 2. Threads 0..5 resolve the six neighbour records; every thread loads its row.
     if (t < 6)
     {
-        gs_nbr[t] = ResolveNeighbor(t);
+        SceneBrickPlace place;
+        place.coord = gs_coord;
+        place.entity = gs_entity;
+        place.slot_base = gs_slot_base;
+        place.reverse_base = gs_reverse_base;
+        place.pos = gs_pos;
+        gs_nbr[t] = SceneResolveNeighbor(Lookup(), place, t);
     }
-    const uint64_t row_address = gs_record + uint64_t(RecordPayloadWord(0, y, z)) * 4;
+    const uint64_t row_address = gs_record + uint64_t(RecordPayloadWord(0, y, z)) * kRecordWordBytes;
     const uint4 own = uint4(CAELIX_LOAD_U32x2(row_address), CAELIX_LOAD_U32x2(row_address + 8));
     {
         const uint base = 4 * y + 32 * z;
@@ -220,13 +187,19 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     const uint64_t xp = gs_nbr[0];
     const uint64_t xn = gs_nbr[1];
     const uint block_xp =
-        xp != 0 ? (CAELIX_LOAD_U32(xp + uint64_t(RecordPayloadWord(0, y, z)) * 4) & 0xFFFFu) : 0u;
+        xp != 0 ? PayloadPairBlock(
+                      CAELIX_LOAD_U32(xp + uint64_t(RecordPayloadWord(0, y, z)) * kRecordWordBytes), 0)
+                : 0u;
     const uint block_xn =
-        xn != 0 ? (CAELIX_LOAD_U32(xn + uint64_t(RecordPayloadWord(7, y, z)) * 4) >> 16) : 0u;
+        xn != 0 ? PayloadPairBlock(
+                      CAELIX_LOAD_U32(xn + uint64_t(RecordPayloadWord(7, y, z)) * kRecordWordBytes), 7)
+                : 0u;
 
     // 4. Per voxel.
     uint out_words[4] = {0u, 0u, 0u, 0u};
     uint occupied = 0;  // bit x
+    const bool lights = g_push.light_codes != 0;
+    uint light_faces = 0;
     CAELIX_UNROLL
     for (uint x = 0; x < 8; ++x)
     {
@@ -251,13 +224,23 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
                 faces |= 1u << d;
             }
         }
+        CAELIX_BRANCH
+        if (lights)
+        {
+            // v is the material code (opaque: the value, transparent: the id).
+            const uint code_word = CAELIX_LOAD_U32(g_push.light_codes + uint64_t(v >> 5) * 4);
+            if (((code_word >> (v & 31)) & 1u) != 0)
+            {
+                light_faces += 6 - opaque_count;
+            }
+        }
         const bool alive = opaque_count < 6;
         const uint result = (v & opaque_mask) != 0 ? v : (v | (faces << face_shift));
         if (alive && result != 0)
         {
             occupied |= 1u << x;
         }
-        out_words[x >> 1] |= (x & 1) != 0 ? (result << 16) : result;
+        out_words[x >> 1] |= (x & 1) != 0 ? (result << kPayloadOddShift) : result;
     }
 
     // Write back the payload words that changed.
@@ -266,7 +249,16 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     {
         if (out_words[w] != own[w])
         {
-            CAELIX_STORE_U32(row_address + w * 4, out_words[w]);
+            CAELIX_STORE_U32(row_address + w * kRecordWordBytes, out_words[w]);
+        }
+    }
+
+    if (lights)
+    {
+        const uint wave_faces = WaveActiveSum(light_faces);
+        if (WaveIsFirstLane() && wave_faces != 0)
+        {
+            InterlockedAdd(gs_light_faces, wave_faces);
         }
     }
 
@@ -299,7 +291,7 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     // 6. Header words and the AABB row.
     if (t < 16)
     {
-        CAELIX_STORE_U32(gs_record + (kRecordInfoWords + t) * 4, gs_occ[t]);
+        CAELIX_STORE_U32(gs_record + (kRecordInfoWords + t) * kRecordWordBytes, gs_occ[t]);
     }
     if (t == 0)
     {
@@ -316,16 +308,34 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         uint bounds = 0;
         if (!empty)
         {
-            bounds = uint(gs_min[0]) | (uint(gs_min[1]) << 3) | (uint(gs_min[2]) << 6) |
-                     (uint(gs_max[0]) << 9) | (uint(gs_max[1]) << 12) | (uint(gs_max[2]) << 15);
+            const uint b = kRecordBoundsAxisBits;
+            const uint m = kRecordBoundsMaxShift;
+            bounds = uint(gs_min[0]) | (uint(gs_min[1]) << b) | (uint(gs_min[2]) << (2 * b)) |
+                     (uint(gs_max[0]) << m) | (uint(gs_max[1]) << (m + b)) | (uint(gs_max[2]) << (m + 2 * b));
         }
-        CAELIX_STORE_U32(gs_record, (gs_pos & 0xFFFFu) | (coarse << 16));
-        CAELIX_STORE_U32(gs_record + 4, bounds);
+        CAELIX_STORE_U32(gs_record, (gs_pos & kRecordPosMask) | (coarse << kRecordCoarseShift));
+        CAELIX_BRANCH
+        if (lights)
+        {
+            // The light face count (at most 512 * 6 = 3072) and the stale bit (set until a group
+            // pass recomputes the brick's light record).
+            const uint old_count = LtLightFaceCount(gs_old_word1);
+            const uint new_count = gs_light_faces;
+            bounds |= (new_count << kLtRecordFaceCountShift) | (gs_old_word1 & kLtRecordStaleBit);
+            if (old_count != 0 || new_count != 0)
+            {
+                bounds |= kLtRecordStaleBit;
+                const uint64_t row = g_push.light_group_rows + uint64_t(gs_group) * kLtGroupRowBytes;
+                CAELIX_ATOMIC_OR_U32(row + kLtRowGpuFlags, kLtGpuLightChanged);
+            }
+        }
+        CAELIX_STORE_U32(gs_record + kRecordBoundsWord * kRecordWordBytes, bounds);
 
         const uint shift = g_push.group_shift;
+        // BrickOfPos(gs_pos, shift), written out on the groupshared word (keeps the kernel's code).
         const uint mask = (1u << shift) - 1u;
         const int3 brick = int3(gs_pos & mask, (gs_pos >> shift) & mask, (gs_pos >> (2 * shift)) & mask);
-        const int3 origin = (gs_coord * int(1u << shift) + brick) * 8;
+        const int3 origin = (gs_coord * int(1u << shift) + brick) * int(kBrickEdge);
         uint3 lo = uint3(kQuietNaN, kQuietNaN, kQuietNaN);
         uint3 hi = uint3(kQuietNaN, kQuietNaN, kQuietNaN);
         if (!empty)
@@ -333,6 +343,7 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
             lo = asuint(float3(origin + int3(gs_min[0], gs_min[1], gs_min[2])));
             hi = asuint(float3(origin + int3(gs_max[0], gs_max[1], gs_max[2]) + 1));
         }
+        // The 24-byte row (float3 min, float3 max) as three 8-byte stores.
         const uint64_t aabb = g_push.aabb_pool + (uint64_t(gs_aabb_base) + gs_id) * kAabbRowBytes;
         CAELIX_STORE_U32x2(aabb, lo.xy);
         CAELIX_STORE_U32x2(aabb + 8, uint2(lo.z, hi.x));

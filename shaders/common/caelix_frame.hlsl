@@ -1,5 +1,5 @@
 // Per-frame constants of the trace, composite, cross resolve, sky SH and upscale encode kernels.
-// Mirrors lib/src/render/frame_constants.h; change both together. 544 bytes, read as the uniform
+// Mirrors lib/src/render/frame_constants.h; change both together. 560 bytes, read as the uniform
 // buffer g_frame (common/caelix_frame_ubo.hlsl: set 1, binding 0).
 // Layout rule: the uniform block gets DXC's default constant buffer layout, which gives the C
 // offsets only while every field sits at an offset that is a multiple of its size, no vector
@@ -76,7 +76,10 @@ struct CaelixFrameConstants
     uint2 output_size;              // 520  the colour target's size (= size without an upscaler)
     uint2 upscale_src_size;         // 528  size of the encode kernel's source image
     uint upscaler;                  // 536  kUpscaler*: 2 = the trace writes the RR guide images
-    uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear) -> 544
+    uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear)
+    uint64_t light_tree;            // 544  light tree descriptor (scene/caelix_light_tree.hlsl), 0 = no tree
+    uint pad_552;                   // 552
+    uint pad_556;                   // 556 -> 560
 };
 
 // CaelixDebugView

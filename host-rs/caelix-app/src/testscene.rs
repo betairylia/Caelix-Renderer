@@ -389,6 +389,12 @@ impl TestScene {
         if result != CaelixResult_CAELIX_OK {
             bail!("caelix_scene_add_entity (test entity) failed: CaelixResult {result}");
         }
+        // It moves every frame: its lights belong in the dynamic light BVH.
+        // SAFETY: the scene is live and the entity was just added.
+        let result = unsafe { caelix_scene_set_entity_motion(scene, id, CAELIX_ENTITY_DYNAMIC) };
+        if result != CaelixResult_CAELIX_OK {
+            bail!("caelix_scene_set_entity_motion (test entity) failed: CaelixResult {result}");
+        }
         self.entity = Some(id);
         self.sent = Some((position, rotation));
         self.uploads = 0;

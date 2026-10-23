@@ -11,6 +11,8 @@
 namespace caelix {
 namespace {
 
+static_assert(RecordPool::kInvalidIndex == kInvalidRecord);
+
 // The group index is the instance's 24-bit instanceCustomIndex.
 constexpr size_t kMaxGroups = size_t{1} << 24;
 
@@ -69,8 +71,9 @@ Scene::Placed Scene::PlaceBrick(CaelixEntityId entity_id, const Location& loc)
                 slot.state = kSlotResident;
                 ++bricks_resident_;
                 MarkDirty(group_index, id);
+                return Placed{record, group_index, id, false};
             }
-            return Placed{slot.record_index, group_index, id};
+            return Placed{slot.record_index, group_index, id, true};
         }
     }
 
@@ -174,7 +177,7 @@ Scene::Placed Scene::PlaceBrick(CaelixEntityId entity_id, const Location& loc)
     ++bricks_known_;
     MarkDirty(group_index, id);
     MarkReverseDirty(group, loc.pos);
-    return Placed{record, group_index, id};
+    return Placed{record, group_index, id, false};
 }
 
 // ---------------------------------------------------------------------------
@@ -248,9 +251,11 @@ void Scene::WriteRecord(uint8_t* dst, uint32_t pos, const uint8_t* blocks) const
 {
     // Build the record in local memory, then copy it in one go: the staging memory
     // may be write-combined.
-    uint32_t record[2 + 16 + 256];
+    constexpr uint32_t kMaxBlockBytes = 2;  // the largest block size of this version
+    constexpr uint32_t kMaxPayloadWords = kBrickVoxels * kMaxBlockBytes / kRecordWordBytes;
+    uint32_t record[kRecordInfoWords + kRecordOccupancyWords + kMaxPayloadWords];
     static_assert(sizeof(record) == 1096);
-    record[0] = pos & 0xFFFFu;  // the finalize kernel fills bits 16..23 and words 1..17
+    record[0] = pos & kRecordPosMask;  // the finalize kernel fills the coarse byte and words 1..17
     for (uint32_t w = 1; w < layout_.payload_first_word(); ++w)
     {
         record[w] = 0;
@@ -261,6 +266,55 @@ void Scene::WriteRecord(uint8_t* dst, uint32_t pos, const uint8_t* blocks) const
     std::memcpy(record + layout_.payload_first_word(), blocks,
                 static_cast<size_t>(RecordLayout::kBlocksPerBrick) * layout_.block_bytes);
     std::memcpy(dst, record, layout_.record_bytes);
+}
+
+void Scene::StageRecordCopy(const Placed& placed, VkDeviceSize src_offset)
+{
+    // A new record (or a reused one: its old content belongs to another brick) is copied whole. A
+    // resident record whose content is replaced keeps its word 1 (kRecordBoundsWord): the
+    // finalize kernel compares the old light face count and stale bit there with the new content, so
+    // a light brick that loses its lights still marks its group for the light tree. A record staged
+    // again in the same window rewrites its staged regions in place (the newest content wins); once
+    // it has a full copy in the window, it keeps one.
+    const VkBuffer page = records_.PageBuffer(placed.record);
+    const VkDeviceSize dst_offset = records_.PageOffset(placed.record);
+    constexpr VkDeviceSize kSkipBegin = kRecordBoundsWord * kRecordWordBytes;
+    constexpr VkDeviceSize kSkipEnd = kSkipBegin + kRecordWordBytes;
+    const auto found = record_copies_.find(placed.record);
+    const bool full = !placed.replaced || (found != record_copies_.end() && found->second.full);
+    const StagedCopy whole{src_offset, page, dst_offset, layout_.record_bytes};
+    const StagedCopy head{src_offset, page, dst_offset, kSkipBegin};
+    const StagedCopy tail{src_offset + kSkipEnd, page, dst_offset + kSkipEnd,
+                          layout_.record_bytes - kSkipEnd};
+    if (found == record_copies_.end())
+    {
+        record_copies_.emplace(placed.record, StagedRecord{pending_.size(), full});
+        if (full)
+        {
+            pending_.push_back(whole);
+        }
+        else
+        {
+            pending_.push_back(head);
+            pending_.push_back(tail);
+        }
+        return;
+    }
+    StagedRecord& copies = found->second;
+    if (full)
+    {
+        pending_[copies.first] = whole;
+        if (!copies.full)
+        {
+            pending_[copies.first + 1].size = 0;  // dropped by RecordCopies
+        }
+        copies.full = true;
+    }
+    else
+    {
+        pending_[copies.first] = head;
+        pending_[copies.first + 1] = tail;
+    }
 }
 
 CaelixResult Scene::UploadBricks(CaelixEntityId entity, uint32_t count, const CaelixBrickKey* keys,
@@ -289,8 +343,7 @@ CaelixResult Scene::UploadBricks(CaelixEntityId entity, uint32_t count, const Ca
         const Location loc = Locate(keys[i]);
         const Placed placed = PlaceBrick(entity, loc);
         WriteRecord(span.data, loc.pos, block_bytes + i * brick_bytes);
-        pending_.push_back(PendingCopy{span.offset, records_.PageBuffer(placed.record),
-                                       records_.PageOffset(placed.record), layout_.record_bytes});
+        StageRecordCopy(placed, span.offset);
         // The brick and its resident neighbours are finalized at the next flush.
         QueueFinalize(placed.group_index, placed.id);
         QueueNeighbors(entity, keys[i], placed.group_index);
@@ -352,6 +405,10 @@ CaelixResult Scene::RemoveBricks(CaelixEntityId entity_id, uint32_t count,
             MarkReverseDirty(group, loc.pos);
             group.nan_ids.push_back(id);  // the freed id's AABB row becomes inactive
             MarkBlasDirty(group_index);
+            if (light_ != nullptr)
+            {
+                light_->OnGroupBricksRemoved(group_index);
+            }
         }
         // The neighbours lose a neighbour: they are finalized again.
         QueueNeighbors(entity_id, keys[i], group.brick_count > 0 ? group_index : 0xFFFFFFFFu);

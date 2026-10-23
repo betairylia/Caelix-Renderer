@@ -144,8 +144,10 @@ struct Args {
     #[arg(long, value_name = "N")]
     frames: Option<u64>,
     /// With --screenshot --exit-after-screenshot: keep running after the screenshot until N more
-    /// frames have GPU timings, print `timings_avg: trace_ms=<mean> median=<median> min=<min> n=N`
-    /// on stdout and exit then. The single-frame `timings:` line varies by 1 .. 2 ms between runs.
+    /// frames have GPU timings, print `timings_avg: trace_ms=<mean> median=<median> min=<min> n=N
+    /// flush_ms=<mean> load_flush_ms=<mean before the screenshot> load_flush_max_ms=<max>
+    /// load_frames=<count>` (and with --light-tree the light tree stats) on stdout and exit then.
+    /// The single-frame `timings:` line varies by 1 .. 2 ms between runs.
     #[arg(long, value_name = "N", default_value_t = 0)]
     timing_frames: u64,
     /// Debug log level (includes Vulkan validation layer and loader messages).
@@ -375,6 +377,15 @@ struct Args {
     /// them (clean offline frames).
     #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=4096))]
     sequence_samples: u32,
+    /// Build the scene's light tree (docs/LIGHT_TREE.md; caelix_scene_set_light_options). No render
+    /// kernel uses it yet: its stats show in the Stats window and in the --timing-frames output.
+    /// The world's entities are static (CAELIX_ENTITY_STATIC), the --test-entity is dynamic.
+    #[arg(long)]
+    light_tree: bool,
+    /// With --light-tree: the light voxel threshold, luminance of the material emission before
+    /// --emission-scale (0 = the library's default, 20).
+    #[arg(long, value_name = "F", default_value_t = 0.0, requires = "light_tree")]
+    light_min_emission: f32,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -515,6 +526,10 @@ struct Timing {
     fps: f64,
     /// --timing-frames: trace_ms of every distinct timed frame after the screenshot.
     samples: Vec<f32>,
+    /// --timing-frames: flush_ms of the same frames.
+    flush_samples: Vec<f32>,
+    /// --timing-frames: flush_ms of every distinct timed frame before the screenshot (the load).
+    load_flush_samples: Vec<f32>,
     /// The frame number of the newest sample (0 = none).
     sample_frame: u64,
 }
@@ -677,6 +692,20 @@ impl App {
         if let Some(path) = self.args.materials.as_deref() {
             materials::apply(state.scene, path)?;
         }
+        if self.args.light_tree {
+            // Before any upload: enabling the tree later finalizes every resident brick again.
+            let options = CaelixLightOptions {
+                enabled: 1,
+                min_emission: self.args.light_min_emission,
+                heap_bytes: 0, // 16 MiB per heap buffer, grown on demand
+            };
+            // SAFETY: the scene is live; options is valid for the call.
+            let result = unsafe { caelix_scene_set_light_options(state.scene, &options) };
+            if result != CaelixResult_CAELIX_OK {
+                bail!("caelix_scene_set_light_options failed: CaelixResult {result}");
+            }
+            log::info!("light tree enabled (min_emission {})", self.args.light_min_emission);
+        }
         // SAFETY: the device and the scene are live; the out pointer is valid for the call.
         let result = unsafe { caelix_renderer_create(state.caelix_device, state.scene, &mut state.renderer) };
         if result != CaelixResult_CAELIX_OK || state.renderer.is_null() {
@@ -775,6 +804,7 @@ impl App {
                     frame_number: frame.frame_number,
                     target: (frame.width, frame.height),
                     scene: scene_stats(state.scene),
+                    light: light_stats(state.scene),
                     nrd: nrd_info(state.renderer),
                     load_state: match (state.loader.as_ref(), self.args.world.as_deref()) {
                         (Some(loader), _) => loader.status_line(),
@@ -1158,12 +1188,21 @@ impl App {
             }
         }
 
-        // --timing-frames: the trace time of every distinct timed frame after the screenshot.
+        // --timing-frames: the flush time of every distinct timed frame before the screenshot (the
+        // load), and the trace and flush times of every distinct timed frame after it.
+        if self.args.timing_frames > 0 && self.screenshot != Screenshot::Done {
+            let t = gpu_timings(state.renderer);
+            if t.frame_number != 0 && t.frame_number != self.timing.sample_frame {
+                self.timing.sample_frame = t.frame_number;
+                self.timing.load_flush_samples.push(t.flush_ms);
+            }
+        }
         if self.args.timing_frames > 0 && self.screenshot == Screenshot::Done {
             let t = gpu_timings(state.renderer);
             if t.frame_number != 0 && t.frame_number != self.timing.sample_frame {
                 self.timing.sample_frame = t.frame_number;
                 self.timing.samples.push(t.trace_ms);
+                self.timing.flush_samples.push(t.flush_ms);
             }
             if self.timing.samples.len() as u64 >= self.args.timing_frames {
                 let mut sorted = self.timing.samples.clone();
@@ -1175,7 +1214,43 @@ impl App {
                 } else {
                     (sorted[n / 2 - 1] as f64 + sorted[n / 2] as f64) * 0.5
                 };
-                println!("timings_avg: trace_ms={mean:.3} median={median:.3} min={:.3} n={n}", sorted[0]);
+                let flush_mean = self.timing.flush_samples.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+                let load = &self.timing.load_flush_samples;
+                let load_mean = load.iter().map(|&x| x as f64).sum::<f64>() / load.len().max(1) as f64;
+                let load_max = load.iter().fold(0.0f32, |a, &b| a.max(b));
+                let light = if self.args.light_tree {
+                    let l = light_stats(state.scene);
+                    format!(
+                        " light: groups={} bricks={} faces={} dropped={} heap_used={} heap_capacity={} passes={} \
+                         failed={} recomputed={} copied={} static_leaves={} static_nodes={} static_builds={} \
+                         dynamic_leaves={} dynamic_nodes={} dynamic_builds={} gpu_ms={:.3}",
+                        l.light_groups,
+                        l.light_bricks,
+                        l.light_faces,
+                        l.bricks_dropped,
+                        l.heap_bytes_used,
+                        l.heap_bytes_capacity,
+                        l.passes,
+                        l.failed_passes,
+                        l.records_recomputed,
+                        l.records_copied,
+                        l.tree_leaves[0],
+                        l.tree_nodes[0],
+                        l.tree_builds[0],
+                        l.tree_leaves[1],
+                        l.tree_nodes[1],
+                        l.tree_builds[1],
+                        l.gpu_ms
+                    )
+                } else {
+                    String::new()
+                };
+                println!(
+                    "timings_avg: trace_ms={mean:.3} median={median:.3} min={:.3} n={n} flush_ms={flush_mean:.3} \
+                     load_flush_ms={load_mean:.3} load_flush_max_ms={load_max:.3} load_frames={}{light}",
+                    sorted[0],
+                    load.len()
+                );
                 if self.args.exit_after_screenshot {
                     event_loop.exit();
                     return Ok(());
@@ -1592,6 +1667,14 @@ fn gpu_timings(renderer: *const CaelixRenderer) -> CaelixGpuTimings {
     // SAFETY: the renderer is live and timings is writable.
     unsafe { caelix_renderer_get_gpu_timings(renderer, &mut timings) };
     timings
+}
+
+fn light_stats(scene: *const CaelixScene) -> CaelixLightStats {
+    // SAFETY: CaelixLightStats holds only integers and floats, so all-zero is a valid value.
+    let mut stats: CaelixLightStats = unsafe { std::mem::zeroed() };
+    // SAFETY: the scene is live (or null, which the library ignores); stats is valid for the call.
+    unsafe { caelix_scene_get_light_stats(scene, &mut stats) };
+    stats
 }
 
 fn scene_stats(scene: *const CaelixScene) -> CaelixSceneStats {
@@ -2020,6 +2103,8 @@ fn main() -> anyhow::Result<()> {
             window_frames: 0,
             fps: 0.0,
             samples: Vec::new(),
+            flush_samples: Vec::new(),
+            load_flush_samples: Vec::new(),
             sample_frame: 0,
         },
         load_mismatch: false,

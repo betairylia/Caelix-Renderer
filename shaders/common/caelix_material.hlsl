@@ -23,6 +23,11 @@ struct CaelixMaterial
 };
 
 static const uint kMaterialBytes = 48;
+// Field offsets (macros: see common/caelix_record.hlsl). The loads take the 16-byte rows (albedo,
+// smoothness), (emission, metallic), (ior, extinction).
+#define kMaterialAlbedo 0
+#define kMaterialEmission 16
+#define kMaterialIor 32
 
 // Set by the kernel from CaelixFrameConstants::materials before the first lookup.
 static uint64_t g_materialTable;
@@ -38,9 +43,9 @@ inline uint CaelixMaterialCode(uint blk)
 CaelixMaterial CaelixGetMaterial(uint blk)
 {
     const uint64_t address = g_materialTable + uint64_t(CaelixMaterialCode(blk)) * kMaterialBytes;
-    const float4 w0 = asfloat(CAELIX_LOAD_U32x4(address));
-    const float4 w1 = asfloat(CAELIX_LOAD_U32x4(address + 16));
-    const float2 w2 = asfloat(CAELIX_LOAD_U32x2(address + 32));
+    const float4 w0 = asfloat(CAELIX_LOAD_U32x4(address));  // kMaterialAlbedo = 0
+    const float4 w1 = asfloat(CAELIX_LOAD_U32x4(address + kMaterialEmission));
+    const float2 w2 = asfloat(CAELIX_LOAD_U32x2(address + kMaterialIor));
     CaelixMaterial m;
     m.albedo = w0.xyz;
     m.smoothness = w0.w;

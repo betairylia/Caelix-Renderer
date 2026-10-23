@@ -40,15 +40,17 @@
 // bounds (also keeps uint64_t occupancy loads 8-byte aligned).
 // Word 1 layout (matches BrickRecordLayout.PackBrickTightBounds, both bounds inclusive):
 // [minX:0-2][minY:3-5][minZ:6-8][maxX:9-11][maxY:12-14][maxZ:15-17]
-#define BRICK_INFO_WORDS 2
-#define BRICK_TIGHT_AXIS_MASK 7u
-#define BRICK_TIGHT_MAX_SHIFT 9u
-#define BRICK_OCCUPANCY_WORDS 16
-#define BRICK_BLOCK_DATA_OFFSET 18
-#define BRICK_DATA_LENGTH 274
-#define BRICK_INFO_ABSOLUTE_INDEX_MASK 0xFFFFu
-#define BRICK_INFO_COARSE_OCCUPANCY_SHIFT 16u
-#define BRICK_INFO_COARSE_OCCUPANCY_MASK 0xFFu
+// The Unity names of the record layout (common/caelix_record.hlsl).
+#define BRICK_INFO_WORDS kRecordInfoWords
+#define BRICK_TIGHT_AXIS_BITS uint(kRecordBoundsAxisBits)
+#define BRICK_TIGHT_AXIS_MASK uint(kRecordBoundsAxisMask)
+#define BRICK_TIGHT_MAX_SHIFT uint(kRecordBoundsMaxShift)
+#define BRICK_OCCUPANCY_WORDS kRecordOccupancyWords
+#define BRICK_BLOCK_DATA_OFFSET kRecordPayloadWord
+#define BRICK_DATA_LENGTH kRecordWords
+#define BRICK_INFO_ABSOLUTE_INDEX_MASK kRecordPosMask
+#define BRICK_INFO_COARSE_OCCUPANCY_SHIFT uint(kRecordCoarseShift)
+#define BRICK_INFO_COARSE_OCCUPANCY_MASK kRecordCoarseMask
 #define BRICK_COARSE_SIZE_IN_BLOCKS 4
 #define BRICK_MICRO_SHIFT 2
 #define BRICK_MICRO_SIZE (1 << BRICK_MICRO_SHIFT)
@@ -382,12 +384,14 @@ inline float CaelixTraceBrickPrimitiveCore(uint brickBase, float3 objectRayOrigi
     uint tightBounds = brickInfo.y;
     float3 tightMin = float3(
         tightBounds & BRICK_TIGHT_AXIS_MASK,
-        (tightBounds >> 3u) & BRICK_TIGHT_AXIS_MASK,
-        (tightBounds >> 6u) & BRICK_TIGHT_AXIS_MASK);
+        (tightBounds >> BRICK_TIGHT_AXIS_BITS) & BRICK_TIGHT_AXIS_MASK,
+        (tightBounds >> (2u * BRICK_TIGHT_AXIS_BITS)) & BRICK_TIGHT_AXIS_MASK);
     float3 tightMax = float3(
                           (tightBounds >> BRICK_TIGHT_MAX_SHIFT) & BRICK_TIGHT_AXIS_MASK,
-                          (tightBounds >> (BRICK_TIGHT_MAX_SHIFT + 3u)) & BRICK_TIGHT_AXIS_MASK,
-                          (tightBounds >> (BRICK_TIGHT_MAX_SHIFT + 6u)) & BRICK_TIGHT_AXIS_MASK) +
+                          (tightBounds >> (BRICK_TIGHT_MAX_SHIFT + BRICK_TIGHT_AXIS_BITS)) &
+                              BRICK_TIGHT_AXIS_MASK,
+                          (tightBounds >> (BRICK_TIGHT_MAX_SHIFT + 2u * BRICK_TIGHT_AXIS_BITS)) &
+                              BRICK_TIGHT_AXIS_MASK) +
                       1.0f;
 
     float3 aabbMin = brickOrigin + tightMin;

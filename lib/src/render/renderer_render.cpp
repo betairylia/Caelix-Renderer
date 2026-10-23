@@ -516,6 +516,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.group_infos = scene_.group_infos_address();
     constants.entity_infos = scene_.entity_infos_address();
     constants.materials = scene_.materials_address();
+    constants.light_tree = scene_.light_tree_address();
     constants.records_per_page_shift = scene_.records_per_page_shift();
     constants.record_bytes = scene_.record_bytes();
     constants.group_shift = scene_.group_shift();

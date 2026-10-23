@@ -32,6 +32,8 @@ pub struct Stats {
     /// Size of the render target (the swapchain image).
     pub target: (u32, u32),
     pub scene: CaelixSceneStats,
+    /// The light tree (`enabled` = 0 without --light-tree).
+    pub light: CaelixLightStats,
     pub nrd: CaelixNrdInfo,
     pub load_state: String,
     /// Reference mode: frames accumulated since the last reset.
@@ -378,6 +380,33 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
             ],
         );
     });
+    let l = &stats.light;
+    if l.enabled != 0 {
+        CollapsingHeader::new("Light tree").default_open(true).show(ui, |ui| {
+            value_grid(
+                ui,
+                "stats_light",
+                &[
+                    ("light groups", l.light_groups.to_string()),
+                    ("light bricks", l.light_bricks.to_string()),
+                    ("light faces", l.light_faces.to_string()),
+                    ("bricks dropped", l.bricks_dropped.to_string()),
+                    ("heap used / capacity", format!("{:.1} / {:.1} MiB", mib(l.heap_bytes_used), mib(l.heap_bytes_capacity))),
+                    ("passes (failed)", format!("{} ({})", l.passes, l.failed_passes)),
+                    ("records recomputed / copied", format!("{} / {}", l.records_recomputed, l.records_copied)),
+                    (
+                        "static BVH leaves / nodes / builds",
+                        format!("{} / {} / {}", l.tree_leaves[0], l.tree_nodes[0], l.tree_builds[0]),
+                    ),
+                    (
+                        "dynamic BVH leaves / nodes / builds",
+                        format!("{} / {} / {}", l.tree_leaves[1], l.tree_nodes[1], l.tree_builds[1]),
+                    ),
+                    ("light update", format!("{:.3} ms", l.gpu_ms)),
+                ],
+            );
+        });
+    }
     CollapsingHeader::new("NRD and world").default_open(demo).show(ui, |ui| {
         let nrd = &stats.nrd;
         let version = format!("{}.{}.{}", nrd.version_major, nrd.version_minor, nrd.version_build);

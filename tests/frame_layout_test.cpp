@@ -1,6 +1,12 @@
-// The uniform block of the frame constants in the compiled kernels against the C layout of
-// lib/src/render/frame_constants.h. No GPU: the test reads the .spv files of the build
-// (CAELIX_SHADER_SPV_DIR, written by cmake/Shaders.cmake) and parses the SPIR-V binary.
+// The GPU layouts that C++ and HLSL share, checked without a GPU:
+//   - the uniform block of the frame constants in the compiled kernels against the C layout of
+//     lib/src/render/frame_constants.h (below);
+//   - the push constant blocks of the scene and light tree kernels against their C++ structs, member
+//     by member and by name;
+//   - every named constant of the HLSL layout headers (caelix_record.hlsl, caelix_material.hlsl,
+//     caelix_light_tree_layout.hlsl) against the C++ constant of the same name.
+// The test reads the .spv files of the build (CAELIX_SHADER_SPV_DIR, written by cmake/Shaders.cmake)
+// and parses the SPIR-V binary, and reads the HLSL sources (CAELIX_SHADER_SOURCE_DIR).
 //
 // For each of the five frame-constant kernels it finds the variable of storage class Uniform whose
 // pointee is a struct decorated Block (exactly one), checks its DescriptorSet / Binding against
@@ -12,20 +18,31 @@
 // from the C layout when a vector crosses a 16-byte row or an array element is not 16 bytes; such a
 // change of CaelixFrameConstants fails here.
 #include "render/frame_constants.h"
+#include "scene/gpu_structs.h"
+#include "scene/light_tree_layout.h"
+#include "scene/material_table.h"
+#include "scene/record_layout.h"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <map>
 #include <optional>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #ifndef CAELIX_SHADER_SPV_DIR
 #error "CAELIX_SHADER_SPV_DIR must name the build's shader folder"
+#endif
+#ifndef CAELIX_SHADER_SOURCE_DIR
+#error "CAELIX_SHADER_SOURCE_DIR must name the shader source folder"
 #endif
 
 namespace {
@@ -50,6 +67,7 @@ constexpr uint32_t kDecorationBinding = 33;
 constexpr uint32_t kDecorationDescriptorSet = 34;
 constexpr uint32_t kDecorationOffset = 35;
 constexpr uint32_t kStorageClassUniform = 2;
+constexpr uint32_t kStorageClassPushConstant = 9;
 constexpr uint32_t kSpirvMagic = 0x07230203u;
 
 struct Type
@@ -67,6 +85,7 @@ struct Module
     std::map<std::pair<uint32_t, uint32_t>, uint32_t> member_matrix_strides;
     std::map<std::pair<uint32_t, uint32_t>, std::string> member_names;
     std::vector<std::pair<uint32_t, uint32_t>> uniform_variables;     // (variable id, pointer type id)
+    std::vector<std::pair<uint32_t, uint32_t>> push_variables;        // (variable id, pointer type id)
 };
 
 std::vector<uint32_t> ReadWords(const std::string& path)
@@ -140,6 +159,10 @@ std::string Parse(const std::vector<uint32_t>& words, Module& module)
             if (count >= 4 && w[3] == kStorageClassUniform)
             {
                 module.uniform_variables.emplace_back(w[2], w[1]);
+            }
+            if (count >= 4 && w[3] == kStorageClassPushConstant)
+            {
+                module.push_variables.emplace_back(w[2], w[1]);
             }
             break;
         case kOpDecorate:
@@ -349,4 +372,600 @@ TEST_CASE("frame constants: the uniform block of every frame-constant kernel has
         INFO(text);
         CHECK(errors.empty());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Push constant blocks against the C++ structs
+
+namespace {
+
+struct Field
+{
+    const char* name;
+    size_t offset;
+};
+#define CAELIX_FIELD(Struct, member) Field{#member, offsetof(Struct, member)}
+
+// Checks the push constant block of one kernel: one block, every member named like a field of the C++
+// struct and at its offset, as many members as fields.
+std::vector<std::string> CheckPushBlock(const std::string& name, const std::vector<Field>& fields)
+{
+    const std::string path = std::string(CAELIX_SHADER_SPV_DIR) + "/" + name + ".spv";
+    const std::vector<uint32_t> words = ReadWords(path);
+    if (words.empty())
+    {
+        return {"cannot read " + path};
+    }
+    Module module;
+    const std::string parse_error = Parse(words, module);
+    if (!parse_error.empty())
+    {
+        return {path + ": " + parse_error};
+    }
+    if (module.push_variables.size() != 1)
+    {
+        return {name + ": " + std::to_string(module.push_variables.size()) +
+                " push constant blocks (expected 1)"};
+    }
+    const auto pointer = module.types.find(module.push_variables[0].second);
+    if (pointer == module.types.end() || pointer->second.opcode != kOpTypePointer)
+    {
+        return {name + ": the push constant variable has no pointer type"};
+    }
+    const uint32_t block = pointer->second.operands[1];
+    const auto block_type = module.types.find(block);
+    if (block_type == module.types.end() || block_type->second.opcode != kOpTypeStruct)
+    {
+        return {name + ": the push constant block is not a struct"};
+    }
+    std::vector<std::string> errors;
+    const size_t members = block_type->second.operands.size();
+    if (members != fields.size())
+    {
+        errors.push_back(name + ": " + std::to_string(members) + " members, the C++ struct has " +
+                         std::to_string(fields.size()) + " fields");
+    }
+    for (uint32_t i = 0; i < members; ++i)
+    {
+        const auto member_name = module.member_names.find({block, i});
+        const auto offset = module.member_offsets.find({block, i});
+        if (member_name == module.member_names.end() || offset == module.member_offsets.end())
+        {
+            errors.push_back(name + ": member " + std::to_string(i) + " has no name or no offset");
+            continue;
+        }
+        const Field* field = nullptr;
+        for (const Field& f : fields)
+        {
+            field = member_name->second == f.name ? &f : field;
+        }
+        if (field == nullptr)
+        {
+            errors.push_back(name + ": member " + member_name->second + " is not a field of the C++ struct");
+        }
+        else if (field->offset != offset->second)
+        {
+            errors.push_back(name + ": member " + member_name->second + " at " +
+                             std::to_string(offset->second) + ", the C++ field at " +
+                             std::to_string(field->offset));
+        }
+    }
+    if (errors.empty())
+    {
+        std::printf("%s: %zu push constant members match the C++ struct\n", name.c_str(), members);
+    }
+    return errors;
+}
+
+}  // namespace
+
+TEST_CASE("push constants: the scene and light tree kernels have the C++ layouts")
+{
+    using namespace caelix;
+    const std::vector<Field> finalize = {
+        CAELIX_FIELD(FinalizePush, dirty_list),      CAELIX_FIELD(FinalizePush, page_table),
+        CAELIX_FIELD(FinalizePush, slot_tables),     CAELIX_FIELD(FinalizePush, reverse_tables),
+        CAELIX_FIELD(FinalizePush, group_infos),     CAELIX_FIELD(FinalizePush, entity_infos),
+        CAELIX_FIELD(FinalizePush, group_grids),     CAELIX_FIELD(FinalizePush, aabb_pool),
+        CAELIX_FIELD(FinalizePush, dirty_count),     CAELIX_FIELD(FinalizePush, records_per_page_shift),
+        CAELIX_FIELD(FinalizePush, record_bytes),    CAELIX_FIELD(FinalizePush, group_shift),
+        CAELIX_FIELD(FinalizePush, encoding),        CAELIX_FIELD(FinalizePush, pad),
+        CAELIX_FIELD(FinalizePush, light_codes),     CAELIX_FIELD(FinalizePush, light_group_rows),
+    };
+    const std::vector<Field> group = {
+        CAELIX_FIELD(LightGroupPush, descriptor),      CAELIX_FIELD(LightGroupPush, page_table),
+        CAELIX_FIELD(LightGroupPush, slot_tables),     CAELIX_FIELD(LightGroupPush, reverse_tables),
+        CAELIX_FIELD(LightGroupPush, materials),       CAELIX_FIELD(LightGroupPush, offsets),
+        CAELIX_FIELD(LightGroupPush, staged_flags),    CAELIX_FIELD(LightGroupPush, records_per_page_shift),
+        CAELIX_FIELD(LightGroupPush, record_bytes),    CAELIX_FIELD(LightGroupPush, group_base),
+        CAELIX_FIELD(LightGroupPush, group_count),     CAELIX_FIELD(LightGroupPush, capacity_units),
+        CAELIX_FIELD(LightGroupPush, pad),
+    };
+    const std::vector<Field> bvh = {
+        CAELIX_FIELD(LightBvhPush, descriptor),    CAELIX_FIELD(LightBvhPush, scratch),
+        CAELIX_FIELD(LightBvhPush, offsets),       CAELIX_FIELD(LightBvhPush, tree),
+        CAELIX_FIELD(LightBvhPush, leaf_capacity), CAELIX_FIELD(LightBvhPush, node_capacity),
+        CAELIX_FIELD(LightBvhPush, group_count),   CAELIX_FIELD(LightBvhPush, reason),
+        CAELIX_FIELD(LightBvhPush, pass_recorded), CAELIX_FIELD(LightBvhPush, group_base),
+        CAELIX_FIELD(LightBvhPush, pad),
+    };
+    const std::vector<Field> scan = {
+        CAELIX_FIELD(LightScanPush, data),         CAELIX_FIELD(LightScanPush, total_address),
+        CAELIX_FIELD(LightScanPush, gate_address), CAELIX_FIELD(LightScanPush, count),
+        CAELIX_FIELD(LightScanPush, pad),
+    };
+    const std::vector<Field> sort = {
+        CAELIX_FIELD(LightSortPush, keys_in),      CAELIX_FIELD(LightSortPush, values_in),
+        CAELIX_FIELD(LightSortPush, keys_out),     CAELIX_FIELD(LightSortPush, values_out),
+        CAELIX_FIELD(LightSortPush, histogram),    CAELIX_FIELD(LightSortPush, count_address),
+        CAELIX_FIELD(LightSortPush, gate_address), CAELIX_FIELD(LightSortPush, shift),
+        CAELIX_FIELD(LightSortPush, block_count),
+    };
+    const std::vector<std::pair<const char*, const std::vector<Field>*>> kernels = {
+        {"caelix_finalize", &finalize},
+        {"caelix_light_tree_size", &group},
+        {"caelix_light_tree_scan", &group},
+        {"caelix_light_tree_build", &group},
+        {"caelix_light_tree_commit", &group},
+        {"caelix_light_bvh_begin", &bvh},
+        {"caelix_light_gather_count", &bvh},
+        {"caelix_light_gather_emit", &bvh},
+        {"caelix_light_bvh_bounds", &bvh},
+        {"caelix_light_bvh_morton", &bvh},
+        {"caelix_light_bvh_karras", &bvh},
+        {"caelix_light_bvh_aggregate", &bvh},
+        {"caelix_light_bvh_depth", &bvh},
+        {"caelix_light_bvh_wide", &bvh},
+        {"caelix_light_bvh_finish", &bvh},
+        {"caelix_light_bvh_scan", &scan},
+        {"caelix_light_bvh_sort_histogram", &sort},
+        {"caelix_light_bvh_sort_scatter", &sort},
+    };
+    for (const auto& [kernel, fields] : kernels)
+    {
+        const std::vector<std::string> errors = CheckPushBlock(kernel, *fields);
+        std::string text;
+        for (const std::string& error : errors)
+        {
+            text += error + "\n";
+        }
+        INFO(text);
+        CHECK(errors.empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Named constants of the HLSL layout headers against the C++ constants
+
+namespace {
+
+// The value of a constant expression of an HLSL layout header: integer literals (decimal or hex, an
+// optional u suffix), earlier constants, parentheses and + - * / << | &. nullopt when it is not one.
+class Expression
+{
+public:
+    Expression(const std::string& text, const std::map<std::string, uint64_t>& known)
+        : text_(text), known_(known)
+    {
+    }
+
+    std::optional<uint64_t> Evaluate()
+    {
+        const std::optional<uint64_t> value = Or();
+        Skip();
+        if (!value || at_ != text_.size())
+        {
+            return std::nullopt;
+        }
+        return value;
+    }
+
+private:
+    void Skip()
+    {
+        while (at_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[at_])) != 0)
+        {
+            ++at_;
+        }
+    }
+    bool Take(const char* op)
+    {
+        Skip();
+        const size_t n = std::char_traits<char>::length(op);
+        if (text_.compare(at_, n, op) == 0)
+        {
+            at_ += n;
+            return true;
+        }
+        return false;
+    }
+    std::optional<uint64_t> Or()
+    {
+        std::optional<uint64_t> a = And();
+        while (a && Take("|"))
+        {
+            const std::optional<uint64_t> b = And();
+            a = b ? std::optional<uint64_t>(*a | *b) : std::nullopt;
+        }
+        return a;
+    }
+    std::optional<uint64_t> And()
+    {
+        std::optional<uint64_t> a = Shift();
+        while (a && Take("&"))
+        {
+            const std::optional<uint64_t> b = Shift();
+            a = b ? std::optional<uint64_t>(*a & *b) : std::nullopt;
+        }
+        return a;
+    }
+    std::optional<uint64_t> Shift()
+    {
+        std::optional<uint64_t> a = Sum();
+        while (a && Take("<<"))
+        {
+            const std::optional<uint64_t> b = Sum();
+            a = b ? std::optional<uint64_t>(*a << *b) : std::nullopt;
+        }
+        return a;
+    }
+    std::optional<uint64_t> Sum()
+    {
+        std::optional<uint64_t> a = Product();
+        while (a)
+        {
+            if (Take("+"))
+            {
+                const std::optional<uint64_t> b = Product();
+                a = b ? std::optional<uint64_t>(*a + *b) : std::nullopt;
+            }
+            else if (Take("-"))
+            {
+                const std::optional<uint64_t> b = Product();
+                a = b ? std::optional<uint64_t>(*a - *b) : std::nullopt;
+            }
+            else
+            {
+                break;
+            }
+        }
+        return a;
+    }
+    std::optional<uint64_t> Product()
+    {
+        std::optional<uint64_t> a = Primary();
+        while (a)
+        {
+            if (Take("*"))
+            {
+                const std::optional<uint64_t> b = Primary();
+                a = b ? std::optional<uint64_t>(*a * *b) : std::nullopt;
+            }
+            else if (Take("/"))
+            {
+                const std::optional<uint64_t> b = Primary();
+                a = b && *b != 0 ? std::optional<uint64_t>(*a / *b) : std::nullopt;
+            }
+            else
+            {
+                break;
+            }
+        }
+        return a;
+    }
+    std::optional<uint64_t> Primary()
+    {
+        Skip();
+        if (Take("("))
+        {
+            const std::optional<uint64_t> value = Or();
+            return Take(")") ? value : std::nullopt;
+        }
+        if (at_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[at_])) != 0)
+        {
+            size_t used = 0;
+            const uint64_t value = std::stoull(text_.substr(at_), &used, 0);
+            at_ += used;
+            if (at_ < text_.size() && (text_[at_] == 'u' || text_[at_] == 'U'))
+            {
+                ++at_;
+            }
+            return value;
+        }
+        size_t end = at_;
+        while (end < text_.size() &&
+               (std::isalnum(static_cast<unsigned char>(text_[end])) != 0 || text_[end] == '_'))
+        {
+            ++end;
+        }
+        const auto found = known_.find(text_.substr(at_, end - at_));
+        if (end == at_ || found == known_.end())
+        {
+            return std::nullopt;
+        }
+        at_ = end;
+        return found->second;
+    }
+
+    const std::string& text_;
+    const std::map<std::string, uint64_t>& known_;
+    size_t at_ = 0;
+};
+
+// The named constants of one HLSL header in order: `static const uint kName = <expression>;` and
+// `#define kName <expression>`. `errors` gets the ones whose value cannot be computed.
+std::vector<std::pair<std::string, uint64_t>> HlslConstants(const std::string& file,
+                                                            std::map<std::string, uint64_t>& known,
+                                                            std::vector<std::string>& errors)
+{
+    std::ifstream in(std::string(CAELIX_SHADER_SOURCE_DIR) + "/" + file);
+    if (!in)
+    {
+        errors.push_back("cannot read shaders/" + file);
+        return {};
+    }
+    const std::regex constant(R"(^\s*static\s+const\s+uint\s+(k\w+)\s*=\s*([^;]+);)");
+    const std::regex macro(R"(^\s*#define\s+(k\w+)\s+(.*?)\s*(//.*)?$)");
+    std::vector<std::pair<std::string, uint64_t>> out;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        std::smatch match;
+        if (!std::regex_search(line, match, constant) && !std::regex_search(line, match, macro))
+        {
+            continue;
+        }
+        const std::string name = match[1];
+        const std::string text = match[2];
+        const std::optional<uint64_t> value = Expression(text, known).Evaluate();
+        if (!value)
+        {
+            errors.push_back(file + ": " + name + " = " + text + " is not a constant expression");
+            continue;
+        }
+        known[name] = *value;
+        out.emplace_back(name, *value);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant of the same name")
+{
+    using namespace caelix;
+    const RecordLayout record = RecordLayout::ForBlockBytes(2);  // the HLSL record is the 16-bit one
+#define CAELIX_CONSTANT(name) {#name, static_cast<uint64_t>(name)}
+    const std::map<std::string, uint64_t> cpp = {
+        // shaders/common/caelix_record.hlsl: lib/src/scene/record_layout.h, gpu_structs.h
+        CAELIX_CONSTANT(kPageTableEntryBytes),
+        CAELIX_CONSTANT(kRecordInfoWords),
+        CAELIX_CONSTANT(kRecordOccupancyWords),
+        {"kRecordPayloadWord", record.payload_first_word()},
+        {"kRecordWords", record.record_words},
+        CAELIX_CONSTANT(kRecordWordBytes),
+        CAELIX_CONSTANT(kRecordPosMask),
+        CAELIX_CONSTANT(kRecordCoarseShift),
+        CAELIX_CONSTANT(kRecordCoarseMask),
+        CAELIX_CONSTANT(kRecordBoundsWord),
+        CAELIX_CONSTANT(kRecordBoundsAxisBits),
+        CAELIX_CONSTANT(kRecordBoundsAxisMask),
+        CAELIX_CONSTANT(kRecordBoundsMaxShift),
+        CAELIX_CONSTANT(kBrickEdge),
+        CAELIX_CONSTANT(kBrickVoxels),
+        CAELIX_CONSTANT(kPayloadOddShift),
+        CAELIX_CONSTANT(kSlotRowBytes),
+        CAELIX_CONSTANT(kSlotRowPosMask),
+        CAELIX_CONSTANT(kSlotRowStateShift),
+        {"kSlotStateResident", kSlotResident},
+        CAELIX_CONSTANT(kInvalidRecord),
+        CAELIX_CONSTANT(kAabbRowBytes),
+        {"kQuietNaN", kQuietNaNBits},
+        CAELIX_CONSTANT(kNoBrickId),
+        CAELIX_CONSTANT(kNoGroup),
+        CAELIX_CONSTANT(kDirtyEntryBytes),
+        CAELIX_CONSTANT(kGroupInfoCoord),
+        CAELIX_CONSTANT(kGroupInfoEntity),
+        CAELIX_CONSTANT(kGroupInfoSlotRowBase),
+        CAELIX_CONSTANT(kGroupInfoReverseBase),
+        CAELIX_CONSTANT(kGroupInfoAabbRowBase),
+        CAELIX_CONSTANT(kGroupInfoHighWater),
+        CAELIX_CONSTANT(kGroupInfoBytes),
+        CAELIX_CONSTANT(kEntityInfoGridMin),
+        CAELIX_CONSTANT(kEntityInfoGridBase),
+        CAELIX_CONSTANT(kEntityInfoGridDims),
+        CAELIX_CONSTANT(kEntityInfoCurRow0),
+        CAELIX_CONSTANT(kEntityInfoCurRow1),
+        CAELIX_CONSTANT(kEntityInfoCurRow2),
+        CAELIX_CONSTANT(kEntityInfoPrevRow0),
+        CAELIX_CONSTANT(kEntityInfoPrevRow1),
+        CAELIX_CONSTANT(kEntityInfoPrevRow2),
+        CAELIX_CONSTANT(kEntityInfoBytes),
+        CAELIX_CONSTANT(kEncodingPacked),
+        CAELIX_CONSTANT(kEncodingBlockId),
+        CAELIX_CONSTANT(kPackedOpaqueMask),
+        CAELIX_CONSTANT(kPackedIdMask),
+        CAELIX_CONSTANT(kPackedFaceShift),
+        CAELIX_CONSTANT(kBlockIdOpaqueMask),
+        CAELIX_CONSTANT(kBlockIdIdMask),
+        CAELIX_CONSTANT(kBlockIdFaceShift),
+        // shaders/common/caelix_material.hlsl: lib/src/scene/material_table.h
+        CAELIX_CONSTANT(kMaterialBytes),
+        CAELIX_CONSTANT(kMaterialAlbedo),
+        CAELIX_CONSTANT(kMaterialEmission),
+        CAELIX_CONSTANT(kMaterialIor),
+        // shaders/common/caelix_light_tree_layout.hlsl: lib/src/scene/light_tree_layout.h
+        CAELIX_CONSTANT(kLtNone),
+        CAELIX_CONSTANT(kLtTrees),
+        CAELIX_CONSTANT(kLtMaxLightBricksPerGroup),
+        CAELIX_CONSTANT(kLtRecordFaceCountShift),
+        CAELIX_CONSTANT(kLtRecordFaceCountMask),
+        CAELIX_CONSTANT(kLtRecordStaleBit),
+        CAELIX_CONSTANT(kLtDescControl),
+        CAELIX_CONSTANT(kLtDescHeap0),
+        CAELIX_CONSTANT(kLtDescHeap1),
+        CAELIX_CONSTANT(kLtDescGroupRows),
+        CAELIX_CONSTANT(kLtDescGroupInfos),
+        CAELIX_CONSTANT(kLtDescEntityInfos),
+        CAELIX_CONSTANT(kLtDescEntityMotion),
+        CAELIX_CONSTANT(kLtDescGrids),
+        CAELIX_CONSTANT(kLtDescNodes0),
+        CAELIX_CONSTANT(kLtDescLeaves0),
+        CAELIX_CONSTANT(kLtDescTreeStride),
+        CAELIX_CONSTANT(kLtDescLightCodes),
+        CAELIX_CONSTANT(kLtDescTreeHeaders),
+        CAELIX_CONSTANT(kLtDescGroupShift),
+        CAELIX_CONSTANT(kLtDescEncoding),
+        CAELIX_CONSTANT(kLtDescGroupCount),
+        CAELIX_CONSTANT(kLtDescriptorBytes),
+        CAELIX_CONSTANT(kLtSummaryFace),
+        CAELIX_CONSTANT(kLtSummaryLo),
+        CAELIX_CONSTANT(kLtSummaryHi),
+        CAELIX_CONSTANT(kLtSummaryBytes),
+        CAELIX_CONSTANT(kLtHdrRoot),
+        CAELIX_CONSTANT(kLtHdrLeafCount),
+        CAELIX_CONSTANT(kLtHdrNodeCount),
+        CAELIX_CONSTANT(kLtTreeHeaderBytes),
+        CAELIX_CONSTANT(kLtStBuilding),
+        CAELIX_CONSTANT(kLtStLeavesFound),
+        CAELIX_CONSTANT(kLtStLeavesDropped),
+        CAELIX_CONSTANT(kLtStBuilds),
+        CAELIX_CONSTANT(kLtStNodeOverflow),
+        CAELIX_CONSTANT(kLtStBounds),
+        CAELIX_CONSTANT(kLtTreeStateBytes),
+        CAELIX_CONSTANT(kLtCtlCurrent),
+        CAELIX_CONSTANT(kLtCtlPassResult),
+        CAELIX_CONSTANT(kLtCtlNeededUnits),
+        CAELIX_CONSTANT(kLtCtlLightGroups),
+        CAELIX_CONSTANT(kLtCtlBricksDropped),
+        CAELIX_CONSTANT(kLtCtlLightBricks),
+        CAELIX_CONSTANT(kLtCtlLightFaces),
+        CAELIX_CONSTANT(kLtCtlPasses),
+        CAELIX_CONSTANT(kLtCtlFailedPasses),
+        CAELIX_CONSTANT(kLtCtlPassFlags),
+        CAELIX_CONSTANT(kLtCtlRecordsRecomputed),
+        CAELIX_CONSTANT(kLtCtlRecordsCopied),
+        CAELIX_CONSTANT(kLtCtlTreesChanged),
+        CAELIX_CONSTANT(kLtCtlTreeHeaders),
+        CAELIX_CONSTANT(kLtCtlTreeStates),
+        CAELIX_CONSTANT(kLtControlBytes),
+        CAELIX_CONSTANT(kLtPassFailed),
+        CAELIX_CONSTANT(kLtPassOk),
+        CAELIX_CONSTANT(kLtPassNoChange),
+        CAELIX_CONSTANT(kLtPassFlagChanged),
+        CAELIX_CONSTANT(kLtPassFlagTreeShift),
+        CAELIX_CONSTANT(kLtRowBlockOffset),
+        CAELIX_CONSTANT(kLtRowBlockUnits),
+        CAELIX_CONSTANT(kLtRowGeneration),
+        CAELIX_CONSTANT(kLtRowGpuFlags),
+        CAELIX_CONSTANT(kLtRowCpuFlags),
+        CAELIX_CONSTANT(kLtRowBricks),
+        CAELIX_CONSTANT(kLtRowLightFaces),
+        CAELIX_CONSTANT(kLtGroupRowBytes),
+        CAELIX_CONSTANT(kLtRowBricksMask),
+        CAELIX_CONSTANT(kLtRowDroppedShift),
+        CAELIX_CONSTANT(kLtGpuLightChanged),
+        CAELIX_CONSTANT(kLtCpuRebuild),
+        CAELIX_CONSTANT(kLtCpuReleased),
+        CAELIX_CONSTANT(kLtCpuFresh),
+        CAELIX_CONSTANT(kLtUnitBytes),
+        CAELIX_CONSTANT(kLtBlockIndexOffset),
+        CAELIX_CONSTANT(kLtIndexPos),
+        CAELIX_CONSTANT(kLtIndexDenseId),
+        CAELIX_CONSTANT(kLtIndexRecordOffset),
+        CAELIX_CONSTANT(kLtIndexBvhLeaf),
+        CAELIX_CONSTANT(kLtIndexEntryBytes),
+        CAELIX_CONSTANT(kLtBvhLeafTreeShift),
+        CAELIX_CONSTANT(kLtBvhLeafIndexMask),
+        CAELIX_CONSTANT(kLtRecordFace),
+        CAELIX_CONSTANT(kLtRecordBoxLo),
+        CAELIX_CONSTANT(kLtRecordBoxHi),
+        CAELIX_CONSTANT(kLtRecordPos),
+        CAELIX_CONSTANT(kLtRecordEntryCount),
+        CAELIX_CONSTANT(kLtRecordCountsLo),
+        CAELIX_CONSTANT(kLtRecordCountsHi),
+        CAELIX_CONSTANT(kLtRecordHeaderBytes),
+        CAELIX_CONSTANT(kLtFamilyCountBits),
+        CAELIX_CONSTANT(kLtFamilyCountMask),
+        CAELIX_CONSTANT(kLtFamiliesPerCountWord),
+        CAELIX_CONSTANT(kLtFaceEntryBytes),
+        CAELIX_CONSTANT(kLtFaceEntryVoxelMask),
+        CAELIX_CONSTANT(kLtFaceEntryBlockShift),
+        CAELIX_CONSTANT(kLtVoxelBits),
+        CAELIX_CONSTANT(kLtVoxelMask),
+        CAELIX_CONSTANT(kLtLeafGroup),
+        CAELIX_CONSTANT(kLtLeafEntry),
+        CAELIX_CONSTANT(kLtLeafParent),
+        CAELIX_CONSTANT(kLtLeafBytes),
+        CAELIX_CONSTANT(kLtParentSlotBits),
+        CAELIX_CONSTANT(kLtParentSlotMask),
+        CAELIX_CONSTANT(kLtNodeChildFace),
+        CAELIX_CONSTANT(kLtNodeChildLo),
+        CAELIX_CONSTANT(kLtNodeChildHi),
+        CAELIX_CONSTANT(kLtNodeChild),
+        CAELIX_CONSTANT(kLtNodeParent),
+        CAELIX_CONSTANT(kLtNodeParentSlot),
+        CAELIX_CONSTANT(kLtNodeBytes),
+        CAELIX_CONSTANT(kLtNodeSlots),
+        CAELIX_CONSTANT(kLtNodeFaceBytes),
+        CAELIX_CONSTANT(kLtNodeBoxBytes),
+        CAELIX_CONSTANT(kLtChildLeafBit),
+        CAELIX_CONSTANT(kLtScratchKeys),
+        CAELIX_CONSTANT(kLtScratchValues),
+        CAELIX_CONSTANT(kLtScratchSortBufferStride),
+        CAELIX_CONSTANT(kLtScratchLeft),
+        CAELIX_CONSTANT(kLtScratchRight),
+        CAELIX_CONSTANT(kLtScratchParent),
+        CAELIX_CONSTANT(kLtScratchSortedLeafParent),
+        CAELIX_CONSTANT(kLtScratchCounter),
+        CAELIX_CONSTANT(kLtScratchWide),
+        CAELIX_CONSTANT(kLtScratchAggregates),
+        CAELIX_CONSTANT(kLtScratchHistogram),
+        CAELIX_CONSTANT(kLtSortBits),
+        CAELIX_CONSTANT(kLtSortDigits),
+        CAELIX_CONSTANT(kLtSortPasses),
+        CAELIX_CONSTANT(kLtSortBlock),
+    };
+#undef CAELIX_CONSTANT
+    std::map<std::string, uint64_t> known;
+    std::vector<std::string> errors;
+    size_t checked = 0;
+    for (const char* file : {"common/caelix_record.hlsl", "common/caelix_material.hlsl",
+                             "common/caelix_light_tree_layout.hlsl"})
+    {
+        for (const auto& [name, value] : HlslConstants(file, known, errors))
+        {
+            const auto found = cpp.find(name);
+            if (found == cpp.end())
+            {
+                errors.push_back(std::string(file) + ": " + name +
+                                 " has no C++ constant in this test's table");
+            }
+            else if (found->second != value)
+            {
+                errors.push_back(std::string(file) + ": " + name + " = " + std::to_string(value) + ", C++ " +
+                                 std::to_string(found->second));
+            }
+            ++checked;
+        }
+    }
+    for (const auto& [name, value] : cpp)
+    {
+        if (known.count(name) == 0)
+        {
+            errors.push_back(name + " is in the C++ table but in no HLSL layout header");
+        }
+    }
+    std::string text;
+    for (const std::string& error : errors)
+    {
+        text += error + "\n";
+    }
+    INFO(text);
+    CHECK(errors.empty());
+    std::printf("%zu HLSL layout constants compared with C++\n", checked);
 }

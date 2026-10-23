@@ -65,19 +65,40 @@ target_compile_definitions(caelix_material_test PRIVATE
 # has no DLSS.
 caelix_add_gpu_test(caelix_dlss_test dlss_test.cpp)
 
-# The frame constants' uniform block in the five compiled frame-constant kernels against the C layout of
-# lib/src/render/frame_constants.h (no GPU: parses the .spv files of the build's shader folder). Fails
-# when a member offset or an array stride of DXC's constant buffer layout differs from the C struct.
+# The GPU layouts shared by C++ and HLSL, no GPU: the frame constants' uniform block in the five
+# compiled frame-constant kernels against lib/src/render/frame_constants.h (fails when a member offset
+# or an array stride of DXC's constant buffer layout differs from the C struct), the push constant
+# blocks of the scene and light tree kernels against their C++ structs by member name, and every named
+# constant of the HLSL layout headers against the C++ constant of the same name.
 add_executable(caelix_frame_layout_test frame_layout_test.cpp)
 if(MSVC)
   target_compile_options(caelix_frame_layout_test PRIVATE /W4)
 else()
   target_compile_options(caelix_frame_layout_test PRIVATE -Wall -Wextra)
 endif()
-target_include_directories(caelix_frame_layout_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/src)
+target_include_directories(caelix_frame_layout_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/src
+  ${PROJECT_SOURCE_DIR}/include)
 target_compile_definitions(caelix_frame_layout_test PRIVATE
-  CAELIX_SHADER_SPV_DIR="${CMAKE_BINARY_DIR}/shaders")
+  CAELIX_SHADER_SPV_DIR="${CMAKE_BINARY_DIR}/shaders"
+  CAELIX_SHADER_SOURCE_DIR="${PROJECT_SOURCE_DIR}/shaders")
 target_link_libraries(caelix_frame_layout_test PRIVATE Catch2::Catch2WithMain)
 # The .spv files are outputs of the caelix_renderer build (cmake/Shaders.cmake).
 add_dependencies(caelix_frame_layout_test caelix_renderer)
 add_test(NAME caelix_frame_layout_test COMMAND caelix_frame_layout_test)
+
+# The light tree (docs/LIGHT_TREE.md) through the C ABI and a probe kernel that runs its device API
+# (tests/shaders/caelix_light_tree_probe.hlsl, compiled, not embedded: the test loads it from
+# ${CMAKE_BINARY_DIR}/shaders): light faces against a CPU reference, rows, leaves, records,
+# normalisation, sample/pdf consistency, histogram, bound property, updates, record copies, heap
+# growth. The hidden case [.bench] measures draws, the group pass and the BVH builds at about 10k,
+# 54k and 1M light bricks.
+caelix_compile_shaders(light_tree_probe_spv
+  SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shaders/caelix_light_tree_probe.hlsl)
+add_custom_target(caelix_light_tree_probe_shaders DEPENDS ${light_tree_probe_spv})
+caelix_add_gpu_test(caelix_light_tree_test light_tree_test.cpp)
+add_dependencies(caelix_light_tree_test caelix_light_tree_probe_shaders)
+# The library's layout headers (lib/src/scene/light_tree_layout.h) are the test's view of the GPU
+# memory; the probe and the library kernels load from the build's shader folder.
+target_include_directories(caelix_light_tree_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/src)
+target_compile_definitions(caelix_light_tree_test PRIVATE
+  CAELIX_TEST_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")

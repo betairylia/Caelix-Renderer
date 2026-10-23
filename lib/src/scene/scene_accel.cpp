@@ -331,7 +331,7 @@ bool Scene::PlanAccelerationStructures(uint64_t frame, bool& out_of_memory)
     }
     if (instance_count > 0)
     {
-        pending_.push_back(PendingCopy{span.offset, instances_.buffer(), 0,
+        pending_.push_back(StagedCopy{span.offset, instances_.buffer(), 0,
                                        static_cast<VkDeviceSize>(instance_count) * kInstanceBytes});
     }
     tlas_geometry_ = InstanceGeometry(instances_.address());

@@ -25,7 +25,7 @@ uint64_t RecordAddress(CaelixFrameConstants fc, uint record_index)
 {
     const uint page = record_index >> fc.records_per_page_shift;
     const uint slot = record_index & ((1u << fc.records_per_page_shift) - 1u);
-    const uint64_t page_address = CAELIX_LOAD_U64(fc.page_table + uint64_t(page) * 8);
+    const uint64_t page_address = CAELIX_LOAD_U64(fc.page_table + uint64_t(page) * kPageTableEntryBytes);
     return page_address + uint64_t(slot) * fc.record_bytes;
 }
 
@@ -49,10 +49,9 @@ float TraceCandidate(CaelixFrameConstants fc, uint group, uint id, float3 object
                      float3 object_direction, float t_current, out AttributeData attrib)
 {
     attrib.matID_faceNormal = 0u;
-    // GroupInfo: coord (words 0..2), entity, slot_row_base (word 4), ...
-    const uint64_t info = fc.group_infos + uint64_t(group) * 32;
-    const uint4 w0 = CAELIX_LOAD_U32x4(info);
-    const uint slot_row_base = CAELIX_LOAD_U32(info + 16);
+    const uint64_t info = fc.group_infos + uint64_t(group) * kGroupInfoBytes;
+    const uint4 w0 = CAELIX_LOAD_U32x4(info);  // coord, entity (kGroupInfoCoord = 0)
+    const uint slot_row_base = CAELIX_LOAD_U32(info + kGroupInfoSlotRowBase);
     const uint4 row = CAELIX_LOAD_U32x4(fc.slot_tables + (uint64_t(slot_row_base) + id) * kSlotRowBytes);
     if (SlotRowState(row.x) != kSlotStateResident || row.z == kInvalidRecord)
     {
@@ -65,7 +64,7 @@ float TraceCandidate(CaelixFrameConstants fc, uint group, uint id, float3 object
     const int mask = int((1u << shift) - 1u);
     const uint pos = SlotRowPos(row.x);
     const int3 brick = int3(int(pos) & mask, int(pos >> shift) & mask, int(pos >> (2 * shift)) & mask);
-    const float3 brick_origin = float3((int3(w0.xyz) * int(1u << shift) + brick) * 8);
+    const float3 brick_origin = float3((int3(w0.xyz) * int(1u << shift) + brick) * int(kBrickEdge));
     return CaelixTraceBrickPrimitiveCore(0, object_origin, object_direction, t_current, brick_origin,
                                          attrib);
 }
@@ -158,32 +157,32 @@ bool TraceShadow(CaelixFrameConstants fc, RayDesc ray)
     return occluded;
 }
 
-// The entity that owns `group` (GroupInfo word 3).
+// The entity that owns `group` (GroupInfo entity).
 uint GroupEntity(CaelixFrameConstants fc, uint group)
 {
-    return CAELIX_LOAD_U32(fc.group_infos + uint64_t(group) * 32 + 12);
+    return CAELIX_LOAD_U32(fc.group_infos + uint64_t(group) * kGroupInfoBytes + kGroupInfoEntity);
 }
 
 // The entity-local point `p` of the entity that owns `group` under the entity's
-// current transform (EntityInfo cur rows, bytes 32..79 of the 128-byte row).
+// current transform (EntityInfo cur rows).
 float3 EntityCurWorld(CaelixFrameConstants fc, uint group, float3 p)
 {
     const uint64_t entity_info = fc.entity_infos + uint64_t(GroupEntity(fc, group)) * kEntityInfoBytes;
-    const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + 32));
-    const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + 48));
-    const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + 64));
+    const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow0));
+    const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow1));
+    const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow2));
     const float4 h = float4(p, 1.0f);
     return float3(dot(r0, h), dot(r1, h), dot(r2, h));
 }
 
 // The same point under the entity's previous-frame transform (EntityInfo prev
-// rows, bytes 80..127).
+// rows).
 float3 EntityPrevWorld(CaelixFrameConstants fc, uint group, float3 p)
 {
     const uint64_t entity_info = fc.entity_infos + uint64_t(GroupEntity(fc, group)) * kEntityInfoBytes;
-    const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + 80));
-    const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + 96));
-    const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + 112));
+    const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoPrevRow0));
+    const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoPrevRow1));
+    const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoPrevRow2));
     const float4 h = float4(p, 1.0f);
     return float3(dot(r0, h), dot(r1, h), dot(r2, h));
 }

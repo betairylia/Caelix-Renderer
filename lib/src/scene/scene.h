@@ -10,9 +10,11 @@
 #include "rhi/pipeline.h"
 #include "rhi/staging_ring.h"
 #include "scene/gpu_structs.h"
+#include "scene/light_tree.h"
 #include "scene/material_table.h"
 #include "scene/record_layout.h"
 #include "scene/slot_table_pool.h"
+#include "scene/staged_copy.h"
 
 #include <cstdint>
 #include <memory>
@@ -103,6 +105,8 @@ struct Entity
     // position/rotation changed since the last flush: the next flush moves cur to
     // prev and computes cur.
     bool transform_changed = false;
+    // CAELIX_ENTITY_STATIC or CAELIX_ENTITY_DYNAMIC (caelix_scene_set_entity_motion).
+    uint32_t motion = CAELIX_ENTITY_STATIC;
 };
 
 class Scene
@@ -118,6 +122,7 @@ public:
     CaelixResult RemoveEntity(CaelixEntityId entity);
     CaelixResult SetEntityTransform(CaelixEntityId entity, const float position[3],
                                     const float rotation[4]);
+    CaelixResult SetEntityMotion(CaelixEntityId entity, uint32_t motion);
     // `consumed` is updated brick by brick, so it stays correct when a later
     // brick throws.
     CaelixResult UploadBricks(CaelixEntityId entity, uint32_t count, const CaelixBrickKey* keys,
@@ -134,6 +139,14 @@ public:
     CaelixResult SetGlassPalette(const CaelixMaterial* entries, uint32_t count);
     CaelixResult SetMaterialEntries(const CaelixMaterialEntry* entries, uint32_t count);
     CaelixResult GetMaterial(uint32_t code, CaelixMaterial& out) const;
+    // Light tree (scene_light.cpp, lib/src/scene/light_tree.h).
+    CaelixResult SetLightOptions(const CaelixLightOptions& options);
+    void GetLightStats(CaelixLightStats& out) const;
+    // The light tree descriptor's device address, 0 when the tree is disabled.
+    VkDeviceAddress light_tree_address() const
+    {
+        return light_ != nullptr ? light_->descriptor_address() : 0;
+    }
 
     bool EntityAlive(CaelixEntityId entity) const
     {
@@ -204,13 +217,13 @@ private:
         uint32_t record;
         uint32_t group_index;
         uint16_t id;
+        bool replaced;  // the brick was resident: the upload replaces the content of its record
     };
-    struct PendingCopy
+    // The staged copies of one record in the current window (StageRecordCopy).
+    struct StagedRecord
     {
-        VkDeviceSize src_offset;
-        VkBuffer dst;
-        VkDeviceSize dst_offset;
-        VkDeviceSize size;
+        size_t first;  // index in pending_ of the first region
+        bool full;     // one region of the whole record; else two that skip kRecordBoundsWord
     };
     struct PendingFill
     {
@@ -245,6 +258,11 @@ private:
         AsBlock block;
         VkAccelerationStructureKHR handle;
     };
+    struct RetiredLightTree
+    {
+        uint64_t frame;  // destroy when the safe frame is >= this
+        std::unique_ptr<LightTree> tree;
+    };
 
     explicit Scene(Device& device);
 
@@ -277,6 +295,8 @@ private:
     void QueueNeighbors(CaelixEntityId entity, const CaelixBrickKey& key, uint32_t group_index);
 
     void WriteRecord(uint8_t* dst, uint32_t pos, const uint8_t* blocks) const;
+    // Stages the copy of a written record (at `src_offset` in the ring) into its pool slot.
+    void StageRecordCopy(const Placed& placed, VkDeviceSize src_offset);
     // AABB range moves and fills of a group (no staging space needed).
     void PrepareGroupAabbs(Group& group);
     // Writes the dirty rows of one group (slot rows, info row, reverse words, NaN
@@ -292,6 +312,11 @@ private:
     uint32_t StageDirtyList();
     bool EnsureNanRow();
     void RecordCopies(VkCommandBuffer cmd);
+
+    // Light tree (scene_light.cpp).
+    LightSceneTables LightTables() const;
+    // Queues every resident brick for finalization (a new light code set).
+    void RequeueAllResident();
 
     // Acceleration structures.
     void MarkBlasDirty(uint32_t group_index);
@@ -341,6 +366,10 @@ private:
     ComputePipeline finalize_;
     GpuTimer flush_timer_;  // brackets the work that a flush records
 
+    // Light tree: null while disabled. A disabled tree lives until its last frame is safe.
+    std::unique_ptr<LightTree> light_;
+    std::vector<RetiredLightTree> retired_light_;
+
     // Acceleration structures.
     BlockAllocator as_pool_;
     GpuBuffer scratch_;         // build scratch of one flush, bump-allocated
@@ -365,7 +394,8 @@ private:
     uint64_t blas_count_ = 0;
     uint64_t as_builds_total_ = 0;
 
-    std::vector<PendingCopy> pending_;
+    std::vector<StagedCopy> pending_;
+    ankerl::unordered_dense::map<uint32_t, StagedRecord> record_copies_;  // by record index, this window
     std::vector<PendingFill> fills_;
     std::vector<VkBufferCopy> aabb_moves_;  // inside aabbs_.buffer()
     std::vector<RangeToFree> ranges_to_free_after_flush_;

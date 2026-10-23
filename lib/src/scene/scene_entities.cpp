@@ -24,8 +24,6 @@ constexpr uint32_t kMaxGroupShift = 8;
 // 1 << 15 bricks in this version.
 constexpr uint32_t kMaxImplementedGroupShift = 5;
 constexpr uint32_t kDefaultBlockBytes = 2;
-constexpr uint32_t kEncodingPacked = 0;
-constexpr uint32_t kEncodingBlockId = 1;
 
 // Brick keys must fit 21 bits per axis.
 constexpr int32_t kKeyLimit = 1 << 20;
@@ -234,6 +232,7 @@ CaelixResult Scene::AddEntity(const CaelixEntityDesc& desc, CaelixEntityId& out_
     // Initialize previous transforms as copy from current ones for entity creation
     std::memcpy(entity.prev_rows, entity.cur_rows, sizeof(entity.prev_rows));
     entity.transform_changed = false;
+    entity.motion = CAELIX_ENTITY_STATIC;
 
     // Initialize voxel data
     entity.groups.clear();
@@ -250,6 +249,10 @@ CaelixResult Scene::AddEntity(const CaelixEntityDesc& desc, CaelixEntityId& out_
 
     ListEntity(id); // Mark dirty
     ++entities_alive_;
+    if (light_ != nullptr)
+    {
+        light_->OnEntityAdded(id, entity.motion);
+    }
     out_id = id;
     return CAELIX_OK;
 }
@@ -286,6 +289,28 @@ CaelixResult Scene::RemoveEntity(CaelixEntityId id)
     free_entities_.push_back(id);
     tlas_dirty_ = true;
     --entities_alive_;
+    if (light_ != nullptr)
+    {
+        light_->OnEntityRemoved(id);
+    }
+    return CAELIX_OK;
+}
+
+CaelixResult Scene::SetEntityMotion(CaelixEntityId id, uint32_t motion)
+{
+    if (motion != CAELIX_ENTITY_STATIC && motion != CAELIX_ENTITY_DYNAMIC)
+    {
+        CAELIX_LOGE("caelix_scene_set_entity_motion: motion %u is not CAELIX_ENTITY_STATIC (0) or "
+                    "CAELIX_ENTITY_DYNAMIC (1)",
+                    motion);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    Entity& entity = entities_[id];
+    entity.motion = motion;
+    if (light_ != nullptr)
+    {
+        light_->OnEntityMotion(id, motion);
+    }
     return CAELIX_OK;
 }
 
@@ -299,6 +324,10 @@ CaelixResult Scene::SetEntityTransform(CaelixEntityId id, const float position[3
     entity.transform_changed = true;
     ListEntity(id);
     tlas_dirty_ = true;
+    if (light_ != nullptr)
+    {
+        light_->OnEntityMoved(id);
+    }
     return CAELIX_OK;
 }
 
@@ -490,6 +519,10 @@ uint32_t Scene::CreateGroup(CaelixEntityId entity_id, const Location& loc, SlotR
     SetGridCell(entity, loc.gx, loc.gy, loc.gz, index);
     ListEntity(entity_id);
     ++groups_alive_;
+    if (light_ != nullptr)
+    {
+        light_->OnGroupCreated(index);
+    }
     return index;
 }
 
@@ -535,6 +568,10 @@ void Scene::ReleaseGroup(uint32_t group_index)
     group.blas_dirty = false;
     free_groups_.push_back(group_index);
     --groups_alive_;
+    if (light_ != nullptr)
+    {
+        light_->OnGroupReleased(group_index, entity.motion);
+    }
 }
 
 // ---------------------------------------------------------------------------

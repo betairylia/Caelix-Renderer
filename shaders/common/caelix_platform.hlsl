@@ -48,4 +48,30 @@
 #define CAELIX_STORE_U32x2(addr, v) vk::RawBufferStore<uint2>(addr, v, 8)
 #define CAELIX_STORE_U32x4(addr, v) vk::RawBufferStore<uint4>(addr, v, 16)
 
+// Atomics on a buffer device address (DXC 1.8 has no vk::BufferPointer): the address becomes a
+// PhysicalStorageBuffer pointer through OpConvertUToPtr, and the SPIR-V atomic takes it directly.
+// Device scope. The plain forms are relaxed (order with barriers) and return the value before the
+// operation; _ACQ_REL orders the caller's other uniform-memory accesses around it (a counter that
+// hands data from one invocation to another); LOAD / STORE are coherent single-word accesses.
+typedef vk::SpirvType</* OpTypePointer */ 32, 8, 8,
+                      vk::Literal<vk::integral_constant<uint, /* PhysicalStorageBuffer */ 5349> >, uint>
+    CaelixPointerU32;
+[[vk::ext_instruction(/* OpConvertUToPtr */ 120)]]
+CaelixPointerU32 CaelixAddressToPointerU32(uint64_t address);
+[[vk::ext_instruction(/* OpAtomicLoad */ 227)]]
+uint CaelixSpirvAtomicLoad(CaelixPointerU32 pointer, uint scope, uint semantics);
+[[vk::ext_instruction(/* OpAtomicStore */ 228)]]
+void CaelixSpirvAtomicStore(CaelixPointerU32 pointer, uint scope, uint semantics, uint value);
+[[vk::ext_instruction(/* OpAtomicIAdd */ 234)]]
+uint CaelixSpirvAtomicAdd(CaelixPointerU32 pointer, uint scope, uint semantics, uint value);
+[[vk::ext_instruction(/* OpAtomicOr */ 241)]]
+uint CaelixSpirvAtomicOr(CaelixPointerU32 pointer, uint scope, uint semantics, uint value);
+// Scope Device = 1; semantics AcquireRelease (0x8) | UniformMemory (0x40) = 0x48.
+#define CAELIX_ATOMIC_ADD_U32(addr, v) CaelixSpirvAtomicAdd(CaelixAddressToPointerU32(addr), 1u, 0u, v)
+#define CAELIX_ATOMIC_ADD_ACQ_REL_U32(addr, v) \
+    CaelixSpirvAtomicAdd(CaelixAddressToPointerU32(addr), 1u, 0x48u, v)
+#define CAELIX_ATOMIC_OR_U32(addr, v) CaelixSpirvAtomicOr(CaelixAddressToPointerU32(addr), 1u, 0u, v)
+#define CAELIX_ATOMIC_LOAD_U32(addr) CaelixSpirvAtomicLoad(CaelixAddressToPointerU32(addr), 1u, 0u)
+#define CAELIX_ATOMIC_STORE_U32(addr, v) CaelixSpirvAtomicStore(CaelixAddressToPointerU32(addr), 1u, 0u, v)
+
 #endif  // CAELIX_PLATFORM_HLSL

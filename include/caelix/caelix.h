@@ -70,8 +70,12 @@ extern "C" {
    caelix_upscaler_query), the extension lists (caelix_upscaler_instance_extensions,
    caelix_upscaler_device_extensions), the jitter helpers (caelix_upscaler_jitter_phases,
    caelix_jitter_halton) and CaelixUpscalerInfo with caelix_renderer_get_upscaler_info, also without
-   a bump. A host built against an older version-2 header must be rebuilt (the library reads and
-   writes the larger structs). */
+   a bump. The light tree step added CaelixLightOptions, caelix_scene_set_light_options,
+   CaelixLightStats, caelix_scene_get_light_stats, caelix_scene_get_light_tree,
+   CAELIX_ENTITY_STATIC, CAELIX_ENTITY_DYNAMIC and caelix_scene_set_entity_motion, and record word 1
+   bits 18..30 (light face count, record stale; readers of the tight bounds mask bits 0..17), also
+   without a bump. A host built against an older version-2 header must be rebuilt (the library reads
+   and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
 typedef struct CaelixVersion
@@ -294,6 +298,18 @@ CAELIX_API CaelixResult caelix_scene_set_entity_transform(CaelixScene* scene, Ca
                                                           const float position[3],
                                                           const float rotation[4]);
 
+/* Entity motion: whether the host expects the entity to move (for example its physics body type).
+   Today only the light tree uses it: it chooses which of the two light BVHs holds the entity's
+   lights. A static entity may still move, but every move of one rebuilds the whole static light
+   BVH; a dynamic entity's move rebuilds only the dynamic one. Other parts of the library may use it
+   later. A new entity is static; the value survives until the entity is removed. */
+#define CAELIX_ENTITY_STATIC 0u
+#define CAELIX_ENTITY_DYNAMIC 1u
+/* Sets the motion of an entity (CAELIX_ENTITY_STATIC or CAELIX_ENTITY_DYNAMIC; other values return
+   CAELIX_ERROR_INVALID_ARGUMENT). Takes effect at the next flush. */
+CAELIX_API CaelixResult caelix_scene_set_entity_motion(CaelixScene* scene, CaelixEntityId entity,
+                                                       uint32_t motion);
+
 /* Entity-local brick key = block >> 3 per axis. Each axis must be in [-2^20, 2^20). */
 typedef struct CaelixBrickKey
 {
@@ -503,6 +519,97 @@ CAELIX_API CaelixResult caelix_scene_set_material_entries(CaelixScene* scene,
    GPU at the next flush. */
 CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint32_t code,
                                                   CaelixMaterial* out);
+
+/* ---------------------------------------------------------------------------
+ * Light tree (docs/LIGHT_TREE.md)
+ *
+ * An optional light BVH at brick granularity over the emissive voxels of the scene, for drawing a
+ * light point for any receiver with an exact pdf (the device API in
+ * shaders/scene/caelix_light_tree.hlsl). Disabled by default: a scene without it pays nothing.
+ *
+ * A light voxel is a voxel whose material emission luminance, dot(emission, (0.2126, 0.7152,
+ * 0.0722)) before CaelixRenderOptions::emission_scale, is at least min_emission; a light face is a
+ * face of a light voxel whose neighbour voxel (also across bricks and groups of the entity; an
+ * absent brick is air) is not opaque. Structure: every light brick has a brick light record (face
+ * sums, tight box, its face entries) in its render group's block; two world-space 4-wide BVHs over
+ * the light bricks, one for the static and one for the dynamic entities
+ * (caelix_scene_set_entity_motion), whose depth follows the number of light bricks, not the size of
+ * the world.
+ *
+ * caelix_scene_flush updates it after the finalize kernel: the groups whose light content changed
+ * are rebuilt (only the records of the changed bricks are recomputed, the others are copied), every
+ * other group's block is copied into the other of two heap buffers (a pass either commits
+ * completely or changes nothing); then a BVH is gathered and rebuilt on the GPU when its leaves
+ * changed (a committed pass that rebuilt or released a group of its entities, a moved entity of its
+ * motion). When the heap or a BVH is too small, the library reads that back once the frame is safe
+ * (caelix_scene_recycle or a later flush), grows the buffers and retries at the next flush. The GPU
+ * time of this work is inside CaelixGpuTimings::flush_ms and reported separately as
+ * CaelixLightStats::gpu_ms.
+ *
+ * Set the options (and the materials) before uploading bricks: enabling the tree, or a change of
+ * the set of light material codes (materials or min_emission) while bricks are resident, finalizes
+ * every resident brick again, as a reload would. Emission changes that keep every code on the same
+ * side of min_emission rebuild nothing (the radiance comes from the material table at draw time;
+ * stale weights change only the sampling quality).
+ * ------------------------------------------------------------------------- */
+
+typedef struct CaelixLightOptions
+{
+    uint32_t enabled;    /* 0 = no light tree (the default), 1 = build it */
+    float min_emission;  /* light voxel threshold: luminance of the material emission before
+                            emission_scale. 0 = 20. Must be finite and >= 0. */
+    uint64_t heap_bytes; /* initial capacity of each of the two heap buffers, rounded up to 16
+                            bytes. 0 = 16 MiB; at most 2^32 x 16 bytes. Used when the tree is
+                            created (enabled 0 -> 1); the heap grows on demand. */
+} CaelixLightOptions;
+
+/* Enables, disables or reconfigures the light tree. Disabling releases its GPU buffers once the
+   last flushed frame is safe; enabling it again starts from scratch. Takes effect at the next
+   flush. Invalid values (enabled not 0 or 1, min_emission negative or not finite, heap_bytes above
+   2^32 x 16) return CAELIX_ERROR_INVALID_ARGUMENT and change nothing. */
+CAELIX_API CaelixResult caelix_scene_set_light_options(CaelixScene* scene,
+                                                       const CaelixLightOptions* options);
+
+/* The newest light update the library has read back (once its frame is safe). 104 bytes. */
+typedef struct CaelixLightStats
+{
+    uint32_t enabled;             /* 1 while the light tree is enabled */
+    uint32_t light_groups;        /* render groups with at least one light brick */
+    uint64_t light_bricks;        /* bricks with at least one light face, in the tree */
+    uint64_t light_faces;         /* light faces in the tree */
+    uint64_t bricks_dropped;      /* light bricks above the 4096 per group limit (group_shift 5
+                                     only) */
+    uint64_t heap_bytes_used;     /* bytes of every live light block after the newest pass with
+                                     changes */
+    uint64_t heap_bytes_capacity; /* capacity of EACH of the two heap buffers */
+    uint32_t passes;              /* group passes that rebuilt or released at least one group */
+    uint32_t failed_passes;       /* of those, passes that did not fit the heap (retried after
+                                     growth) */
+    uint32_t records_recomputed;  /* brick light records recomputed by the newest pass */
+    uint32_t records_copied;      /* brick light records copied from the old block by the newest
+                                     pass */
+    float gpu_ms;                 /* GPU time of the newest measured light update (group pass,
+                                     gathers, BVH builds); 0 before the first one */
+    uint32_t pad;
+    /* The two light BVHs, indexed by CAELIX_ENTITY_STATIC / CAELIX_ENTITY_DYNAMIC, at their newest
+       build: */
+    uint32_t tree_leaves[2];         /* light bricks (leaves) in the tree */
+    uint32_t tree_nodes[2];          /* 4-wide nodes */
+    uint32_t tree_builds[2];         /* builds so far */
+    uint32_t tree_leaves_dropped[2]; /* light bricks above the leaf capacity (the capacity grows
+                                        and the tree is rebuilt at a later flush) */
+} CaelixLightStats;
+
+/* Fills *out. A NULL argument is ignored; a scene without a light tree reports enabled = 0 and 0
+   in every other field. */
+CAELIX_API void caelix_scene_get_light_stats(const CaelixScene* scene, CaelixLightStats* out);
+
+/* Device address of the light tree descriptor (128 bytes, docs/LIGHT_TREE.md section 2.3), the
+   argument of LightTreeOpen; 0 when the tree is disabled or the scene is NULL. The address is
+   valid for commands recorded after the flush that followed the call (the descriptor's contents
+   change at flushes; its address stays while the tree is enabled). The renderer passes the same
+   value in its frame constants (light_tree). */
+CAELIX_API uint64_t caelix_scene_get_light_tree(const CaelixScene* scene);
 
 /* ---------------------------------------------------------------------------
  * Renderer: traces a scene into the host's images

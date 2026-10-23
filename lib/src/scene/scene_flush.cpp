@@ -22,7 +22,7 @@ constexpr size_t kMaxRegionsPerCopy = 4096;
 SlotRow ToRow(const BrickSlotCpu& slot)
 {
     SlotRow row{};
-    row.pos_state = (slot.pos & 0x00FFFFFFu) | (static_cast<uint32_t>(slot.state) << 24);
+    row.pos_state = (slot.pos & kSlotRowPosMask) | (static_cast<uint32_t>(slot.state) << kSlotRowStateShift);
     row.summary = 0;
     row.record_index = slot.record_index;
     row.last_used = 0;
@@ -189,14 +189,14 @@ bool Scene::StageGroup(uint32_t group_index, Group& group)
         std::memcpy(span.data + k * kSlotRowBytes, &row, sizeof(row));
         if (!group.full_rewrite)
         {
-            pending_.push_back(PendingCopy{span.offset + k * kSlotRowBytes, table,
+            pending_.push_back(StagedCopy{span.offset + k * kSlotRowBytes, table,
                                            range_base + static_cast<VkDeviceSize>(id) * kSlotRowBytes,
                                            kSlotRowBytes});
         }
     }
     if (group.full_rewrite && slot_rows > 0)
     {
-        pending_.push_back(PendingCopy{span.offset, table, range_base, slot_bytes});
+        pending_.push_back(StagedCopy{span.offset, table, range_base, slot_bytes});
     }
 
     // GroupInfo row.
@@ -213,7 +213,7 @@ bool Scene::StageGroup(uint32_t group_index, Group& group)
         info.aabb_row_base = group.aabb_rows.offset;
         info.high_water = static_cast<uint32_t>(group.slots.size());
         std::memcpy(span.data + cursor, &info, sizeof(info));
-        pending_.push_back(PendingCopy{span.offset + cursor, group_infos_.buffer(),
+        pending_.push_back(StagedCopy{span.offset + cursor, group_infos_.buffer(),
                                        static_cast<VkDeviceSize>(group_index) * sizeof(GroupInfo),
                                        sizeof(GroupInfo)});
         cursor += sizeof(GroupInfo);
@@ -231,15 +231,15 @@ bool Scene::StageGroup(uint32_t group_index, Group& group)
             std::memcpy(span.data + cursor, &value, sizeof(value));
             cursor += sizeof(uint32_t);
         }
-        pending_.push_back(PendingCopy{span.offset + run_begin, reverse_tables_.buffer(),
-                                       reverse_base + static_cast<VkDeviceSize>(run.first) * 4,
+        pending_.push_back(StagedCopy{span.offset + run_begin, reverse_tables_.buffer(),
+                                       reverse_base + static_cast<VkDeviceSize>(run.first) * sizeof(uint32_t),
                                        cursor - run_begin});
     }
 
     // NaN rows of freed ids.
     for (const uint16_t id : group.nan_ids)
     {
-        pending_.push_back(PendingCopy{nan_row_offset_, aabbs_.buffer(),
+        pending_.push_back(StagedCopy{nan_row_offset_, aabbs_.buffer(),
                                        aabbs_.ByteOffset(group.aabb_rows.offset + id), kAabbRowBytes});
     }
 
@@ -281,7 +281,7 @@ bool Scene::StageEntity(CaelixEntityId id, Entity& entity)
         std::memcpy(info.cur_rows, entity.cur_rows, sizeof(info.cur_rows));
         std::memcpy(info.prev_rows, entity.prev_rows, sizeof(info.prev_rows));
         std::memcpy(span.data, &info, sizeof(info));
-        pending_.push_back(PendingCopy{span.offset, entity_infos_.buffer(),
+        pending_.push_back(StagedCopy{span.offset, entity_infos_.buffer(),
                                        static_cast<VkDeviceSize>(id) * sizeof(EntityInfo),
                                        sizeof(EntityInfo)});
         cursor += sizeof(EntityInfo);
@@ -290,7 +290,7 @@ bool Scene::StageEntity(CaelixEntityId id, Entity& entity)
     {
         const uint64_t bytes = (static_cast<uint64_t>(run.last) - run.first + 1) * sizeof(uint32_t);
         std::memcpy(span.data + cursor, &entity.grid[run.first], bytes);
-        pending_.push_back(PendingCopy{span.offset + cursor, grids_.buffer(),
+        pending_.push_back(StagedCopy{span.offset + cursor, grids_.buffer(),
                                        grids_.ByteOffset(entity.grid_range.offset + run.first), bytes});
         cursor += bytes;
     }
@@ -317,7 +317,7 @@ bool Scene::StagePageTable()
         const uint64_t address = records_.PageAddress(page);
         std::memcpy(span.data + (page - pages_staged_) * sizeof(uint64_t), &address, sizeof(address));
     }
-    pending_.push_back(PendingCopy{span.offset, page_table_.buffer(),
+    pending_.push_back(StagedCopy{span.offset, page_table_.buffer(),
                                    static_cast<VkDeviceSize>(pages_staged_) * sizeof(uint64_t),
                                    count * sizeof(uint64_t)});
     pages_staged_ = pages;
@@ -353,7 +353,7 @@ void Scene::StageMaterials()
                     reinterpret_cast<const uint8_t*>(materials_->data()) + offset,
                     MaterialTable::kChunkBytes);
         pending_.push_back(
-            PendingCopy{span.offset, material_buffer_.buffer(), offset, MaterialTable::kChunkBytes});
+            StagedCopy{span.offset, material_buffer_.buffer(), offset, MaterialTable::kChunkBytes});
         materials_->MarkStaged(chunk);
     }
 }
@@ -414,7 +414,7 @@ uint32_t Scene::StageDirtyList()
     if (fit > 0)
     {
         pending_.push_back(
-            PendingCopy{span.offset, dirty_buffer_.buffer(), 0, fit * sizeof(DirtyEntry)});
+            StagedCopy{span.offset, dirty_buffer_.buffer(), 0, fit * sizeof(DirtyEntry)});
     }
     if (fit < valid.size())
     {
@@ -431,11 +431,13 @@ uint32_t Scene::StageDirtyList()
 
 void Scene::RecordCopies(VkCommandBuffer cmd)
 {
+    // Regions emptied by StageRecordCopy (a record that switched to one full copy) go first.
+    std::erase_if(pending_, [](const StagedCopy& copy) { return copy.size == 0; });
     // Sort by destination. The sort is stable, so among copies to the same
     // destination (a brick uploaded twice, or a record freed and reused in one
     // window) the last one staged stays last.
     std::stable_sort(pending_.begin(), pending_.end(),
-                     [](const PendingCopy& a, const PendingCopy& b) {
+                     [](const StagedCopy& a, const StagedCopy& b) {
                          const uint64_t da = HandleToU64(a.dst);
                          const uint64_t db = HandleToU64(b.dst);
                          return da != db ? da < db : a.dst_offset < b.dst_offset;
@@ -469,7 +471,7 @@ void Scene::RecordCopies(VkCommandBuffer cmd)
         regions.clear();
         for (; i < pending_.size() && pending_[i].dst == dst; ++i)
         {
-            const PendingCopy& copy = pending_[i];
+            const StagedCopy& copy = pending_[i];
             if (!regions.empty())
             {
                 VkBufferCopy& last = regions.back();
@@ -503,6 +505,12 @@ void Scene::Recycle(uint64_t safe_frame)
     flush_timer_.Resolve(safe_frame_);
     std::erase_if(deferred_buffers_,
                   [this](const DeferredBuffer& deferred) { return deferred.frame <= safe_frame_; });
+    std::erase_if(retired_light_,
+                  [this](const RetiredLightTree& retired) { return retired.frame <= safe_frame_; });
+    if (light_ != nullptr)
+    {
+        light_->Recycle(safe_frame_);
+    }
 }
 
 CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
@@ -540,6 +548,14 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
         }
     }
     motion_entities_.clear();
+
+    // 1b. Light tree: CPU work and allocations (may throw: nothing is staged yet). A new light code
+    //     set finalizes every resident brick again.
+    if (light_ != nullptr && light_->Prepare(*materials_, LightTables()) &&
+        bricks_resident_ > 0)
+    {
+        RequeueAllResident();
+    }
 
     // 2. GPU-side table work that needs no staging space: AABB range moves and
     //    NaN fills, reverse table and group grid fills of new ranges.
@@ -637,6 +653,12 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
         }
     }
 
+    // 4a. The light tree's staged rows (only with consistent scene tables). When the ring is full,
+    //     its whole update waits for a later flush.
+    const bool light_pass =
+        light_ != nullptr && !ring_full && light_->Stage(staging_, pending_, dispatch_count > 0);
+    const bool light_transfers = light_ != nullptr && light_->PrepareTransfers();
+
     // 4b. Acceleration structure builds after the kernel (needs ring space for the
     //     TLAS instances).
     bool as_out_of_memory = false;
@@ -679,7 +701,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
     }
 
     if (!pending_.empty() || !growth.empty() || !fills_.empty() || !aabb_moves_.empty() ||
-        dispatch_count > 0 || as_planned)
+        dispatch_count > 0 || as_planned || light_pass || light_transfers)
     {
         staging_.FlushHostWrites();
         flush_timer_.Begin(cmd, frame, safe_frame_);
@@ -692,14 +714,19 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
 
-        // 7. Growth copies.
-        if (!growth.empty())
+        // 7. Growth copies, and the light tree's transfers (its growth copies, fills, descriptor and
+        //    code set).
+        if (!growth.empty() || light_transfers)
         {
             for (GrowthCopy& copy : growth)
             {
                 const VkBufferCopy region{0, 0, copy.source.size()};
                 vkCmdCopyBuffer(cmd, copy.source.buffer(), copy.destination, 1, &region);
                 deferred_buffers_.push_back(DeferredBuffer{frame, std::move(copy.source)});
+            }
+            if (light_transfers)
+            {
+                light_->RecordTransfers(cmd);
             }
             TransferBarrier(cmd);
         }
@@ -742,6 +769,11 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
             push.record_bytes = layout_.record_bytes;
             push.group_shift = group_shift_;
             push.encoding = encoding_;
+            if (light_ != nullptr)
+            {
+                push.light_codes = light_->light_codes_address();
+                push.light_group_rows = light_->group_rows_address();
+            }
             for (uint32_t base = 0; base < dispatch_count; base += kMaxDispatchGroups)
             {
                 const uint32_t groups = std::min(kMaxDispatchGroups, dispatch_count - base);
@@ -762,6 +794,13 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
                           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         }
 
+        // 10b. The light tree: the group pass, then per tree the gather and the BVH build (its own
+        //      timer; it ends with a compute -> all commands barrier).
+        if (light_pass)
+        {
+            light_->Record(cmd, frame, safe_frame_);
+        }
+
         // 11. BLAS builds over the AABB rows, then the TLAS over the instances. The
         //     barrier above makes the copies and the kernel's writes visible to them.
         if (as_planned)
@@ -774,6 +813,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
     // 12. Close the window.
     staging_.CloseFrame(frame);
     pending_.clear();
+    record_copies_.clear();
     fills_.clear();
     aabb_moves_.clear();
     nan_row_valid_ = false;
@@ -783,6 +823,10 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
         item.pool->Free(item.range);
     }
     ranges_to_free_after_flush_.clear();
+    if (light_ != nullptr)
+    {
+        light_->EndFlush(frame);
+    }
     last_frame_ = frame;
     has_flushed_ = true;
     return as_out_of_memory ? CAELIX_ERROR_OUT_OF_MEMORY : CAELIX_OK;

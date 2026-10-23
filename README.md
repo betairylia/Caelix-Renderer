@@ -166,6 +166,12 @@ All pools grow by doubling with a copy at the next flush, like the slot table.
 Small table updates are staged as runs that also cover short clean gaps,
 because every `vkCmdCopyBuffer` region has a fixed GPU cost.
 
+### Light tree
+
+Light bricks, brick light records, the static and dynamic light BVHs and the device API that draws
+a light point with its pdf (`caelix_scene_set_light_options`, `shaders/scene/caelix_light_tree.hlsl`):
+[`docs/LIGHT_TREE.md`](docs/LIGHT_TREE.md). Test: `caelix_light_tree_test`.
+
 ### Acceleration structures
 
 Each flush builds the acceleration structures after the finalize kernel
@@ -349,7 +355,7 @@ flush builds the TLAS that the render binds.
   with fixed formats, binding 19 the sky cubemap as a sampled image and 20 its
   sampler (`lib/src/render/render_kernels.h`). Set 1 is the frame set, shared by the five
   frame-constant kernels (`caelix_path_trace`, `caelix_composite`, `caelix_cross_resolve`,
-  `caelix_sky_sh`, `caelix_upscale_encode`): binding 0 the frame slot's 544-byte
+  `caelix_sky_sh`, `caelix_upscale_encode`): binding 0 the frame slot's 560-byte
   `CaelixFrameConstants` block as a uniform buffer (`g_frame`, `shaders/common/caelix_frame_ubo.hlsl`,
   `shaders/common/caelix_frame.hlsl`, `lib/src/render/frame_constants.h`; `kFrameSetIndex`).
   A uniform buffer is read-only, so the compiler re-reads a field where it is used instead of
@@ -871,10 +877,23 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   `Block`; member `Offset`, `ArrayStride`, `MatrixStride`, `DescriptorSet` / `Binding`), recomputes
   the C natural layout of the same member sequence and fails on the first member whose offset
   differs (printing the member index, its name and both offsets), on a stride that is not the
-  element size, on a block that does not end at `sizeof(FrameConstants)` (544) or that is not at
+  element size, on a block that does not end at `sizeof(FrameConstants)` (560) or that is not at
   set 1, binding 0. Run it after every change of `CaelixFrameConstants`: DXC's constant buffer
   layout moves a vector that crosses a 16-byte row (`float2` at 476 goes to 480) and gives an array
-  of scalars a 16-byte stride, without any compile error.
+  of scalars a 16-byte stride, without any compile error. Two more cases: the push constant block of
+  every scene and light tree kernel against its C++ struct, member by member and by name
+  (`FinalizePush`, `LightGroupPush`, `LightBvhPush`, `LightScanPush`, `LightSortPush`), and every
+  named constant of `shaders/common/caelix_record.hlsl`, `caelix_material.hlsl` and
+  `caelix_light_tree_layout.hlsl` (the field offsets, bit fields and sizes the kernels address
+  memory with) against the C++ constant of the same name in `lib/src/scene/record_layout.h`,
+  `gpu_structs.h`, `material_table.h` and `light_tree_layout.h`, whose static_asserts tie them to
+  the structs.
+- `caelix_light_tree_test`: the light tree (`docs/LIGHT_TREE.md` section 7) through the C ABI and a
+  probe kernel (`tests/shaders/caelix_light_tree_probe.hlsl`, compiled by the test build into
+  `build/shaders`): light faces, records and both BVHs against a CPU reference, normalisation,
+  sample/pdf consistency, histogram, bound property, edits, record copies, static/dynamic entities,
+  heap growth, the radix sort against `std::sort`. `caelix_light_tree_test.exe "[.bench]"` measures
+  draws, group passes and BVH builds at about 10k, 54k and 1M light bricks.
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
