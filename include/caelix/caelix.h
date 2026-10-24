@@ -1107,8 +1107,8 @@ typedef struct CaelixLightNeeOptions
     float footprint;           /* a vertex whose pixel footprint (world units per pixel at its camera
                                   distance) is below this uses 32-voxel cells, else 128-voxel cells.
                                   0 = 0.25; finite and >= 0 */
-    uint32_t reservoir_mode;   /* CAELIX_LIGHT_NEE_RESERVOIRS_*; DEFAULT = ROTATE (the fill bench of
-                                  docs/LIGHT_NEE.md section 11.3) */
+    uint32_t reservoir_mode;   /* CAELIX_LIGHT_NEE_RESERVOIRS_*; DEFAULT = OFF (docs/LIGHT_NEE.md
+                                  section 11.3) */
     uint32_t candidates;       /* candidates per refreshed reservoir: 0 = the default (1), 1 = a plain
                                   light tree draw, 2 = resampled by the brick's importance for the cell */
     uint32_t max_age;          /* a cell not looked up for more than this many frames is evicted.

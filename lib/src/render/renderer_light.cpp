@@ -14,8 +14,9 @@ namespace {
 constexpr uint32_t kDefaultCellCapacity = 262144;
 constexpr uint32_t kMinCellCapacity = 1024;
 constexpr float kDefaultFootprint = 0.25f;
-// The fill bench's decision (docs/LIGHT_NEE.md section 3.2, the owner's rule on rootfall): see there.
-constexpr uint32_t kDefaultReservoirMode = kLightCellModeRotate;
+// Mode "off" (owner choice 2026-10-24 after the fill bench, docs/LIGHT_NEE.md section 11.3): white
+// frame-to-frame noise for the denoiser, at the higher fill cost.
+constexpr uint32_t kDefaultReservoirMode = kLightCellModeOff;
 constexpr uint32_t kDefaultCandidates = 1;
 constexpr uint32_t kMaxCandidates = 2;
 constexpr uint32_t kDefaultMaxAge = 128;
