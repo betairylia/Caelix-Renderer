@@ -74,7 +74,9 @@ extern "C" {
    CaelixLightStats, caelix_scene_get_light_stats, caelix_scene_get_light_tree,
    CAELIX_ENTITY_STATIC, CAELIX_ENTITY_DYNAMIC and caelix_scene_set_entity_motion, and record word 1
    bits 18..30 (light face count, record stale; readers of the tight bounds mask bits 0..17), also
-   without a bump. A host built against an older version-2 header must be rebuilt (the library reads
+   without a bump. The light NEE step added CaelixLightNeeOptions, CAELIX_LIGHT_NEE_FLAG_NO_MIS,
+   caelix_renderer_set_light_nee_options, CaelixLightNeeStats and caelix_renderer_get_light_nee_stats,
+   also without a bump. A host built against an older version-2 header must be rebuilt (the library reads
    and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -1067,109 +1069,42 @@ CAELIX_API CaelixResult caelix_renderer_render(CaelixRenderer* renderer, const C
 
 /* ---------------------------------------------------------------------------
  * Light NEE (docs/LIGHT_NEE.md): next-event estimation of the scene's light voxels (the light tree,
- * caelix_scene_set_light_options) in the lighting modes. Every renderer owns a hash table of light
- * cells: world regions of 32 or 128 voxels per entity and receiver face (the level follows the pixel
- * footprint), each with 64 reservoirs (128 or 256 by the options) of light bricks drawn from the light
- * tree for the cell's
- * receiver box. Per render call: the cells' maintenance (eviction after max_age frames without a
- * lookup, the key table rebuilt from the live cells), the fill of the cells the previous frame looked
- * up, then the trace: every diffuse path vertex with a next segment looks its (jittered) cell up
- * (inserting a missing one), draws one lamp candidate from a uniform reservoir and a point on the
- * brick, chooses between it and the sun candidate (CAELIX_RENDER_FLAG_SUN_NEE) by their unoccluded
- * contributions times the cell's sun visibility hint, and traces ONE shadow ray; the next BSDF hit on
- * a lamp the NEE can sample is weighted by the balance heuristic (MIS) with a density proxy from the
- * cell. A vertex without a usable cell (none yet, a full table) does no lamp NEE: the BSDF path keeps
- * the full emission there. Without a light tree (or in the primary mode) nothing runs.
- * Memory per renderer: cell_capacity cells x (64 + 16 x reservoirs) bytes + the key table and the free
- * stack and active list; at the defaults 262144 cells x 1088 bytes + 16 MiB + 2 MiB: about 290 MiB
- * (256 reservoirs: 262144 x 4160 bytes, about 1.02 GiB of cells), allocated at the first render call
- * with light NEE and released (once its frames are safe) when it is disabled or the capacity, the
- * reservoir count or CAELIX_LIGHT_NEE_FLAG_NO_CELLS changes. With CAELIX_LIGHT_NEE_FLAG_NO_CELLS
- * (experimental) no cell exists: every NEE vertex draws its lamp from the light tree for its own
- * point and normal.
+ * caelix_scene_set_light_options) in the lighting modes. Every diffuse path vertex with a next
+ * segment draws one lamp point from the light tree for its own point and normal. One shadow ray is
+ * chosen between the sun candidate (CAELIX_RENDER_FLAG_SUN_NEE) and the lamp candidate by their
+ * unoccluded contributions (one-sample RIS, no hint) and traced. The next BSDF hit on a lamp that the
+ * NEE can sample is weighted by the balance heuristic (MIS) with the exact light tree pdf of that
+ * point, evaluated for the same receiver point and normal as the draw. Lamp points closer than 8
+ * world units to the receiver belong to the BSDF path on both sides (the near field). The light NEE
+ * uses no memory: nothing is kept between frames or shared between pixels. Without a light tree (or
+ * in the primary mode) it does not run; frames without light NEE use a trace kernel without its code.
  * ------------------------------------------------------------------------- */
 
-#define CAELIX_LIGHT_NEE_RESERVOIRS_DEFAULT 0u /* the library's default (see CaelixLightNeeOptions) */
-#define CAELIX_LIGHT_NEE_RESERVOIRS_OFF 1u     /* every reservoir of an active cell is redrawn per fill */
-#define CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE 2u  /* a rotating quarter is redrawn per fill (each at most 4
-                                                  fills old; a stale one at once) */
-#define CAELIX_LIGHT_NEE_FLAG_NO_JITTER (1u << 0)     /* look the cell up at the vertex's own cell point
-                                                         (no random offset of half a cell) */
-#define CAELIX_LIGHT_NEE_FLAG_NO_MIS (1u << 1)        /* exclusive rule instead of the balance heuristic:
-                                                         the BSDF path counts no lamp the NEE can sample */
-#define CAELIX_LIGHT_NEE_FLAG_NO_SUN_HINT (1u << 2)   /* the sun / lamp choice without the cell's sun
-                                                         visibility hint */
-#define CAELIX_LIGHT_NEE_FLAG_NO_CONTROLLER (1u << 3) /* a fixed footprint (no coarsening when the table
-                                                         fills up) */
-#define CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY (1u << 4)   /* measurement: cells are looked up, inserted and
-                                                         filled, but no lamp NEE runs (the image is the
-                                                         one without light NEE) */
-#define CAELIX_LIGHT_NEE_FLAG_NO_CELLS (1u << 5)      /* experimental (docs/LIGHT_NEE.md section 11.6): no
-                                                         light cells (no table, fill or maintenance; no
-                                                         cell memory); every NEE vertex draws its lamp
-                                                         from the light tree for its own point and
-                                                         normal (LightTreeSample), the BSDF side's MIS
-                                                         weight uses the exact pdf (LightTreeBrickPdf x
-                                                         in_brick); the sun / lamp choice runs without
-                                                         the sun hint. NO_JITTER, NO_SUN_HINT and
-                                                         NO_CONTROLLER have no effect; NO_CELLS with
-                                                         LOOKUP_ONLY is CAELIX_ERROR_INVALID_ARGUMENT */
+#define CAELIX_LIGHT_NEE_FLAG_NO_MIS (1u << 0) /* exclusive rule instead of the balance heuristic: the
+                                                  BSDF path counts no lamp the NEE can sample */
 
 typedef struct CaelixLightNeeOptions
 {
-    uint32_t enabled;          /* 0 = off (the default), 1 = on */
-    uint32_t cell_capacity;    /* light cells of the renderer's table. 0 = 262144; else 1024 .. 2^21 */
-    float footprint;           /* a vertex whose pixel footprint (world units per pixel at its camera
-                                  distance) is below this uses 32-voxel cells, else 128-voxel cells.
-                                  0 = 0.25; finite and >= 0 */
-    uint32_t reservoir_mode;   /* CAELIX_LIGHT_NEE_RESERVOIRS_*; DEFAULT = OFF (docs/LIGHT_NEE.md
-                                  section 11.3) */
-    uint32_t candidates;       /* candidates per refreshed reservoir: 0 = the default (1), 1 = a plain
-                                  light tree draw, 2 = resampled by the brick's importance for the cell */
-    uint32_t max_age;          /* a cell not looked up for more than this many frames is evicted.
-                                  0 = 128; at most 2^20 */
-    uint32_t flags;            /* CAELIX_LIGHT_NEE_FLAG_* */
-    uint32_t reservoirs;       /* reservoirs per cell: 0 = 64; else 64, 128 or 256 (cell_capacity x
-                                  (64 + 16 x reservoirs) bytes must stay within 4 GiB) */
-} CaelixLightNeeOptions;       /* 32 bytes */
+    uint32_t enabled;     /* 0 = off (the default), 1 = on */
+    uint32_t flags;       /* CAELIX_LIGHT_NEE_FLAG_* */
+    uint32_t reserved[2]; /* must be 0 */
+} CaelixLightNeeOptions;  /* 16 bytes */
 
-/* Sets the light NEE options of a renderer; they apply from its next render call (a new cell_capacity
-   or reservoir count replaces the table: its cells start empty). Invalid values (enabled not 0 or 1,
-   cell_capacity out of range, footprint negative or not finite, an unknown reservoir mode, candidates
-   above 2, max_age above 2^20, unknown flag bits, reservoirs not 0, 64, 128 or 256, cells above 4 GiB,
-   NO_CELLS with LOOKUP_ONLY) return CAELIX_ERROR_INVALID_ARGUMENT (logged) and change nothing. */
+/* Sets the light NEE options of a renderer; they apply from its next render call. Invalid values
+   (enabled not 0 or 1, unknown flag bits, reserved not 0) return CAELIX_ERROR_INVALID_ARGUMENT
+   (logged) and change nothing. */
 CAELIX_API CaelixResult caelix_renderer_set_light_nee_options(CaelixRenderer* renderer,
                                                               const CaelixLightNeeOptions* options);
 
-/* The renderer's light cells at the newest frame whose counters were read back (they trail the
-   current frame by the frames in flight). 96 bytes. */
+/* The renderer's light NEE state. 16 bytes. */
 typedef struct CaelixLightNeeStats
 {
-    uint32_t enabled;             /* 1 while the options enable light NEE */
-    uint32_t running;             /* 1 when the newest render call ran it (a lighting mode, a light tree) */
-    uint32_t live_cells;          /* cells alive after that frame's maintenance */
-    uint32_t active_cells;        /* of those, looked up by the frame before: the cells filled */
-    uint32_t inserted;            /* cells inserted by that frame's trace */
-    uint32_t pending;             /* lookups that met an insert in progress (no lamp NEE there) */
-    uint32_t failed_slot;         /* lookups whose probe window was full */
-    uint32_t failed_payload;      /* inserts that found no free cell (the table is full) */
-    uint32_t evicted;             /* cells evicted by age in that frame's maintenance */
-    uint32_t rebuild_dropped;     /* cells dropped by the key rebuild (a full probe window) */
-    uint32_t fresh_draws;         /* light tree draws of the reservoir refreshes in that frame's fill */
-    uint32_t normalisation_draws; /* light tree draws of the cells' normalisation (one per filled cell) */
-    uint32_t stale_refreshed;     /* reservoirs refreshed before their turn (stale or new) */
-    uint32_t cell_capacity;       /* the table's cells */
-    uint32_t reservoir_mode;      /* the effective CAELIX_LIGHT_NEE_RESERVOIRS_* */
-    uint32_t candidates;          /* the effective candidates per refresh */
-    float controller_scale;       /* footprint multiplier of the cell-size controller, 0.25 .. 1 */
-    float footprint;              /* the effective level-0 footprint threshold (footprint x scale) */
-    float maintenance_ms;         /* GPU time of the newest measured maintenance (eviction, key rebuild) */
-    float fill_ms;                /* GPU time of the newest measured fill */
-    uint64_t frame_number;        /* the frame of the counters; 0 = none yet */
-    uint64_t cell_bytes;          /* GPU memory of the cells and their table */
+    uint32_t enabled;     /* 1 while the options enable light NEE */
+    uint32_t running;     /* 1 when the newest render call ran it (a lighting mode, a light tree) */
+    uint32_t reserved[2]; /* 0 */
 } CaelixLightNeeStats;
 
-/* Fills *out (all zero for a renderer that never ran light NEE). A NULL argument is ignored. */
+/* Fills *out. A NULL argument is ignored. */
 CAELIX_API void caelix_renderer_get_light_nee_stats(const CaelixRenderer* renderer, CaelixLightNeeStats* out);
 
 /* Destroys every cached image view. Call it before the host destroys target images, for example

@@ -16,9 +16,9 @@ typedef char caelix_material_is_48_bytes[(sizeof(CaelixMaterial) == 48) ? 1 : -1
 typedef char caelix_render_options_is_192_bytes[(sizeof(CaelixRenderOptions) == 192) ? 1 : -1];
 typedef char caelix_sky_cubemap_at_152[(offsetof(CaelixRenderOptions, sky) == 152) ? 1 : -1];
 typedef char caelix_upscaler_at_176[(offsetof(CaelixRenderOptions, upscaler) == 176) ? 1 : -1];
-/* The light NEE options and stats: 32 and 96 bytes. */
-typedef char caelix_light_nee_options_is_32_bytes[(sizeof(CaelixLightNeeOptions) == 32) ? 1 : -1];
-typedef char caelix_light_nee_stats_is_96_bytes[(sizeof(CaelixLightNeeStats) == 96) ? 1 : -1];
+/* The light NEE options and stats: 16 bytes each. */
+typedef char caelix_light_nee_options_is_16_bytes[(sizeof(CaelixLightNeeOptions) == 16) ? 1 : -1];
+typedef char caelix_light_nee_stats_is_16_bytes[(sizeof(CaelixLightNeeStats) == 16) ? 1 : -1];
 
 size_t caelix_abi_c99_touch(void)
 {
@@ -85,12 +85,8 @@ size_t caelix_abi_c99_touch(void)
                  sizeof(reason) + upscale_flags;
     /* Take the address of every function so a declaration typo fails to compile. Casts between
        function pointer types are valid C; the pointers are never called. */
-    CaelixLightNeeOptions nee_options = {1, 0, 0.0f, CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE, 0, 0,
-                                         CAELIX_LIGHT_NEE_FLAG_NO_JITTER | CAELIX_LIGHT_NEE_FLAG_NO_MIS |
-                                             CAELIX_LIGHT_NEE_FLAG_NO_SUN_HINT | CAELIX_LIGHT_NEE_FLAG_NO_CONTROLLER |
-                                             CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY | CAELIX_LIGHT_NEE_FLAG_NO_CELLS,
-                                         256};
-    CaelixLightNeeStats nee_stats = {0};
+    CaelixLightNeeOptions nee_options = {1, CAELIX_LIGHT_NEE_FLAG_NO_MIS, {0, 0}};
+    CaelixLightNeeStats nee_stats = {0, 0, {0, 0}};
     AnyFn functions[36];
     functions[0] = (AnyFn)caelix_get_version;
     functions[1] = (AnyFn)caelix_version_string;
@@ -128,9 +124,8 @@ size_t caelix_abi_c99_touch(void)
     functions[33] = (AnyFn)caelix_renderer_get_upscaler_info;
     functions[34] = (AnyFn)caelix_renderer_set_light_nee_options;
     functions[35] = (AnyFn)caelix_renderer_get_light_nee_stats;
-    sum += sizeof(nee_options) + sizeof(nee_stats) + sizeof(caelix_light_nee_options_is_32_bytes) +
-           sizeof(caelix_light_nee_stats_is_96_bytes) + CAELIX_LIGHT_NEE_RESERVOIRS_OFF +
-           CAELIX_LIGHT_NEE_RESERVOIRS_DEFAULT;
+    sum += sizeof(nee_options) + sizeof(nee_stats) + sizeof(caelix_light_nee_options_is_16_bytes) +
+           sizeof(caelix_light_nee_stats_is_16_bytes);
     sum += sizeof(functions) + (create != NULL ? 1u : 0u) + (functions[22] != NULL ? 1u : 0u);
     sum += (size_t)key.x + (size_t)frame.frame_number + (size_t)info.resident;
     return sum;

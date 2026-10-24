@@ -174,13 +174,20 @@ a light point with its pdf (`caelix_scene_set_light_options`, `shaders/scene/cae
 
 ### Light NEE
 
-Next-event estimation of the light voxels through per-renderer light cells (a reusable GPU hash table,
-`lib/src/rhi/hash_table.h`, `shaders/common/caelix_hash_table.hlsl`), the cell fill from the light
-tree, one lamp candidate per diffuse vertex chosen against the sun candidate, one shadow ray, MIS
-with the BSDF path (`caelix_renderer_set_light_nee_options`, `shaders/render/caelix_light_cells.hlsl`,
-`caelix_light_cell_fill.hlsl`, the NEE in `caelix_path_trace.hlsl`; frames without light NEE bind the
-kernel variant `caelix_path_trace_no_light_nee`): [`docs/LIGHT_NEE.md`](docs/LIGHT_NEE.md). Tests:
-`caelix_hash_table_test`, `caelix_light_nee_test`, the "light NEE" cases of `caelix_trace_test`.
+Next-event estimation of the light voxels: every diffuse vertex with a next segment draws one lamp
+point from the light tree for its own point and normal, one shadow ray is chosen between it and the
+sun candidate, and the next BSDF hit on a lamp is weighted by MIS with the exact light tree pdf; no
+memory between frames or pixels (`caelix_renderer_set_light_nee_options`, the NEE in
+`shaders/render/caelix_path_trace.hlsl`, `shaders/render/caelix_light_nee.hlsl`; frames without light
+NEE bind the kernel variant `caelix_path_trace_no_light_nee`): [`docs/LIGHT_NEE.md`](docs/LIGHT_NEE.md).
+The light cells of the first version (removed 2026-10-24) are in its history section. Tests:
+`caelix_light_nee_test`, the "light NEE" cases of `caelix_trace_test`.
+
+### Hash table
+
+A reusable GPU hash table (64-bit keys -> payload indices, `lib/src/rhi/hash_table.h`,
+`shaders/common/caelix_hash_table.hlsl`), first written for the light cells; no library code uses it
+today: [`docs/HASH_TABLE.md`](docs/HASH_TABLE.md). Test: `caelix_hash_table_test`.
 
 ### Acceleration structures
 
@@ -883,42 +890,42 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   random) the mean of 128 checkerboard frames is within 0.02 % of the
   stochastic reference.
 - `caelix_frame_layout_test`: no GPU. Reads `build/shaders/<kernel>.spv` of the five
-  frame-constant kernels, parses the SPIR-V binary (the Uniform variable whose struct is decorated
+  frame-constant kernels and the trace variant `caelix_path_trace_no_light_nee`, parses the SPIR-V binary (the Uniform variable whose struct is decorated
   `Block`; member `Offset`, `ArrayStride`, `MatrixStride`, `DescriptorSet` / `Binding`), recomputes
   the C natural layout of the same member sequence and fails on the first member whose offset
   differs (printing the member index, its name and both offsets), on a stride that is not the
-  element size, on a block that does not end at `sizeof(FrameConstants)` (608) or that is not at
+  element size, on a block that does not end at `sizeof(FrameConstants)` (560) or that is not at
   set 1, binding 0. Run it after every change of `CaelixFrameConstants`: DXC's constant buffer
   layout moves a vector that crosses a 16-byte row (`float2` at 476 goes to 480) and gives an array
   of scalars a 16-byte stride, without any compile error. Two more cases: the push constant block of
-  every scene, light tree, hash table and light cell kernel against its C++ struct, member by
-  member and by name (`FinalizePush`, `LightGroupPush`, `LightBvhPush`, `LightScanPush`,
-  `LightSortPush`, `HashPush`, `LightCellFillPush`), and every named constant of
-  `shaders/common/caelix_record.hlsl`, `caelix_material.hlsl`, `caelix_light_tree_layout.hlsl`,
-  `caelix_hash_table.hlsl` and `caelix_light_cells_layout.hlsl` (the field offsets, bit fields and
-  sizes the kernels address memory with) against the C++ constant of the same name in
-  `lib/src/scene/record_layout.h`, `gpu_structs.h`, `material_table.h`, `light_tree_layout.h`,
-  `lib/src/rhi/hash_table_layout.h` and `lib/src/render/light_cells_layout.h`, whose static_asserts
-  tie them to the structs.
+  every scene, light tree and hash table kernel against its C++ struct, member by member and by
+  name (`FinalizePush`, `LightGroupPush`, `LightBvhPush`, `LightScanPush`, `LightSortPush`,
+  `HashPush`), and every named constant of `shaders/common/caelix_record.hlsl`,
+  `caelix_material.hlsl`, `caelix_light_tree_layout.hlsl` and `caelix_hash_table.hlsl` (the field
+  offsets, bit fields and sizes the kernels address memory with) against the C++ constant of the
+  same name in `lib/src/scene/record_layout.h`, `gpu_structs.h`, `material_table.h`,
+  `light_tree_layout.h` and `lib/src/rhi/hash_table_layout.h`, whose static_asserts tie them to the
+  structs.
 - `caelix_light_tree_test`: the light tree (`docs/LIGHT_TREE.md` section 7) through the C ABI and a
   probe kernel (`tests/shaders/caelix_light_tree_probe.hlsl`, compiled by the test build into
   `build/shaders`): light faces, records and both BVHs against a CPU reference, normalisation,
   sample/pdf consistency, histogram, bound property, edits, record copies, static/dynamic entities,
   heap growth, the radix sort against `std::sort`. `caelix_light_tree_test.exe "[.bench]"` measures
   draws, group passes and BVH builds at about 10k, 54k and 1M light bricks.
-- `caelix_hash_table_test`: the reusable GPU hash table (`docs/LIGHT_NEE.md` section 2) against a CPU
+- `caelix_hash_table_test`: the reusable GPU hash table (`docs/HASH_TABLE.md`) against a CPU
   model, with the library's maintenance kernels and a probe kernel
   (`tests/shaders/caelix_hash_probe.hlsl`) that inserts from up to 100k threads: one key from 65536
   threads, colliding home slots, equal key_lo, payload exhaustion and recovery, eviction at the age
   boundary, the key rebuild, the active list and the indirect dispatch, the free stack over 40 random
   frames.
-- `caelix_light_nee_test`: the light cells and the light tree functions of the light NEE through a
-  probe kernel (`tests/shaders/caelix_light_nee_probe.hlsl`): every receiver that reads a cell lies in
-  its region (jitter range, both levels, a rotated entity), the box sampler's support, both MIS sides
-  see the same proxy and their weights sum to 1. `caelix_trace_test` holds the image cases: the light
-  NEE against the path tracer in a closed box with lamps, a sun opening and glass (four option sets,
-  lamps alone and with the sun), and the lifecycle (a full cell table and its recovery, entity and
-  group reuse, a paused renderer, option checks).
+- `caelix_light_nee_test`: the light tree functions of the light NEE and its MIS weight through a
+  probe kernel (`tests/shaders/caelix_light_nee_probe.hlsl`): the box sampler's support (a region
+  receiver), both MIS sides see the same exact pdf for a drawn lamp point and their weights sum to 1
+  (a rotated entity too), the weight at degenerate inputs. `caelix_trace_test` holds the image cases:
+  the light NEE against the path tracer in a closed box with lamps, a sun opening and glass (with
+  and without MIS, lamps alone and with the sun), and the lifecycle (option checks, both lighting
+  modes and the primary mode, entity and group reuse, a paused renderer, a scene without a light
+  tree, disable and enable).
 - `caelix_abi_c99`: compiles `caelix.h` as C99 with `/W4` (a compile check, not
   run).
 
@@ -1027,18 +1034,11 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
 - `--screenshot-frame <N>`: take `--screenshot` at frame number N (the frame seed; the first frame
   at or after it once the world is complete) instead of `--warmup` frames after the load, so runs
   with different options capture the same random numbers.
-- Light NEE (`docs/LIGHT_NEE.md`, on by default; it enables the light tree): `--no-light-nee`,
-  `--light-cells <N>` (0 = 262144), `--light-footprint <F>` (0 = 0.25), `--light-reservoirs
-  <default|off|rotate>` (default = the library's, "off"), `--light-reservoir-count <N>` (reservoirs
-  per cell: 0 = 64, else 64, 128 or 256; 64 + 16 N bytes per cell), `--light-candidates <0..2>`,
-  `--light-max-age <N>` (0 = 128), the opt-outs `--light-no-jitter`, `--light-no-mis`,
-  `--light-no-sun-hint`, `--light-no-controller`, `--light-lookup-only` (measurement: cells looked up
-  and filled, no lamp NEE), and `--light-no-cells` (experimental: no light cells, every NEE vertex
-  draws its lamp from the light tree for its own point and normal with the exact MIS; docs section
-  11.6). `--light-tree` builds
-  the light tree also with `--no-light-nee`; `--light-min-emission <F>` sets its threshold. The Stats
-  window (F1) has a "Light NEE" section; `--timing-frames` adds `light_nee:` (the maintenance and
-  fill means and the newest counters) to the `timings_avg:` line.
+- Light NEE (`docs/LIGHT_NEE.md`, on by default; it enables the light tree): `--no-light-nee` turns
+  it off, `--light-no-mis` uses the exclusive rule instead of MIS. `--light-tree` builds the light
+  tree also with `--no-light-nee`; `--light-min-emission <F>` sets its threshold. The Stats window
+  (F1) has a "Light NEE" section (enabled, running, MIS); `--timing-frames` adds
+  `light_nee: running=<0|1>` to the `timings_avg:` line.
 - `--no-input`: ignore keyboard and mouse, for deterministic automated runs.
   It also disables the debug UI (no egui context, no overlay renderer).
 - `--no-ui`: start with the debug UI hidden (`F1` shows it).

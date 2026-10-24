@@ -82,8 +82,9 @@
 #define CAELIX_SKY_BINDING_IMAGE 19
 #define CAELIX_SKY_BINDING_SAMPLER 20
 #include "render/caelix_shading.hlsl"
-// The light cells and the light tree (light NEE, docs/LIGHT_NEE.md).
-#include "render/caelix_light_cells.hlsl"
+// The light tree and the light NEE's near field and MIS weight (docs/LIGHT_NEE.md).
+#include "scene/caelix_light_tree.hlsl"
+#include "render/caelix_light_nee.hlsl"
 // NRD's front-end packing (normal + roughness, radiance + normalized hit distance);
 // NRDConfig.hlsli next to it fixes the encodings NRD was built with.
 #include "NRD.hlsli"
@@ -167,53 +168,29 @@ float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout
 }
 
 // ---------------------------------------------------------------------------
-// Light NEE (docs/LIGHT_NEE.md sections 4 and 6; fc.light_nee_flags != 0)
+// Light NEE (docs/LIGHT_NEE.md; fc.light_nee_flags & kLightNeeOn)
 //
-// At every vertex that runs the sun NEE today (the diffuse lobe was sampled and a next segment
-// exists), the vertex looks its light cell up (LightCellAtVertex: the jittered cell point, inserted
-// when missing) and, with kLightNeeContribute, draws one lamp candidate from a uniform reservoir of
-// that cell (fc.light_cell_reservoirs of them: 64, 128 or 256; LampCandidate: a point on the brick by
-// the light tree, W_l = W_brick / pdf_in_brick) and the sun candidate (SunCandidate), keeps one of
-// the two in proportion to its unoccluded contribution (the sun's times the cell's sun visibility
-// hint; one-sample RIS over the disjoint domains: E = C_s V_s + C_l V_l) and traces ONE shadow ray
-// toward it (NextEventAtVertex). A kept sun candidate is drawn again from its saved random state, the
-// lamp candidate stays live (see there). A vertex without a usable cell (none, pending, no payload, uninitialised) has no lamp candidate, and the segment that
-// leaves it counts every lamp's full emission. With a usable cell the segment carries one state word
-// (kSegmentLamp*, the cell's slot): a lamp hit beyond the near field that the NEE can sample counts
-// its emission times the BSDF's balance heuristic weight (LampHitWeight; 0 without MIS). The lamp
-// stream (light_rng) draws a fixed count per vertex (3 jitter, 1 reservoir, 1 point seed); the sun
-// stream draws the sun's two numbers and, with kLightNeeContribute, one more for the choice, so a frame
-// without light NEE consumes every stream exactly as before.
-//
-// The kernel variant caelix_path_trace_light_tree_nee (CAELIX_SPEC_LIGHT_NEE_DIRECT; experimental,
-// CAELIX_LIGHT_NEE_FLAG_NO_CELLS, docs/LIGHT_NEE.md section 11.6) has no cells: light NEE runs with
-// kLightNeeContribute, the lamp candidate is a light tree draw for the vertex's own receiver point and
-// normal (LampCandidateDirect, p = LightTreeSample's area pdf), the sun / lamp choice has no hint, the
-// segment state carries no slot, and the BSDF side's MIS weight uses the exact pdf of the same draw
-// (LightTreeBrickPdf x in_brick, for the receiver point and normal of the vertex the segment left: the
-// segment's origin and segment_normal are the x_r and hit.normal that NextEventAtVertex got). The
-// lamp stream draws one number per vertex (the point seed).
+// At every vertex that runs the sun NEE without light NEE (the diffuse lobe was sampled and a next
+// segment exists), the vertex draws one lamp point from the light tree for its own receiver point x_r
+// (the pushed-off origin of its bounce) and normal n (LampCandidate: LightTreeSample, the point form of
+// the importance at every tree level and the in-brick draw for x_r; p = the area pdf of the point) and
+// the sun candidate (SunCandidate), keeps one of the two in proportion to its unoccluded contribution
+// (one-sample RIS over the disjoint domains: E = C_s V_s + C_l V_l) and traces ONE shadow ray toward it
+// (NextEventAtVertex). A kept sun candidate is drawn again from its saved random state; the lamp
+// candidate stays live (see there). The segment that leaves the vertex carries one state word
+// (kSegmentLamp*): a lamp hit beyond the near field that the NEE can sample counts its emission times
+// the BSDF's balance heuristic weight (LampHitWeight; 0 without MIS) with the exact pdf of the same
+// draw: LightTreeBrickPdf x in_brick for the segment's origin and segment_normal, which are bit for bit
+// the x_r and n that NextEventAtVertex got (both come from the shade's bounce_origin and the hit's
+// normal in TracePath). No memory: nothing is kept from frame to frame or shared between pixels. The
+// lamp stream (light_rng) draws one number per vertex (the point seed); the sun stream draws the sun's
+// two numbers and one more for the choice, so a frame without light NEE consumes every stream exactly
+// as before.
 
-// The state of a path segment: kSegmentLampNee = the vertex it leaves ran the lamp NEE from the cell
-// in the low bits (kSegmentSlotMask); kSegmentLampMis = with MIS.
+// The state of a path segment: kSegmentLampNee = the vertex it leaves ran the lamp NEE;
+// kSegmentLampMis = with MIS.
 static const uint kSegmentLampNee = 1u << 31;
 static const uint kSegmentLampMis = 1u << 30;
-static const uint kSegmentSlotMask = 0x3FFFFFFFu;
-// One wave in this many counts its sun shadow rays into the cells' sun hint (the hint is a ratio, so
-// a lower count rate costs only its precision; a per-lane atomic cost 1.4 ms on bistro at 1080p).
-static const uint kNeeCountWaveShare = 4;
-
-HashTable LightCellTable(CaelixFrameConstants fc)
-{
-    HashTable t;
-    t.keys = fc.light_cell_keys;
-    t.stack = fc.light_cell_stack;
-    t.counters = fc.light_cell_counters;
-    t.payloads = fc.light_cells;
-    t.key_mask = fc.light_cell_mask;
-    t.payload_stride = LightCellBytes(fc.light_cell_reservoirs);
-    return t;
-}
 
 // A full 32-bit draw of the xorshift stream (RandomFloat01's state step).
 uint RandomU32(inout uint state)
@@ -224,42 +201,8 @@ uint RandomU32(inout uint state)
     return state;
 }
 
-// The light cell of the diffuse vertex `hit` (pushed-off world position x_r): the cell point (the
-// entity-local hit point moved kLightCellPointOffset into the air), moved by a uniform offset in
-// (-0.5, 0.5) cells per axis with kLightNeeJitter (three numbers of the lamp stream either way), at
-// the level of the vertex's pixel footprint, keyed with the entity, its life and the hit face. Looks
-// it up and inserts it when missing (the insert, pending and failure counts go to the table's
-// counters). Returns the slot of a READY cell, else kHashNone (no lamp NEE at this vertex).
-uint LightCellAtVertex(CaelixFrameConstants fc, TraceResult hit, float3 x_r, inout uint light_rng)
-{
-    const uint entity = GroupEntity(fc, hit.group);
-    const uint64_t entity_info = fc.entity_infos + uint64_t(entity) * kEntityInfoBytes;
-    const uint life = CAELIX_LOAD_U32(entity_info + kEntityInfoLife);
-    const float footprint = 2.0f * length(x_r - fc.position.xyz) * fc.tan_half_fov_y / float(fc.size.y);
-    const uint level = footprint < fc.light_footprint ? 0u : 1u;
-    const float3 u = float3(RandomFloat01(light_rng), RandomFloat01(light_rng), RandomFloat01(light_rng));
-    const int3 coord = LightCellCoordOfHit(hit.object_hit, float3(UnpackObjectNormal(hit.attrib)), u,
-                                           (fc.light_nee_flags & kLightNeeJitter) != 0u, level);
-    uint words[kHashMaxKeyWords];
-    LightCellKeyWords(entity, life, coord, level, firstbitlow(hit.attrib & 0x3Fu), words);
-    const HashTable table = LightCellTable(fc);
-    uint slot;
-    const uint result =
-        HashLookupOrInsert(table, HashFingerprint(words, kLightCellKeyWords), words, kLightCellKeyWords,
-                           fc.light_frame, slot);
-    HashCountResult(table, result);
-    if (result != kHashHit)
-    {
-        return kHashNone;  // inserted (uninitialised until the next fill), pending or no entry
-    }
-    const uint64_t cell = LightCellAddress(fc.light_cells, slot, fc.light_cell_reservoirs);
-    const bool ready = CAELIX_ATOMIC_LOAD_U32(cell + kLcState) == kHashStateReady &&
-                       CAELIX_LOAD_U32(cell + kLcNormCount) != 0u;
-    return ready ? slot : kHashNone;
-}
-
 // One next-event candidate before its shadow ray: the unit direction, the shadow ray's TMax (0 =
-// no candidate) and the unoccluded demodulated radiance of the Lambert lobe (W and the MIS weight in).
+// no candidate) and the unoccluded demodulated radiance of the Lambert lobe (1 / p and the MIS weight in).
 struct NeeCandidate
 {
     float3 direction;
@@ -298,72 +241,12 @@ float3 LampEmission(uint block)
     return asfloat(CAELIX_LOAD_U32x4(address + kMaterialEmission)).xyz * g_emissionScale;
 }
 
-// The lamp candidate of a vertex (receiver x_r, normal n_r) from the ready cell `slot`: reservoir
-// min(R - 1, u_reservoir * R), R = fc.light_cell_reservoirs (each reservoir is an unbiased
-// contribution weight of its brick, so the uniform choice needs no factor); an empty or stale
-// reservoir gives no candidate (still on the MIS path). The point on the brick comes from
-// LightBrickSamplePoint with the PCG state `point_seed` (pdf_in_brick). Points inside the near field
-// (kLightNeeNearField) and back-facing ones give no candidate. Contribution:
-// L_e (cos_r / pi) (cos_l / d^2) W / pdf_in_brick, times w_nee with `mis`.
-// A deterministic function of its arguments: the replay of the kept candidate calls it again.
-NeeCandidate LampCandidate(CaelixFrameConstants fc, uint slot, float3 x_r, float3 n_r, float u_reservoir,
-                           uint point_seed, bool mis)
-{
-    NeeCandidate c = NeeCandidateNone();
-    // A ready cell exists only with a light tree (the renderer runs light NEE only then).
-    const LightTree tree = LightTreeView(fc.light_tree);
-    const uint reservoirs = fc.light_cell_reservoirs;
-    const uint64_t cell = LightCellAddress(fc.light_cells, slot, reservoirs);
-    const uint r = min(reservoirs - 1u, uint(u_reservoir * float(reservoirs)));
-    const uint4 reservoir = CAELIX_LOAD_U32x4(cell + kLcReservoirs + r * kLightCellReservoirBytes);
-    const LightBrickRef brick = LightCellReservoirRef(reservoir);
-    if (reservoir.x == kLightCellNoGroup || !LightBrickRefValid(tree, brick))
-    {
-        return c;
-    }
-    uint rng = point_seed;
-    LightPoint p;
-    if (!LightBrickSamplePoint(tree, brick, x_r, n_r, rng, p) || !(p.pdf > 0.0f))
-    {
-        return c;
-    }
-    const float3 d = p.position - x_r;
-    const float d2 = dot(d, d);
-    const float distance = sqrt(d2);
-    if (!(distance >= kLightNeeNearField))
-    {
-        return c;
-    }
-    const float3 w = d / distance;
-    const float cos_r = dot(n_r, w);
-    const float cos_l = -dot(p.normal, w);
-    if (!(cos_r > 0.0f) || !(cos_l > 0.0f))
-    {
-        return c;
-    }
-    float scale = asfloat(reservoir.z) / p.pdf * (cos_r * (1.0f / K_PI)) * (cos_l / d2);
-    if (mis)
-    {
-        const LightCellRegion region = LightCellRegionOfHeader(fc.entity_infos, cell);
-        const float norm = asfloat(CAELIX_LOAD_U32(cell + kLcNorm));
-        const float p_area = LightNeeProxyArea(tree, region, norm, brick, p.pdf);
-        scale *= LightNeeMisWeight(p_area, n_r, w, distance, cos_l, true);
-    }
-    c.direction = w;
-    // The point lies on a voxel face: the ray stops two push-offs short of it.
-    c.t_max = distance - 2.0f * K_RAY_ORIGIN_PUSH_OFF;
-    c.contribution = LampEmission(p.block) * scale;
-    return c;
-}
-
-#ifdef CAELIX_SPEC_LIGHT_NEE_DIRECT
-// The lamp candidate of a vertex (receiver x_r, normal n_r) without light cells (the kernel variant
-// caelix_path_trace_light_tree_nee): a light tree draw for the point receiver (LightTreeSample with the
-// PCG state `point_seed`; p.pdf = P(brick | x_r, n_r) P(face | brick, x_r) / face_count, the area pdf
-// that LampHitWeight evaluates on the BSDF side). The rejections of LampCandidate (a failed draw, the
-// near field, back-facing points). Contribution: L_e (cos_r / pi) (cos_l / d^2) / p.pdf, times w_nee
-// with `mis`.
-NeeCandidate LampCandidateDirect(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint point_seed, bool mis)
+// The lamp candidate of a vertex (receiver x_r, normal n_r): a light tree draw for the point receiver
+// (LightTreeSample with the PCG state `point_seed`; p.pdf = P(brick | x_r, n_r) P(face | brick, x_r) /
+// face_count, the area pdf that LampHitWeight evaluates on the BSDF side). A failed draw, points inside
+// the near field (kLightNeeNearField) and back-facing points give no candidate. Contribution:
+// L_e (cos_r / pi) (cos_l / d^2) / p.pdf, times w_nee with `mis`.
+NeeCandidate LampCandidate(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint point_seed, bool mis)
 {
     NeeCandidate c = NeeCandidateNone();
     // The renderer runs light NEE only with a light tree (its descriptor is not 0).
@@ -399,109 +282,31 @@ NeeCandidate LampCandidateDirect(CaelixFrameConstants fc, float3 x_r, float3 n_r
     c.contribution = LampEmission(p.block) * scale;
     return c;
 }
-#endif
 
-// The sun visibility hint of a ready cell: max(kLightNeeSunHintFloor, visible / tests), 1 without tests.
-float SunHint(CaelixFrameConstants fc, uint slot)
-{
-    // tests, visible
-    const uint2 counts =
-        CAELIX_LOAD_U32x2(LightCellAddress(fc.light_cells, slot, fc.light_cell_reservoirs) + kLcSunTests);
-    return counts.x == 0u ? 1.0f : max(kLightNeeSunHintFloor, float(counts.y) / float(counts.x));
-}
-
-// The sun hint counters of the traced sun shadow rays, aggregated over the wave: the lanes of one
-// 8 x 4 pixel block mostly share a cell at the primary vertex, so the lanes with the same slot add
-// their counts with one atomic (the first of them); only one wave in kNeeCountWaveShare counts
-// (decided from the first active lane's sun stream state, so the branch is uniform and draws nothing).
-void CountSunRay(CaelixFrameConstants fc, uint slot, bool traced, bool visible, uint nee_rng)
-{
-    const bool count = (HashU32(WaveReadLaneFirst(nee_rng) ^ 0x9E3779B9u) % kNeeCountWaveShare) == 0u;
-    const uint my_slot = traced ? slot : kHashNone;
-    CAELIX_BRANCH
-    if (count && WaveActiveAnyTrue(my_slot != kHashNone))
-    {
-        CAELIX_LOOP
-        for (;;)
-        {
-            const uint first = WaveReadLaneFirst(my_slot);
-            const bool mine = my_slot == first;
-            const uint tests = WaveActiveCountBits(mine);
-            const uint seen = WaveActiveCountBits(mine && visible);
-            if (mine)
-            {
-                if (WaveIsFirstLane() && first != kHashNone)
-                {
-                    const uint64_t cell = LightCellAddress(fc.light_cells, first, fc.light_cell_reservoirs);
-                    CAELIX_ATOMIC_ADD_U32(cell + kLcSunTests, tests);
-                    if (seen != 0u)
-                    {
-                        CAELIX_ATOMIC_ADD_U32(cell + kLcSunVisible, seen);
-                    }
-                }
-                break;
-            }
-        }
-    }
-}
-
-// Next-event estimation at a diffuse vertex `hit` with light NEE (pushed-off receiver x_r): the cell
-// lookup, then (kLightNeeContribute) the sun / lamp choice and one shadow ray. `sun`: the sun NEE runs
-// at this vertex. Returns the demodulated radiance (the caller multiplies the throughput) and the
-// state of the segment that leaves the vertex. With kLightNeeLookup alone the sun NEE runs as without
-// light NEE (SunNextEvent). CAELIX_SPEC_LIGHT_NEE_DIRECT: no cell, the lamp candidate of
-// LampCandidateDirect, no sun hint (and no sun hint counters).
-float3 NextEventAtVertex(CaelixFrameConstants fc, TraceResult hit, float3 x_r, bool sun, inout uint nee_rng,
+// Next-event estimation at a diffuse vertex with light NEE (pushed-off receiver x_r, world normal
+// n_r): the lamp candidate, the sun candidate when `sun` (the sun NEE runs at this vertex), the choice
+// between them and one shadow ray. Returns the demodulated radiance (the caller multiplies the
+// throughput) and the state of the segment that leaves the vertex.
+float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool sun, inout uint nee_rng,
                          inout uint light_rng, out uint segment_light)
 {
-    segment_light = 0u;
-#ifdef CAELIX_SPEC_LIGHT_NEE_DIRECT
     const uint point_seed = RandomU32(light_rng);
-    const bool mis = (fc.light_nee_flags & kLightNeeMis) != 0u;
-    const NeeCandidate lamp_candidate = LampCandidateDirect(fc, x_r, hit.normal, point_seed, mis);
-    const float w_lamp = LtLuminance(lamp_candidate.contribution);
-    segment_light = kSegmentLampNee | (mis ? kSegmentLampMis : 0u);
-#else
-    const uint slot = LightCellAtVertex(fc, hit, x_r, light_rng);
-    const float u_reservoir = RandomFloat01(light_rng);
-    const uint point_seed = RandomU32(light_rng);
-    CAELIX_BRANCH
-    if ((fc.light_nee_flags & kLightNeeContribute) == 0u)
-    {
-        return sun ? SunNextEvent(fc, x_r, hit.normal, nee_rng) : float3(0.0f, 0.0f, 0.0f);
-    }
-    const bool lamp = slot != kHashNone;
     const bool mis = (fc.light_nee_flags & kLightNeeMis) != 0u;
     // The lamp candidate stays live through the sun candidate's draw (cheap); the sun candidate is drawn
-    // again from its saved state when it is kept. (Replaying the lamp candidate instead cost 1.5 ms at
-    // 2560 x 1440 on rootfall and more spill: its evaluation is the expensive one.)
-    NeeCandidate lamp_candidate = NeeCandidateNone();
-    float w_lamp = 0.0f;
-    CAELIX_BRANCH
-    if (lamp)
-    {
-        lamp_candidate = LampCandidate(fc, slot, x_r, hit.normal, u_reservoir, point_seed, mis);
-        w_lamp = LtLuminance(lamp_candidate.contribution);
-        segment_light = kSegmentLampNee | (mis ? kSegmentLampMis : 0u) | slot;
-    }
-#endif
+    // again from its saved state when it is kept (the lamp candidate's evaluation is the expensive one).
+    const NeeCandidate lamp_candidate = LampCandidate(fc, x_r, n_r, point_seed, mis);
+    const float w_lamp = LtLuminance(lamp_candidate.contribution);
+    segment_light = kSegmentLampNee | (mis ? kSegmentLampMis : 0u);
     const uint sun_start = nee_rng;
     float w_sun = 0.0f;
     float u_choice = 0.0f;
     if (sun)
     {
-#ifdef CAELIX_SPEC_LIGHT_NEE_DIRECT
-        const float hint = 1.0f;
-#else
-        const float hint = lamp && (fc.light_nee_flags & kLightNeeSunHint) != 0u ? SunHint(fc, slot) : 1.0f;
-#endif
-        w_sun = LtLuminance(SunCandidate(fc, hit.normal, nee_rng).contribution) * hint;
+        w_sun = LtLuminance(SunCandidate(fc, n_r, nee_rng).contribution);
         u_choice = RandomFloat01(nee_rng);
     }
     const float w_sum = w_sun + w_lamp;
     float3 radiance = float3(0.0f, 0.0f, 0.0f);
-    bool sun_traced = false;
-    bool sun_visible = false;
     CAELIX_BRANCH
     if (w_sum > 0.0f)
     {
@@ -511,7 +316,7 @@ float3 NextEventAtVertex(CaelixFrameConstants fc, TraceResult hit, float3 x_r, b
         if (pick_sun)
         {
             uint replay = sun_start;
-            c = SunCandidate(fc, hit.normal, replay);
+            c = SunCandidate(fc, n_r, replay);
         }
         RayDesc shadow;
         shadow.Origin = x_r;
@@ -523,26 +328,17 @@ float3 NextEventAtVertex(CaelixFrameConstants fc, TraceResult hit, float3 x_r, b
         {
             radiance = c.contribution * (w_sum / (pick_sun ? w_sun : w_lamp));
         }
-        sun_traced = pick_sun;
-        sun_visible = visible;
     }
-#ifndef CAELIX_SPEC_LIGHT_NEE_DIRECT
-    if (lamp && (fc.light_nee_flags & kLightNeeSunHint) != 0u)
-    {
-        CountSunRay(fc, slot, sun_traced, sun_visible, nee_rng);
-    }
-#endif
     return radiance;
 }
 
 // The weight of the emission of the hit `hit` of the segment `bounce` that left a vertex with the
-// state `segment_light` and normal `segment_normal` (docs/LIGHT_NEE.md section 6): 1 (the full
+// state `segment_light` and normal `segment_normal` (docs/LIGHT_NEE.md section 4): 1 (the full
 // emission) without lamp NEE at that vertex, inside the near field, or for a point the NEE cannot
 // sample (not a light face of the tree, a brick without a leaf); else the BSDF's balance heuristic
-// weight with the proxy of the vertex's cell (rebuilt from its header: region, C), or 0 without MIS.
-// CAELIX_SPEC_LIGHT_NEE_DIRECT: the weight with the exact pdf of LampCandidateDirect's draw for the
-// vertex's receiver point bounce.Origin and normal segment_normal (the x_r and hit.normal that
-// NextEventAtVertex got): LightTreeBrickPdf x in_brick.
+// weight with the exact pdf of LampCandidate's draw for the vertex's receiver point bounce.Origin and
+// normal segment_normal (the x_r and n_r that NextEventAtVertex got): LightTreeBrickPdf x in_brick; 0
+// without MIS.
 float LampHitWeight(CaelixFrameConstants fc, uint segment_light, TraceResult hit, RayDesc bounce,
                     float3 segment_normal)
 {
@@ -571,19 +367,9 @@ float LampHitWeight(CaelixFrameConstants fc, uint segment_light, TraceResult hit
     {
         return 0.0f;
     }
-#ifdef CAELIX_SPEC_LIGHT_NEE_DIRECT
-    const float cos_l_direct = -dot(hit.normal, bounce.Direction);
-    const float p_direct = LightTreeBrickPdf(tree, bounce.Origin, segment_normal, brick) * in_brick;
-    return LightNeeMisWeight(p_direct, segment_normal, bounce.Direction, hit.T, cos_l_direct, false);
-#else
-    const uint64_t cell =
-        LightCellAddress(fc.light_cells, segment_light & kSegmentSlotMask, fc.light_cell_reservoirs);
-    const LightCellRegion region = LightCellRegionOfHeader(fc.entity_infos, cell);
-    const float norm = asfloat(CAELIX_LOAD_U32(cell + kLcNorm));
     const float cos_l = -dot(hit.normal, bounce.Direction);
-    const float p_area = LightNeeProxyArea(tree, region, norm, brick, in_brick);
+    const float p_area = LightTreeBrickPdf(tree, bounce.Origin, segment_normal, brick) * in_brick;
     return LightNeeMisWeight(p_area, segment_normal, bounce.Direction, hit.T, cos_l, false);
-#endif
 }
 
 // NRD lobe rule of a path that went through a delta interface (primary surface
@@ -719,13 +505,8 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
 {
     uint nee_rng = InitRandom(pixel, fc.frame_seed ^ 0x68E31DA4u);
     const bool nee = (fc.flags & kRenderFlagSunNee) != 0u && any(fc.sun_radiance.xyz > 0.0f);
-    // Light NEE: its own random stream; the state word of the current segment. Without cells
-    // (CAELIX_SPEC_LIGHT_NEE_DIRECT) it runs with kLightNeeContribute (there is no lookup).
-#ifdef CAELIX_SPEC_LIGHT_NEE_DIRECT
-    const bool light_nee = (fc.light_nee_flags & kLightNeeContribute) != 0u;
-#else
-    const bool light_nee = (fc.light_nee_flags & kLightNeeLookup) != 0u;
-#endif
+    // Light NEE: its own random stream; the state word of the current segment.
+    const bool light_nee = (fc.light_nee_flags & kLightNeeOn) != 0u;
     uint light_rng = InitRandom(pixel, fc.frame_seed ^ 0x7F4A7C15u);
     uint segment_light = 0u;
     const uint surface_block = (surface.attrib >> 16) & 0xFFFFu;
@@ -751,8 +532,8 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     CAELIX_BRANCH
     if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
     {
-        radiance += NextEventAtVertex(fc, surface, primary_shade.bounce_origin, nee, nee_rng, light_rng,
-                                      segment_light) * throughput;
+        radiance += NextEventAtVertex(fc, primary_shade.bounce_origin, surface.normal, nee, nee_rng,
+                                      light_rng, segment_light) * throughput;
         segment_sees_sun = !nee;
     }
     else
@@ -816,8 +597,8 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         CAELIX_BRANCH
         if (light_nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
         {
-            const float3 nee_radiance =
-                NextEventAtVertex(fc, hit, shade.bounce_origin, nee, nee_rng, light_rng, segment_light);
+            const float3 nee_radiance = NextEventAtVertex(fc, shade.bounce_origin, hit.normal, nee, nee_rng,
+                                                          light_rng, segment_light);
             radiance += nee_radiance * throughput;
             segment_sees_sun = !nee;
         }
@@ -874,11 +655,7 @@ float3 MaterialViewColor(uint block)
 // CAELIX_SPEC_BOUNCES_TRANSPARENT forces the delta chain budget. CAELIX_SPEC_NO_LIGHT_NEE: no light NEE
 // (the build's kernel variant caelix_path_trace_no_light_nee, render/caelix_path_trace_no_light_nee.hlsl,
 // which the renderer binds for frames without light NEE: the light NEE code holds registers and costs
-// occupancy even when its flags are 0). CAELIX_SPEC_LIGHT_NEE_LOOKUP_ONLY (measurement): the light cell
-// lookups without the lamp NEE (the trace of CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY).
-// CAELIX_SPEC_LIGHT_NEE_DIRECT is not a field specialization but another light NEE (no cells; the
-// kernel variant caelix_path_trace_light_tree_nee, render/caelix_path_trace_light_tree_nee.hlsl): see
-// the light NEE section above.
+// occupancy even when its flags are 0).
 void SpecializeFrameConstants(inout CaelixFrameConstants fc)
 {
 #ifdef CAELIX_SPEC_NO_PRIMARY_MODE
@@ -908,9 +685,6 @@ void SpecializeFrameConstants(inout CaelixFrameConstants fc)
 #endif
 #ifdef CAELIX_SPEC_NO_LIGHT_NEE
     fc.light_nee_flags = 0u;
-#endif
-#ifdef CAELIX_SPEC_LIGHT_NEE_LOOKUP_ONLY
-    fc.light_nee_flags &= kLightNeeLookup | kLightNeeJitter;
 #endif
 }
 

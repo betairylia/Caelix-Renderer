@@ -1,4 +1,4 @@
-// The reusable GPU hash table (docs/LIGHT_NEE.md section 2): 64-bit keys -> indices of a payload
+// The reusable GPU hash table (docs/HASH_TABLE.md): 64-bit keys -> indices of a payload
 // pool that the user owns. Layouts mirror lib/src/rhi/hash_table_layout.h (every constant has the
 // same name and value there; caelix_frame_layout_test compares the two files). The table knows only
 // the payload header contract (state, touched, key words); it has no knowledge of any user.

@@ -1,4 +1,4 @@
-// Shared part of the hash table's maintenance kernels (docs/LIGHT_NEE.md section 2,
+// Shared part of the hash table's maintenance kernels (docs/HASH_TABLE.md,
 // lib/src/rhi/hash_table.h): the push constants (HashPush, lib/src/rhi/hash_table_layout.h; the
 // member names are checked by caelix_frame_layout_test) and the table view.
 //

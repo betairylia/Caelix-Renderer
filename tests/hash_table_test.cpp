@@ -1,4 +1,4 @@
-// The reusable GPU hash table (docs/LIGHT_NEE.md section 2; lib/src/rhi/hash_table.h) against a CPU
+// The reusable GPU hash table (docs/HASH_TABLE.md; lib/src/rhi/hash_table.h) against a CPU
 // model, without the rest of the library: the test owns the buffers (host-visible, so it reads every
 // table word), runs the library's maintenance kernels from the build's shader folder in the order of
 // HashTable::RecordMaintenance, and drives the device API (common/caelix_hash_table.hlsl) with the

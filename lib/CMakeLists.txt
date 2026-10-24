@@ -57,9 +57,6 @@ add_library(caelix_renderer SHARED
   src/render/dlss_upscaler.cpp
   src/render/dlss_upscaler.h
   src/render/frame_constants.h
-  src/render/light_cells.cpp
-  src/render/light_cells.h
-  src/render/light_cells_layout.h
   src/render/nrd_executor.cpp
   src/render/nrd_executor.h
   src/render/render_kernels.cpp
@@ -153,12 +150,9 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_brick_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_scene_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_light_cells_layout.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_cells.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_cell_fill.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_nee.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace_no_light_nee.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace_light_tree_nee.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_output.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite_set.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite.hlsl

@@ -3,7 +3,8 @@
 Status: as built on `main` (2026-10-24). This file is the truth for the code.
 
 Owner decisions:
-- 2026-10-23: a light BVH at brick granularity, plus the per-cell sampling reuse. Reasons:
+- 2026-10-23: a light BVH at brick granularity, plus the per-cell sampling reuse (the light cells;
+  removed 2026-10-24, `docs/LIGHT_NEE.md` "History: light cells"). Reasons:
   volumetrics need a receiver-weighted light draw with an exact pdf at any world point, and many
   moving lights break a per-cell cut.
 - 2026-10-24: strong emitters are rare in the game (meridian-deep is a stress case), so the hierarchy
@@ -11,8 +12,8 @@ Owner decisions:
   general entity flag `caelix_scene_set_entity_motion`, independent of physics; the host maps its
   own states), not an octree or pyramid over the group grid. Face lists are owned by the brick
   (self-contained brick light records). The double-buffered copy heap stays for now. Open faces are
-  counted across brick and group borders of one entity. The light cells, the NEE and the MIS are
-  specified in `docs/LIGHT_NEE.md` on top of this.
+  counted across brick and group borders of one entity. The light NEE and its MIS are specified in
+  `docs/LIGHT_NEE.md` on top of this (every NEE vertex draws from the tree with LightTreeSample).
 
 Background: `docs/human_wrote/Caelix-Renderer Towards A Million Stars.md`, the 2026-10-23
 discussion summarised in the family `CLAUDE.md` ("Light sampling bench", "Lamp visibility",
@@ -32,7 +33,8 @@ chunk border must mark the neighbour chunk's records stale; host-known record si
 in-place allocation, which then replaces the copy heap.
 
 Scope of this step: the scene side (light bricks, the records, the BVHs, their updates) and the
-device API (draw a light point, evaluate its pdf). No cells, no NEE, no MIS in the trace kernel.
+device API (draw a light point, evaluate its pdf). The light NEE came in the next step
+(`docs/LIGHT_NEE.md`).
 
 ## 1. Terms
 
@@ -370,7 +372,9 @@ float LightTreeRandomFloat(inout uint rng); // [0, 1)
 `rng` is a PCG state owned by the caller; the API consumes a variable number of steps. A brick
 reference stays valid while its group is not rebuilt (`LightBrickRefValid`).
 
-Additions for the light NEE (docs/LIGHT_NEE.md section 5, 2026-10-24):
+Additions of the light NEE step (2026-10-24; the box functions serve a region receiver, for example
+a volume; their first user, the light cells, was removed on 2026-10-24, and the box tests stay in
+`caelix_light_nee_test`):
 
 ```hlsl
 float LightTreeImportanceBox(float3 r_lo, float3 r_hi, float3 n, float3 lo, float3 hi, float face[6]);
@@ -474,9 +478,11 @@ CaelixResult caelix_scene_set_entity_motion(CaelixScene*, CaelixEntityId, uint32
 Disabling releases the tree's buffers once the last flushed frame is safe; enabling again starts
 from scratch (every resident brick is finalized again). EntityInfo word 7 (`kEntityInfoLife`, the
 former pad) holds the entity's life: +1 every time `caelix_scene_add_entity` hands its id out again
-(the light cells key on it). Entity motion is a general entity flag;
+(a general rule for GPU keys that hold an entity id; the light cells keyed on it until their
+removal on 2026-10-24). Entity motion is a general entity flag;
 today only the light tree reads it. Renderer: `FrameConstants::light_tree` (offset 544; the struct is
-560 bytes). No render kernel uses it in this step.
+560 bytes). No render kernel used it in this step; the trace kernel's light NEE reads it since
+(`docs/LIGHT_NEE.md`).
 
 Rust host (`caelix-app`): `--light-tree`, `--light-min-emission <f>`; the Stats window (F1) shows a
 "Light tree" section; `--timing-frames` prints the light stats on the `timings_avg:` line, plus

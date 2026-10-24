@@ -108,7 +108,8 @@ struct Entity
     // CAELIX_ENTITY_STATIC or CAELIX_ENTITY_DYNAMIC (caelix_scene_set_entity_motion).
     uint32_t motion = CAELIX_ENTITY_STATIC;
     // +1 every time AddEntity hands this id out again (EntityInfo::life): GPU keys that hold the id
-    // and its life (the renderer's light cells) never match a later entity of the same id.
+    // and its life never match a later entity of the same id (general; first used by the renderer's
+    // light cells, removed 2026-10-24).
     uint32_t life = 0;
 };
 

@@ -78,9 +78,9 @@ struct NrdKernels
 // - the descriptor set layouts of the trace set, the composite set (also used by the
 //   cross resolve kernel), the sky SH set (binding 0 the cubemap, 1 the sampler), the
 //   encode set and the frame set (one uniform buffer), every binding PARTIALLY_BOUND;
-// - the compute pipelines caelix_path_trace, caelix_composite, caelix_cross_resolve,
-//   caelix_sky_sh and caelix_upscale_encode (set 0 their own set, set kFrameSetIndex the
-//   frame set; no push constants);
+// - the compute pipelines caelix_path_trace, caelix_path_trace_no_light_nee,
+//   caelix_composite, caelix_cross_resolve, caelix_sky_sh and caelix_upscale_encode (set 0
+//   their own set, set kFrameSetIndex the frame set; no push constants);
 // - the sky sampler (linear, mipmapped, clamp to edge) and the fallback sky cube (1 x 1
 //   RGBA8), bound in every sky binding when the host gives no cubemap. The first render
 //   call on the device moves the cube from UNDEFINED to GENERAL (TakeFallbackSkyInit);
@@ -116,10 +116,8 @@ public:
     {
         return frame_layout_;
     }
-    // The trace kernel with the light NEE (frames that run it with light cells), its variant without
-    // it (every frame without light NEE; shaders/render/caelix_path_trace_no_light_nee.hlsl) and the
-    // variant whose light NEE draws from the light tree without cells (CAELIX_LIGHT_NEE_FLAG_NO_CELLS;
-    // shaders/render/caelix_path_trace_light_tree_nee.hlsl).
+    // The trace kernel with the light NEE (frames that run it) and its variant without it (every frame
+    // without light NEE; shaders/render/caelix_path_trace_no_light_nee.hlsl).
     const ComputePipeline& trace() const
     {
         return trace_;
@@ -127,10 +125,6 @@ public:
     const ComputePipeline& trace_no_light_nee() const
     {
         return trace_no_light_nee_;
-    }
-    const ComputePipeline& trace_light_tree_nee() const
-    {
-        return trace_light_tree_nee_;
     }
     const ComputePipeline& composite() const
     {
@@ -184,7 +178,6 @@ private:
     VkDescriptorSetLayout frame_layout_ = VK_NULL_HANDLE;  // the frame constants (uniform buffer)
     ComputePipeline trace_;                   // shaders/render/caelix_path_trace.hlsl, trace set
     ComputePipeline trace_no_light_nee_;      // caelix_path_trace_no_light_nee.hlsl, trace set
-    ComputePipeline trace_light_tree_nee_;    // caelix_path_trace_light_tree_nee.hlsl, trace set
     ComputePipeline composite_;               // shaders/render/caelix_composite.hlsl, composite set
     ComputePipeline cross_resolve_;           // shaders/render/caelix_cross_resolve.hlsl, composite set
     ComputePipeline sky_sh_;                  // shaders/render/caelix_sky_sh.hlsl, sky set

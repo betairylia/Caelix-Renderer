@@ -109,7 +109,6 @@ RenderKernels::RenderKernels(Device& device)
         };
         trace_ = create("caelix_path_trace", trace_layout_);
         trace_no_light_nee_ = create("caelix_path_trace_no_light_nee", trace_layout_);
-        trace_light_tree_nee_ = create("caelix_path_trace_light_tree_nee", trace_layout_);
         composite_ = create("caelix_composite", composite_layout_);
         cross_resolve_ = create("caelix_cross_resolve", composite_layout_);
         sky_sh_ = create("caelix_sky_sh", sky_layout_);
@@ -146,7 +145,6 @@ RenderKernels::RenderKernels(Device& device)
         // here (the pipelines and the image destroy themselves).
         trace_ = ComputePipeline();
         trace_no_light_nee_ = ComputePipeline();
-        trace_light_tree_nee_ = ComputePipeline();
         composite_ = ComputePipeline();
         cross_resolve_ = ComputePipeline();
         sky_sh_ = ComputePipeline();
@@ -166,8 +164,7 @@ RenderKernels::RenderKernels(Device& device)
         throw;
     }
     CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_path_trace_no_light_nee, "
-                "caelix_path_trace_light_tree_nee, caelix_composite, caelix_cross_resolve, caelix_sky_sh, "
-                "caelix_upscale_encode");
+                "caelix_composite, caelix_cross_resolve, caelix_sky_sh, caelix_upscale_encode");
 }
 
 RenderKernels::~RenderKernels()
@@ -180,7 +177,6 @@ RenderKernels::~RenderKernels()
     }
     trace_ = ComputePipeline();
     trace_no_light_nee_ = ComputePipeline();
-    trace_light_tree_nee_ = ComputePipeline();
     composite_ = ComputePipeline();
     cross_resolve_ = ComputePipeline();
     sky_sh_ = ComputePipeline();

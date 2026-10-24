@@ -1,18 +1,17 @@
-// The light NEE (docs/LIGHT_NEE.md) beyond the image test of caelix_trace_test ("light NEE: unbiased
-// against the path tracer"): the probe kernel tests/shaders/caelix_light_nee_probe.hlsl runs the light
-// cells' and the light tree's functions on a scene with lamps on a plain and on a rotated entity, and the
-// public C ABI runs the lifecycle:
-//   - cell regions: every receiver that reads a cell (any hit face, both levels, the jitter range and its
-//     edges, a rotated entity) lies in the cell's region and has its normal;
-//   - support: for receiver boxes (cell regions, boxes touching lamp planes, zero-size boxes), every light
-//     face that can send light to a receiver point of the box (both cosines positive for some point of
-//     the face) has a positive box pdf and a positive target (the leaf's box importance);
-//   - MIS: a lamp point drawn on the NEE side and found again as a BSDF hit gives the same in-brick
-//     density and proxy on both sides, and the two balance heuristic weights sum to 1;
-//   - lifecycle: a full cell table (inserts without payload) and its recovery after eviction, an entity
-//     removed and its id reused at once (a new life), a group released and re-created, a renderer paused
-//     while the scene changes many times, the options and their argument checks; no validation or library
-//     error, finite images.
+// The light NEE (docs/LIGHT_NEE.md) beyond the image tests of caelix_trace_test ("light NEE: unbiased
+// against the path tracer", "light NEE: lifecycle"): the probe kernel
+// tests/shaders/caelix_light_nee_probe.hlsl runs the light tree's functions and the light NEE's MIS
+// weight on a scene with lamps on a plain and on a rotated entity:
+//   - support: for receiver boxes (cell-sized region boxes around receivers, boxes touching lamp planes,
+//     zero-size boxes), every light face that can send light to a receiver point of the box (both
+//     cosines positive for some point of the face) has a positive box pdf and a positive target (the
+//     leaf's box importance); the region receiver of the light tree (first used by the light cells,
+//     removed 2026-10-24);
+//   - MIS: a lamp point drawn on the NEE side (LightTreeSample for the receiver point and normal) and
+//     found again as a BSDF hit gives the same brick and, up to rounding, the same pdf on the BSDF side
+//     (LightTreeBrickPdf x in_brick), and the two balance heuristic weights sum to 1;
+//   - weight edges: LightNeeMisWeight at degenerate inputs (cos_l <= 0, densities 0, +inf, NaN,
+//     overflow, a receiver facing away) gives the documented values on both sides.
 #include "test_kernels.h"
 #include "test_scenes.h"
 
@@ -21,7 +20,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
+#include <utility>
 #include <vector>
 
 #ifndef CAELIX_TEST_SHADER_DIR
@@ -250,25 +251,13 @@ struct ProbePush
 {
     uint64_t descriptor;
     uint64_t input;
-    uint64_t input2;
     uint64_t output;
     uint32_t mode;
     uint32_t count;
     uint32_t draws;
     uint32_t seed;
 };
-static_assert(sizeof(ProbePush) == 48);
-
-struct alignas(16) RegionQuery
-{
-    uint32_t entity, face, level, jitter;
-    float u[3];
-    float pad0;
-    float hit[3];
-    float pad1;
-    float pad2[4];
-};
-static_assert(sizeof(RegionQuery) == 64);
+static_assert(sizeof(ProbePush) == 40);
 
 struct alignas(16) SupportQuery
 {
@@ -284,16 +273,23 @@ static_assert(sizeof(SupportQuery) == 64);
 
 struct alignas(16) MisQuery
 {
-    float lo[3];
-    float norm;
-    float hi[3];
+    float x[3];
     float pad0;
     float normal[3];
     float pad1;
-    float x[3];
+};
+static_assert(sizeof(MisQuery) == 32);
+
+struct alignas(16) WeightQuery
+{
+    float p_area, d, cos_l;
+    float pad0;
+    float normal[3];
+    float pad1;
+    float w[3];
     float pad2;
 };
-static_assert(sizeof(MisQuery) == 64);
+static_assert(sizeof(WeightQuery) == 48);
 
 struct Box
 {
@@ -318,7 +314,7 @@ public:
         test::HostBuffer in = test::CreateHostBuffer(gpu_, queries.size() * sizeof(Query));
         test::HostBuffer out = test::CreateHostBuffer(gpu_, uint64_t{count} * sizeof(Result));
         std::memcpy(in.data, queries.data(), queries.size() * sizeof(Query));
-        ProbePush push{descriptor, in.address, in.address, out.address, mode, count, draws, seed};
+        ProbePush push{descriptor, in.address, out.address, mode, count, draws, seed};
         test::SubmitAndWait(gpu_,
                             [&](VkCommandBuffer cmd) { kernel_.Dispatch(cmd, &push, (count + 63) / 64); });
         std::vector<Result> results(count);
@@ -421,84 +417,25 @@ Hit RandomHit(std::mt19937& rng, uint32_t entity_index, int32_t extent)
 
 }  // namespace
 
-TEST_CASE("light NEE: cell regions hold every receiver that reads them", "[light_nee]")
+
+namespace {
+
+// The receiver of a hit as the trace sees it: the world hit point pushed 0.002 (K_RAY_ORIGIN_PUSH_OFF) off
+// the face along the world normal.
+struct Receiver
 {
-    LampScene s;
-    OpenLampScene(s, 7);
-    {
-        Probe probe(s.rig.gpu);
-        std::mt19937 rng(11);
-        std::vector<RegionQuery> queries;
-        std::vector<Hit> hits;
-        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
-        for (int i = 0; i < 20000; ++i)
-        {
-            const uint32_t e = static_cast<uint32_t>(i & 1);
-            const Hit h = RandomHit(rng, e, 300);
-            RegionQuery q{};
-            q.entity = s.entities[e].id;
-            q.face = h.face;
-            q.level = static_cast<uint32_t>(rng() % 2);
-            q.jitter = (i % 5) != 0 ? 1u : 0u;
-            for (int a = 0; a < 3; ++a)
-            {
-                // The edges of the jitter range at the start: 0 and the largest float below 1.
-                const float edge = (i % 3 == 0) ? 0.0f : 0.99999994f;
-                q.u[a] = i < 600 ? edge : u01(rng);
-                q.hit[a] = static_cast<float>(h.local[a]);
-            }
-            queries.push_back(q);
-            hits.push_back(h);
-        }
-        struct RegionResult
-        {
-            float lo[3];
-            float hi[3];
-            float normal[3];
-            int32_t coord[3];
-        };
-        static_assert(sizeof(RegionResult) == 48);
-        const std::vector<RegionResult> results =
-            probe.Run<RegionQuery, RegionResult>(s.descriptor, 0, queries);
-        double worst_inside = 1e30;
-        for (size_t i = 0; i < queries.size(); ++i)
-        {
-            const RegionQuery& q = queries[i];
-            const RegionResult& r = results[i];
-            const EntityModel& m = s.entities[hits[i].entity_index];
-            // The CPU cell rule (LightCellCoordOfHit).
-            const double edge = static_cast<double>(1 << (5 + 2 * q.level));
-            const Vec3 d = FaceDir(q.face);
-            for (int a = 0; a < 3; ++a)
-            {
-                double p = static_cast<double>(q.hit[a]) + 0.25 * d[a];
-                if (q.jitter != 0)
-                {
-                    p += (static_cast<double>(q.u[a]) - 0.5) * edge;
-                }
-                const int32_t expected = static_cast<int32_t>(std::floor(p)) >> (5 + 2 * q.level);
-                INFO("query " << i << " axis " << a);
-                CHECK(r.coord[a] == expected);
-            }
-            // The receiver: the world hit point pushed 0.002 off the face (K_RAY_ORIGIN_PUSH_OFF).
-            const Vec3 hit_world = Add(Mul(m.rotation, {q.hit[0], q.hit[1], q.hit[2]}), m.translation);
-            const Vec3 n = Mul(m.rotation, d);
-            const Vec3 x = Add(hit_world, Scale(n, 0.002));
-            for (int a = 0; a < 3; ++a)
-            {
-                const double inside = std::min(x[a] - r.lo[a], r.hi[a] - x[a]);
-                worst_inside = std::min(worst_inside, inside);
-                INFO("query " << i << " axis " << a << " x " << x[a] << " lo " << r.lo[a] << " hi "
-                              << r.hi[a]);
-                REQUIRE(inside > 0.0);
-                REQUIRE(std::abs(r.normal[a] - n[a]) < 1e-5);
-            }
-        }
-        std::printf("cell regions: %zu receivers inside their region, smallest margin %.4f voxels\n",
-                    queries.size(), worst_inside);
-    }
-    test::CloseRig(s.rig);
+    Vec3 x;
+    Vec3 normal;
+};
+
+Receiver ReceiverOf(const LampScene& s, const Hit& h)
+{
+    const EntityModel& m = s.entities[h.entity_index];
+    const Vec3 n = Mul(m.rotation, FaceDir(h.face));
+    return {Add(Add(Mul(m.rotation, h.local), m.translation), Scale(n, 0.002)), n};
 }
+
+}  // namespace
 
 TEST_CASE("light NEE: the box sampler supports every light face that can reach the box", "[light_nee]")
 {
@@ -507,37 +444,16 @@ TEST_CASE("light NEE: the box sampler supports every light face that can reach t
     {
         Probe probe(s.rig.gpu);
         std::mt19937 rng(13);
-        // Receiver boxes: cell regions of random hits near the lamps (both levels, both entities), the
-        // same boxes shrunk to a point (the point form), and thin boxes on the planes of lamp faces.
+        // Receiver boxes: regions around random receivers near the lamps (both entities; the size of a
+        // 32- or 128-voxel cell inflated by half a cell and a voxel on every side, as the light cells had
+        // them), the same boxes shrunk to a point (the point form), and boxes on the planes of lamp faces.
         std::vector<Box> boxes;
-        std::vector<RegionQuery> regions;
         for (int i = 0; i < 160; ++i)
         {
-            const uint32_t e = static_cast<uint32_t>(i & 1);
-            const Hit h = RandomHit(rng, e, 48);
-            RegionQuery q{};
-            q.entity = s.entities[e].id;
-            q.face = h.face;
-            q.level = static_cast<uint32_t>(i % 4 == 0);
-            q.jitter = 1;
-            q.u[0] = q.u[1] = q.u[2] = 0.5f;
-            for (int a = 0; a < 3; ++a)
-            {
-                q.hit[a] = static_cast<float>(h.local[a]);
-            }
-            regions.push_back(q);
-        }
-        struct RegionResult
-        {
-            float lo[3];
-            float hi[3];
-            float normal[3];
-            int32_t coord[3];
-        };
-        for (const RegionResult& r : probe.Run<RegionQuery, RegionResult>(s.descriptor, 0, regions))
-        {
-            boxes.push_back({{r.lo[0], r.lo[1], r.lo[2]}, {r.hi[0], r.hi[1], r.hi[2]},
-                             {r.normal[0], r.normal[1], r.normal[2]}});
+            const Receiver r = ReceiverOf(s, RandomHit(rng, static_cast<uint32_t>(i & 1), 48));
+            const double edge = i % 4 == 0 ? 128.0 : 32.0;
+            const double half = edge + 1.0;
+            boxes.push_back({Sub(r.x, {half, half, half}), Add(r.x, {half, half, half}), r.normal});
         }
         const size_t region_boxes = boxes.size();
         for (size_t i = 0; i < region_boxes; i += 2)
@@ -613,7 +529,7 @@ TEST_CASE("light NEE: the box sampler supports every light face that can reach t
             float found, has_leaf, pdf, target;
         };
         const std::vector<SupportResult> results =
-            probe.Run<SupportQuery, SupportResult>(s.descriptor, 1, queries);
+            probe.Run<SupportQuery, SupportResult>(s.descriptor, 0, queries);
         for (size_t i = 0; i < results.size(); ++i)
         {
             const SupportResult& r = results[i];
@@ -633,63 +549,34 @@ TEST_CASE("light NEE: the box sampler supports every light face that can reach t
     test::CloseRig(s.rig);
 }
 
-TEST_CASE("light NEE: both MIS sides see the same proxy and their weights sum to 1", "[light_nee]")
+TEST_CASE("light NEE: both MIS sides see the same exact pdf and their weights sum to 1", "[light_nee]")
 {
     LampScene s;
     OpenLampScene(s, 21);
     {
         Probe probe(s.rig.gpu);
         std::mt19937 rng(23);
-        std::uniform_real_distribution<double> u01(0.0, 1.0);
         std::vector<MisQuery> queries;
         for (int i = 0; i < 400; ++i)
         {
-            const uint32_t e = static_cast<uint32_t>(i & 1);
-            const Hit h = RandomHit(rng, e, 48);
-            RegionQuery q{};
-            q.entity = s.entities[e].id;
-            q.face = h.face;
-            q.level = static_cast<uint32_t>(i % 3 == 0);
-            q.jitter = 1;
-            q.u[0] = static_cast<float>(u01(rng));
-            q.u[1] = static_cast<float>(u01(rng));
-            q.u[2] = static_cast<float>(u01(rng));
+            const Receiver r = ReceiverOf(s, RandomHit(rng, static_cast<uint32_t>(i & 1), 48));
+            MisQuery q{};
             for (int a = 0; a < 3; ++a)
             {
-                q.hit[a] = static_cast<float>(h.local[a]);
+                q.x[a] = static_cast<float>(r.x[a]);
+                q.normal[a] = static_cast<float>(r.normal[a]);
             }
-            struct RegionResult
-            {
-                float lo[3];
-                float hi[3];
-                float normal[3];
-                int32_t coord[3];
-            };
-            const RegionResult r =
-                probe.Run<RegionQuery, RegionResult>(s.descriptor, 0, std::vector<RegionQuery>{q})[0];
-            const EntityModel& m = s.entities[e];
-            const Vec3 hit_world = Add(Mul(m.rotation, h.local), m.translation);
-            const Vec3 x = Add(hit_world, Scale(Mul(m.rotation, FaceDir(h.face)), 0.002));
-            MisQuery mq{};
-            for (int a = 0; a < 3; ++a)
-            {
-                mq.lo[a] = r.lo[a];
-                mq.hi[a] = r.hi[a];
-                mq.normal[a] = r.normal[a];
-                mq.x[a] = static_cast<float>(x[a]);
-            }
-            mq.norm = static_cast<float>(0.01 + u01(rng) * 10.0);
-            queries.push_back(mq);
+            queries.push_back(q);
         }
         struct MisResult
         {
-            float ok, same, pdf, in_brick, p_nee, p_bsdf, w_nee, w_bsdf;
+            float ok, same, pdf_nee, pdf_bsdf, w_nee, w_bsdf, pad0, pad1;
         };
         constexpr uint32_t kDraws = 64;
         const std::vector<MisResult> results =
-            probe.Run<MisQuery, MisResult>(s.descriptor, 2, queries, kDraws, 99);
+            probe.Run<MisQuery, MisResult>(s.descriptor, 1, queries, kDraws, 99);
         size_t ok = 0;
-        size_t with_proxy = 0;
+        double worst_pdf = 0.0;
         double worst_sum = 0.0;
         for (size_t i = 0; i < results.size(); ++i)
         {
@@ -699,21 +586,95 @@ TEST_CASE("light NEE: both MIS sides see the same proxy and their weights sum to
                 continue;
             }
             ++ok;
-            with_proxy += r.p_nee > 0.0f ? 1u : 0u;
-            INFO("draw " << i << " pdf " << r.pdf << " in_brick " << r.in_brick << " p_nee " << r.p_nee
-                         << " p_bsdf " << r.p_bsdf << " w " << r.w_nee << " + " << r.w_bsdf);
+            INFO("draw " << i << " pdf " << r.pdf_nee << " / " << r.pdf_bsdf << " w " << r.w_nee << " + "
+                         << r.w_bsdf);
             REQUIRE(r.same == 1.0f);
-            REQUIRE(r.in_brick == r.pdf);
-            REQUIRE(r.p_bsdf == r.p_nee);
+            REQUIRE(r.pdf_bsdf > 0.0f);
+            // The draw multiplies its choices top-down, the evaluation bottom-up: equal up to rounding.
+            const double relative = std::abs(static_cast<double>(r.pdf_bsdf) / r.pdf_nee - 1.0);
+            worst_pdf = std::max(worst_pdf, relative);
+            REQUIRE(relative < 1e-4);
             const double sum = static_cast<double>(r.w_nee) + r.w_bsdf;
             worst_sum = std::max(worst_sum, std::abs(sum - 1.0));
-            REQUIRE(std::abs(sum - 1.0) < 1e-6);
+            REQUIRE(std::abs(sum - 1.0) < 1e-4);
         }
-        std::printf("MIS: %zu drawn lamp points of %zu draws (%zu with a proxy), largest "
-                    "|w_nee + w_bsdf - 1| = %.2e\n",
-                    ok, results.size(), with_proxy, worst_sum);
+        std::printf("MIS: %zu drawn lamp points of %zu draws, largest |pdf_bsdf / pdf_nee - 1| = %.2e, "
+                    "largest |w_nee + w_bsdf - 1| = %.2e\n",
+                    ok, results.size(), worst_pdf, worst_sum);
         REQUIRE(ok > results.size() / 2);
-        REQUIRE(with_proxy > ok / 2);
+    }
+    test::CloseRig(s.rig);
+}
+
+TEST_CASE("light NEE: the MIS weight at degenerate inputs", "[light_nee]")
+{
+    LampScene s;
+    OpenLampScene(s, 31);
+    {
+        Probe probe(s.rig.gpu);
+        constexpr float kInf = std::numeric_limits<float>::infinity();
+        constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
+        const float inv_sqrt2 = static_cast<float>(1.0 / std::sqrt(2.0));
+        struct Case
+        {
+            const char* name;
+            float p_area, d, cos_l;
+            float w[3];
+            float nee, bsdf;  // the expected weights; nee < 0: both positive (and summing to 1)
+        };
+        // The receiver normal is +Y in every case.
+        const Case cases[] = {
+            {"regular", 0.01f, 10.0f, 0.5f, {0.0f, inv_sqrt2, inv_sqrt2}, -1.0f, -1.0f},
+            {"regular, grazing receiver", 0.2f, 30.0f, 0.9f, {0.0f, 1e-4f, 1.0f}, -1.0f, -1.0f},
+            {"lamp facing away (cos_l < 0)", 0.01f, 10.0f, -0.5f, {0.0f, 1.0f, 0.0f}, 1.0f, 0.0f},
+            {"lamp edge-on (cos_l = 0)", 0.01f, 10.0f, 0.0f, {0.0f, 1.0f, 0.0f}, 1.0f, 0.0f},
+            {"infinite density", kInf, 10.0f, 0.5f, {0.0f, 1.0f, 0.0f}, 1.0f, 0.0f},
+            {"NaN density", kNan, 10.0f, 0.5f, {0.0f, 1.0f, 0.0f}, 1.0f, 0.0f},
+            {"overflowing solid angle density", 1e30f, 1e10f, 1e-10f, {0.0f, 1.0f, 0.0f}, 1.0f, 0.0f},
+            {"zero density, receiver facing away", 0.0f, 10.0f, 0.5f, {0.0f, -1.0f, 0.0f}, 0.0f, 1.0f},
+            {"zero density", 0.0f, 10.0f, 0.5f, {0.0f, 1.0f, 0.0f}, 0.0f, 1.0f},
+            {"receiver facing away", 0.01f, 10.0f, 0.5f, {0.0f, -1.0f, 0.0f}, 1.0f, 0.0f},
+        };
+        std::vector<WeightQuery> queries;
+        for (const Case& c : cases)
+        {
+            WeightQuery q{};
+            q.p_area = c.p_area;
+            q.d = c.d;
+            q.cos_l = c.cos_l;
+            q.normal[1] = 1.0f;
+            for (int a = 0; a < 3; ++a)
+            {
+                q.w[a] = c.w[a];
+            }
+            queries.push_back(q);
+        }
+        struct WeightResult
+        {
+            float w_nee, w_bsdf, pad0, pad1;
+        };
+        const std::vector<WeightResult> results =
+            probe.Run<WeightQuery, WeightResult>(s.descriptor, 2, queries);
+        for (size_t i = 0; i < results.size(); ++i)
+        {
+            const Case& c = cases[i];
+            const WeightResult& r = results[i];
+            INFO(c.name << ": w_nee " << r.w_nee << ", w_bsdf " << r.w_bsdf);
+            CHECK(std::isfinite(r.w_nee));
+            CHECK(std::isfinite(r.w_bsdf));
+            CHECK(std::abs(static_cast<double>(r.w_nee) + r.w_bsdf - 1.0) < 1e-6);
+            if (c.nee >= 0.0f)
+            {
+                CHECK(r.w_nee == c.nee);
+                CHECK(r.w_bsdf == c.bsdf);
+            }
+            else
+            {
+                CHECK(r.w_nee > 0.0f);
+                CHECK(r.w_bsdf > 0.0f);
+            }
+        }
+        std::printf("MIS weight: %zu degenerate and regular inputs checked on both sides\n", results.size());
     }
     test::CloseRig(s.rig);
 }

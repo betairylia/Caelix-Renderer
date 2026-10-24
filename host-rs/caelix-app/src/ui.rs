@@ -36,6 +36,8 @@ pub struct Stats {
     pub light: CaelixLightStats,
     /// The renderer's light NEE (`enabled` = 0 with --no-light-nee).
     pub light_nee: CaelixLightNeeStats,
+    /// The light NEE runs with MIS (no --light-no-mis).
+    pub light_nee_mis: bool,
     pub nrd: CaelixNrdInfo,
     pub load_state: String,
     /// Reference mode: frames accumulated since the last reset.
@@ -412,28 +414,13 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
     let n = &stats.light_nee;
     if n.enabled != 0 {
         CollapsingHeader::new("Light NEE").default_open(true).show(ui, |ui| {
-            let mode = match n.reservoir_mode {
-                CAELIX_LIGHT_NEE_RESERVOIRS_OFF => "off",
-                CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE => "rotate",
-                // CAELIX_LIGHT_NEE_FLAG_NO_CELLS: running without cells.
-                _ if n.running != 0 && n.cell_capacity == 0 => "no cells (light tree per vertex)",
-                _ => "-",
-            };
             value_grid(
                 ui,
                 "stats_light_nee",
                 &[
+                    ("enabled", "yes".to_string()),
                     ("running", if n.running != 0 { "yes" } else { "no (no light tree or primary mode)" }.to_string()),
-                    ("cells live / active / capacity", format!("{} / {} / {}", n.live_cells, n.active_cells, n.cell_capacity)),
-                    ("inserted / pending", format!("{} / {}", n.inserted, n.pending)),
-                    ("failed slot / payload", format!("{} / {}", n.failed_slot, n.failed_payload)),
-                    ("evicted / rebuild dropped", format!("{} / {}", n.evicted, n.rebuild_dropped)),
-                    ("fresh / norm draws", format!("{} / {}", n.fresh_draws, n.normalisation_draws)),
-                    ("stale refreshed", n.stale_refreshed.to_string()),
-                    ("reservoirs / candidates", format!("{mode} / {}", n.candidates)),
-                    ("footprint (scale)", format!("{:.3} ({:.2})", n.footprint, n.controller_scale)),
-                    ("maintenance / fill", format!("{:.3} / {:.3} ms", n.maintenance_ms, n.fill_ms)),
-                    ("cell memory", format!("{:.1} MiB", mib(n.cell_bytes))),
+                    ("MIS", if stats.light_nee_mis { "on" } else { "off (exclusive rule)" }.to_string()),
                 ],
             );
         });

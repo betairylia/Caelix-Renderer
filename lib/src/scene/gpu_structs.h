@@ -74,7 +74,8 @@ struct EntityInfo
     uint32_t grid_base;    // first u32 cell of the group grid
     int32_t grid_dims[3];  // cells per axis, powers of two; 0 = no grid
     uint32_t life;         // +1 every time the id is handed out again (Scene::AddEntity): keys that hold
-                           // (id, life) never match a later entity of the same id (light cells)
+                           // (id, life) never match a later entity of the same id (general; first
+                           // used by the light cells, removed 2026-10-24)
     // Object-to-world rows (3x4, row-major: rotation | position) of the current
     // transform, then of the previous frame's transform. prev differs from cur for
     // exactly one flush after a transform change.

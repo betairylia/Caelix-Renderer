@@ -1,6 +1,5 @@
 #pragma once
 #include "caelix/caelix.h"
-#include "render/light_cells.h"
 #include "render/nrd_executor.h"
 #include "render/render_kernels.h"
 #include "render/upscaler.h"
@@ -89,8 +88,8 @@ public:
     void GetTimings(CaelixGpuTimings& out) const;
     void GetNrdInfo(CaelixNrdInfo& out) const;
     void GetUpscalerInfo(CaelixUpscalerInfo& out) const;
-    // Light NEE (render/light_cells.h, docs/LIGHT_NEE.md). The options are validated here; they apply
-    // from the next render call.
+    // Light NEE (docs/LIGHT_NEE.md). The options are validated here; they apply from the next render
+    // call.
     CaelixResult SetLightNeeOptions(const CaelixLightNeeOptions& options);
     void GetLightNeeStats(CaelixLightNeeStats& out) const;
 
@@ -170,11 +169,6 @@ private:
         std::unique_ptr<Upscaler> upscaler;
         GpuImage output;
     };
-    struct RetiredLightCells
-    {
-        uint64_t frame = 0;  // the last frame that used them
-        std::unique_ptr<LightCells> cells;
-    };
     // The newest caelix_upscaler_query answer of this renderer (render calls re-query only when
     // the key changes).
     struct UpscaleQuery
@@ -205,12 +199,11 @@ private:
     // Creates the internal targets when they are missing or have another size; the
     // old ones are retired until `frame` is safe. Returns true when it created them.
     bool EnsureInternalTargets(uint32_t width, uint32_t height, uint64_t frame);
-    // The light cells of this frame (created, or recreated with another capacity, when needed; the
-    // old ones retired until their last frame is safe), or null when light NEE does not run: off, the
-    // primary mode, or a scene without a light tree.
-    LightCells* EnsureLightCells(bool lighting, uint64_t frame);
-    // Destroys retired internal targets, NRD executors, upscalers and light cells whose frame is <=
-    // safe_frame.
+    // FrameConstants::light_nee_flags of this render call (kLightNee*; 0 when light NEE does not run:
+    // off, the primary mode, or a scene without a light tree, which is logged once); sets
+    // light_nee_running_.
+    uint32_t LightNeeFlags(bool lighting);
+    // Destroys retired internal targets, NRD executors and upscalers whose frame is <= safe_frame.
     void FreeRetired(uint64_t safe_frame);
     // The render size of `upscaler` at `quality` for an output_width x output_height colour target
     // (renderer_upscale.cpp): CAELIX_OK and the size, or CAELIX_ERROR_UNSUPPORTED (logged once per
@@ -281,12 +274,7 @@ private:
     std::chrono::steady_clock::time_point upscale_last_time_{};
     bool upscale_unsupported_logged_ = false;  // the build has no upscaler: logged once
     // Light NEE.
-    CaelixLightNeeOptions light_nee_options_{};  // as set (validated); 0 = defaults
-    LightCells::Settings light_nee_settings_{};  // the effective values
-    std::unique_ptr<LightCells> light_cells_;
-    uint64_t light_cells_last_frame_ = 0;        // the last frame that used light_cells_
-    VkDeviceAddress light_cells_tree_ = 0;       // the light tree descriptor light_cells_ was made for
-    std::vector<RetiredLightCells> retired_light_cells_;
+    CaelixLightNeeOptions light_nee_options_{};  // as set (validated)
     bool light_nee_running_ = false;             // the newest render call ran light NEE
     bool light_nee_no_tree_logged_ = false;      // enabled without a light tree: logged once
 };

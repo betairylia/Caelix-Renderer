@@ -10,11 +10,12 @@
 
 namespace caelix {
 
-// The reusable GPU hash table (docs/LIGHT_NEE.md section 2): 64-bit keys -> indices of a payload pool
-// that the user owns and allocates. The table owns the key slots, the free stack, the counters and
-// their readback, the active list and the indirect dispatch of the user's pass, and the maintenance
-// kernels (shaders/hash/). The kernels use it through shaders/common/caelix_hash_table.hlsl; it knows
-// only the payload header contract of hash_table_layout.h (state, touched, key words).
+// The reusable GPU hash table (docs/HASH_TABLE.md; first written for the light cells, removed
+// 2026-10-24): 64-bit keys -> indices of a payload pool that the user owns and allocates. The table
+// owns the key slots, the free stack, the counters and their readback, the active list and the
+// indirect dispatch of the user's pass, and the maintenance kernels (shaders/hash/). The kernels use it
+// through shaders/common/caelix_hash_table.hlsl; it knows only the payload header contract of
+// hash_table_layout.h (state, touched, key words).
 //
 // Per frame, on one command buffer: RecordMaintenance (evict by age, rebuild the key table from the
 // live payloads, write the active list and the dispatch) -> the user's pass over the active list

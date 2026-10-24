@@ -104,7 +104,7 @@ target_include_directories(caelix_light_tree_test PRIVATE ${PROJECT_SOURCE_DIR}/
 target_compile_definitions(caelix_light_tree_test PRIVATE
   CAELIX_TEST_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
 
-# The reusable GPU hash table (docs/LIGHT_NEE.md section 2) against a CPU model: the library's
+# The reusable GPU hash table (docs/HASH_TABLE.md) against a CPU model: the library's
 # maintenance kernels (from ${CMAKE_BINARY_DIR}/shaders) and a probe kernel that runs the device API
 # from many threads (tests/shaders/caelix_hash_probe.hlsl): contention on one key and on many keys,
 # colliding home slots and equal key_lo, payload exhaustion, eviction, the key rebuild, the active list
@@ -118,11 +118,11 @@ target_include_directories(caelix_hash_table_test PRIVATE ${PROJECT_SOURCE_DIR}/
 target_compile_definitions(caelix_hash_table_test PRIVATE
   CAELIX_TEST_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
 
-# The light NEE's cells and light tree functions through a probe kernel (tests/shaders/
-# caelix_light_nee_probe.hlsl) on a scene with lamps on a plain and a rotated entity: every receiver that
-# reads a cell lies in its region (both levels, the jitter range and its edges); the box sampler's support
-# (every light face that can reach a receiver of a box has a positive box pdf and target); both MIS sides
-# see the same proxy and their weights sum to 1. (The image tests of the light NEE are in caelix_trace_test.)
+# The light tree functions of the light NEE and its MIS weight through a probe kernel (tests/shaders/
+# caelix_light_nee_probe.hlsl) on a scene with lamps on a plain and a rotated entity: the box sampler's
+# support (every light face that can reach a receiver of a box has a positive box pdf and target); both
+# MIS sides see the same exact pdf and their weights sum to 1; the weight at degenerate inputs. (The image
+# tests of the light NEE are in caelix_trace_test.)
 caelix_compile_shaders(light_nee_probe_spv
   SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shaders/caelix_light_nee_probe.hlsl)
 add_custom_target(caelix_light_nee_probe_shaders DEPENDS ${light_nee_probe_spv})

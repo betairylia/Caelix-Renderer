@@ -1,5 +1,5 @@
 // Per-frame constants of the trace, composite, cross resolve, sky SH and upscale encode kernels.
-// Mirrors lib/src/render/frame_constants.h; change both together. 608 bytes, read as the uniform
+// Mirrors lib/src/render/frame_constants.h; change both together. 560 bytes, read as the uniform
 // buffer g_frame (common/caelix_frame_ubo.hlsl: set 1, binding 0).
 // Layout rule: the uniform block gets DXC's default constant buffer layout, which gives the C
 // offsets only while every field sits at an offset that is a multiple of its size, no vector
@@ -78,16 +78,8 @@ struct CaelixFrameConstants
     uint upscaler;                  // 536  kUpscaler*: 2 = the trace writes the RR guide images
     uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear)
     uint64_t light_tree;            // 544  light tree descriptor (scene/caelix_light_tree.hlsl), 0 = no tree
-    uint light_nee_flags;           // 552  kLightNee*: light cells and lamp NEE of this frame (0 = off)
-    uint light_frame;               // 556  the light cells' frame counter (a lookup's touched word)
-    uint64_t light_cells;           // 560  the cells (common/caelix_light_cells_layout.hlsl)
-    uint64_t light_cell_keys;       // 568  their hash table (common/caelix_hash_table.hlsl): key slots
-    uint64_t light_cell_stack;      // 576  free stack
-    uint64_t light_cell_counters;   // 584  counters
-    uint light_cell_mask;           // 592  key slots - 1
-    float light_footprint;          // 596  level-0 footprint threshold (world units per pixel)
-    uint light_cell_reservoirs;     // 600  reservoirs per cell (64, 128, 256)
-    uint pad_604;                   // 604 -> 608
+    uint light_nee_flags;           // 552  kLightNee*: the light NEE of this frame (0 = off)
+    uint pad_556;                   // 556 -> 560
 };
 
 // CaelixDebugView
@@ -122,12 +114,8 @@ static const uint kRenderFlagFlipY = 1u << 4;
 
 // CaelixFrameConstants::light_nee_flags (lib/src/render/frame_constants.h). Macros: a static const here
 // would add constants to the four other frame-constant kernels, which never read them.
-#define kLightNeeLookup (1u << 0)
-#define kLightNeeContribute (1u << 1)
-#define kLightNeeJitter (1u << 2)
-#define kLightNeeMis (1u << 3)
-#define kLightNeeSunHint (1u << 4)
-#define kLightNeeDirect (1u << 5)
+#define kLightNeeOn (1u << 0)
+#define kLightNeeMis (1u << 1)
 
 // CaelixFrameConstants::target_mask: bit i = the target at descriptor binding i + 1.
 static const uint kTargetColor = 1u << 0;

@@ -38,6 +38,8 @@ static_assert(sizeof(CaelixUpscalerQueryDesc) == 16);
 static_assert(sizeof(CaelixUpscalerQueryResult) == 40);
 static_assert(sizeof(CaelixUpscalerInfo) == 36);
 static_assert(sizeof(CaelixLightOptions) == 16);
+static_assert(sizeof(CaelixLightNeeOptions) == 16);
+static_assert(sizeof(CaelixLightNeeStats) == 16);
 static_assert(sizeof(CaelixLightStats) == 104);
 static_assert(offsetof(CaelixLightStats, tree_leaves) == 72);
 static_assert(offsetof(CaelixLightStats, passes) == 48);

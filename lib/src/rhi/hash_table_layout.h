@@ -4,7 +4,7 @@
 
 namespace caelix {
 
-// GPU layouts of the reusable hash table (docs/LIGHT_NEE.md section 2; rhi/hash_table.h). The table
+// GPU layouts of the reusable hash table (docs/HASH_TABLE.md; rhi/hash_table.h). The table
 // maps 64-bit keys to the indices of a payload pool that its user owns; it knows nothing of what the
 // payloads hold beyond the header contract below. shaders/common/caelix_hash_table.hlsl mirrors every
 // constant of this file by name (caelix_frame_layout_test compares the two files, and the push
@@ -14,7 +14,7 @@ constexpr uint32_t kHashNone = 0xFFFFFFFFu;  // no payload
 // Linear probing: a key lives in one of kHashProbes slots from its home slot (key_lo & mask).
 constexpr uint32_t kHashProbes = 8;
 // Key slots per payload of capacity: about 20 % key fill when the pool is 80 % full (1.2 probes per
-// hit, < 0.1 % failed inserts with 8 probes; docs/LIGHT_NEE.md section 9).
+// hit, < 0.1 % failed inserts with 8 probes; docs/HASH_TABLE.md section 3).
 constexpr uint32_t kHashKeySlotsPerPayload = 4;
 
 // ---------------------------------------------------------------------------

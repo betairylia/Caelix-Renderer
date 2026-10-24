@@ -103,7 +103,7 @@ void LightTreeEmitterCosines(float3 x, float3 lo, float3 hi, out float c[6])
 }
 
 // The importance of a summary (box [lo, hi], face sums) for the receiver box [r_lo, r_hi] with unit
-// normal n (0: no surface), docs/LIGHT_TREE.md section 5.1 and docs/LIGHT_NEE.md section 5. One
+// normal n (0: no surface), docs/LIGHT_TREE.md sections 5 and 5.1. One
 // implementation for both receivers: `is_point` (a constant at every call site, r_lo = r_hi = x) keeps
 // the point form's code exactly as it was before the box form existed (the compiler removes the box
 // terms). With a box: the emitter cosines over D = [r_lo - hi, r_hi - lo]; the receiver term
@@ -271,8 +271,9 @@ void LightTreeSelect(inout LightTree t, uint trees)
 }
 
 // The tree's view without LightTreeOpen's check for lights (which loads both root summaries): for a
-// caller that already holds a brick reference of the tree (a light cell's reservoir, a light face it
-// found). `descriptor` must not be 0.
+// caller that does not need that check: one that already holds a brick reference of the tree (a light
+// face it found), or a draw that fails by itself on a tree without lights (the light NEE's
+// LightTreeSample: no tree is chosen). `descriptor` must not be 0.
 LightTree LightTreeView(uint64_t descriptor)
 {
     LightTree tree;
@@ -775,11 +776,12 @@ float LightTreeBrickPdf(LightTree t, float3 x, float3 n, LightBrickRef brick)
     return LtBrickProbability(t, x, n, t.heap + uint64_t(row.x) * kLtUnitBytes, brick.group, brick.entry);
 }
 
-// The draw of a brick for every receiver point of the box [box_lo, box_hi] with the normal n (the
-// light cells' fill, docs/LIGHT_NEE.md section 3.4): as LightTreeSampleBrick with the box importance
-// (LightTreeImportanceBox) at every choice. `pdf_brick` includes the tree choice; `leaf` = the drawn
-// leaf as tree << kLtBvhLeafTreeShift | leaf index; `importance` = the box importance of the leaf's
-// summary (the fill's RIS target; 0 when the draw fell back to the power).
+// The draw of a brick for every receiver point of the box [box_lo, box_hi] with the normal n (a region
+// receiver, for example a volume; first used by the light cells, removed 2026-10-24; docs/LIGHT_TREE.md
+// section 5): as LightTreeSampleBrick with the box importance (LightTreeImportanceBox) at every
+// choice. `pdf_brick` includes the tree choice; `leaf` = the drawn leaf as tree << kLtBvhLeafTreeShift
+// | leaf index; `importance` = the box importance of the leaf's summary (a RIS target for the region;
+// 0 when the draw fell back to the power).
 bool LightTreeSampleBrickBox(LightTree t, float3 box_lo, float3 box_hi, float3 n, inout uint rng,
                              out LightBrickRef brick, out float pdf_brick, out uint leaf,
                              out float importance)
@@ -825,9 +827,9 @@ float LightTreeBrickPdfBox(LightTree t, float3 box_lo, float3 box_hi, float3 n, 
 }
 
 // The box importance of a brick's leaf summary, read from the leaf array (0 when the brick has no leaf
-// of its own: dropped, or not gathered since its block was rebuilt): the fill's target for the brick,
-// evaluated in the same way by both sides of the light NEE's MIS (docs/LIGHT_NEE.md section 6).
-// `brick` must be valid (LightBrickRefValid).
+// of its own: dropped, or not gathered since its block was rebuilt): a target for the brick and a
+// region receiver (for example a volume; first used by the light cells, removed 2026-10-24), the same
+// value wherever it is evaluated. `brick` must be valid (LightBrickRefValid).
 float LightTreeLeafImportanceBox(LightTree t, LightBrickRef brick, float3 box_lo, float3 box_hi, float3 n)
 {
     const uint4 row = LtGroupRow(t, brick.group);

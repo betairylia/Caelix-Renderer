@@ -393,68 +393,13 @@ struct Args {
     #[arg(long, value_name = "F", default_value_t = 0.0)]
     light_min_emission: f32,
     /// Turn the light NEE off (docs/LIGHT_NEE.md; caelix_renderer_set_light_nee_options). On by
-    /// default: the light cells, the lamp NEE with the sun / lamp choice and its MIS.
+    /// default: every NEE vertex draws a lamp point from the light tree, one shadow ray chosen between
+    /// the sun and the lamp, and the MIS with the BSDF path.
     #[arg(long)]
     no_light_nee: bool,
-    /// Light cells of the renderer's table (0 = the library's default, 262144).
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    light_cells: u32,
-    /// Level-0 (32-voxel) cells below this pixel footprint in world units per pixel, else 128-voxel
-    /// cells (0 = the library's default, 0.25).
-    #[arg(long, value_name = "F", default_value_t = 0.0)]
-    light_footprint: f32,
-    /// Reservoir refresh of the light cell fill: default (the library's), off (every reservoir per
-    /// fill) or rotate (a quarter per fill).
-    #[arg(long, value_name = "MODE", default_value = "default")]
-    light_reservoirs: LightReservoirs,
-    /// Reservoirs per light cell: 0 = the library's default (64), else 64, 128 or 256 (memory per
-    /// cell 64 + 16 x N bytes).
-    #[arg(long, value_name = "N", default_value_t = 0, value_parser = parse_light_reservoir_count)]
-    light_reservoir_count: u32,
-    /// Candidates per refreshed reservoir: 0 = the library's default, 1 = a plain light tree draw,
-    /// 2 = resampled by the brick's importance for the cell.
-    #[arg(long, value_name = "M", default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2))]
-    light_candidates: u32,
-    /// Frames without a lookup before a light cell is evicted (0 = the library's default, 128).
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    light_max_age: u32,
-    /// Light NEE without the jittered cell lookup.
-    #[arg(long)]
-    light_no_jitter: bool,
     /// Light NEE without MIS (the exclusive rule).
     #[arg(long)]
     light_no_mis: bool,
-    /// The sun / lamp choice without the cells' sun visibility hint.
-    #[arg(long)]
-    light_no_sun_hint: bool,
-    /// A fixed light cell footprint (no coarsening when the table fills up).
-    #[arg(long)]
-    light_no_controller: bool,
-    /// Measurement: light cells are looked up and filled, but no lamp NEE runs (the image is the
-    /// one with --no-light-nee).
-    #[arg(long, conflicts_with = "light_no_cells")]
-    light_lookup_only: bool,
-    /// Experimental: light NEE without light cells; every NEE vertex draws its lamp from the light
-    /// tree for its own point and normal, with the exact MIS (docs/LIGHT_NEE.md section 11.6). The
-    /// cell options have no effect.
-    #[arg(long)]
-    light_no_cells: bool,
-}
-
-/// --light-reservoir-count: 0, 64, 128 or 256.
-fn parse_light_reservoir_count(text: &str) -> Result<u32, String> {
-    match text.parse::<u32>() {
-        Ok(n @ (0 | 64 | 128 | 256)) => Ok(n),
-        _ => Err(format!("{text} is not 0, 64, 128 or 256")),
-    }
-}
-
-/// --light-reservoirs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum LightReservoirs {
-    Default,
-    Off,
-    Rotate,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -601,10 +546,6 @@ struct Timing {
     load_flush_samples: Vec<f32>,
     /// The frame number of the newest sample (0 = none).
     sample_frame: u64,
-    /// --timing-frames: the light NEE's maintenance and fill ms of every distinct counters frame
-    /// after the screenshot, and the frame of the newest one.
-    light_nee_samples: Vec<(f32, f32)>,
-    light_nee_frame: u64,
 }
 
 /// The --sky cubemap, converted on the CPU before the window exists and uploaded in `create_state`.
@@ -785,33 +726,10 @@ impl App {
             bail!("caelix_renderer_create failed: CaelixResult {result}");
         }
         if !self.args.no_light_nee {
-            let a = &self.args;
-            let mut flags = 0u32;
-            for (set, flag) in [
-                (a.light_no_jitter, CAELIX_LIGHT_NEE_FLAG_NO_JITTER),
-                (a.light_no_mis, CAELIX_LIGHT_NEE_FLAG_NO_MIS),
-                (a.light_no_sun_hint, CAELIX_LIGHT_NEE_FLAG_NO_SUN_HINT),
-                (a.light_no_controller, CAELIX_LIGHT_NEE_FLAG_NO_CONTROLLER),
-                (a.light_lookup_only, CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY),
-                (a.light_no_cells, CAELIX_LIGHT_NEE_FLAG_NO_CELLS),
-            ] {
-                if set {
-                    flags |= flag;
-                }
-            }
             let options = CaelixLightNeeOptions {
                 enabled: 1,
-                cell_capacity: a.light_cells,
-                footprint: a.light_footprint,
-                reservoir_mode: match a.light_reservoirs {
-                    LightReservoirs::Default => CAELIX_LIGHT_NEE_RESERVOIRS_DEFAULT,
-                    LightReservoirs::Off => CAELIX_LIGHT_NEE_RESERVOIRS_OFF,
-                    LightReservoirs::Rotate => CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE,
-                },
-                candidates: a.light_candidates,
-                max_age: a.light_max_age,
-                flags,
-                reservoirs: a.light_reservoir_count,
+                flags: if self.args.light_no_mis { CAELIX_LIGHT_NEE_FLAG_NO_MIS } else { 0 },
+                reserved: [0; 2],
             };
             // SAFETY: the renderer is live; options is valid for the call.
             let result = unsafe { caelix_renderer_set_light_nee_options(state.renderer, &options) };
@@ -915,6 +833,7 @@ impl App {
                     scene: scene_stats(state.scene),
                     light: light_stats(state.scene),
                     light_nee: light_nee_stats(state.renderer),
+                    light_nee_mis: !self.args.light_no_mis,
                     nrd: nrd_info(state.renderer),
                     load_state: match (state.loader.as_ref(), self.args.world.as_deref()) {
                         (Some(loader), _) => loader.status_line(),
@@ -1317,11 +1236,6 @@ impl App {
                 self.timing.samples.push(t.trace_ms);
                 self.timing.flush_samples.push(t.flush_ms);
             }
-            let l = light_nee_stats(state.renderer);
-            if l.running != 0 && l.frame_number != 0 && l.frame_number != self.timing.light_nee_frame {
-                self.timing.light_nee_frame = l.frame_number;
-                self.timing.light_nee_samples.push((l.maintenance_ms, l.fill_ms));
-            }
             if self.timing.samples.len() as u64 >= self.args.timing_frames {
                 let mut sorted = self.timing.samples.clone();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1364,38 +1278,8 @@ impl App {
                     String::new()
                 };
                 let l = light_nee_stats(state.renderer);
-                let light_nee = if l.enabled != 0 {
-                    let samples = &self.timing.light_nee_samples;
-                    let count = samples.len().max(1) as f64;
-                    let maintenance = samples.iter().map(|s| s.0 as f64).sum::<f64>() / count;
-                    let fill = samples.iter().map(|s| s.1 as f64).sum::<f64>() / count;
-                    format!(
-                        " light_nee: running={} maintenance_ms={maintenance:.3} fill_ms={fill:.3} samples={} \
-                         live={} active={} inserted={} pending={} failed_slot={} failed_payload={} evicted={} \
-                         fresh_draws={} norm_draws={} stale={} capacity={} mode={} candidates={} scale={:.3} \
-                         footprint={:.4} cell_bytes={}",
-                        l.running,
-                        samples.len(),
-                        l.live_cells,
-                        l.active_cells,
-                        l.inserted,
-                        l.pending,
-                        l.failed_slot,
-                        l.failed_payload,
-                        l.evicted,
-                        l.fresh_draws,
-                        l.normalisation_draws,
-                        l.stale_refreshed,
-                        l.cell_capacity,
-                        l.reservoir_mode,
-                        l.candidates,
-                        l.controller_scale,
-                        l.footprint,
-                        l.cell_bytes
-                    )
-                } else {
-                    String::new()
-                };
+                let light_nee =
+                    if l.enabled != 0 { format!(" light_nee: running={}", l.running) } else { String::new() };
                 println!(
                     "timings_avg: trace_ms={mean:.3} median={median:.3} min={:.3} n={n} flush_ms={flush_mean:.3} \
                      load_flush_ms={load_mean:.3} load_flush_max_ms={load_max:.3} load_frames={}{light}{light_nee}",
@@ -2264,8 +2148,6 @@ fn main() -> anyhow::Result<()> {
             samples: Vec::new(),
             flush_samples: Vec::new(),
             load_flush_samples: Vec::new(),
-            light_nee_samples: Vec::new(),
-            light_nee_frame: 0,
             sample_frame: 0,
         },
         load_mismatch: false,
