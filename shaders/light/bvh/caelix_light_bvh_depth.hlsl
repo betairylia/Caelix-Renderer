@@ -2,7 +2,7 @@
 // depth 0). One thread per binary node walks up to the root for its depth (stored in the counter
 // array, free after the aggregation) and writes wide[i] = 1 for an even depth, else 0 (also for
 // i >= n - 1). caelix_light_bvh_scan then turns the flags into 4-wide node indices.
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 [numthreads(64, 1, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID)

@@ -4,7 +4,7 @@
 //   no released or flagged group -> kLtPassNoChange (the build returns at once, no flip)
 //   total <= capacity_units      -> kLtPassOk
 //   otherwise                    -> kLtPassFailed (nothing changes on the GPU; the flags stay)
-#include "scene/caelix_light_tree_group.hlsl"
+#include "light/records/caelix_light_tree_group.hlsl"
 
 groupshared uint gs_flags;
 

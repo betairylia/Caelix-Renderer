@@ -83,7 +83,7 @@
 #define CAELIX_SKY_BINDING_SAMPLER 20
 #include "render/caelix_shading.hlsl"
 // The light tree and the light NEE's near field and MIS weight (docs/LIGHT_NEE.md).
-#include "scene/caelix_light_tree.hlsl"
+#include "light/caelix_light_tree.hlsl"
 #include "render/caelix_light_nee.hlsl"
 // NRD's front-end packing (normal + roughness, radiance + normalized hit distance);
 // NRDConfig.hlsli next to it fixes the encodings NRD was built with.

@@ -1,5 +1,5 @@
 // GPU layouts of the light tree (docs/LIGHT_TREE.md) and the helpers that read them. Mirrors
-// lib/src/scene/light_tree_layout.h, where the structs and their static_asserts are: every constant
+// lib/src/light/light_tree_layout.h, where the structs and their static_asserts are: every constant
 // here has the same name and value there (caelix_frame_layout_test compares the two files). Every
 // table is read and written through buffer device addresses.
 #ifndef CAELIX_LIGHT_TREE_LAYOUT_HLSL
@@ -201,7 +201,7 @@ static const uint kLtChildLeafBit = 0x80000000u;
 
 // ---------------------------------------------------------------------------
 // Build scratch of the BVH kernels for a leaf capacity C: array X starts at byte kLtScratchX * C
-// (lib/src/scene/light_tree_layout.h describes the arrays).
+// (lib/src/light/light_tree_layout.h describes the arrays).
 static const uint kLtScratchKeys = 0;
 static const uint kLtScratchValues = 4;
 static const uint kLtScratchSortBufferStride = 8;

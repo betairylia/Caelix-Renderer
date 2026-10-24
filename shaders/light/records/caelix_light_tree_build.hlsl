@@ -17,7 +17,7 @@
 // the two can differ only while a neighbour's change waits for its finalization, and that
 // finalization marks the record stale again.
 #include "common/caelix_material.hlsl"
-#include "scene/caelix_light_tree_group.hlsl"
+#include "light/records/caelix_light_tree_group.hlsl"
 
 static const uint kModeCopy = 0;
 static const uint kModeRebuild = 1;

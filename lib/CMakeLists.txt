@@ -35,10 +35,6 @@ add_library(caelix_renderer SHARED
   src/rhi/alloc/row_pool.h
   # The scene: entities, bricks, flush, acceleration structures.
   src/scene/gpu_structs.h
-  src/scene/light_tree.cpp
-  src/scene/light_tree.h
-  src/scene/light_tree_layout.h
-  src/scene/light_tree_record.cpp
   src/scene/record_layout.h
   src/scene/scene.h
   src/scene/scene_accel.cpp
@@ -53,6 +49,11 @@ add_library(caelix_renderer SHARED
   src/scene/scene_internal.h
   src/scene/slot_table_pool.h
   src/scene/staged_copy.h
+  # The light tree (docs/LIGHT_TREE.md): brick light records, two world-space light BVHs, device sampling API.
+  src/light/light_tree.cpp
+  src/light/light_tree.h
+  src/light/light_tree_layout.h
+  src/light/light_tree_record.cpp
   # The renderer: per-device kernels, render targets, the pass sequence, NRD, the upscalers.
   src/render/dlss_upscaler.cpp
   src/render/dlss_upscaler.h
@@ -126,27 +127,27 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_finish.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_scene_lookup.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_finalize.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_tree_group.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_tree_size.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_tree_scan.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_tree_build.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_tree_commit.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_common.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_sort.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_begin.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_gather_count.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_gather_emit.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_scan.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_bounds.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_morton.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_sort_histogram.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_sort_scatter.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_karras.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_aggregate.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_depth.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_wide.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_bvh_finish.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_light_tree.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/caelix_light_tree.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/records/caelix_light_tree_group.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/records/caelix_light_tree_size.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/records/caelix_light_tree_scan.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/records/caelix_light_tree_build.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/records/caelix_light_tree_commit.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_common.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_sort.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_begin.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_gather_count.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_gather_emit.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_scan.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_bounds.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_morton.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_sort_histogram.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_sort_scatter.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_karras.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_aggregate.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_depth.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_wide.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_finish.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_brick_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_scene_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl

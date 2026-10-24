@@ -2,7 +2,7 @@
 // leaf capacity), and the dropped rest into the tree's header and state (also for a scene without
 // groups, where the gather dispatches nothing), then the bounds of the leaf box centres for the
 // Morton codes.
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 groupshared float3 gs_lo[256];
 groupshared float3 gs_hi[256];

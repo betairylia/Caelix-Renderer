@@ -6,7 +6,7 @@
 //   W[+a] = sum_f F[f] * max(0, (R d_f)_a),  W[-a] = sum_f F[f] * max(0, -(R d_f)_a)
 // (an upper bound of the cosine-weighted power in every direction; exact for axis-aligned
 // rotations).
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 LtSummary LtWorldSummary(LtSummary local, float3x3 rotation, float3 translation)
 {

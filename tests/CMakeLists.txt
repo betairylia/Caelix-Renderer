@@ -98,7 +98,7 @@ caelix_compile_shaders(light_tree_probe_spv
 add_custom_target(caelix_light_tree_probe_shaders DEPENDS ${light_tree_probe_spv})
 caelix_add_gpu_test(caelix_light_tree_test light_tree_test.cpp)
 add_dependencies(caelix_light_tree_test caelix_light_tree_probe_shaders)
-# The library's layout headers (lib/src/scene/light_tree_layout.h) are the test's view of the GPU
+# The library's layout headers (lib/src/light/light_tree_layout.h) are the test's view of the GPU
 # memory; the probe and the library kernels load from the build's shader folder.
 target_include_directories(caelix_light_tree_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/src)
 target_compile_definitions(caelix_light_tree_test PRIVATE

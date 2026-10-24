@@ -11,7 +11,7 @@
 // A released or flagged group sets kLtPassFlagChanged in the control's pass_flags (without one, the
 // pass changes nothing: no copy, no heap flip) and the flag of the BVH of its entity's motion (only
 // those BVHs are gathered and rebuilt after a committed pass).
-#include "scene/caelix_light_tree_group.hlsl"
+#include "light/records/caelix_light_tree_group.hlsl"
 
 static const uint kModeKeep = 0;
 static const uint kModeRebuild = 1;

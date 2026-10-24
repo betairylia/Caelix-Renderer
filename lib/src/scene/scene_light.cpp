@@ -1,5 +1,5 @@
 // The scene's light tree: caelix_scene_set_light_options, caelix_scene_get_light_stats and the
-// scene-side helpers of the flush. The tree itself is lib/src/scene/light_tree.*.
+// scene-side helpers of the flush. The tree itself is lib/src/light/light_tree.*.
 #include "scene/scene.h"
 
 #include "core/log.h"

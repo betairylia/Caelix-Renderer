@@ -62,7 +62,7 @@ tree choice (2 root summaries, world space)
            -> face family -> face entry -> point on the unit face
 ```
 
-Every layout below is defined once in `lib/src/scene/light_tree_layout.h` (structs, named offsets,
+Every layout below is defined once in `lib/src/light/light_tree_layout.h` (structs, named offsets,
 static_asserts) and mirrored by name in `shaders/common/caelix_light_tree_layout.hlsl`;
 `caelix_frame_layout_test` compares the two files and the push constant blocks of the compiled
 kernels with the C++ push structs. Heap offsets and sizes count 16-byte **units** (`kLtUnitBytes`).
@@ -330,7 +330,7 @@ creates a group that reuses it), its old block stays in place and is gathered in
 new entity's motion with the new entity's transform; the retry then rebuilds the group (fresh: every
 record recomputed) and the trees.
 
-## 5. Device API (`shaders/scene/caelix_light_tree.hlsl`)
+## 5. Device API (`shaders/light/caelix_light_tree.hlsl`)
 
 Includable by every kernel; it reads only the descriptor and the buffers it points to. All
 positions and normals are world space. `n` is the receiver's unit normal, or 0 for a receiver
@@ -558,16 +558,16 @@ newest one of the load.
 
 ## 9. Files
 
-- `lib/src/scene/light_tree.h`, `light_tree.cpp` (hooks, code set, Prepare, Stage),
+- `lib/src/light/light_tree.h`, `light_tree.cpp` (hooks, code set, Prepare, Stage),
   `light_tree_record.cpp` (transfers, group pass, gather and build recording, readback, stats),
-  `light_tree_layout.h` (GPU layouts, named offsets, push structs), `scene_light.cpp` (the Scene
-  side: options, stats, requeue), `staged_copy.h`.
+  `light_tree_layout.h` (GPU layouts, named offsets, push structs); `lib/src/scene/scene_light.cpp`
+  (the Scene side: options, stats, requeue), `scene/staged_copy.h`.
 - `shaders/common/caelix_light_tree_layout.hlsl` (layouts and their readers),
   `shaders/common/caelix_workgroup_scan.hlsl`, `shaders/scene/caelix_scene_lookup.hlsl` (record and
-  neighbour lookups shared with the finalize kernel), `caelix_light_tree_group.hlsl` +
-  `caelix_light_tree_{size,scan,build,commit}.hlsl` (group pass), `caelix_light_bvh_common.hlsl`,
+  neighbour lookups shared with the finalize kernel); `shaders/light/records/caelix_light_tree_group.hlsl`
+  + `caelix_light_tree_{size,scan,build,commit}.hlsl` (group pass); `shaders/light/bvh/caelix_light_bvh_common.hlsl`,
   `caelix_light_bvh_sort.hlsl`, `caelix_light_bvh_{begin,scan,bounds,morton,sort_histogram,
   sort_scatter,karras,aggregate,depth,wide,finish}.hlsl`, `caelix_light_gather_{count,emit}.hlsl`
-  (gather and build), `caelix_light_tree.hlsl` (device API).
+  (gather and build); `shaders/light/caelix_light_tree.hlsl` (device API).
 - `tests/light_tree_test.cpp`, `tests/shaders/caelix_light_tree_probe.hlsl`,
   `tests/frame_layout_test.cpp` (layouts).

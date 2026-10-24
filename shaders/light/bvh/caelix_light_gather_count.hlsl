@@ -2,7 +2,7 @@
 // the number of leaves the group gives to this tree: its block's record count when the group's
 // entity has this tree's motion, else 0 (no block, or a release still pending after a failed pass).
 // caelix_light_bvh_scan turns the counts into leaf offsets.
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 [numthreads(64, 1, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID)

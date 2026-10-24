@@ -77,7 +77,7 @@ struct CaelixFrameConstants
     uint2 upscale_src_size;         // 528  size of the encode kernel's source image
     uint upscaler;                  // 536  kUpscaler*: 2 = the trace writes the RR guide images
     uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear)
-    uint64_t light_tree;            // 544  light tree descriptor (scene/caelix_light_tree.hlsl), 0 = no tree
+    uint64_t light_tree;            // 544  light tree descriptor (light/caelix_light_tree.hlsl), 0 = no tree
     uint light_nee_flags;           // 552  kLightNee*: the light NEE of this frame (0 = off)
     uint pad_556;                   // 556 -> 560
 };

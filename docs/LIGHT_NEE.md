@@ -22,7 +22,7 @@ temporal lag).
 Code: `shaders/render/caelix_path_trace.hlsl` (section "Light NEE": `LampCandidate`, `SunCandidate`,
 `NextEventAtVertex`, `LampHitWeight`; the gate in `TracePath`), `shaders/render/caelix_light_nee.hlsl`
 (`kLightNeeNearField`, `LightNeeMisWeight`), the light tree device API
-(`shaders/scene/caelix_light_tree.hlsl`: `LightTreeView`, `LightTreeSample`, `LightTreeFindLightFace`,
+(`shaders/light/caelix_light_tree.hlsl`: `LightTreeView`, `LightTreeSample`, `LightTreeFindLightFace`,
 `LightTreeBrickPdf`), the renderer side `lib/src/render/renderer_light.cpp` (options, the choice per
 render call, stats) and `renderer_render.cpp` (flags, kernel binding).
 

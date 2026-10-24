@@ -55,7 +55,7 @@ constexpr uint32_t BlockMaterialCode(uint32_t v, uint32_t encoding)
 //                 bits 16..23 coarse occupancy (2x2x2 bits). 0 until a later
 //                             kernel fills it.
 //   word 1        bits 0..17 tight bounds, bits 18..29 light face count, bit 30
-//                 light record stale (scene/light_tree_layout.h). 0 until a later
+//                 light record stale (light/light_tree_layout.h). 0 until a later
 //                 kernel fills it; readers of the bounds mask bits 0..17.
 //   words 2..17   micro occupancy (4^3 bits per 64-bit pair). 0 until a later
 //                 kernel fills it.

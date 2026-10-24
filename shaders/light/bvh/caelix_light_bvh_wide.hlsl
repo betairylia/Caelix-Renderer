@@ -5,7 +5,7 @@
 // node's summaries are inlined per slot. The thread also writes the parent links of its slots
 // (leaf.parent = w << 2 | slot; child node's parent / parent_slot). A node index at or above the
 // node capacity is not written (caelix_light_bvh_finish then marks the tree empty and the overflow).
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 [numthreads(64, 1, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID)

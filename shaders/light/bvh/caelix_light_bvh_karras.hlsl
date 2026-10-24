@@ -3,7 +3,7 @@
 // i in [0, n - 1). Equal Morton codes are ordered by their sorted position (the key is
 // (code, position)), so every key is distinct. Writes left/right (bit 31 = a leaf at that sorted
 // position) and the parent of every child; node 0 is the root.
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 uint LtCountLeadingZeros(uint x)
 {

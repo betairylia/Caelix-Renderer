@@ -527,7 +527,7 @@ CAELIX_API CaelixResult caelix_scene_get_material(const CaelixScene* scene, uint
  *
  * An optional light BVH at brick granularity over the emissive voxels of the scene, for drawing a
  * light point for any receiver with an exact pdf (the device API in
- * shaders/scene/caelix_light_tree.hlsl). Disabled by default: a scene without it pays nothing.
+ * shaders/light/caelix_light_tree.hlsl). Disabled by default: a scene without it pays nothing.
  *
  * A light voxel is a voxel whose material emission luminance, dot(emission, (0.2126, 0.7152,
  * 0.0722)) before CaelixRenderOptions::emission_scale, is at least min_emission; a light face is a

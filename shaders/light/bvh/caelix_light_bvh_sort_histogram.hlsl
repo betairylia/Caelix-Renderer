@@ -1,7 +1,7 @@
-// Light BVH radix sort pass, kernel 1 of 2 (scene/caelix_light_bvh_sort.hlsl): the digit counts of
+// Light BVH radix sort pass, kernel 1 of 2 (light/bvh/caelix_light_bvh_sort.hlsl): the digit counts of
 // one block of 1024 elements, written to histogram[digit * block_count + block] (0 for a block past
 // the element count).
-#include "scene/caelix_light_bvh_sort.hlsl"
+#include "light/bvh/caelix_light_bvh_sort.hlsl"
 
 groupshared uint gs_counts[kLtSortDigits];
 

@@ -442,7 +442,7 @@ constexpr uint64_t LightBvhScratchBytes(uint32_t leaf_capacity)
 // Push constants. The HLSL structs have the same member names (caelix_frame_layout_test checks the
 // compiled blocks against these).
 
-// The group pass kernels (shaders/scene/caelix_light_tree_group.hlsl). 80 bytes.
+// The group pass kernels (shaders/light/records/caelix_light_tree_group.hlsl). 80 bytes.
 struct LightGroupPush
 {
     uint64_t descriptor;
@@ -464,7 +464,7 @@ static_assert(offsetof(LightGroupPush, records_per_page_shift) == 56);
 static_assert(offsetof(LightGroupPush, capacity_units) == 72);
 static_assert(sizeof(LightGroupPush) == 80);
 
-// The gather and build kernels (shaders/scene/caelix_light_bvh_common.hlsl). 56 bytes.
+// The gather and build kernels (shaders/light/bvh/caelix_light_bvh_common.hlsl). 56 bytes.
 struct LightBvhPush
 {
     uint64_t descriptor;
@@ -495,7 +495,7 @@ struct LightScanPush
 static_assert(offsetof(LightScanPush, count) == 24);
 static_assert(sizeof(LightScanPush) == 32);
 
-// The radix sort kernels (shaders/scene/caelix_light_bvh_sort.hlsl). 64 bytes.
+// The radix sort kernels (shaders/light/bvh/caelix_light_bvh_sort.hlsl). 64 bytes.
 struct LightSortPush
 {
     uint64_t keys_in;

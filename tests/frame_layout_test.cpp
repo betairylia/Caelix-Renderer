@@ -20,7 +20,7 @@
 #include "render/frame_constants.h"
 #include "rhi/hash_table_layout.h"
 #include "scene/gpu_structs.h"
-#include "scene/light_tree_layout.h"
+#include "light/light_tree_layout.h"
 #include "scene/material_table.h"
 #include "scene/record_layout.h"
 
@@ -813,7 +813,7 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kMaterialAlbedo),
         CAELIX_CONSTANT(kMaterialEmission),
         CAELIX_CONSTANT(kMaterialIor),
-        // shaders/common/caelix_light_tree_layout.hlsl: lib/src/scene/light_tree_layout.h
+        // shaders/common/caelix_light_tree_layout.hlsl: lib/src/light/light_tree_layout.h
         CAELIX_CONSTANT(kLtNone),
         CAELIX_CONSTANT(kLtTrees),
         CAELIX_CONSTANT(kLtMaxLightBricksPerGroup),

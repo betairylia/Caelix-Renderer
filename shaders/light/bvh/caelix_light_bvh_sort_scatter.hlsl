@@ -1,8 +1,8 @@
-// Light BVH radix sort pass, kernel 2 of 2 (scene/caelix_light_bvh_sort.hlsl): one block of 1024
+// Light BVH radix sort pass, kernel 2 of 2 (light/bvh/caelix_light_bvh_sort.hlsl): one block of 1024
 // elements goes to its scanned digit offsets. Stable: the block's elements are taken in 4 rounds of
 // 256 in input order; inside a round an element's rank among equal digits comes from the wave's
 // prefix ballot counts plus the counts of the earlier waves and rounds.
-#include "scene/caelix_light_bvh_sort.hlsl"
+#include "light/bvh/caelix_light_bvh_sort.hlsl"
 
 groupshared uint gs_running[kLtSortDigits];  // elements per digit written by the earlier rounds
 groupshared uint gs_wave_counts[kLtSortMaxWaves][kLtSortDigits];  // elements per digit and wave, this round

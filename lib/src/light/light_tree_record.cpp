@@ -1,6 +1,6 @@
 // The light tree: the recording half of the flush (transfers, the group pass, the gathers and BVH
 // builds), the heap growth, the readback of the results and the stats.
-#include "scene/light_tree.h"
+#include "light/light_tree.h"
 
 #include "core/log.h"
 #include "scene/gpu_structs.h"

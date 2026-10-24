@@ -4,7 +4,7 @@
 // released group of this tree (its leaves change; the other tree's leaves name (group, index entry)
 // pairs that the pass did not change, since its blocks were only copied). Every later kernel of the
 // sequence reads the decision.
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 [numthreads(1, 1, 1)]
 void main()

@@ -1,5 +1,5 @@
 // Probe kernel of caelix_light_nee_test (tests/light_nee_test.cpp): runs the light tree's functions of the
-// light NEE and of a region receiver (scene/caelix_light_tree.hlsl) and the light NEE's MIS weight
+// light NEE and of a region receiver (light/caelix_light_tree.hlsl) and the light NEE's MIS weight
 // (render/caelix_light_nee.hlsl).
 //   mode 0 support: thread i < count: SupportQuery at input + 64 i (a box receiver lo, hi, normal, a point
 //                   in front of the light face and the face: group, voxel in group, face, block) -> the
@@ -14,7 +14,7 @@
 //   mode 2 weight:  thread i < count: WeightQuery at input + 48 i (p_area, d, cos_l, the receiver normal
 //                   n and the unit direction w) -> LightNeeMisWeight on both sides: output + 16 i =
 //                   (w_nee, w_bsdf, 0, 0)
-#include "scene/caelix_light_tree.hlsl"
+#include "light/caelix_light_tree.hlsl"
 #include "render/caelix_light_nee.hlsl"
 
 struct LightNeeProbePush

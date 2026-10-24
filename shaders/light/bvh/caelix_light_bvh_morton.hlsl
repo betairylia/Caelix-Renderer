@@ -1,6 +1,6 @@
 // Light BVH build: one thread per leaf writes the sort input (30-bit Morton code of the leaf box
 // centre over the centre bounds, leaf index) and clears the aggregation counters.
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 [numthreads(64, 1, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID)

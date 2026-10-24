@@ -2,7 +2,7 @@
 // pass. kLtPassOk: the target heap buffer becomes current, the totals over the rows are recounted
 // for the stats, passes + 1. kLtPassFailed: passes + 1, failed_passes + 1 (the rows and flags stay;
 // the next pass retries). kLtPassNoChange: nothing.
-#include "scene/caelix_light_tree_group.hlsl"
+#include "light/records/caelix_light_tree_group.hlsl"
 
 groupshared uint64_t gs_sums[3][kLtThreads];  // light bricks, light faces, dropped
 groupshared uint gs_groups[kLtThreads];

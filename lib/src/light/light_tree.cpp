@@ -1,6 +1,6 @@
 // The light tree: creation, the scene hooks, the light code set and the CPU half of the flush
 // (Prepare, Stage). The recording half is light_tree_record.cpp.
-#include "scene/light_tree.h"
+#include "light/light_tree.h"
 
 #include "core/log.h"
 #include "rhi/shader_loader.h"

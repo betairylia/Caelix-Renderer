@@ -6,7 +6,7 @@
 #include "rhi/gpu_timer.h"
 #include "rhi/pipeline.h"
 #include "rhi/staging_ring.h"
-#include "scene/light_tree_layout.h"
+#include "light/light_tree_layout.h"
 #include "scene/staged_copy.h"
 
 #include <array>

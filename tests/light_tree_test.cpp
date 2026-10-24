@@ -13,7 +13,7 @@
 #include "test_scenes.h"
 
 #include "scene/gpu_structs.h"
-#include "scene/light_tree_layout.h"
+#include "light/light_tree_layout.h"
 #include "scene/record_layout.h"
 
 #include <algorithm>
@@ -41,7 +41,7 @@ using test::Brick;
 using test::Key;
 using test::World;
 
-// The GPU layouts are the library's own (lib/src/scene/light_tree_layout.h); the test reads them
+// The GPU layouts are the library's own (lib/src/light/light_tree_layout.h); the test reads them
 // through memory.
 using caelix::BrickLightRecordHeader;
 using caelix::GroupInfo;

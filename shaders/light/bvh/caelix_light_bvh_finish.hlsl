@@ -3,7 +3,7 @@
 // root is node 0, node_count comes from the scan of the even-depth flags; more nodes than the
 // capacity leave the tree empty and set the overflow flag (the CPU grows the node buffer and
 // rebuilds). Counts the build.
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 [numthreads(1, 1, 1)]
 void main()

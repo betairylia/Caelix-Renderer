@@ -1,5 +1,5 @@
 // Probe kernel of caelix_light_tree_test (tests/light_tree_test.cpp): runs the light tree's device
-// API (scene/caelix_light_tree.hlsl) and copies GPU memory for the test's readback.
+// API (light/caelix_light_tree.hlsl) and copies GPU memory for the test's readback.
 //   mode 0 copy:   thread i < count: output[i] = the uint4 at input + 16 i (any device address)
 //   mode 1 sample: thread i < count: receiver i / draws (input2, 32 bytes: float4 position,
 //                  float4 normal); one LightTreeSample, the pdf evaluations of its result, and one
@@ -11,7 +11,7 @@
 //                  (input2); the sum of the pdfs to output + 4 i
 //   mode 4 draw:   thread i < count: one LightTreeSample for receiver i / draws; uint4 (group, voxel in
 //                  group, face, ok) to output + 16 i
-#include "scene/caelix_light_tree.hlsl"
+#include "light/caelix_light_tree.hlsl"
 
 struct ProbePush
 {

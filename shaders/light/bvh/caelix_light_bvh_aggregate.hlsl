@@ -3,7 +3,7 @@
 // node's summary (sum of the face sums, union of the boxes) from both children and goes on. The
 // arrival counter is an acquire/release atomic, and the summaries of internal nodes are written and
 // read with coherent atomic word accesses, so the second thread sees what the first one wrote.
-#include "scene/caelix_light_bvh_common.hlsl"
+#include "light/bvh/caelix_light_bvh_common.hlsl"
 
 void LtStoreAggregateCoherent(uint node, LtSummary s)
 {

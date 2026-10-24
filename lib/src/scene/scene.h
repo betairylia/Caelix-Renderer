@@ -10,7 +10,7 @@
 #include "rhi/pipeline.h"
 #include "rhi/staging_ring.h"
 #include "scene/gpu_structs.h"
-#include "scene/light_tree.h"
+#include "light/light_tree.h"
 #include "scene/material_table.h"
 #include "scene/record_layout.h"
 #include "scene/slot_table_pool.h"
@@ -143,7 +143,7 @@ public:
     CaelixResult SetGlassPalette(const CaelixMaterial* entries, uint32_t count);
     CaelixResult SetMaterialEntries(const CaelixMaterialEntry* entries, uint32_t count);
     CaelixResult GetMaterial(uint32_t code, CaelixMaterial& out) const;
-    // Light tree (scene_light.cpp, lib/src/scene/light_tree.h).
+    // Light tree (scene_light.cpp, lib/src/light/light_tree.h).
     CaelixResult SetLightOptions(const CaelixLightOptions& options);
     void GetLightStats(CaelixLightStats& out) const;
     // The light tree descriptor's device address, 0 when the tree is disabled.
