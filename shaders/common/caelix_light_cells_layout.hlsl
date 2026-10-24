@@ -2,7 +2,9 @@
 // table (common/caelix_hash_table.hlsl). Mirrors lib/src/render/light_cells_layout.h: every constant
 // here has the same name and value there (caelix_frame_layout_test compares the two files).
 //
-// One cell (1088 bytes): the 64-byte header, then 64 reservoirs of 16 bytes.
+// One cell (LightCellBytes(R) bytes, 1088 at the default R = 64): the 64-byte header, then R reservoirs
+// of 16 bytes (R = CaelixFrameConstants::light_cell_reservoirs, LightCellFillPush::reservoirs: 64, 128
+// or 256).
 //   0   state         kHashState* (the hash table's payload contract)
 //   4   touched       the renderer's light frame of the newest lookup
 //   8   entity        \
@@ -21,7 +23,9 @@
 
 #include "common/caelix_hash_table.hlsl"
 
-static const uint kLightCellReservoirCount = 64;
+static const uint kLightCellDefaultReservoirs = 64;
+static const uint kLightCellMinReservoirs = 64;
+static const uint kLightCellMaxReservoirs = 256;
 static const uint kLightCellReservoirBytes = 16;
 static const uint kLcState = 0;
 static const uint kLcTouched = 4;
@@ -43,7 +47,6 @@ static const uint kLcResWeight = 8;
 static const uint kLcResGeneration = 12;
 static const uint kLightCellNoGroup = 0xFFFFFFFFu;
 static const uint kLcReservoirs = 64;
-static const uint kLightCellBytes = 1088;
 static const uint kLightCellBaseShift = 5;
 static const uint kLightCellLevelShift = 2;
 static const uint kLightCellLevels = 2;
@@ -57,5 +60,19 @@ static const uint kLcCounterNormDraws = kHashCounterUser + 4;
 static const uint kLcCounterStaleRefreshed = kHashCounterUser + 8;
 static const uint kLightCellModeOff = 1;
 static const uint kLightCellModeRotate = 2;
+
+// The bytes of a cell with `reservoirs` reservoirs (the hash table's payload stride).
+uint LightCellBytes(uint reservoirs)
+{
+    return kLightCellHeaderBytes + reservoirs * kLightCellReservoirBytes;
+}
+
+// The fill's thread mapping (lib/src/render/light_cells_layout.h has the same function): the threads
+// of one cell, min(kLightCellFillThreads, the reservoirs due per fill).
+uint LightCellFillThreadsPerCell(uint reservoirs, uint mode)
+{
+    const uint due = mode == kLightCellModeRotate ? reservoirs / kLightCellRotation : reservoirs;
+    return min(kLightCellFillThreads, due);
+}
 
 #endif  // CAELIX_LIGHT_CELLS_LAYOUT_HLSL

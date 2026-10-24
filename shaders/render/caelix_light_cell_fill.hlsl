@@ -1,11 +1,15 @@
 // The light cell fill (docs/LIGHT_NEE.md section 3.4) over the ACTIVE cells (the hash table's active
 // list: cells looked up by the previous frame's trace; an indirect dispatch written by the table's
-// maintenance), before the trace, after the maintenance. Workgroups of 64 threads:
-//   mode "off":    one cell per workgroup, thread r owns reservoir r;
-//   mode "rotate": kLightCellRotation (4) cells per workgroup, 16 threads per cell, thread j owns the
-//                  reservoirs 4 j .. 4 j + 3, exactly one of which is due by the rotation, so the waves
-//                  carry only reservoirs that draw (with one cell per workgroup a quarter of the lanes
-//                  would draw and the waves would cost as much as in mode "off").
+// maintenance), before the trace, after the maintenance. Workgroups of 64 threads; a cell has R
+// reservoirs (g_push.reservoirs: 64, 128 or 256) and T = LightCellFillThreadsPerCell(R, mode) =
+// min(64, the reservoirs due per fill) threads, thread j owns the reservoirs j R / T .. (j + 1) R / T - 1
+// (docs/LIGHT_NEE.md section 11.6):
+//   mode "off":    T = 64: R = 64 one reservoir per thread (thread r owns reservoir r), R = 256 four;
+//   mode "rotate": T = R / kLightCellRotation (16, 32, 64), 64 / T cells per workgroup, every thread owns
+//                  kLightCellRotation (4) consecutive reservoirs, exactly one of which is due by the
+//                  rotation, so the waves carry only reservoirs that draw (with one cell of 64 threads
+//                  per workgroup at R = 64 a quarter of the lanes would draw and the waves would cost as
+//                  much as in mode "off").
 // Per cell:
 // 1. The receiver region (render/caelix_light_cells.hlsl): the inflated cell box as a world AABB and
 //    the receivers' normal R e_face.
@@ -29,8 +33,8 @@
 //    kLightCellNormalisationFills fills. The MIS proxy reads the current C (LightNeeProxyArea).
 // 5. The cell's first thread, after a barrier (every thread has read the header): the sun hint counters
 //    lose 1/8 (0 for a new cell), fills + 1, state ready.
-// The random stream of a reservoir is a function of (cell slot, reservoir, frame seed) only. The counters
-// of the fresh draws, the normalisation draws and the early (stale or new) refreshes go into the hash
+// The random stream of a reservoir is a function of (cell slot x R + reservoir, frame seed) only. The
+// counters of the fresh draws, the normalisation draws and the early (stale or new) refreshes go into the hash
 // table's user counter words (one atomic per wave).
 #include "render/caelix_light_cells.hlsl"
 
@@ -44,7 +48,7 @@ struct LightCellFillPush
     uint frame_seed;
     uint mode;
     uint candidates;
-    uint pad;
+    uint reservoirs;
 };
 
 CAELIX_PUSH_CONSTANTS(LightCellFillPush, g_push);
@@ -116,16 +120,17 @@ uint4 FillReservoir(LightTree tree, LightCellRegion region, uint candidates, ino
 void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
 {
     const bool rotate = g_push.mode == kLightCellModeRotate;
-    const uint cells_per_group = rotate ? kLightCellRotation : 1u;
-    const uint threads_per_cell = kLightCellFillThreads / cells_per_group;
-    const uint reservoirs_per_thread = kLightCellReservoirCount / threads_per_cell;
+    const uint reservoirs = g_push.reservoirs;
+    const uint threads_per_cell = LightCellFillThreadsPerCell(reservoirs, g_push.mode);
+    const uint cells_per_group = kLightCellFillThreads / threads_per_cell;
+    const uint reservoirs_per_thread = reservoirs / threads_per_cell;
     const uint j = thread_id.x % threads_per_cell;
     const uint group_index = group_id.y * kHashDispatchRowGroups + group_id.x;
     const uint index = group_index * cells_per_group + thread_id.x / threads_per_cell;
     // Every thread reaches the barrier below; a thread without a cell only skips the work.
     const bool active = index < CAELIX_LOAD_U32(g_push.dispatch + kHashDispatchCount);
     const uint slot = active ? CAELIX_LOAD_U32(g_push.active + uint64_t(index) * 4) : 0u;
-    const uint64_t cell = LightCellAddress(g_push.payloads, slot);
+    const uint64_t cell = LightCellAddress(g_push.payloads, slot, reservoirs);
 
     bool fresh = false;
     uint fills = 0;
@@ -161,7 +166,7 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
             const bool stale = fresh || !open || mismatch;
             if (scheduled || stale)
             {
-                uint rng = FillHash(slot * kLightCellReservoirCount + r) ^
+                uint rng = FillHash(slot * reservoirs + r) ^
                            FillHash(g_push.frame_seed ^ 0x3C6EF372u);
                 const uint4 value = open ? FillReservoir(tree, region, g_push.candidates, rng)
                                          : uint4(kLightCellNoGroup, 0u, 0u, 0u);

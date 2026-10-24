@@ -8,15 +8,15 @@
 // The test reads the .spv files of the build (CAELIX_SHADER_SPV_DIR, written by cmake/Shaders.cmake)
 // and parses the SPIR-V binary, and reads the HLSL sources (CAELIX_SHADER_SOURCE_DIR).
 //
-// For each of the five frame-constant kernels it finds the variable of storage class Uniform whose
-// pointee is a struct decorated Block (exactly one), checks its DescriptorSet / Binding against
-// kFrameSetIndex / kFrameConstantsBinding, recomputes the C natural layout of the block's member
-// sequence (each member aligned to its scalar size; arrays and matrices without padding) and requires
-// every member's Offset decoration to equal that offset, every ArrayStride / MatrixStride to equal
-// the element / column size, and the end of the last member to equal sizeof(FrameConstants) (whose
-// field offsets the static_asserts of frame_constants.h pin). DXC's constant buffer layout differs
-// from the C layout when a vector crosses a 16-byte row or an array element is not 16 bytes; such a
-// change of CaelixFrameConstants fails here.
+// For each of the frame-constant kernels (the five kernels and the two trace variants) it finds the
+// variable of storage class Uniform whose pointee is a struct decorated Block (exactly one), checks
+// its DescriptorSet / Binding against kFrameSetIndex / kFrameConstantsBinding, recomputes the C
+// natural layout of the block's member sequence (each member aligned to its scalar size; arrays and
+// matrices without padding) and requires every member's Offset decoration to equal that offset,
+// every ArrayStride / MatrixStride to equal the element / column size, and the end of the last member
+// to equal sizeof(FrameConstants) (whose field offsets the static_asserts of frame_constants.h pin).
+// DXC's constant buffer layout differs from the C layout when a vector crosses a 16-byte row or an
+// array element is not 16 bytes; such a change of CaelixFrameConstants fails here.
 #include "render/frame_constants.h"
 #include "render/light_cells_layout.h"
 #include "rhi/hash_table_layout.h"
@@ -361,7 +361,8 @@ std::vector<std::string> CheckKernel(const std::string& name)
 
 TEST_CASE("frame constants: the uniform block of every frame-constant kernel has the C layout")
 {
-    const char* const kernels[] = {"caelix_path_trace", "caelix_path_trace_no_light_nee", "caelix_composite",
+    const char* const kernels[] = {"caelix_path_trace", "caelix_path_trace_no_light_nee",
+                                   "caelix_path_trace_light_tree_nee", "caelix_composite",
                                    "caelix_cross_resolve", "caelix_sky_sh", "caelix_upscale_encode"};
     for (const char* kernel : kernels)
     {
@@ -517,7 +518,7 @@ TEST_CASE("push constants: the scene and light tree kernels have the C++ layouts
         CAELIX_FIELD(LightCellFillPush, dispatch),   CAELIX_FIELD(LightCellFillPush, counters),
         CAELIX_FIELD(LightCellFillPush, light_tree), CAELIX_FIELD(LightCellFillPush, frame_seed),
         CAELIX_FIELD(LightCellFillPush, mode),       CAELIX_FIELD(LightCellFillPush, candidates),
-        CAELIX_FIELD(LightCellFillPush, pad),
+        CAELIX_FIELD(LightCellFillPush, reservoirs),
     };
     const std::vector<std::pair<const char*, const std::vector<Field>*>> kernels = {
         {"caelix_light_cell_fill", &fill},
@@ -999,7 +1000,9 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kHashEmptyEntry),
         CAELIX_CONSTANT(kHashMissing),
         // shaders/common/caelix_light_cells_layout.hlsl: lib/src/render/light_cells_layout.h
-        CAELIX_CONSTANT(kLightCellReservoirCount),
+        CAELIX_CONSTANT(kLightCellDefaultReservoirs),
+        CAELIX_CONSTANT(kLightCellMinReservoirs),
+        CAELIX_CONSTANT(kLightCellMaxReservoirs),
         CAELIX_CONSTANT(kLightCellReservoirBytes),
         CAELIX_CONSTANT(kLcState),
         CAELIX_CONSTANT(kLcTouched),
@@ -1021,7 +1024,6 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kLcResGeneration),
         CAELIX_CONSTANT(kLightCellNoGroup),
         CAELIX_CONSTANT(kLcReservoirs),
-        CAELIX_CONSTANT(kLightCellBytes),
         CAELIX_CONSTANT(kLightCellBaseShift),
         CAELIX_CONSTANT(kLightCellLevelShift),
         CAELIX_CONSTANT(kLightCellLevels),

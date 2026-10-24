@@ -3045,13 +3045,14 @@ LightComparison CompareLight(const std::vector<float>& ref, const std::vector<fl
 }
 
 void SetLightNee(CaelixRenderer* renderer, uint32_t enabled, uint32_t flags, uint32_t mode = 0,
-                 uint32_t candidates = 0)
+                 uint32_t candidates = 0, uint32_t reservoirs = 0)
 {
     CaelixLightNeeOptions options{};
     options.enabled = enabled;
     options.flags = flags;
     options.reservoir_mode = mode;
     options.candidates = candidates;
+    options.reservoirs = reservoirs;
     REQUIRE(caelix_renderer_set_light_nee_options(renderer, &options) == CAELIX_OK);
 }
 
@@ -3077,15 +3078,19 @@ TEST_CASE("light NEE: unbiased against the path tracer (lamps, sun, glass)")
         uint32_t flags;
         uint32_t mode;
         uint32_t candidates;
+        uint32_t reservoirs;
     };
     const Variant variants[] = {
-        {"defaults (rotate, M 1, jitter, MIS, sun hint)", 0, 0, 0},
-        {"no MIS (exclusive rule)", CAELIX_LIGHT_NEE_FLAG_NO_MIS, 0, 0},
-        {"mode off, M 2", 0, CAELIX_LIGHT_NEE_RESERVOIRS_OFF, 2},
+        {"defaults (off, M 1, jitter, MIS, sun hint)", 0, 0, 0, 0},
+        {"no MIS (exclusive rule)", CAELIX_LIGHT_NEE_FLAG_NO_MIS, 0, 0, 0},
+        {"mode off, M 2", 0, CAELIX_LIGHT_NEE_RESERVOIRS_OFF, 2, 0},
         {"rotate, M 2, no jitter, no sun hint",
          CAELIX_LIGHT_NEE_FLAG_NO_JITTER | CAELIX_LIGHT_NEE_FLAG_NO_SUN_HINT,
          CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE,
-         2},
+         2,
+         0},
+        {"rotate, 256 reservoirs, M 1", 0, CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE, 1, 256},
+        {"no cells (light tree per vertex)", CAELIX_LIGHT_NEE_FLAG_NO_CELLS, 0, 0, 0},
     };
     // The lamps alone, then the lamps with the sun (the sun / lamp choice, the sun through glass).
     for (const float sun : {0.0f, kNeeSunRadiance})
@@ -3101,7 +3106,7 @@ TEST_CASE("light NEE: unbiased against the path tracer (lamps, sun, glass)")
                     static_cast<double>(sun), floor_c.ref_mean, floor_c.ratio, floor_c.block_psnr);
         for (const Variant& v : variants)
         {
-            SetLightNee(renderer, 1, v.flags, v.mode, v.candidates);
+            SetLightNee(renderer, 1, v.flags, v.mode, v.candidates, v.reservoirs);
             const std::vector<float> nee = LampBoxAccumulate(rig, renderer, set, 1024, 200000, sun);
             CaelixLightNeeStats stats{};
             caelix_renderer_get_light_nee_stats(renderer, &stats);
@@ -3111,8 +3116,9 @@ TEST_CASE("light NEE: unbiased against the path tracer (lamps, sun, glass)")
                         static_cast<double>(sun), v.name, c.test_mean, c.ref_mean, c.ratio, c.block_psnr,
                         stats.live_cells, stats.active_cells, stats.failed_slot + stats.failed_payload);
             INFO(v.name << ", sun " << sun);
+            const bool cells = (v.flags & CAELIX_LIGHT_NEE_FLAG_NO_CELLS) == 0;
             CHECK(stats.running == 1);
-            CHECK(stats.live_cells > 0);
+            CHECK((stats.live_cells > 0) == cells);
             CHECK(c.ref_mean > 0.01);
             CHECK(c.ratio > 0.97);
             CHECK(c.ratio < 1.03);
@@ -3211,6 +3217,13 @@ TEST_CASE("light NEE: lifecycle (a full table, entity and group reuse, a paused 
     expect_invalid(bad);
     bad = CaelixLightNeeOptions{1, 0, 0.0f, 0, 0, 0, 1u << 31, 0};
     expect_invalid(bad);
+    bad = CaelixLightNeeOptions{1, 0, 0.0f, 0, 0, 0, 0, 100};  // reservoirs not 64, 128 or 256
+    expect_invalid(bad);
+    bad = CaelixLightNeeOptions{1, 1u << 21, 0.0f, 0, 0, 0, 0, 256};  // 2^21 x 4160 bytes: above 4 GiB
+    expect_invalid(bad);
+    bad = CaelixLightNeeOptions{1, 0, 0.0f, 0, 0, 0,
+                                CAELIX_LIGHT_NEE_FLAG_NO_CELLS | CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY, 0};
+    expect_invalid(bad);
     REQUIRE(NeeStats(renderer).enabled == 0);
 
     // The smallest table and a short age, so that it fills up and empties within the test.
@@ -3297,7 +3310,11 @@ TEST_CASE("light NEE: lifecycle (a full table, entity and group reuse, a paused 
 
     // 4. Groups released and re-created at once: every brick removed, other lamp bricks uploaded at the
     // same keys in the next flush (new lives of the group indices: the reservoirs that name them are
-    // stale and refreshed out of turn).
+    // stale and refreshed out of turn). Out of turn exists only in mode "rotate" (in mode "off", the
+    // default since 2026-10-24, every reservoir is due at every fill): the mode changes here (the cells
+    // stay).
+    options.reservoir_mode = CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE;
+    REQUIRE(caelix_renderer_set_light_nee_options(renderer, &options) == CAELIX_OK);
     std::vector<Key> keys = KeysOf(world);
     Remove(rig, keys);
     world = LampBlobWorld(7, 1);
@@ -3345,6 +3362,22 @@ TEST_CASE("light NEE: lifecycle (a full table, entity and group reuse, a paused 
     s = frames(look, 4);
     CHECK(s.cell_capacity == 2048);
     CHECK(s.live_cells > 0);
+    // 7. Without cells (CAELIX_LIGHT_NEE_FLAG_NO_CELLS): light NEE runs, the cells are released.
+    options.flags = CAELIX_LIGHT_NEE_FLAG_NO_CELLS;
+    REQUIRE(caelix_renderer_set_light_nee_options(renderer, &options) == CAELIX_OK);
+    s = frames(look, 3);
+    CHECK(s.running == 1);
+    CHECK(s.cell_bytes == 0);
+    CHECK(s.live_cells == 0);
+    // 8. Cells again, with 256 reservoirs.
+    options.flags = 0;
+    options.reservoirs = 256;
+    options.reservoir_mode = CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE;
+    REQUIRE(caelix_renderer_set_light_nee_options(renderer, &options) == CAELIX_OK);
+    s = frames(look, 4);
+    CHECK(s.running == 1);
+    CHECK(s.live_cells > 0);
+    CHECK(s.cell_bytes >= uint64_t{2048} * (64 + 16 * 256));
 
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);

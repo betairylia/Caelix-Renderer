@@ -21,21 +21,21 @@ constexpr float kMinScale = 0.25f;
 
 }  // namespace
 
-LightCells::LightCells(Device& device, uint32_t payload_capacity)
-    : device_(device)
+LightCells::LightCells(Device& device, uint32_t payload_capacity, uint32_t reservoirs)
+    : device_(device), reservoirs_(reservoirs)
 {
     HashTable::Desc desc;
     desc.name = "light cells";
     desc.payload_capacity = payload_capacity;
-    desc.payload_stride = kLightCellBytes;
+    desc.payload_stride = LightCellBytes(reservoirs);
     desc.key_words = kLightCellKeyWords;
     table_ = std::make_unique<HashTable>(device, desc);
     payloads_ = GpuBuffer::DeviceLocal(device.allocator(), device.device(),
-                                       uint64_t{payload_capacity} * kLightCellBytes);
+                                       uint64_t{payload_capacity} * LightCellBytes(reservoirs));
     fill_ = ComputePipeline(device.device(), LoadShader("caelix_light_cell_fill"), sizeof(LightCellFillPush),
                             "caelix_light_cell_fill");
     fill_timer_ = GpuTimer(device);
-    CAELIX_LOGI("light cells: %u cells, %llu bytes", payload_capacity,
+    CAELIX_LOGI("light cells: %u cells of %u reservoirs, %llu bytes", payload_capacity, reservoirs,
                 static_cast<unsigned long long>(bytes()));
 }
 
@@ -50,9 +50,9 @@ void LightCells::Record(VkCommandBuffer cmd, VkDeviceAddress light_tree, const S
         vkCmdFillBuffer(cmd, payloads_.buffer(), 0, VK_WHOLE_SIZE, 0);
         payloads_cleared_ = true;
     }
-    // Cells per fill workgroup (caelix_light_cell_fill): 1 in mode "off", kLightCellRotation in "rotate".
+    // Cells per fill workgroup (caelix_light_cell_fill, the mapping of LightCellFillThreadsPerCell).
     const uint32_t cells_per_group =
-        settings.reservoir_mode == kLightCellModeRotate ? kLightCellRotation : 1u;
+        kLightCellFillThreads / LightCellFillThreadsPerCell(reservoirs_, settings.reservoir_mode);
     table_->RecordMaintenance(cmd, payloads_.address(), frame_, settings.max_age, cells_per_group,
                               frame_number, safe_frame);
 
@@ -65,6 +65,7 @@ void LightCells::Record(VkCommandBuffer cmd, VkDeviceAddress light_tree, const S
     push.frame_seed = frame_seed;
     push.mode = settings.reservoir_mode;
     push.candidates = settings.candidates;
+    push.reservoirs = reservoirs_;
     last_mode_ = settings.reservoir_mode;
     last_candidates_ = settings.candidates;
     const bool timed = fill_timer_.Begin(cmd, frame_number, safe_frame);

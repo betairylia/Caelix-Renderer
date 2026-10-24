@@ -88,7 +88,7 @@ struct FrameConstants
     uint64_t light_cell_counters;       // 584  counters (inserted, pending, failed)
     uint32_t light_cell_mask;           // 592  key slots - 1
     float light_footprint;              // 596  level-0 footprint threshold (world units per pixel)
-    uint32_t pad_600;                   // 600
+    uint32_t light_cell_reservoirs;     // 600  reservoirs per cell (64, 128, 256)
     uint32_t pad_604;                   // 604
 };
 static_assert(sizeof(FrameConstants) == 608);
@@ -132,6 +132,7 @@ static_assert(offsetof(FrameConstants, light_cells) == 560);
 static_assert(offsetof(FrameConstants, light_cell_counters) == 584);
 static_assert(offsetof(FrameConstants, light_cell_mask) == 592);
 static_assert(offsetof(FrameConstants, light_footprint) == 596);
+static_assert(offsetof(FrameConstants, light_cell_reservoirs) == 600);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).
@@ -150,12 +151,15 @@ constexpr uint32_t kTargetNormalUnorm = 1u << 16;  // the normal target stores n
 // FrameConstants::light_nee_flags (docs/LIGHT_NEE.md): kLightNeeLookup = the trace looks the light cell
 // of every diffuse NEE vertex up (and inserts it); kLightNeeContribute = it also runs the lamp NEE
 // with the sun / lamp selection; kLightNeeJitter / Mis / SunHint = the options' jittered lookup, MIS
-// and sun visibility hint.
+// and sun visibility hint. kLightNeeDirect (experimental, CAELIX_LIGHT_NEE_FLAG_NO_CELLS): no cells,
+// every NEE vertex draws its lamp from the light tree (the trace kernel caelix_path_trace_light_tree_nee,
+// docs/LIGHT_NEE.md section 11.6); it comes with kLightNeeContribute and kLightNeeMis only.
 constexpr uint32_t kLightNeeLookup = 1u << 0;
 constexpr uint32_t kLightNeeContribute = 1u << 1;
 constexpr uint32_t kLightNeeJitter = 1u << 2;
 constexpr uint32_t kLightNeeMis = 1u << 3;
 constexpr uint32_t kLightNeeSunHint = 1u << 4;
+constexpr uint32_t kLightNeeDirect = 1u << 5;
 
 // The frame set: one descriptor set layout with one binding, the frame slot's FrameConstants as a
 // uniform buffer (range sizeof(FrameConstants), offset 0). Bound as set kFrameSetIndex by the five

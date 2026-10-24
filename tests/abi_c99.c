@@ -88,8 +88,8 @@ size_t caelix_abi_c99_touch(void)
     CaelixLightNeeOptions nee_options = {1, 0, 0.0f, CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE, 0, 0,
                                          CAELIX_LIGHT_NEE_FLAG_NO_JITTER | CAELIX_LIGHT_NEE_FLAG_NO_MIS |
                                              CAELIX_LIGHT_NEE_FLAG_NO_SUN_HINT | CAELIX_LIGHT_NEE_FLAG_NO_CONTROLLER |
-                                             CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY,
-                                         0};
+                                             CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY | CAELIX_LIGHT_NEE_FLAG_NO_CELLS,
+                                         256};
     CaelixLightNeeStats nee_stats = {0};
     AnyFn functions[36];
     functions[0] = (AnyFn)caelix_get_version;

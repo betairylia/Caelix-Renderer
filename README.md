@@ -1029,9 +1029,13 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   with different options capture the same random numbers.
 - Light NEE (`docs/LIGHT_NEE.md`, on by default; it enables the light tree): `--no-light-nee`,
   `--light-cells <N>` (0 = 262144), `--light-footprint <F>` (0 = 0.25), `--light-reservoirs
-  <default|off|rotate>`, `--light-candidates <0..2>`, `--light-max-age <N>` (0 = 128), the opt-outs
-  `--light-no-jitter`, `--light-no-mis`, `--light-no-sun-hint`, `--light-no-controller`, and
-  `--light-lookup-only` (measurement: cells looked up and filled, no lamp NEE). `--light-tree` builds
+  <default|off|rotate>` (default = the library's, "off"), `--light-reservoir-count <N>` (reservoirs
+  per cell: 0 = 64, else 64, 128 or 256; 64 + 16 N bytes per cell), `--light-candidates <0..2>`,
+  `--light-max-age <N>` (0 = 128), the opt-outs `--light-no-jitter`, `--light-no-mis`,
+  `--light-no-sun-hint`, `--light-no-controller`, `--light-lookup-only` (measurement: cells looked up
+  and filled, no lamp NEE), and `--light-no-cells` (experimental: no light cells, every NEE vertex
+  draws its lamp from the light tree for its own point and normal with the exact MIS; docs section
+  11.6). `--light-tree` builds
   the light tree also with `--no-light-nee`; `--light-min-emission <F>` sets its threshold. The Stats
   window (F1) has a "Light NEE" section; `--timing-frames` adds `light_nee:` (the maintenance and
   fill means and the newest counters) to the `timings_avg:` line.

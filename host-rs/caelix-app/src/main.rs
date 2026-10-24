@@ -407,6 +407,10 @@ struct Args {
     /// fill) or rotate (a quarter per fill).
     #[arg(long, value_name = "MODE", default_value = "default")]
     light_reservoirs: LightReservoirs,
+    /// Reservoirs per light cell: 0 = the library's default (64), else 64, 128 or 256 (memory per
+    /// cell 64 + 16 x N bytes).
+    #[arg(long, value_name = "N", default_value_t = 0, value_parser = parse_light_reservoir_count)]
+    light_reservoir_count: u32,
     /// Candidates per refreshed reservoir: 0 = the library's default, 1 = a plain light tree draw,
     /// 2 = resampled by the brick's importance for the cell.
     #[arg(long, value_name = "M", default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=2))]
@@ -428,8 +432,21 @@ struct Args {
     light_no_controller: bool,
     /// Measurement: light cells are looked up and filled, but no lamp NEE runs (the image is the
     /// one with --no-light-nee).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "light_no_cells")]
     light_lookup_only: bool,
+    /// Experimental: light NEE without light cells; every NEE vertex draws its lamp from the light
+    /// tree for its own point and normal, with the exact MIS (docs/LIGHT_NEE.md section 11.6). The
+    /// cell options have no effect.
+    #[arg(long)]
+    light_no_cells: bool,
+}
+
+/// --light-reservoir-count: 0, 64, 128 or 256.
+fn parse_light_reservoir_count(text: &str) -> Result<u32, String> {
+    match text.parse::<u32>() {
+        Ok(n @ (0 | 64 | 128 | 256)) => Ok(n),
+        _ => Err(format!("{text} is not 0, 64, 128 or 256")),
+    }
 }
 
 /// --light-reservoirs.
@@ -776,6 +793,7 @@ impl App {
                 (a.light_no_sun_hint, CAELIX_LIGHT_NEE_FLAG_NO_SUN_HINT),
                 (a.light_no_controller, CAELIX_LIGHT_NEE_FLAG_NO_CONTROLLER),
                 (a.light_lookup_only, CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY),
+                (a.light_no_cells, CAELIX_LIGHT_NEE_FLAG_NO_CELLS),
             ] {
                 if set {
                     flags |= flag;
@@ -793,7 +811,7 @@ impl App {
                 candidates: a.light_candidates,
                 max_age: a.light_max_age,
                 flags,
-                pad: 0,
+                reservoirs: a.light_reservoir_count,
             };
             // SAFETY: the renderer is live; options is valid for the call.
             let result = unsafe { caelix_renderer_set_light_nee_options(state.renderer, &options) };

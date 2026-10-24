@@ -12,8 +12,12 @@ namespace caelix {
 // caelix_light_cell_fill with LightCellFillPush).
 
 // ---------------------------------------------------------------------------
-// One cell: the 64-byte header, then kLightCellReservoirCount reservoirs. 1088 bytes.
-constexpr uint32_t kLightCellReservoirCount = 64;
+// One cell: the 64-byte header, then R reservoirs, R = CaelixLightNeeOptions::reservoirs (64, 128 or 256;
+// FrameConstants::light_cell_reservoirs, LightCellFillPush::reservoirs): LightCellBytes(R) bytes, 1088
+// at the default R = 64.
+constexpr uint32_t kLightCellDefaultReservoirs = 64;
+constexpr uint32_t kLightCellMinReservoirs = 64;
+constexpr uint32_t kLightCellMaxReservoirs = 256;
 constexpr uint32_t kLightCellReservoirBytes = 16;
 
 // The header. The first words are the hash table's payload contract (state, touched, the key words);
@@ -84,9 +88,12 @@ static_assert(offsetof(LightCellReservoir, generation) == kLcResGeneration);
 static_assert(sizeof(LightCellReservoir) == kLightCellReservoirBytes);
 
 constexpr uint32_t kLcReservoirs = kLightCellHeaderBytes;  // byte offset of reservoir 0
-constexpr uint32_t kLightCellBytes =
-    kLightCellHeaderBytes + kLightCellReservoirCount * kLightCellReservoirBytes;
-static_assert(kLightCellBytes == 1088);
+// The bytes of a cell with `reservoirs` reservoirs (the hash table's payload stride).
+constexpr uint32_t LightCellBytes(uint32_t reservoirs)
+{
+    return kLightCellHeaderBytes + reservoirs * kLightCellReservoirBytes;
+}
+static_assert(LightCellBytes(kLightCellDefaultReservoirs) == 1088);
 
 // ---------------------------------------------------------------------------
 // Cell geometry: level L cells are 1 << (kLightCellBaseShift + kLightCellLevelShift L) voxels on an
@@ -103,12 +110,9 @@ constexpr uint32_t kLightCellNormalisationFills = 32;
 constexpr uint32_t kLightCellSunDecayShift = 3;
 // Reservoir mode "rotate": reservoir r is refreshed by the fills with (r + fills) % this == 0.
 constexpr uint32_t kLightCellRotation = 4;
-// The fill: workgroups of kLightCellFillThreads threads. Mode "off": one active cell per workgroup,
-// thread r owns reservoir r. Mode "rotate": kLightCellRotation cells per workgroup, the
-// kLightCellReservoirCount / kLightCellRotation threads of a cell own kLightCellRotation reservoirs each
-// (exactly one of them due by the rotation), so the waves hold only the reservoirs that draw.
+// The fill: workgroups of kLightCellFillThreads threads (LightCellFillThreadsPerCell below).
 constexpr uint32_t kLightCellFillThreads = 64;
-static_assert(kLightCellFillThreads == kLightCellReservoirCount);
+static_assert(kLightCellFillThreads == kLightCellMinReservoirs);
 
 // The user counters of the hash table (HashCounters::user words), written by the fill.
 constexpr uint32_t kLcCounterFreshDraws = kHashCounterUser + 0;     // fresh candidates drawn
@@ -118,6 +122,27 @@ constexpr uint32_t kLcCounterStaleRefreshed = kHashCounterUser + 8; // reservoir
 // The fill's reservoir modes (LightCellFillPush::mode; CaelixLightNeeOptions::reservoir_mode).
 constexpr uint32_t kLightCellModeOff = 1;     // every reservoir refreshed every fill
 constexpr uint32_t kLightCellModeRotate = 2;  // a rotating quarter refreshed every fill
+
+// The fill's thread mapping (docs/LIGHT_NEE.md section 11.6; caelix_light_cell_fill.hlsl has the same
+// function): the threads of one cell, min(kLightCellFillThreads, the reservoirs due per fill: R in mode
+// "off", R / kLightCellRotation in mode "rotate"). A workgroup holds kLightCellFillThreads / that many
+// cells; thread j of a cell owns the R / that many reservoirs from j x that, so in mode "rotate" a
+// thread owns kLightCellRotation consecutive reservoirs of which exactly one is due, and the waves
+// carry only reservoirs that draw. R = 64: "off" one cell per workgroup, thread r = reservoir r;
+// "rotate" 4 cells of 16 threads with 4 reservoirs each.
+constexpr uint32_t LightCellFillThreadsPerCell(uint32_t reservoirs, uint32_t mode)
+{
+    const uint32_t due = mode == kLightCellModeRotate ? reservoirs / kLightCellRotation : reservoirs;
+    return due < kLightCellFillThreads ? due : kLightCellFillThreads;
+}
+static_assert(LightCellFillThreadsPerCell(64, kLightCellModeOff) == 64);
+static_assert(LightCellFillThreadsPerCell(64, kLightCellModeRotate) == 16);
+static_assert(LightCellFillThreadsPerCell(128, kLightCellModeRotate) == 32);
+static_assert(LightCellFillThreadsPerCell(256, kLightCellModeRotate) == 64);
+static_assert(LightCellFillThreadsPerCell(256, kLightCellModeOff) == 64);
+static_assert(kLightCellMinReservoirs / kLightCellRotation >= 1 &&
+              kLightCellFillThreads % (kLightCellMinReservoirs / kLightCellRotation) == 0,
+              "every mapping divides the workgroup into whole cells");
 
 // ---------------------------------------------------------------------------
 // Push constants of caelix_light_cell_fill (shaders/render/caelix_light_cell_fill.hlsl). 56 bytes.
@@ -131,7 +156,7 @@ struct LightCellFillPush
     uint32_t frame_seed;  // CaelixRenderOptions::frame_seed of the frame
     uint32_t mode;        // kLightCellMode*
     uint32_t candidates;  // M: 1 (a plain draw, W = 1 / p) or 2 (streaming RIS by the leaf importance)
-    uint32_t pad;
+    uint32_t reservoirs;  // R: reservoirs per cell (64, 128 or 256; LightCellBytes(R) per cell)
 };
 static_assert(offsetof(LightCellFillPush, frame_seed) == 40);
 static_assert(sizeof(LightCellFillPush) == 56);

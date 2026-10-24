@@ -21,9 +21,11 @@ constexpr uint32_t kDefaultCandidates = 1;
 constexpr uint32_t kMaxCandidates = 2;
 constexpr uint32_t kDefaultMaxAge = 128;
 constexpr uint32_t kMaxMaxAge = 1u << 20;
+// The cell pool of one renderer (cell_capacity x LightCellBytes(reservoirs)) stays within 4 GiB.
+constexpr uint64_t kMaxCellPoolBytes = 1ull << 32;
 constexpr uint32_t kKnownFlags = CAELIX_LIGHT_NEE_FLAG_NO_JITTER | CAELIX_LIGHT_NEE_FLAG_NO_MIS |
                                  CAELIX_LIGHT_NEE_FLAG_NO_SUN_HINT | CAELIX_LIGHT_NEE_FLAG_NO_CONTROLLER |
-                                 CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY;
+                                 CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY | CAELIX_LIGHT_NEE_FLAG_NO_CELLS;
 static_assert(kLightCellModeOff == CAELIX_LIGHT_NEE_RESERVOIRS_OFF);
 static_assert(kLightCellModeRotate == CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE);
 
@@ -70,13 +72,39 @@ CaelixResult Renderer::SetLightNeeOptions(const CaelixLightNeeOptions& options)
         CAELIX_LOGE("%s: unknown flags 0x%x", kFunction, options.flags & ~kKnownFlags);
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    constexpr uint32_t kNoCellsLookupOnly = CAELIX_LIGHT_NEE_FLAG_NO_CELLS | CAELIX_LIGHT_NEE_FLAG_LOOKUP_ONLY;
+    if ((options.flags & kNoCellsLookupOnly) == kNoCellsLookupOnly)
+    {
+        CAELIX_LOGE("%s: the flags NO_CELLS and LOOKUP_ONLY exclude each other", kFunction);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    // A power of two in kLightCellMinReservoirs .. kLightCellMaxReservoirs (64, 128, 256): the fill's
+    // thread mapping (LightCellFillThreadsPerCell) divides it evenly.
+    const uint32_t r = options.reservoirs;
+    if (r != 0 && (r < kLightCellMinReservoirs || r > kLightCellMaxReservoirs || (r & (r - 1)) != 0))
+    {
+        CAELIX_LOGE("%s: reservoirs %u must be 0 (= %u) or a power of two in %u .. %u", kFunction, r,
+                    kLightCellDefaultReservoirs, kLightCellMinReservoirs, kLightCellMaxReservoirs);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    const uint32_t capacity = options.cell_capacity != 0 ? options.cell_capacity : kDefaultCellCapacity;
+    const uint32_t reservoirs = options.reservoirs != 0 ? options.reservoirs : kLightCellDefaultReservoirs;
+    const uint64_t pool_bytes = uint64_t{capacity} * LightCellBytes(reservoirs);
+    if (pool_bytes > kMaxCellPoolBytes)
+    {
+        CAELIX_LOGE("%s: %u cells of %u reservoirs need %llu bytes, above the limit of %llu", kFunction,
+                    capacity, reservoirs, static_cast<unsigned long long>(pool_bytes),
+                    static_cast<unsigned long long>(kMaxCellPoolBytes));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
     light_nee_options_ = options;
     LightCells::Settings& s = light_nee_settings_;
-    s.payload_capacity = options.cell_capacity != 0 ? options.cell_capacity : kDefaultCellCapacity;
+    s.payload_capacity = capacity;
     s.footprint = options.footprint > 0.0f ? options.footprint : kDefaultFootprint;
     s.reservoir_mode = options.reservoir_mode != 0 ? options.reservoir_mode : kDefaultReservoirMode;
     s.candidates = options.candidates != 0 ? options.candidates : kDefaultCandidates;
     s.max_age = options.max_age != 0 ? options.max_age : kDefaultMaxAge;
+    s.reservoirs = reservoirs;
     s.flags = options.flags;
     return CAELIX_OK;
 }
@@ -85,13 +113,16 @@ LightCells* Renderer::EnsureLightCells(bool lighting, uint64_t frame)
 {
     light_nee_running_ = false;
     const bool wanted = light_nee_options_.enabled != 0;
+    // CAELIX_LIGHT_NEE_FLAG_NO_CELLS (docs/LIGHT_NEE.md section 11.6): light NEE without cells.
+    const bool no_cells = (light_nee_settings_.flags & CAELIX_LIGHT_NEE_FLAG_NO_CELLS) != 0;
     // A new light tree (disabled and enabled again: new rows whose generations start over) could match
     // the generation of a reservoir of the old one: the cells start over with it.
     const VkDeviceAddress tree = scene_.light_tree_address();
     const bool new_tree = tree != 0 && tree != light_cells_tree_;
     const bool retire = light_cells_ != nullptr &&
-                        (!wanted || new_tree ||
-                         light_cells_->payload_capacity() != light_nee_settings_.payload_capacity);
+                        (!wanted || no_cells || new_tree ||
+                         light_cells_->payload_capacity() != light_nee_settings_.payload_capacity ||
+                         light_cells_->reservoirs() != light_nee_settings_.reservoirs);
     if (retire)
     {
         // Released once its last frame is safe; a later enable starts with empty cells.
@@ -111,9 +142,16 @@ LightCells* Renderer::EnsureLightCells(bool lighting, uint64_t frame)
         }
         return nullptr;
     }
+    if (no_cells)
+    {
+        // The trace draws every lamp from the light tree (caelix_path_trace_light_tree_nee).
+        light_nee_running_ = true;
+        return nullptr;
+    }
     if (light_cells_ == nullptr)
     {
-        light_cells_ = std::make_unique<LightCells>(device_, light_nee_settings_.payload_capacity);
+        light_cells_ = std::make_unique<LightCells>(device_, light_nee_settings_.payload_capacity,
+                                                    light_nee_settings_.reservoirs);
         light_cells_tree_ = tree;
     }
     light_cells_last_frame_ = frame;
@@ -125,12 +163,13 @@ void Renderer::GetLightNeeStats(CaelixLightNeeStats& out) const
 {
     out = CaelixLightNeeStats{};
     out.enabled = light_nee_options_.enabled;
+    // Without cells (CAELIX_LIGHT_NEE_FLAG_NO_CELLS) only enabled and running are set.
+    out.running = light_nee_running_ ? 1u : 0u;
     if (light_cells_ == nullptr)
     {
         return;
     }
     light_cells_->GetStats(out);
-    out.running = light_nee_running_ ? 1u : 0u;
     out.footprint = light_cells_->footprint(light_nee_settings_);
 }
 

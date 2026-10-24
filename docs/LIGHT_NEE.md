@@ -17,7 +17,7 @@ unbiasedness when the difference is within what the eye accepts.
 | candidate source | the light tree, drawn for the cell's receiver BOX and the cell's receiver normal (section 5) |
 | fill scope | ACTIVE cells only (looked up by the previous frame's trace) |
 | fill schedule | M fresh candidates per refreshed reservoir: M = 2 if the fill with M = 2 costs < 1 ms on rootfall, else M = 1 (then a reservoir is a plain tree draw, no RIS) |
-| reservoirs | 64 per cell, 16 B each |
+| reservoirs | 64 per cell, 16 B each (experimental option: 128 or 256, section 11.6) |
 | cell lifetime | evicted after 128 frames without a lookup |
 | history | NO temporal reuse (owner decision 2026-10-24). Reservoir mode "off" (every reservoir is refreshed every fill) or "rotate" (a rotating quarter is refreshed per fill, each reservoir lives at most 4 fills); the default is chosen by the fill bench (section 3.2) |
 | sun / lamp | one shadow ray per NEE vertex, chosen between the sun and the lamp candidate by their unoccluded contributions (one-sample RIS; old `nee_combine 1`), with the per-cell sun visibility hint |
@@ -106,7 +106,9 @@ enough to the target that fresh draws give low-variance weights.
   at once whatever its turn. Each reservoir is still a valid contribution weight of the frame it was drawn
   in; between refreshes a moving light lags by at most 4 frames (accepted).
 - The default mode is chosen by the fill bench: "off" if its fill time is acceptable, else "rotate".
-  Chosen: "rotate" (section 11.3).
+  Chosen by the bench rule: "rotate" (section 11.3). The owner changed the default to "off" after her
+  visual check (2026-10-24): white frame-to-frame noise for the denoiser (section 11.4), at the higher
+  fill cost.
 - **Identity**: a reservoir stores the group, its index entry and the group's 32-bit generation
   `(group life << 16) | group version` (life bumped when the group index is released, version at every
   rebuild within one life). A mismatch means the entry may point at another brick: the fill refreshes the
@@ -123,7 +125,8 @@ header 64 B: state, touched, entity, entity life, coord (int3), level, face,
 reservoirs 64 x 16 B: uint group; uint entry; float W; uint generation ((group life << 16) | version)
 ```
 
-1088 B per cell; at the default payload capacity 262144: 272 MiB + key table 16 MiB (per renderer;
+1088 B per cell (64 + 16 R with R reservoirs, section 11.6); at the default payload capacity 262144:
+272 MiB + key table 16 MiB (per renderer;
 section 7). A reservoir is one aligned 16-byte load. The fill initialises the reservoirs of an
 uninitialised cell (empty, no history) and sets it ready; a trace that sees an uninitialised cell does
 no lamp NEE, so it never reads the W, C or sun counters of a previous cell in a reused payload. The
@@ -370,16 +373,20 @@ active cells. Rootfall pose: the first keyframe of `rootfall.packed.street1.sequ
 `-21.961,270.802,-933.939,-3.500,44.000`.
 
 **Decision by the owner's rule:** fill(off, M 1) = 1.39 ms >= 1 ms on rootfall -> mode **rotate**;
-fill(rotate, M 2) = 1.03 .. 1.05 ms >= 1 ms -> **M = 1**. The library's 0 values and the Rust host use
+fill(rotate, M 2) = 1.03 .. 1.05 ms >= 1 ms -> **M = 1**. The library's 0 values and the Rust host used
 rotate and M = 1. (M = 2 adds little here anyway: the box draw's proposal already follows the leaf
 importance, which is the RIS target.) The temporal cost of rotate is in 11.4.
+
+**Owner change (2026-10-24, after her visual check):** the default mode is **off** (white
+frame-to-frame noise, section 11.4) at 1.39 ms of fill on rootfall instead of 0.61 ms; M stays 1. The
+library's 0 values and the Rust host use off and M = 1 (`d5670aa`).
 
 ### 11.4 Measurements
 
 Rust host, RTX 5080, driver 610.88, 100-frame means of the trace dispatch, one GPU job at a time; the
-light NEE at its defaults (rotate, M 1, jitter, MIS, sun hint), the host's 4 bounces, no sun (sky only;
-dark sky for rootfall, bistro and shroom). "off" = `--no-light-nee` (the trace kernel variant without
-light NEE).
+light NEE at the defaults of the time (rotate, M 1, jitter, MIS, sun hint), the host's 4 bounces, no
+sun (sky only; dark sky for rootfall, bistro and shroom). "off" = `--no-light-nee` (the trace kernel
+variant without light NEE).
 
 | scene | 2560x1440 on / off | 1920x1080 on / off | fill, maintenance (1440p) | live / active cells (1440p) |
 |---|---|---|---|---|
@@ -426,4 +433,101 @@ through an opening and glass, ratios 0.998 .. 0.999 against a path tracer floor 
 39.3 .. 40.5 dB against the floor's 37.6 dB; lifecycle), `caelix_frame_layout_test` (the new push blocks,
 the 608-byte uniform block of six kernels, 260+ named constants), `caelix_light_tree_test` and the rest
 unchanged. Not built: the dynamic response curves of section 8 (a lamp switched on, removed, moved; a
-receiver entity rotated).
+receiver entity rotated). Since 11.6 the unbiasedness case runs six option sets (the two variants of
+11.6 added) and the lifecycle case runs its step 4 (stale reservoirs refreshed out of turn) in mode
+"rotate": with the default mode "off" every reservoir is due at every fill, so nothing is out of turn.
+
+### 11.6 Experimental variants (2026-10-24, owner visual check)
+
+Two variants for the owner's visual comparison: more reservoirs per cell, and no cells at all. The
+defaults (mode "off", 64 reservoirs, M = 1) are unchanged: the full trace kernel differs only in reading
+the reservoir count from the frame constants (128 registers and 16 bytes of spill as before), the
+fill kernel only in reading it from its push constants, and every value at R = 64 is the one of before
+(cell stride 1088, reservoir `min(63, u 64)`, random stream `FillHash(slot 64 + r)`).
+
+**Reservoir count.** `CaelixLightNeeOptions::reservoirs` (the former `pad`; the struct stays 32 bytes):
+0 = 64, else 64, 128 or 256 (a power of two in `kLightCellMinReservoirs` .. `kLightCellMaxReservoirs`).
+A cell is `LightCellBytes(R) = 64 + 16 R` bytes (1088, 2112, 4160); the pool `cell_capacity x
+LightCellBytes(R)` must stay within 4 GiB (`kMaxCellPoolBytes`; 262144 cells x 4160 bytes = 1.02 GiB),
+otherwise the options are INVALID_ARGUMENT. A new R replaces the cells (as a new capacity does). The
+trace reads R from `FrameConstants::light_cell_reservoirs` (offset 600, the former `pad_600`), the fill
+from `LightCellFillPush::reservoirs`. Host: `--light-reservoir-count <0|64|128|256>`.
+
+Fill mapping (`LightCellFillThreadsPerCell`, the same function in `light_cells_layout.h` and
+`caelix_light_cells_layout.hlsl`): threads per cell T = min(64, R in mode "off", R / 4 in mode
+"rotate"), 64 / T cells per workgroup (also the maintenance's `items_per_group`), thread j owns the R / T
+reservoirs from j R / T.
+
+| R | mode | threads per cell | cells per workgroup | reservoirs per thread | due per thread and fill |
+|---|---|---|---|---|---|
+| 64 | off | 64 | 1 | 1 | 1 |
+| 64 | rotate | 16 | 4 | 4 | 1 |
+| 128 | off | 64 | 1 | 2 | 2 |
+| 128 | rotate | 32 | 2 | 4 | 1 |
+| 256 | off | 64 | 1 | 4 | 4 |
+| 256 | rotate | 64 | 1 | 4 | 1 |
+
+R = 64 keeps the mappings of 11.2 item 1. "rotate" with R = 256 draws 64 reservoirs per cell and fill,
+as many as "off" with R = 64 (2.75 M fresh draws per frame on rootfall in both), and every reservoir is
+at most 4 fills old.
+
+**No cells.** `CAELIX_LIGHT_NEE_FLAG_NO_CELLS` (host `--light-no-cells`): no hash table, fill,
+maintenance or cell memory (cells of an earlier configuration are retired). Every NEE vertex draws its
+lamp point with `LightTreeSample` for its own receiver x_r (the pushed-off origin) and normal n: the
+point form of the importance at every tree level, then the in-brick draw for x_r, so p = P(brick | x_r,
+n) P(face | brick, x_r) / face_count. Contribution `L_e (cos_r / pi) (cos_l / d^2) / p`, times the
+balance heuristic weight with that p. The BSDF side of a lamp hit uses `LightTreeBrickPdf(x_r, n, brick)
+x in_brick`, the same function of (x_r, n, point) as the draw: the segment's origin and `segment_normal`
+are bit for bit the x_r and hit normal that the NEE got (checked in `TracePath`: both come from
+`shade.bounce_origin` and the hit's normal), so the two MIS weights of a point sum to 1 up to the
+rounding of the two pdf walks (top-down draw, bottom-up evaluation). No proxy. The near-field rule (8
+world units on both sides) is kept, so only the source of the lamp candidate changes. The sun / lamp
+one-sample RIS runs as before with hint 1 (no cell, no sun counters). The lamp stream draws one number
+per vertex (the point seed). NO_JITTER, NO_SUN_HINT and NO_CONTROLLER have no effect; NO_CELLS with
+LOOKUP_ONLY is INVALID_ARGUMENT. Stats: `enabled` and `running`, every cell field 0 (the Stats window
+shows "no cells").
+
+The trace runs a third kernel, `caelix_path_trace_light_tree_nee`
+(`shaders/render/caelix_path_trace_light_tree_nee.hlsl`, `CAELIX_SPEC_LIGHT_NEE_DIRECT`; frame flags
+`kLightNeeDirect | kLightNeeContribute`, plus `kLightNeeMis` without NO_MIS; the cell fields stay 0).
+The direct path exists only in that variant (`#ifdef`); the full kernel keeps only the cell path, and
+`caelix_path_trace_no_light_nee` is unchanged (its SPIR-V differs only in the member name of offset 600).
+
+**Measurements** (`Artifacts/light-nee-variants-20261024/`, RTX 5080, driver 610.88, 2560x1440, the
+settings of 11.4: 4 bounces, no sun, dark sky, NRD on, 100-frame means after 64 warm-up frames).
+
+Registers (`CAELIX_PIPELINE_STATS`): `caelix_path_trace` 128 + 16 bytes of spill (as before; binary
+210560 -> 211200 bytes), `caelix_path_trace_no_light_nee` 96 + 48 (unchanged),
+`caelix_path_trace_light_tree_nee` 128 + 16, `caelix_light_cell_fill` 80 + 16 (driver shared memory
+1280 -> 1536 bytes).
+
+Trace times: on this machine on 2026-10-24 the frame times of the cell variants fell into two states,
+about 16.5 ms and about 22.5 ms on both scenes, and the state changed from run to run whatever the
+variant (the GPU clock stayed at about 2850 MHz; the desktop had other GPU clients). The table gives the
+per-run medians of three interleaved runs; compare the variants within one state:
+
+| scene | variant | trace, per-run medians | fill | maintenance | cell memory |
+|---|---|---|---|---|---|
+| rootfall | before this work (old kernels, `CAELIX_SHADER_DIR`) | 18.18, 18.02, 16.42 ms | 1.54 ms | 0.062 ms | 290 MiB |
+| rootfall | default (off, 64) | 16.51, 16.31, 22.51 ms | 1.59 ms | 0.062 ms | 290 MiB |
+| rootfall | rotate, 256 | 22.51, 22.60, 22.51 ms | 1.68 ms | 0.066 ms | 1.03 GiB |
+| rootfall | no cells | 27.58, 27.55, 27.60 ms | - | - | 0 |
+| bistro | before this work | 22.51, 16.89, 22.53 ms | 1.47 ms | 0.061 ms | 290 MiB |
+| bistro | default (off, 64) | 22.70, 22.66, 22.72 ms | 1.52 ms | 0.061 ms | 290 MiB |
+| bistro | rotate, 256 | 22.76, 16.90, 22.71 ms | 1.60 ms | 0.066 ms | 1.03 GiB |
+| bistro | no cells | 28.07, 28.11, 28.12 ms | - | - | 0 |
+
+Within one state the default with the new kernels equals the kernels of before (rootfall 16.31 / 16.51
+vs 16.42 ms; bistro 22.66 .. 22.72 vs 22.51 / 22.53 ms), and rotate with 256 reservoirs equals the
+default (bistro 16.90 vs 16.89 ms, 22.7 vs 22.7 ms); its fill costs 0.05 .. 0.1 ms more (the same
+draws, a 4x larger pool). No cells never showed the faster state: 27.6 / 28.1 ms, about 5 ms (+22 %)
+above the cell variants' slower state (a light tree descent with the point importance at every NEE
+vertex instead of a reservoir load and an in-brick draw), without the fill's 1.5 ms.
+
+Bias (bistro, reference mode, 512 frames, linear mean luminance ratio against the 1024-frame reference of
+11.4 with light NEE in mode "rotate", `scripts/bias.py`): default 0.9994, rotate with 256 reservoirs
+0.9998, no cells 0.9991 (quadrants 0.998 .. 1.001; block PSNR 56.7, 56.5, 56.9 dB). The test case
+"light NEE: unbiased" (lamp box, against the 4096-frame path tracer; floor 0.9982 / 0.9986, 37.6 /
+37.7 dB): rotate with 256 reservoirs 0.9983 / 0.9982 (sun 0 / 1000), 40.4 / 39.6 dB; no cells 0.9983 /
+0.9984, 40.1 / 39.6 dB.
+

@@ -355,6 +355,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     }
     // The light cells (light NEE in the lighting modes with a light tree; the allocation can throw).
     LightCells* const light_cells = EnsureLightCells(lighting, frame.frame_number);
+    // Light NEE without cells (CAELIX_LIGHT_NEE_FLAG_NO_CELLS, docs/LIGHT_NEE.md section 11.6).
+    const bool light_nee_direct = light_cells == nullptr && light_nee_running_;
     bool nrd_error = false;
     NrdExecutor* denoiser = nullptr;
     if (options.mode == CAELIX_MODE_PATH_TRACE && options.denoise != 0 && composite && !nrd_failed_ &&
@@ -689,6 +691,13 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         constants.light_cell_counters = light_cells->table().counters_address();
         constants.light_cell_mask = light_cells->table().key_mask();
         constants.light_footprint = light_cells->footprint(s);
+        constants.light_cell_reservoirs = light_cells->reservoirs();
+    }
+    else if (light_nee_direct)
+    {
+        // Every NEE vertex draws its lamp from the light tree; the cell fields stay 0.
+        const bool mis = (light_nee_settings_.flags & CAELIX_LIGHT_NEE_FLAG_NO_MIS) == 0;
+        constants.light_nee_flags = kLightNeeDirect | kLightNeeContribute | (mis ? kLightNeeMis : 0u);
     }
     timer_.Begin(cmd, frame.frame_number, safe);
     // Sky SH (host cubemap): one workgroup projects the cubemap into sky_sh_buffer_; the
@@ -702,8 +711,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         sh_written.Record(cmd);
     }
-    // Trace (the variant without the light NEE code when this frame runs none).
-    bind_sets(light_cells != nullptr ? kernels_.trace() : kernels_.trace_no_light_nee(), slot->set);
+    // Trace (the variant without the light NEE code when this frame runs none, the one without light
+    // cells for light NEE without cells).
+    const ComputePipeline& trace = light_cells != nullptr ? kernels_.trace()
+                                   : light_nee_direct     ? kernels_.trace_light_tree_nee()
+                                                          : kernels_.trace_no_light_nee();
+    bind_sets(trace, slot->set);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
     timer_.End(cmd);
     if (light_cells != nullptr)

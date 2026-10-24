@@ -12,9 +12,9 @@
 
 namespace caelix {
 
-// The light cells of one renderer (docs/LIGHT_NEE.md section 3): a payload pool of cells (1088 bytes
-// each) in a hash table (rhi/hash_table.h), the fill kernel, the cell-size controller and the
-// counters. Per frame, before the trace: Record (the table's maintenance: eviction, active list, key
+// The light cells of one renderer (docs/LIGHT_NEE.md section 3): a payload pool of cells
+// (LightCellBytes(reservoirs) each, 1088 bytes at the default 64 reservoirs) in a hash table
+// (rhi/hash_table.h), the fill kernel, the cell-size controller and the counters. Per frame, before the trace: Record (the table's maintenance: eviction, active list, key
 // rebuild; then the fill over the active cells); the trace looks cells up and inserts missing ones;
 // after the trace: RecordReadback. Resolve reads the counters of safe frames and runs the controller.
 //
@@ -30,18 +30,21 @@ public:
         float footprint = 0.0f;
         uint32_t reservoir_mode = 0;  // kLightCellModeOff / Rotate
         uint32_t candidates = 0;      // 1 or 2
+        uint32_t reservoirs = 0;      // per cell: 64, 128 or 256
         uint32_t max_age = 0;
         uint32_t flags = 0;  // CAELIX_LIGHT_NEE_FLAG_*
     };
 
-    // Allocates the pool (zero-filled at the first Record) and the table; throws VulkanError or the
-    // shader loader's errors.
-    LightCells(Device& device, uint32_t payload_capacity);
+    // Allocates the pool of `payload_capacity` cells of `reservoirs` reservoirs (zero-filled at the
+    // first Record) and the table; throws VulkanError or the shader loader's errors.
+    LightCells(Device& device, uint32_t payload_capacity, uint32_t reservoirs);
     LightCells(const LightCells&) = delete;
     LightCells& operator=(const LightCells&) = delete;
 
     // The maintenance and the fill of this frame (light_frame() advances first). `light_tree` is the
-    // scene's descriptor (nonzero). Ends with the fill's writes visible to the trace.
+    // scene's descriptor (nonzero). Ends with the fill's writes visible to the trace. The reservoir
+    // count is the pool's (reservoirs()), not the settings' (the renderer replaces the cells when it
+    // changes).
     void Record(VkCommandBuffer cmd, VkDeviceAddress light_tree, const Settings& settings,
                 uint32_t frame_seed, uint64_t frame_number, uint64_t safe_frame);
     // After the trace of the frame: the counters to a readback slot.
@@ -73,6 +76,10 @@ public:
     {
         return table_->payload_capacity();
     }
+    uint32_t reservoirs() const
+    {
+        return reservoirs_;
+    }
     uint64_t bytes() const
     {
         return payloads_.size() + table_->bytes();
@@ -82,6 +89,7 @@ public:
 
 private:
     Device& device_;
+    uint32_t reservoirs_ = 0;  // per cell
     std::unique_ptr<HashTable> table_;
     GpuBuffer payloads_;
     bool payloads_cleared_ = false;

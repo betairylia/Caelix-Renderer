@@ -86,7 +86,7 @@ struct CaelixFrameConstants
     uint64_t light_cell_counters;   // 584  counters
     uint light_cell_mask;           // 592  key slots - 1
     float light_footprint;          // 596  level-0 footprint threshold (world units per pixel)
-    uint pad_600;                   // 600
+    uint light_cell_reservoirs;     // 600  reservoirs per cell (64, 128, 256)
     uint pad_604;                   // 604 -> 608
 };
 
@@ -127,6 +127,7 @@ static const uint kRenderFlagFlipY = 1u << 4;
 #define kLightNeeJitter (1u << 2)
 #define kLightNeeMis (1u << 3)
 #define kLightNeeSunHint (1u << 4)
+#define kLightNeeDirect (1u << 5)
 
 // CaelixFrameConstants::target_mask: bit i = the target at descriptor binding i + 1.
 static const uint kTargetColor = 1u << 0;

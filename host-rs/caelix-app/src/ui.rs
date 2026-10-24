@@ -415,6 +415,8 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
             let mode = match n.reservoir_mode {
                 CAELIX_LIGHT_NEE_RESERVOIRS_OFF => "off",
                 CAELIX_LIGHT_NEE_RESERVOIRS_ROTATE => "rotate",
+                // CAELIX_LIGHT_NEE_FLAG_NO_CELLS: running without cells.
+                _ if n.running != 0 && n.cell_capacity == 0 => "no cells (light tree per vertex)",
                 _ => "-",
             };
             value_grid(

@@ -30,9 +30,10 @@ static const float kLightNeeNearField = 8.0f;
 // The floor of the sun hint of the sun / lamp selection: a visible sun keeps a positive probability.
 static const float kLightNeeSunHintFloor = 0.05f;
 
-uint64_t LightCellAddress(uint64_t payloads, uint slot)
+// The cell at `slot` of the pool `payloads` of cells with `reservoirs` reservoirs.
+uint64_t LightCellAddress(uint64_t payloads, uint slot, uint reservoirs)
 {
-    return payloads + uint64_t(slot) * kLightCellBytes;
+    return payloads + uint64_t(slot) * LightCellBytes(reservoirs);
 }
 
 // The edge of a level-`level` cell in voxels (32, 128).
