@@ -236,7 +236,9 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
         }
         const bool alive = opaque_count < 6;
         const uint result = (v & opaque_mask) != 0 ? v : (v | (faces << face_shift));
-        if (alive && result != 0)
+
+        const bool has_interface = (v & opaque_mask) != 0 || faces != 0;
+        if (alive && result != 0 && has_interface)
         {
             occupied |= 1u << x;
         }
