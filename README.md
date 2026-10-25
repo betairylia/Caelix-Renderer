@@ -1,5 +1,16 @@
 # Caelix-Renderer
 
+**This repo is completely vibe coded. Read/use at your own risk.**
+
+This repo also contains a rust rendering host (with CLI), see `host-rs/`.
+
+Main Caelix repo: https://github.com/betairylia/Caelix
+
+---
+
+AI Generated readme file during development:
+---
+
 Native Vulkan renderer for the Caelix voxel engine. The core is a C++20 shared
 library (`caelix_renderer`) that exposes a small C ABI (`include/caelix/caelix.h`).
 A Rust standalone host (`host-rs/`) links the library through bindgen-generated
