@@ -76,7 +76,10 @@ extern "C" {
    bits 18..30 (light face count, record stale; readers of the tight bounds mask bits 0..17), also
    without a bump. The light NEE step added CaelixLightNeeOptions, CAELIX_LIGHT_NEE_FLAG_NO_MIS,
    caelix_renderer_set_light_nee_options, CaelixLightNeeStats and caelix_renderer_get_light_nee_stats,
-   also without a bump. A host built against an older version-2 header must be rebuilt (the library reads
+   also without a bump. The subsurface experiment (branch sss-expr, docs/SSS_EXPERIMENT.md) replaced
+   CaelixMaterial::pad by sss_anisotropy and sss_steps and appended sss_albedo and sss_probability (48 ->
+   64 bytes, CaelixMaterialEntry 52 -> 68 bytes) and added CAELIX_RENDER_FLAG_SUBSURFACE, also without a
+   bump. A host built against an older version-2 header must be rebuilt (the library reads
    and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -386,7 +389,9 @@ typedef struct CaelixSceneStats
     uint64_t as_builds_total;      /* BLAS and TLAS builds recorded so far */
     uint64_t as_builds_pending;    /* groups whose BLAS is out of date (waiting for finalization,
                                       scratch or ring space), plus 1 when the TLAS is out of date */
-    uint64_t material_table_bytes; /* GPU size of the material table (65536 * 48 = 3 MiB) */
+    uint64_t material_table_bytes; /* GPU size of the material table: the main table and, on the
+                                      experiment branch sss-expr, the subsurface table
+                                      (65536 * (48 + 16) = 4 MiB) */
     uint64_t upload_bricks_free; /* upper bound of the bricks that caelix_scene_upload_bricks accepts
                                     before the next flush, from the free staging space minus the row
                                     reserve (wrap fragmentation can make the real number smaller;
@@ -466,7 +471,9 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * upload has completed the GPU table is all zero (black, no emission).
  * ------------------------------------------------------------------------- */
 
-/* One material table entry. 48 bytes, the layout of the GPU table. All values are linear. */
+/* One material table entry. 64 bytes. All values are linear. The GPU keeps the first 48 bytes per code
+   in the main table and (sss_albedo, sss_probability) per code in a separate subsurface table (experiment
+   branch sss-expr), so the main kernels keep a 48-byte stride. */
 typedef struct CaelixMaterial
 {
     float albedo[3];   /* diffuse / base colour; for a transparent medium its tint */
@@ -480,13 +487,26 @@ typedef struct CaelixMaterial
                           opaque entries for the Fresnel term of the specular chance) */
     float extinction;  /* transparent entries: per voxel unit; a segment of length t inside the medium
                           transmits exp(-(1 - albedo) * t * extinction). Must be >= 0. */
-    float pad[2];      /* ignored; stored as 0 */
+    /* Subsurface scattering (experiment branch sss-expr, docs/SSS_EXPERIMENT.md; CAELIX_RENDER_FLAG_SUBSURFACE).
+       Opaque entries only: transparent entries ignore these fields. With sss_probability = p > 0, a hit
+       on the entry runs, with probability p, a 6-direction random walk through the entity's voxel grid
+       (instead of the surface BSDF); the walk moves through opaque voxels whose entries have p > 0,
+       stays at other opaque voxels (walls) and leaves the medium into any other voxel (air, glass); the
+       exit is a diffuse vertex on the leaving face. */
+    float sss_anisotropy;  /* Henyey-Greenstein g of every walk step; [-0.99, 0.99] when sss_probability > 0
+                              (the entry material's value is used for the whole walk) */
+    uint32_t sss_steps;    /* step cap of a walk; 1 .. 4096 when sss_probability > 0; a walk that reaches
+                              it is absorbed (the entry material's value) */
+    float sss_albedo[3];   /* per-step survival colour of a voxel; each in [0, 1] when sss_probability > 0 */
+    float sss_probability; /* p in [0, 1]; 0 = no subsurface scattering */
 } CaelixMaterial;
 
 /* Replaces the whole material table: entries [0, count) come from `entries`, entries [count, 65536)
    get the built-in default of the scene's encoding (packed: with the current glass palette).
    count <= 65536 (0 restores the default table).
-   Every value must be finite, ior > 0 and extinction >= 0: an invalid entry returns
+   Every value must be finite, ior > 0, extinction >= 0, sss_probability in [0, 1] and, when
+   sss_probability > 0, sss_steps in 1 .. 4096, every sss_albedo component in [0, 1] and sss_anisotropy
+   in [-0.99, 0.99]: an invalid entry returns
    CAELIX_ERROR_INVALID_ARGUMENT (logged, the table is unchanged). Entries of transparent codes with
    face bits are stored but never read. Packed scenes: a later caelix_scene_set_glass_palette
    rewrites the transparent codes. */
@@ -499,7 +519,7 @@ CAELIX_API CaelixResult caelix_scene_set_materials(CaelixScene* scene, const Cae
 CAELIX_API CaelixResult caelix_scene_set_glass_palette(CaelixScene* scene,
                                                        const CaelixMaterial* entries, uint32_t count);
 
-/* One entry of caelix_scene_set_material_entries: a 16-bit block code and its table entry. 52 bytes. */
+/* One entry of caelix_scene_set_material_entries: a 16-bit block code and its table entry. 68 bytes. */
 typedef struct CaelixMaterialEntry
 {
     uint32_t code; /* 0 .. 0xFFFF */
@@ -853,6 +873,19 @@ typedef enum CaelixDebugView
                                                 internal targets (also NRD's inputs) are not
                                                 flipped: an image rendered with the flag is the
                                                 image rendered without it, mirrored in y. */
+#define CAELIX_RENDER_FLAG_SUBSURFACE (1u << 5) /* lighting modes only (experiment branch sss-expr,
+                                                docs/SSS_EXPERIMENT.md): hits on opaque materials with
+                                                CaelixMaterial::sss_probability > 0 run the subsurface
+                                                walk with that probability. The library ignores the flag
+                                                when the scene's material table has no such entry (the
+                                                kernels without the walk code are bound then). */
+#define CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER (1u << 6) /* with CAELIX_RENDER_FLAG_SUBSURFACE (experiment):
+                                                the walk starts in the voxel of the hit point moved by
+                                                a uniform offset in [-0.5, 0.5] voxel along the two
+                                                face-tangent axes (a one-voxel box filter over the
+                                                face) instead of the hit voxel; a start voxel that is
+                                                not an SSS voxel falls back to the hit voxel. Removes
+                                                the per-voxel brightness steps of SSS surfaces. */
 
 /* A cubemap of the sky for the lighting modes, given per render call like a target. A cube image
    (VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, 6 layers in the Vulkan face order +X, -X, +Y, -Y, +Z,

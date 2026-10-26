@@ -4,7 +4,9 @@
 // entity infos) through the device addresses in CaelixFrameConstants. The
 // integrator above this file uses only TraceScene, TraceShadow, the entity
 // transform helpers and the block code in TraceResult::attrib; nothing above it
-// knows what a record, a slot row or a group is.
+// knows what a record, a slot row or a group is. Exception (experiment branch
+// sss-expr): the subsurface walk of render/caelix_subsurface.hlsl moves through the
+// voxel grid with FrameSceneLookup and scene/caelix_scene_lookup.hlsl.
 //
 // Instances: instanceCustomIndex (CandidateInstanceID()) is the scene-wide group
 // index, the primitive index is the dense brick id inside the group, and the
@@ -18,6 +20,7 @@
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
 #include "render/caelix_brick_trace.hlsl"
+#include "scene/caelix_scene_lookup.hlsl"
 
 CAELIX_BINDING(0, 0) RaytracingAccelerationStructure g_tlas;
 
@@ -183,6 +186,55 @@ float3 EntityPrevWorld(CaelixFrameConstants fc, uint group, float3 p)
     const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoPrevRow0));
     const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoPrevRow1));
     const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoPrevRow2));
+    const float4 h = float4(p, 1.0f);
+    return float3(dot(r0, h), dot(r1, h), dot(r2, h));
+}
+
+// The scene tables of the frame as the record lookups of scene/caelix_scene_lookup.hlsl take them.
+SceneLookup FrameSceneLookup(CaelixFrameConstants fc)
+{
+    SceneLookup s;
+    s.page_table = fc.page_table;
+    s.slot_tables = fc.slot_tables;
+    s.reverse_tables = fc.reverse_tables;
+    s.group_infos = fc.group_infos;
+    s.entity_infos = fc.entity_infos;
+    s.group_grids = fc.group_grids;
+    s.records_per_page_shift = fc.records_per_page_shift;
+    s.record_bytes = fc.record_bytes;
+    s.group_shift = fc.group_shift;
+    return s;
+}
+
+// Rows of the entity's current object-to-world transform (rigid: rotation | position): the world
+// direction of the entity-local direction `d`.
+float3 EntityWorldDirectionById(CaelixFrameConstants fc, uint entity, float3 d)
+{
+    const uint64_t entity_info = fc.entity_infos + uint64_t(entity) * kEntityInfoBytes;
+    const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow0));
+    const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow1));
+    const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow2));
+    return float3(dot(r0.xyz, d), dot(r1.xyz, d), dot(r2.xyz, d));
+}
+
+// The entity-local direction of the world direction `d` (the transpose of the rotation).
+float3 EntityObjectDirectionById(CaelixFrameConstants fc, uint entity, float3 d)
+{
+    const uint64_t entity_info = fc.entity_infos + uint64_t(entity) * kEntityInfoBytes;
+    const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow0));
+    const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow1));
+    const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow2));
+    return float3(dot(float3(r0.x, r1.x, r2.x), d), dot(float3(r0.y, r1.y, r2.y), d),
+                  dot(float3(r0.z, r1.z, r2.z), d));
+}
+
+// The world point of the entity-local point `p` under the entity's current transform.
+float3 EntityWorldPointById(CaelixFrameConstants fc, uint entity, float3 p)
+{
+    const uint64_t entity_info = fc.entity_infos + uint64_t(entity) * kEntityInfoBytes;
+    const float4 r0 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow0));
+    const float4 r1 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow1));
+    const float4 r2 = asfloat(CAELIX_LOAD_U32x4(entity_info + kEntityInfoCurRow2));
     const float4 h = float4(p, 1.0f);
     return float3(dot(r0, h), dot(r1, h), dot(r2, h));
 }

@@ -228,6 +228,10 @@ pub struct RenderSettings {
     pub sun_nee: bool,
     /// Pt mode: the delta checkerboard at the first glass interface, with the cross resolve.
     pub checkerboard: bool,
+    /// Lighting modes: the subsurface walk of materials with sss_probability > 0 (experiment).
+    pub sss: bool,
+    /// With `sss`: the walk's start voxel jittered over the hit face (CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER).
+    pub sss_entry_jitter: bool,
     /// Lighting modes: the sky where the primary ray misses.
     pub sky_on_miss: bool,
     /// Primary mode: Lambert shading of the albedo view.
@@ -307,6 +311,12 @@ impl RenderSettings {
         }
         if self.mode == Mode::Pt && self.checkerboard {
             flags |= CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD;
+        }
+        if lighting && self.sss {
+            flags |= CAELIX_RENDER_FLAG_SUBSURFACE;
+            if self.sss_entry_jitter {
+                flags |= CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER;
+            }
         }
         // Without an upscaler the other upscaler fields are zero, so they do not restart the
         // reference accumulation (`same_options`). RESET_HISTORY is never needed from the host:

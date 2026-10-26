@@ -257,7 +257,7 @@ TEST_CASE("materials: packed table matches the old decode, the glass palette and
     CHECK(Same(Get(rig, 255 | (5u << 8)), vacuum));
 
     // Stats and argument checks.
-    CHECK(Stats(rig.scene).material_table_bytes == 65536ull * 48ull);
+    CHECK(Stats(rig.scene).material_table_bytes == 65536ull * 64ull);
     ExpectLibraryErrors(1, [&] {
         CaelixMaterial m{};
         CHECK(caelix_scene_get_material(rig.scene, 0x10000u, &m) == CAELIX_ERROR_INVALID_ARGUMENT);
@@ -272,9 +272,14 @@ TEST_CASE("materials: packed table matches the old decode, the glass palette and
         CaelixMaterial entries[3] = {Make(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 9.0f, 0.0f),
                                      Make(0.5f, 0.25f, 0.125f, 1.0f, 0.0f, 1.4f, 0.01f),
                                      Make(0.1f, 0.2f, 0.3f, 0.5f, 0.0f, 1.2f, 0.0f)};
-        entries[1].pad[0] = 7.0f;  // ignored, stored as 0
+        // The subsurface fields round-trip (transparent entries ignore them in the kernels).
+        entries[1].sss_anisotropy = 0.3f;
+        entries[1].sss_steps = 7;
+        entries[1].sss_albedo[0] = 0.9f;
+        entries[1].sss_albedo[1] = 0.5f;
+        entries[1].sss_albedo[2] = 0.25f;
+        entries[1].sss_probability = 0.75f;
         REQUIRE(caelix_scene_set_glass_palette(rig.scene, entries, 3) == CAELIX_OK);
-        entries[1].pad[0] = 0.0f;
         CHECK(Same(Get(rig, 1), entries[1]));
         CHECK(Same(Get(rig, 1 | (0x21u << 8)), entries[1]));
         CHECK(Same(Get(rig, 2), entries[2]));
@@ -412,6 +417,56 @@ TEST_CASE("materials: sparse entries over the current table")
     CHECK(Same(Get(rig, 0x8006), PastelOpaque(HashU32(0x0006u))));
     // count 0 is a no-op.
     REQUIRE(caelix_scene_set_material_entries(rig.scene, nullptr, 0) == CAELIX_OK);
+
+    // Subsurface fields (docs/SSS_EXPERIMENT.md): a valid SSS entry round-trips; with
+    // sss_probability > 0 the steps, albedo and anisotropy are range-checked, with 0 they are free.
+    {
+        CaelixMaterialEntry sss = {};
+        sss.code = 0x8010;
+        sss.material = Make(0.8f, 0.7f, 0.6f, 0.2f, 0.0f, 1.4f, 0.0f);
+        sss.material.sss_anisotropy = -0.5f;
+        sss.material.sss_steps = 4096;
+        sss.material.sss_albedo[0] = 1.0f;
+        sss.material.sss_albedo[1] = 0.8f;
+        sss.material.sss_albedo[2] = 0.0f;
+        sss.material.sss_probability = 1.0f;
+        REQUIRE(caelix_scene_set_material_entries(rig.scene, &sss, 1) == CAELIX_OK);
+        CHECK(Same(Get(rig, 0x8010), sss.material));
+        const auto expect_rejected = [&](CaelixMaterialEntry bad) {
+            ExpectLibraryErrors(1, [&] {
+                CHECK(caelix_scene_set_material_entries(rig.scene, &bad, 1) == CAELIX_ERROR_INVALID_ARGUMENT);
+            });
+            CHECK(Same(Get(rig, 0x8010), sss.material));
+        };
+        CaelixMaterialEntry bad = sss;
+        bad.material.sss_probability = 1.5f;
+        expect_rejected(bad);
+        bad = sss;
+        bad.material.sss_probability = -0.1f;
+        expect_rejected(bad);
+        bad = sss;
+        bad.material.sss_steps = 0;
+        expect_rejected(bad);
+        bad.material.sss_steps = 4097;
+        expect_rejected(bad);
+        bad = sss;
+        bad.material.sss_albedo[1] = 1.01f;
+        expect_rejected(bad);
+        bad = sss;
+        bad.material.sss_anisotropy = 0.995f;
+        expect_rejected(bad);
+        bad = sss;
+        bad.material.sss_albedo[2] = std::numeric_limits<float>::quiet_NaN();
+        expect_rejected(bad);
+        // Probability 0: the other subsurface fields are not range-checked.
+        CaelixMaterialEntry off = sss;
+        off.material.sss_probability = 0.0f;
+        off.material.sss_steps = 0;
+        off.material.sss_albedo[0] = 2.0f;
+        off.material.sss_anisotropy = 1.0f;
+        REQUIRE(caelix_scene_set_material_entries(rig.scene, &off, 1) == CAELIX_OK);
+        CHECK(Same(Get(rig, 0x8010), off.material));
+    }
 
     // An invalid batch changes nothing: one entry with ior 0.
     {

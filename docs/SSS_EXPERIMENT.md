@@ -29,7 +29,7 @@ the SSS albedo are separate fields; an opaque non-SSS voxel is a wall (the walk 
 direction); glass and air are exits; HG anisotropy wanted; soft shadows through SSS later (not part of
 this step).
 
-## Material (64 bytes, was 48)
+## Material (C struct 64 bytes, was 48; GPU: a 48-byte main table + a 16-byte subsurface table)
 
 | offset | field | meaning |
 | --- | --- | --- |
@@ -41,13 +41,24 @@ this step).
 | 48 | `sss_albedo[3]` | per-step survival colour, each in [0, 1] |
 | 60 | `sss_probability` | p, [0, 1]; 0 = no SSS. Opaque codes only (ignored on transparent codes) |
 
-Row 3 (`sss_albedo`, `sss_probability`) is the one row that a walk step loads per voxel.
+The public `CaelixMaterial` is 64 bytes. The GPU keeps it as two tables (revised 2026-10-26, see "As
+built"): the MAIN table, 48 bytes per code = offsets 0 .. 47 above (`kMaterialBytes` 48, so the main
+kernels keep their stride; `kMaterialSssAnisotropy` 40, `kMaterialSssSteps` 44), and the SUBSURFACE
+table, 16 bytes per code = (`sss_albedo`, `sss_probability`) (`kSubsurfaceRowBytes`, 65536 rows = 1 MiB,
+device address `FrameConstants::subsurface_table` @576). `MaterialTable::WriteGpuChunk` splits every
+1024-entry chunk into both tables at upload (one staging span, two copies); both buffers are zero-filled
+in the first flush. The subsurface row is the one row that a walk step loads per voxel.
 
 ## Walk (`shaders/render/caelix_subsurface.hlsl`, compiled only with `CAELIX_SUBSURFACE 1`)
 
 All in the entity's local voxel grid of the hit (object space, block units).
 
-1. Cursor = the hit voxel (`MediumCursorFromHit` of `scattering-expr`: object_hit - 0.5 n).
+1. Cursor = the hit voxel (`MediumCursorFromHit` of `scattering-expr`: object_hit - 0.5 n). With
+   `CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER (1u << 6)` (added 2026-10-26, host default on,
+   `--sss-no-entry-jitter`): the voxel of object_hit - 0.5 n + a uniform offset in [-0.5, 0.5] along the
+   two face-tangent axes (two numbers of `rng`, only when the walk runs), reached from the hit voxel by
+   one `MediumStep` (a neighbour brick is resolved); if it is not an SSS voxel of the entity (absent
+   brick, air, opaque without SSS) the hit voxel. `a` starts as the start voxel's `sss_albedo`.
 2. State: cursor, continuous unit direction `d` (start: the ray direction in object space), weight
    `w = 1`, `a` = the current voxel's `sss_albedo` (start: the entry material's). `g` and the step cap
    come from the ENTRY material only.
@@ -94,8 +105,10 @@ The exit replaces the vertex: it is a diffuse vertex at the exit point with the 
   binds the SSS kernels (`caelix_path_trace_sss`, `caelix_path_trace_sss_no_light_nee`, the main sources
   with `CAELIX_SUBSURFACE 1`) only when the flag is set AND the scene's material table has an SSS entry;
   otherwise it clears the bit and binds the main kernels (their SPIR-V stays identical to `main`).
-- Frame constants grow 560 -> 576 B: `reverse_tables` @560, `group_grids` @568 (as on `scattering-expr`).
-- Host: SSS on by default, `--no-sss`, a UI checkbox; JSON fields `sss_albedo` (default [1, 1, 1]),
+- Frame constants grow 560 -> 592 B: `reverse_tables` @560, `group_grids` @568 (as on `scattering-expr`),
+  `subsurface_table` @576, `pad_584`, `pad_588`.
+- Host: SSS on by default, `--no-sss`, a UI checkbox; entry jitter on by default, `--sss-no-entry-jitter`,
+  a UI checkbox; JSON fields `sss_albedo` (default [1, 1, 1]),
   `sss_probability` (0), `sss_steps` (16), `sss_anisotropy` (0).
 - Not updated: the Unity plugin C# mirror (not used on this branch).
 
@@ -105,3 +118,20 @@ The exit replaces the vertex: it is a diffuse vertex at the exit point with the 
   glass chain does not know it).
 - The walk stays inside the hit entity (another entity's voxels count as air).
 - No soft shadows: SSS voxels are opaque for every shadow ray.
+
+## As built: deviations and findings (2026-10-26)
+
+- DEVIATION (RR guide only): the DLSS RR diffuse albedo guide of an SSS material is
+  `lerp(albedo * (1 - metallic), sss_albedo, p)` (the existing guide keeps the BSDF's metallic term).
+  The G-buffer / NRD demodulation albedo is `lerp(albedo, sss_albedo, p)` as specified. The RR specular
+  albedo guide is unchanged (not scaled by 1 - p).
+- DEVIATION (cost only, same estimate): a bounce vertex that has no next segment (the last vertex of the
+  path) skips the walk; only its emission counts there, so the result does not change.
+- REVISED (first version): a 64-byte GPU material table moved `caelix_path_trace_no_light_nee` from 96 to
+  128 driver registers by the stride change alone (emberdeep 1080p, no light NEE 3.17 -> 3.27 .. 3.41 ms).
+  Now the GPU main table stays 48 bytes and the subsurface row has its own table (see "Material"): the
+  main kernels' SPIR-V equals `main` plus the frame constants growth only, and the registers are back at
+  128 / 96.
+- FINDING -> FIX: a walk that always starts at the hit voxel gives every hit on one voxel face the same
+  walk distribution: converged SSS surfaces showed per-voxel brightness steps (large flat faces). The
+  entry jitter (Walk step 1) removes them (`Artifacts/sss-20261026/impl/`).

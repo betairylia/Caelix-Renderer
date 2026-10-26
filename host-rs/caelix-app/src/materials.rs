@@ -4,11 +4,14 @@
 //!
 //! ```json
 //! [{ "id": 1, "albedo": [0.9, 0.9, 0.9], "smoothness": 1.0, "metallic": 1.0,
-//!    "emission": [0, 0, 0], "ior": 1.5, "extinction": 0.0, "transparent": false }]
+//!    "emission": [0, 0, 0], "ior": 1.5, "extinction": 0.0, "transparent": false,
+//!    "sss_albedo": [1, 1, 1], "sss_probability": 0.0, "sss_steps": 16, "sss_anisotropy": 0.0 }]
 //! ```
 //!
 //! Every field except `id` is optional (defaults: albedo 1, smoothness 0, metallic 0, emission 0,
-//! ior 1.5, extinction 0, transparent false). Mapping to block codes (the block-ID encoding): an
+//! ior 1.5, extinction 0, transparent false, sss_albedo 1, sss_probability 0, sss_steps 16,
+//! sss_anisotropy 0). The `sss_*` fields are the subsurface walk of opaque entries (experiment branch
+//! sss-expr, `docs/SSS_EXPERIMENT.md`). Mapping to block codes (the block-ID encoding): an
 //! opaque entry goes to code `0x8000 | id` (id 0..32767), a transparent entry to code `id` (id
 //! 0..511). The rest of the table keeps the library's built-in content: the host reads every
 //! entry with `caelix_scene_get_material`, replaces the listed ones and writes the whole table.
@@ -30,6 +33,16 @@ fn number(entry: &Value, key: &str, default: f32) -> anyhow::Result<f32> {
             .as_f64()
             .map(|v| v as f32)
             .with_context(|| format!("\"{key}\" is not a number")),
+    }
+}
+
+fn unsigned(entry: &Value, key: &str, default: u32) -> anyhow::Result<u32> {
+    match entry.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .with_context(|| format!("\"{key}\" is not an unsigned 32-bit integer")),
     }
 }
 
@@ -75,7 +88,10 @@ fn parse_entry(entry: &Value) -> anyhow::Result<(usize, CaelixMaterial)> {
         metallic: number(entry, "metallic", 0.0)?,
         ior: number(entry, "ior", 1.5)?,
         extinction: number(entry, "extinction", 0.0)?,
-        pad: [0.0; 2],
+        sss_anisotropy: number(entry, "sss_anisotropy", 0.0)?,
+        sss_steps: unsigned(entry, "sss_steps", 16)?,
+        sss_albedo: vec3(entry, "sss_albedo", [1.0; 3])?,
+        sss_probability: number(entry, "sss_probability", 0.0)?,
     };
     Ok((code, material))
 }
@@ -93,7 +109,10 @@ pub fn apply(scene: *mut CaelixScene, path: &Path) -> anyhow::Result<()> {
         metallic: 0.0,
         ior: 0.0,
         extinction: 0.0,
-        pad: [0.0; 2],
+        sss_anisotropy: 0.0,
+        sss_steps: 0,
+        sss_albedo: [0.0; 3],
+        sss_probability: 0.0,
     };
     let mut table = vec![empty; ENTRIES];
     for (code, slot) in table.iter_mut().enumerate() {

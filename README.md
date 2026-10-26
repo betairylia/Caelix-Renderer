@@ -540,8 +540,10 @@ mean of the raw estimate.
 
 Design and owner decisions: `docs/STEP6D_MATERIALS_DELTA.md` (section "As built").
 
-- Material table: every scene has 65536 `CaelixMaterial` entries (48 bytes:
-  albedo, smoothness, emission, metallic, ior, extinction), one per 16-bit block
+- Material table: every scene has 65536 `CaelixMaterial` entries (48 bytes on the GPU:
+  albedo, smoothness, emission, metallic, ior, extinction; on the experiment branch
+  `sss-expr` the C struct is 64 bytes, its subsurface row lives in a separate 1 MiB GPU
+  table, see `docs/SSS_EXPERIMENT.md`), one per 16-bit block
   code, in a 3 MiB device-local buffer whose address is in the frame constants
   (`materials`, offset 440). The kernels read it with `GET_MATERIAL(code)`
   (`shaders/common/caelix_material.hlsl`); a transparent code loses its face

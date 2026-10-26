@@ -360,8 +360,14 @@ std::vector<std::string> CheckKernel(const std::string& name)
 
 TEST_CASE("frame constants: the uniform block of every frame-constant kernel has the C layout")
 {
-    const char* const kernels[] = {"caelix_path_trace", "caelix_path_trace_no_light_nee", "caelix_composite",
-                                   "caelix_cross_resolve", "caelix_sky_sh", "caelix_upscale_encode"};
+    const char* const kernels[] = {"caelix_path_trace",
+                                   "caelix_path_trace_no_light_nee",
+                                   "caelix_path_trace_sss",
+                                   "caelix_path_trace_sss_no_light_nee",
+                                   "caelix_composite",
+                                   "caelix_cross_resolve",
+                                   "caelix_sky_sh",
+                                   "caelix_upscale_encode"};
     for (const char* kernel : kernels)
     {
         const std::vector<std::string> errors = CheckKernel(kernel);
@@ -813,6 +819,9 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kMaterialAlbedo),
         CAELIX_CONSTANT(kMaterialEmission),
         CAELIX_CONSTANT(kMaterialIor),
+        CAELIX_CONSTANT(kMaterialSssAnisotropy),
+        CAELIX_CONSTANT(kMaterialSssSteps),
+        CAELIX_CONSTANT(kSubsurfaceRowBytes),
         // shaders/common/caelix_light_tree_layout.hlsl: lib/src/light/light_tree_layout.h
         CAELIX_CONSTANT(kLtNone),
         CAELIX_CONSTANT(kLtTrees),

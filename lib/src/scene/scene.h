@@ -184,10 +184,31 @@ public:
     {
         return entity_infos_.address();
     }
+    // The reverse table pool (u16 dense id by group-local position) and the group grid pool (u32 group
+    // index by grid cell) of the record lookups (shaders/scene/caelix_scene_lookup.hlsl); the trace
+    // kernel's subsurface walk moves through them (shaders/render/caelix_subsurface.hlsl).
+    VkDeviceAddress reverse_tables_address() const
+    {
+        return reverse_tables_.address();
+    }
+    VkDeviceAddress group_grids_address() const
+    {
+        return grids_.address();
+    }
     // The GPU material table: 65536 CaelixMaterial entries by block code.
     VkDeviceAddress materials_address() const
     {
         return material_buffer_.address();
+    }
+    // The GPU subsurface table: 65536 rows (sss_albedo, sss_probability) by block code (kSubsurfaceRowBytes).
+    VkDeviceAddress subsurface_table_address() const
+    {
+        return subsurface_buffer_.address();
+    }
+    // The material table has an opaque entry with sss_probability > 0 (MaterialTable::has_subsurface).
+    bool has_subsurface() const
+    {
+        return materials_->has_subsurface();
     }
     uint32_t records_per_page_shift() const;
     uint32_t record_bytes() const
@@ -365,8 +386,9 @@ private:
     uint32_t pages_staged_ = 0;
     StagingRing staging_;
     std::unique_ptr<MaterialTable> materials_;  // CPU copy of the material table
-    GpuBuffer material_buffer_;                 // MaterialTable::kBytes, device local
-    bool material_buffer_filled_ = false;       // the zero fill of the first flush was recorded
+    GpuBuffer material_buffer_;                 // MaterialTable::kMainBytes, device local
+    GpuBuffer subsurface_buffer_;               // MaterialTable::kSubsurfaceBytes, device local
+    bool material_buffer_filled_ = false;       // the zero fill of both tables in the first flush was recorded
     ComputePipeline finalize_;
     GpuTimer flush_timer_;  // brackets the work that a flush records
 

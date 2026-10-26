@@ -9,8 +9,9 @@ typedef CaelixResult (*SceneCreateFn)(CaelixDevice*, const CaelixSceneDesc*, Cae
 
 size_t caelix_abi_c99_touch(void);
 
-/* CaelixMaterial is the GPU table layout: 48 bytes (C99 has no static_assert). */
-typedef char caelix_material_is_48_bytes[(sizeof(CaelixMaterial) == 48) ? 1 : -1];
+/* CaelixMaterial is the GPU table layout: 64 bytes (C99 has no static_assert), the subsurface row at 48. */
+typedef char caelix_material_is_64_bytes[(sizeof(CaelixMaterial) == 64) ? 1 : -1];
+typedef char caelix_material_sss_albedo_at_48[(offsetof(CaelixMaterial, sss_albedo) == 48) ? 1 : -1];
 /* CaelixRenderOptions is embedded by value in host packets (the Unity plugin): 192 bytes, the sky
    cubemap at offset 152, the upscaler fields from offset 176. */
 typedef char caelix_render_options_is_192_bytes[(sizeof(CaelixRenderOptions) == 192) ? 1 : -1];
@@ -53,7 +54,8 @@ size_t caelix_abi_c99_touch(void)
                                    {0.25f, 0.22f, 0.2f},
                                    1,
                                    CAELIX_MAX_BOUNCES_TRANSPARENT};
-    CaelixMaterial material = {{1.0f, 1.0f, 1.0f}, 1.0f, {0.0f, 0.0f, 0.0f}, 0.0f, 1.55f, 0.0f, {0.0f, 0.0f}};
+    CaelixMaterial material = {{1.0f, 1.0f, 1.0f}, 1.0f, {0.0f, 0.0f, 0.0f}, 0.0f, 1.55f, 0.0f,
+                               0.0f, 16u, {1.0f, 1.0f, 1.0f}, 0.0f};
     CaelixRenderTargets targets = {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}};
     CaelixGpuTimings timings = {0.0f, 0.0f, 0, 0.0f, 0.0f, 0.0f};
     CaelixUpscalerQueryDesc upscaler_query = {CAELIX_UPSCALER_DLSS_SR, CAELIX_UPSCALE_QUALITY, 1920, 1080};
@@ -79,10 +81,12 @@ size_t caelix_abi_c99_touch(void)
                  sizeof(level) + sizeof(result) + sizeof(camera) + sizeof(options) +
                  sizeof(targets) + sizeof(timings) + sizeof(view) + sizeof(renderer) +
                  sizeof(mode) + sizeof(nrd_info) + sizeof(read_bit) + sizeof(material) +
-                 sizeof(caelix_material_is_48_bytes) + sizeof(caelix_render_options_is_192_bytes) +
+                 sizeof(caelix_material_is_64_bytes) + sizeof(caelix_material_sss_albedo_at_48) +
+                 sizeof(caelix_render_options_is_192_bytes) +
                  sizeof(caelix_sky_cubemap_at_152) + sizeof(caelix_upscaler_at_176) + sizeof(upscaler_query) +
                  sizeof(upscaler_result) + sizeof(upscaler_info) + sizeof(upscaler) + sizeof(quality) +
-                 sizeof(reason) + upscale_flags;
+                 sizeof(reason) + upscale_flags + CAELIX_RENDER_FLAG_SUBSURFACE +
+                 CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER;
     /* Take the address of every function so a declaration typo fails to compile. Casts between
        function pointer types are valid C; the pointers are never called. */
     CaelixLightNeeOptions nee_options = {1, CAELIX_LIGHT_NEE_FLAG_NO_MIS, {0, 0}};

@@ -1,5 +1,5 @@
 // The scene's material table (Unity's g_Materials, CaelixMaterialTable.hlsl): one
-// CaelixMaterial (48 bytes, the C ABI struct of include/caelix/caelix.h) per 16-bit
+// main row (the first 48 bytes of the C ABI struct CaelixMaterial of include/caelix/caelix.h) per 16-bit
 // block code, read through the buffer device address CaelixFrameConstants::materials.
 // The CPU side builds and uploads it (lib/src/scene/material_table.*); the decode of
 // packed colours, the glass palette and the host's table all live there.
@@ -24,10 +24,17 @@ struct CaelixMaterial
 
 static const uint kMaterialBytes = 48;
 // Field offsets (macros: see common/caelix_record.hlsl). The loads take the 16-byte rows (albedo,
-// smoothness), (emission, metallic), (ior, extinction).
+// smoothness), (emission, metallic), (ior, extinction, sss_anisotropy, sss_steps). CaelixGetMaterial
+// reads the shading fields only; the subsurface walk (render/caelix_subsurface.hlsl, experiment branch
+// sss-expr) reads sss_anisotropy and sss_steps itself, and the row (sss_albedo, sss_probability) of a
+// code from the separate subsurface table (CaelixFrameConstants::subsurface_table, kSubsurfaceRowBytes
+// per code).
 #define kMaterialAlbedo 0
 #define kMaterialEmission 16
 #define kMaterialIor 32
+#define kMaterialSssAnisotropy 40
+#define kMaterialSssSteps 44
+#define kSubsurfaceRowBytes 16
 
 // Set by the kernel from CaelixFrameConstants::materials before the first lookup.
 static uint64_t g_materialTable;

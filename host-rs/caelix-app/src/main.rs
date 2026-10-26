@@ -210,11 +210,20 @@ struct Args {
     /// random per frame, no cross resolve). Default: checkerboard on.
     #[arg(long)]
     no_checkerboard: bool,
+    /// Lighting modes: no subsurface walk (CAELIX_RENDER_FLAG_SUBSURFACE off): materials with
+    /// "sss_probability" > 0 shade with their surface BSDF only. Default: the walk is on.
+    #[arg(long)]
+    no_sss: bool,
+    /// Lighting modes: the subsurface walk always starts in the hit voxel (no entry jitter over the
+    /// hit face; SSS surfaces then show per-voxel brightness steps). Default: entry jitter on.
+    #[arg(long)]
+    sss_no_entry_jitter: bool,
     /// Block encoding of the scene: packed (Caelix worlds) or block-id.
     #[arg(long, value_enum, default_value_t = Encoding::Packed)]
     encoding: Encoding,
     /// A JSON material table (an array of {"id", "albedo", "smoothness", "metallic", "emission",
-    /// "ior", "extinction", "transparent"}), applied with caelix_scene_set_materials over the
+    /// "ior", "extinction", "transparent", "sss_albedo", "sss_probability", "sss_steps",
+    /// "sss_anisotropy"}), applied with caelix_scene_set_materials over the
     /// built-in table. For block-ID worlds: an entry goes to code 0x8000 | id, or to code id with
     /// "transparent": true.
     #[arg(long, value_name = "PATH")]
@@ -1991,7 +2000,7 @@ fn main() -> anyhow::Result<()> {
         "mode {mode:?}, bounces {}, transparent bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, \
          sun NEE {}, denoise {}, sky {}, fog density {} colour {:?}, emission scale {}, \
          upscaler {:?}, upscale quality {:?}, upscale preset {}, upscale auto exposure {}, jitter phases {}, \
-         window {}x{}",
+         subsurface {} entry jitter {}, window {}x{}",
         args.bounces,
         args.bounces_transparent,
         args.exposure,
@@ -2008,6 +2017,8 @@ fn main() -> anyhow::Result<()> {
         args.upscale_preset,
         args.upscale_auto_exposure,
         if args.jitter_phases == 0 { "auto".to_string() } else { args.jitter_phases.to_string() },
+        !args.no_sss,
+        !args.sss_no_entry_jitter,
         args.size.0,
         args.size.1
     );
@@ -2038,6 +2049,8 @@ fn main() -> anyhow::Result<()> {
         denoise: !args.no_denoise,
         sun_nee: !args.no_sun_nee,
         checkerboard: !args.no_checkerboard,
+        sss: !args.no_sss,
+        sss_entry_jitter: !args.sss_no_entry_jitter,
         sky_on_miss: !args.no_sky_on_miss,
         shading: !args.no_shading,
         exposure: args.exposure,

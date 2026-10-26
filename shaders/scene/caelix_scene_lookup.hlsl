@@ -100,4 +100,63 @@ uint64_t SceneResolveNeighbor(SceneLookup s, SceneBrickPlace place, uint d)
     return SceneRecordAddress(s, row.z);
 }
 
+// The record address of the brick at the entity-local brick coordinate `brick` (block coordinate >> 3) of
+// `entity`, whose neighbour brick lies in the group `group`; 0 = that brick is absent (air), `group` is then
+// unspecified (the callers stop there). The brick's group coordinate is brick >> group_shift: the same as
+// the group's -> the reverse lookup with the group's bases, else the entity's group grid gives the new
+// group (and `group` becomes it). The group info is read again at every call (L1 hot): the subsurface walk
+// of render/caelix_subsurface.hlsl keeps only the group index in registers.
+uint64_t SceneBrickAt(SceneLookup s, inout uint group, uint entity, int3 brick)
+{
+    const uint shift = s.group_shift;
+    const int mask = int((1u << shift) - 1u);
+    const uint64_t info = s.group_infos + uint64_t(group) * kGroupInfoBytes;
+    const int3 coord = int3(CAELIX_LOAD_U32x4(info).xyz);  // kGroupInfoCoord = 0
+    // Arithmetic shifts: negative brick coordinates belong to negative group coordinates.
+    const int3 target = brick >> int(shift);
+    uint2 bases;
+    CAELIX_BRANCH
+    if (all(target == coord))
+    {
+        bases = CAELIX_LOAD_U32x4(info + kGroupInfoSlotRowBase).xy;
+    }
+    else
+    {
+        // Another group of the same entity: look it up in the entity's group grid.
+        const uint64_t entity_address = s.entity_infos + uint64_t(entity) * kEntityInfoBytes;
+        const uint4 e0 = CAELIX_LOAD_U32x4(entity_address);  // grid_min, grid_base (kEntityInfoGridMin = 0)
+        const uint4 e1 = CAELIX_LOAD_U32x4(entity_address + kEntityInfoGridDims);
+        const int3 rel = target - int3(e0.xyz);
+        const int3 dims = int3(e1.xyz);
+        if (any(rel < 0) || any(rel >= dims))
+        {
+            return 0;
+        }
+        const uint cell = uint(rel.x) + uint(dims.x) * (uint(rel.y) + uint(dims.y) * uint(rel.z));
+        const uint new_group = CAELIX_LOAD_U32(s.group_grids + (uint64_t(e0.w) + cell) * 4);
+        if (new_group == kNoGroup)
+        {
+            return 0;
+        }
+        group = new_group;
+        bases = SceneGroupBases(s, new_group);
+    }
+    // Two's complement: & mask is the group-local brick coordinate for negative bricks too.
+    const int3 n = brick & mask;
+    const uint pos = uint(n.x) | (uint(n.y) << shift) | (uint(n.z) << (2 * shift));
+    const uint64_t entry = uint64_t(bases.y) + pos;
+    const uint pair = CAELIX_LOAD_U32(s.reverse_tables + (entry >> 1) * 4);
+    const uint id = (entry & 1) != 0 ? (pair >> 16) : (pair & 0xFFFFu);
+    if (id == kNoBrickId)
+    {
+        return 0;
+    }
+    const uint4 row = CAELIX_LOAD_U32x4(s.slot_tables + (uint64_t(bases.x) + id) * kSlotRowBytes);
+    if (SlotRowState(row.x) != kSlotStateResident || row.z == kInvalidRecord)
+    {
+        return 0;
+    }
+    return SceneRecordAddress(s, row.z);
+}
+
 #endif  // CAELIX_SCENE_LOOKUP_HLSL

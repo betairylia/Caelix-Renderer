@@ -116,7 +116,9 @@ bool MaterialTable::Valid(const CaelixMaterial& material, const char*& reason)
 {
     if (!Finite(material.albedo, 3) || !Finite(&material.smoothness, 1) ||
         !Finite(material.emission, 3) || !Finite(&material.metallic, 1) ||
-        !Finite(&material.ior, 1) || !Finite(&material.extinction, 1))
+        !Finite(&material.ior, 1) || !Finite(&material.extinction, 1) ||
+        !Finite(&material.sss_anisotropy, 1) || !Finite(material.sss_albedo, 3) ||
+        !Finite(&material.sss_probability, 1))
     {
         reason = "a value is not finite";
         return false;
@@ -130,6 +132,33 @@ bool MaterialTable::Valid(const CaelixMaterial& material, const char*& reason)
     {
         reason = "extinction is negative";
         return false;
+    }
+    if (material.sss_probability < 0.0f || material.sss_probability > 1.0f)
+    {
+        reason = "sss_probability is outside [0, 1]";
+        return false;
+    }
+    if (material.sss_probability > 0.0f)
+    {
+        if (material.sss_steps < 1 || material.sss_steps > kMaterialSssMaxSteps)
+        {
+            reason = "sss_steps is outside 1 .. 4096";
+            return false;
+        }
+        for (int c = 0; c < 3; ++c)
+        {
+            if (material.sss_albedo[c] < 0.0f || material.sss_albedo[c] > 1.0f)
+            {
+                reason = "an sss_albedo component is outside [0, 1]";
+                return false;
+            }
+        }
+        if (material.sss_anisotropy < -kMaterialSssMaxAnisotropy ||
+            material.sss_anisotropy > kMaterialSssMaxAnisotropy)
+        {
+            reason = "sss_anisotropy is outside [-0.99, 0.99]";
+            return false;
+        }
     }
     return true;
 }
@@ -148,25 +177,40 @@ void MaterialTable::MarkDirty(uint32_t first_code, uint32_t end_code)
     }
 }
 
+uint32_t MaterialTable::SubsurfaceCode(uint32_t code, const CaelixMaterial& material) const
+{
+    return BlockIsOpaque(code, encoding_) && material.sss_probability > 0.0f ? 1u : 0u;
+}
+
 void MaterialTable::Replace(const CaelixMaterial* entries, uint32_t count)
 {
+    subsurface_codes_ = 0;
     for (uint32_t code = 0; code < kEntries; ++code)
     {
-        CaelixMaterial m = code < count ? entries[code] : BuiltIn(code);
-        m.pad[0] = 0.0f;
-        m.pad[1] = 0.0f;
-        entries_[code] = m;
+        entries_[code] = code < count ? entries[code] : BuiltIn(code);
+        subsurface_codes_ += SubsurfaceCode(code, entries_[code]);
     }
     MarkDirty(0, kEntries);
 }
 
 void MaterialTable::Set(uint32_t code, const CaelixMaterial& material)
 {
-    CaelixMaterial m = material;
-    m.pad[0] = 0.0f;
-    m.pad[1] = 0.0f;
-    entries_[code] = m;
+    subsurface_codes_ -= SubsurfaceCode(code, entries_[code]);
+    entries_[code] = material;
+    subsurface_codes_ += SubsurfaceCode(code, material);
     MarkDirty(code, code + 1);
+}
+
+void MaterialTable::WriteGpuChunk(uint32_t chunk, uint8_t* main_rows, uint8_t* subsurface_rows) const
+{
+    const uint32_t first = chunk * kChunkEntries;
+    for (uint32_t i = 0; i < kChunkEntries; ++i)
+    {
+        const uint8_t* entry = reinterpret_cast<const uint8_t*>(&entries_[first + i]);
+        std::memcpy(main_rows + static_cast<size_t>(i) * kMaterialBytes, entry, kMaterialBytes);
+        std::memcpy(subsurface_rows + static_cast<size_t>(i) * kSubsurfaceRowBytes, entry + kMaterialBytes,
+                    kSubsurfaceRowBytes);
+    }
 }
 
 void MaterialTable::SetGlassPalette(const CaelixMaterial* entries, uint32_t count)
@@ -174,8 +218,6 @@ void MaterialTable::SetGlassPalette(const CaelixMaterial* entries, uint32_t coun
     for (uint32_t id = 1; id < count; ++id)
     {
         palette_[id] = entries[id];
-        palette_[id].pad[0] = 0.0f;
-        palette_[id].pad[1] = 0.0f;
     }
     // Transparent codes are 0x0000..0x3FFF: id = code & 0xFF, face bits 8..13.
     for (uint32_t code = 0; code < 0x4000u; ++code)

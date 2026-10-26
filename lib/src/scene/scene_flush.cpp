@@ -329,9 +329,10 @@ void Scene::StageMaterials()
 {
     if (!material_buffer_filled_)
     {
-        // Until the chunks arrive, the kernels read zeros (black, no emission), not
-        // uninitialized memory. The fill is recorded before the copies of this flush.
+        // Until the chunks arrive, the kernels read zeros (black, no emission, no subsurface), not
+        // uninitialized memory. The fills are recorded before the copies of this flush.
         fills_.push_back(PendingFill{material_buffer_.buffer(), 0, material_buffer_.size(), 0});
+        fills_.push_back(PendingFill{subsurface_buffer_.buffer(), 0, subsurface_buffer_.size(), 0});
         material_buffer_filled_ = true;
     }
     const uint64_t dirty = materials_->dirty_chunks();
@@ -349,12 +350,14 @@ void Scene::StageMaterials()
                         "the next flush");
             return;
         }
-        const VkDeviceSize offset = static_cast<VkDeviceSize>(chunk) * MaterialTable::kChunkBytes;
-        std::memcpy(span.data,
-                    reinterpret_cast<const uint8_t*>(materials_->data()) + offset,
-                    MaterialTable::kChunkBytes);
-        pending_.push_back(
-            StagedCopy{span.offset, material_buffer_.buffer(), offset, MaterialTable::kChunkBytes});
+        // One span per chunk: its main table rows, then its subsurface table rows (two copies).
+        materials_->WriteGpuChunk(chunk, span.data, span.data + MaterialTable::kChunkMainBytes);
+        pending_.push_back(StagedCopy{span.offset, material_buffer_.buffer(),
+                                      static_cast<VkDeviceSize>(chunk) * MaterialTable::kChunkMainBytes,
+                                      MaterialTable::kChunkMainBytes});
+        pending_.push_back(StagedCopy{span.offset + MaterialTable::kChunkMainBytes, subsurface_buffer_.buffer(),
+                                      static_cast<VkDeviceSize>(chunk) * MaterialTable::kChunkSubsurfaceBytes,
+                                      MaterialTable::kChunkSubsurfaceBytes});
         materials_->MarkStaged(chunk);
     }
 }

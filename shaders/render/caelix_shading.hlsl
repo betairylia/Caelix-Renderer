@@ -488,6 +488,16 @@ float3 SkySpecularMiss(CaelixFrameConstants fc, float3 direction, float roughnes
 // ---------------------------------------------------------------------------
 // Sun next-event estimation (kRenderFlagSunNee)
 
+// An orthonormal basis (t, b) around the unit vector w (Duff et al. 2017, branchless).
+void OrthonormalBasis(float3 w, out float3 t, out float3 b)
+{
+    const float sign_z = w.z >= 0.0f ? 1.0f : -1.0f;
+    const float p = -1.0f / (sign_z + w.z);
+    const float q = w.x * w.y * p;
+    t = float3(1.0f + sign_z * w.x * w.x * p, sign_z * q, -sign_z * w.x);
+    b = float3(q, sign_z + w.y * w.y * p, -w.y);
+}
+
 // A direction uniform in the solid angle of the sun cone around sun_dir:
 // cos theta = 1 - u1 (1 - cos r), phi = 2 pi u2, pdf = 1 / sun_solid_angle.
 // 1 - cos r is taken from sun_solid_angle / (2 pi) (computed in double on the CPU),
@@ -499,13 +509,10 @@ float3 SampleSunDirection(CaelixFrameConstants fc, inout uint rng)
     const float phi = RandomFloat01(rng) * K_TWO_PI;
     const float cos_theta = 1.0f - a;
     const float sin_theta = sqrt(max(a * (2.0f - a), 0.0f));
-    // Orthonormal basis around the sun direction (Duff et al. 2017, branchless).
     const float3 w = fc.sun_dir.xyz;
-    const float sign_z = w.z >= 0.0f ? 1.0f : -1.0f;
-    const float p = -1.0f / (sign_z + w.z);
-    const float q = w.x * w.y * p;
-    const float3 t = float3(1.0f + sign_z * w.x * w.x * p, sign_z * q, -sign_z * w.x);
-    const float3 b = float3(q, sign_z + w.y * w.y * p, -w.y);
+    float3 t;
+    float3 b;
+    OrthonormalBasis(w, t, b);
     return normalize(t * (cos(phi) * sin_theta) + b * (sin(phi) * sin_theta) + w * cos_theta);
 }
 

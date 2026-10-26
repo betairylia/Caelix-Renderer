@@ -239,8 +239,16 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     }
     // DLSS RR replaces NRD and must not see checkerboard rendering (RR guide 3.5).
     const bool ray_reconstruction = upscaling && options.upscaler == CAELIX_UPSCALER_DLSS_RR;
-    const uint32_t flags =
+    uint32_t flags =
         ray_reconstruction ? (options.flags & ~CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) : options.flags;
+    // Subsurface walks (experiment, docs/SSS_EXPERIMENT.md): only in the lighting modes of a scene whose
+    // material table has an opaque SSS entry; otherwise the bit is cleared and the main kernels run.
+    const bool subsurface =
+        (flags & CAELIX_RENDER_FLAG_SUBSURFACE) != 0 && lighting && scene_.has_subsurface();
+    if (!subsurface)
+    {
+        flags &= ~(CAELIX_RENDER_FLAG_SUBSURFACE | CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER);
+    }
 
     // The present targets (image != 0), in binding order.
     const CaelixTargetImage* const all[kTargetCount] = {&targets.color, &targets.albedo,
@@ -520,6 +528,9 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.materials = scene_.materials_address();
     constants.light_tree = scene_.light_tree_address();
     constants.light_nee_flags = light_nee_flags;
+    constants.reverse_tables = scene_.reverse_tables_address();
+    constants.group_grids = scene_.group_grids_address();
+    constants.subsurface_table = scene_.subsurface_table_address();
     constants.records_per_page_shift = scene_.records_per_page_shift();
     constants.record_bytes = scene_.record_bytes();
     constants.group_shift = scene_.group_shift();
@@ -678,8 +689,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         sh_written.Record(cmd);
     }
-    // Trace (the variant without the light NEE code when this frame runs none).
-    const ComputePipeline& trace = light_nee_flags != 0 ? kernels_.trace() : kernels_.trace_no_light_nee();
+    // Trace (the variant without the light NEE code when this frame runs none; the subsurface variants
+    // only for frames that run the walk, their code holds more registers).
+    const ComputePipeline& trace =
+        subsurface ? (light_nee_flags != 0 ? kernels_.trace_sss() : kernels_.trace_sss_no_light_nee())
+                   : (light_nee_flags != 0 ? kernels_.trace() : kernels_.trace_no_light_nee());
     bind_sets(trace, slot->set);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
     timer_.End(cmd);

@@ -1,5 +1,5 @@
 // Per-frame constants of the trace, composite, cross resolve, sky SH and upscale encode kernels.
-// Mirrors lib/src/render/frame_constants.h; change both together. 560 bytes, read as the uniform
+// Mirrors lib/src/render/frame_constants.h; change both together. 592 bytes, read as the uniform
 // buffer g_frame (common/caelix_frame_ubo.hlsl: set 1, binding 0).
 // Layout rule: the uniform block gets DXC's default constant buffer layout, which gives the C
 // offsets only while every field sits at an offset that is a multiple of its size, no vector
@@ -62,7 +62,7 @@ struct CaelixFrameConstants
     float sun_solid_angle;          // 428  2 pi (1 - sun_cos_radius): solid angle of the sun cone
     uint denoised;                  // 432  1 = NRD ran this frame (composite: validation view)
     uint bounce_count_transparent;  // 436  delta chain interfaces, 0..15
-    uint64_t materials;             // 440  CaelixMaterial (48 B) by block code (common/caelix_material.hlsl)
+    uint64_t materials;             // 440  CaelixMaterial (64 B) by block code (common/caelix_material.hlsl)
     float4 hit_dist_params;         // 448  REBLUR hit distance normalization A, B, C (w unused)
     uint cross_resolve;             // 464  1 = composite -> resolve image -> caelix_cross_resolve -> colour
     uint pad_468;                   // 468
@@ -79,7 +79,12 @@ struct CaelixFrameConstants
     uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear)
     uint64_t light_tree;            // 544  light tree descriptor (light/caelix_light_tree.hlsl), 0 = no tree
     uint light_nee_flags;           // 552  kLightNee*: the light NEE of this frame (0 = off)
-    uint pad_556;                   // 556 -> 560
+    uint pad_556;                   // 556
+    uint64_t reverse_tables;        // 560  u16 reverse table pool base (group-local position -> dense id, 0xFFFF none)
+    uint64_t group_grids;           // 568  u32 group grid pool base (group index or 0xFFFFFFFF)
+    uint64_t subsurface_table;      // 576  (sss_albedo, sss_probability) rows (16 B) by block code (render/caelix_subsurface.hlsl)
+    uint pad_584;                   // 584
+    uint pad_588;                   // 588 -> 592
 };
 
 // CaelixDebugView
@@ -111,6 +116,8 @@ static const uint kRenderFlagSkyOnMiss = 1u << 1;
 static const uint kRenderFlagSunNee = 1u << 2;
 static const uint kRenderFlagDeltaCheckerboard = 1u << 3;
 static const uint kRenderFlagFlipY = 1u << 4;
+static const uint kRenderFlagSubsurface = 1u << 5;
+static const uint kRenderFlagSssEntryJitter = 1u << 6;
 
 // CaelixFrameConstants::light_nee_flags (lib/src/render/frame_constants.h). Macros: a static const here
 // would add constants to the four other frame-constant kernels, which never read them.
