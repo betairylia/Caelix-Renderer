@@ -539,6 +539,8 @@ mean of the raw estimate.
 ### Materials and glass (step 6d)
 
 Design and owner decisions: `docs/STEP6D_MATERIALS_DELTA.md` (section "As built").
+Experiment branch `sss-voxel-color-expr`: `CAELIX_RENDER_FLAG_VOXEL_COLOR` (host `--voxel-color`, key `V`) gives
+every pixel the mean final colour of its camera ray's first-hit voxel, see `docs/VOXEL_COLOR_EXPERIMENT.md`.
 
 - Material table: every scene has 65536 `CaelixMaterial` entries (48 bytes on the GPU:
   albedo, smoothness, emission, metallic, ior, extinction; on the experiment branch

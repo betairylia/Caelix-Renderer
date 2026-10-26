@@ -4,7 +4,8 @@
 //   - the push constant blocks of the scene and light tree kernels against their C++ structs, member
 //     by member and by name;
 //   - every named constant of the HLSL layout headers (caelix_record.hlsl, caelix_material.hlsl,
-//     caelix_light_tree_layout.hlsl) against the C++ constant of the same name.
+//     caelix_light_tree_layout.hlsl, caelix_hash_table.hlsl, caelix_voxel_color.hlsl) against the C++
+//     constant of the same name.
 // The test reads the .spv files of the build (CAELIX_SHADER_SPV_DIR, written by cmake/Shaders.cmake)
 // and parses the SPIR-V binary, and reads the HLSL sources (CAELIX_SHADER_SOURCE_DIR).
 //
@@ -18,6 +19,7 @@
 // DXC's constant buffer layout differs from the C layout when a vector crosses a 16-byte row or an
 // array element is not 16 bytes; such a change of CaelixFrameConstants fails here.
 #include "render/frame_constants.h"
+#include "render/voxel_color_layout.h"
 #include "rhi/hash_table_layout.h"
 #include "scene/gpu_structs.h"
 #include "light/light_tree_layout.h"
@@ -367,7 +369,8 @@ TEST_CASE("frame constants: the uniform block of every frame-constant kernel has
                                    "caelix_composite",
                                    "caelix_cross_resolve",
                                    "caelix_sky_sh",
-                                   "caelix_upscale_encode"};
+                                   "caelix_upscale_encode",
+                                   "caelix_voxel_accumulate"};
     for (const char* kernel : kernels)
     {
         const std::vector<std::string> errors = CheckKernel(kernel);
@@ -998,13 +1001,25 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kHashNoPayload),
         CAELIX_CONSTANT(kHashEmptyEntry),
         CAELIX_CONSTANT(kHashMissing),
+        // shaders/common/caelix_voxel_color.hlsl: lib/src/render/voxel_color_layout.h
+        CAELIX_CONSTANT(kVoxelSlotFingerprint),
+        CAELIX_CONSTANT(kVoxelSlotCount),
+        CAELIX_CONSTANT(kVoxelSlotSumLo),
+        CAELIX_CONSTANT(kVoxelSlotSumHi),
+        CAELIX_CONSTANT(kVoxelSlotWords),
+        CAELIX_CONSTANT(kVoxelSlotBytes),
+        CAELIX_CONSTANT(kVoxelSlotInvalid),
+        CAELIX_CONSTANT(kVoxelProbes),
+        CAELIX_CONSTANT(kVoxelSlotSeed),
+        CAELIX_CONSTANT(kVoxelFingerprintSeed),
     };
 #undef CAELIX_CONSTANT
     std::map<std::string, uint64_t> known;
     std::vector<std::string> errors;
     size_t checked = 0;
     for (const char* file : {"common/caelix_record.hlsl", "common/caelix_material.hlsl",
-                             "common/caelix_light_tree_layout.hlsl", "common/caelix_hash_table.hlsl"})
+                             "common/caelix_light_tree_layout.hlsl", "common/caelix_hash_table.hlsl",
+                             "common/caelix_voxel_color.hlsl"})
     {
         for (const auto& [name, value] : HlslConstants(file, known, errors))
         {

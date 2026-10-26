@@ -1,5 +1,5 @@
 // Renderer::Render: validation, descriptors, frame constants, barriers and the
-// pass sequence (sky SH, trace, NRD, composite, upscaler, encode).
+// pass sequence (sky SH, trace, NRD, composite, upscaler, voxel accumulate, encode).
 #include "render/renderer.h"
 
 #include "core/log.h"
@@ -17,7 +17,8 @@
 namespace caelix {
 namespace {
 
-// [numthreads(8, 8, 1)] in caelix_path_trace.hlsl, caelix_composite.hlsl and caelix_upscale_encode.hlsl.
+// [numthreads(8, 8, 1)] in caelix_path_trace.hlsl, caelix_composite.hlsl, caelix_upscale_encode.hlsl and
+// caelix_voxel_accumulate.hlsl.
 constexpr uint32_t kWorkgroupSize = 8;
 // The smallest output of an upscaler (DLSS: 64 x 32).
 constexpr uint32_t kMinUpscaleOutputWidth = 64;
@@ -111,8 +112,9 @@ public:
     }
 
 private:
-    // The targets, the internal targets, the fallback sky cube and the upscaler's output.
-    VkImageMemoryBarrier2 images_[std::size(kTargetSpecs) + std::size(kInternalSpecs) + 2] = {};
+    // The targets, the internal targets, the fallback sky cube, the upscaler's output and the voxel
+    // slot image.
+    VkImageMemoryBarrier2 images_[std::size(kTargetSpecs) + std::size(kInternalSpecs) + 3] = {};
     uint32_t image_count_ = 0;
     VkMemoryBarrier2 memory_{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     bool has_memory_ = false;
@@ -341,6 +343,13 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     // The delta checkerboard (path trace mode only) needs the cross resolve after the composite.
     const bool cross_resolve = composite && options.mode == CAELIX_MODE_PATH_TRACE &&
                                (flags & CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) != 0;
+    // Per-voxel colour (experiment, docs/VOXEL_COLOR_EXPERIMENT.md): frames with a composite, except the
+    // motion and the NRD validation views of the path trace mode (they render as without the flag). The
+    // pass runs at the output size (= the render size without an upscaler).
+    const bool voxel_color =
+        (flags & CAELIX_RENDER_FLAG_VOXEL_COLOR) != 0 && composite &&
+        !(options.mode == CAELIX_MODE_PATH_TRACE &&
+          (options.debug_view == CAELIX_VIEW_MOTION || options.debug_view == CAELIX_VIEW_NRD_VALIDATION));
 
     const VkCommandBuffer cmd = HandleFromU64<VkCommandBuffer>(frame.command_buffer);
     const uint64_t safe = frame.safe_frame_number;
@@ -356,6 +365,10 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     if (lighting && EnsureInternalTargets(width, height, frame.frame_number))
     {
         restart_accumulation = true;
+    }
+    if (voxel_color)
+    {
+        EnsureVoxelColor(output_width, output_height, frame.frame_number);
     }
     // Light NEE (the lighting modes with a light tree; 0 = it does not run this frame).
     const uint32_t light_nee_flags = LightNeeFlags(lighting);
@@ -431,6 +444,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constexpr uint32_t kMaxWrites = kTraceBindingCount + 2;
     static_assert(kMaxWrites >= kCompositeBindingCount);
     VkDescriptorImageInfo image_infos[kMaxWrites];
+    VkDescriptorBufferInfo buffer_infos[kMaxWrites];
     VkWriteDescriptorSet writes[kMaxWrites];
     uint32_t write_count = 0;
     const auto write_descriptor = [&](VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
@@ -449,6 +463,17 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         write_descriptor(set, binding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                          {VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
     };
+    const auto write_buffer = [&](VkDescriptorSet set, uint32_t binding, VkBuffer buffer) {
+        buffer_infos[write_count] = {buffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet& write = writes[write_count];
+        write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = set;
+        write.dstBinding = binding;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &buffer_infos[write_count];
+        ++write_count;
+    };
     // The sky cubemap: the host's (in its layout) or the device's fallback cube (GENERAL,
     // never sampled: sky_cubemap = 0); the sampler is the device's.
     const GpuImage& fallback_sky = kernels_.fallback_sky();
@@ -462,16 +487,21 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         write_descriptor(set, binding + 1, VK_DESCRIPTOR_TYPE_SAMPLER,
                          {kernels_.sky_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
     };
-    if (tlas != VK_NULL_HANDLE)
-    {
+    // The TLAS at binding 0 of `set` (only when the scene has one: has_tlas).
+    const auto write_tlas = [&](VkDescriptorSet set) {
+        if (tlas == VK_NULL_HANDLE)
+        {
+            return;
+        }
         VkWriteDescriptorSet& write = writes[write_count++];
         write = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         write.pNext = &as_write;
-        write.dstSet = slot->set;
+        write.dstSet = set;
         write.dstBinding = 0;
         write.descriptorCount = 1;
         write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-    }
+    };
+    write_tlas(slot->set);
     VkImage images[kTargetCount];
     VkImageLayout layouts[kTargetCount];
     VkImageView color_view = VK_NULL_HANDLE;
@@ -531,6 +561,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.reverse_tables = scene_.reverse_tables_address();
     constants.group_grids = scene_.group_grids_address();
     constants.subsurface_table = scene_.subsurface_table_address();
+    if (voxel_color)
+    {
+        constants.voxel_color = 1;
+        constants.voxel_slot_mask = voxel_slot_count_ - 1;
+    }
     constants.records_per_page_shift = scene_.records_per_page_shift();
     constants.record_bytes = scene_.record_bytes();
     constants.group_shift = scene_.group_shift();
@@ -664,7 +699,31 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                          VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         }
+        // The voxel colour pass's new slot image (later frames: the lighting memory barrier above orders
+        // the previous frame's encode reads before this frame's accumulate writes).
+        if (voxel_color && voxel_slots_needs_init_)
+        {
+            before.Image(voxel_slots_.image(), VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_NONE,
+                         VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
         before.Record(cmd);
+    }
+    // The voxel hash table is cleared once per frame that uses it: the previous frame's accumulate and
+    // encode accesses -> the fill -> this frame's accumulate.
+    if (voxel_color)
+    {
+        Barriers clear_before;
+        clear_before.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        clear_before.Record(cmd);
+        vkCmdFillBuffer(cmd, voxel_hash_.buffer(), 0, VK_WHOLE_SIZE, 0);
+        Barriers clear_after;
+        clear_after.Memory(VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        clear_after.Record(cmd);
     }
     // Every kernel below binds its own set as set 0 and the slot's frame set (the frame constants,
     // written to the slot's buffer before the submit) as set kFrameSetIndex = 1.
@@ -677,6 +736,42 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
 
     const uint32_t groups_x = (width + kWorkgroupSize - 1) / kWorkgroupSize;
     const uint32_t groups_y = (height + kWorkgroupSize - 1) / kWorkgroupSize;
+    const uint32_t output_groups_x = (output_width + kWorkgroupSize - 1) / kWorkgroupSize;
+    const uint32_t output_groups_y = (output_height + kWorkgroupSize - 1) / kWorkgroupSize;
+    // The voxel accumulate pass over `source` (the image the encode kernel reads next): writes the voxel
+    // set, dispatches one thread per output pixel and orders its slot image and hash writes before the
+    // encode's reads. The writes of the earlier passes to `source` are ordered by the caller.
+    const auto record_voxel_accumulate = [&](VkImageView source) {
+        write_count = 0;
+        write_tlas(slot->voxel_set);
+        write_image(slot->voxel_set, kVoxelSourceBinding, source);
+        write_image(slot->voxel_set, kVoxelAlbedoBinding, internal_[kInternalAlbedo].view());
+        write_image(slot->voxel_set, kVoxelSlotsBinding, voxel_slots_.view());
+        write_buffer(slot->voxel_set, kVoxelHashBinding, voxel_hash_.buffer());
+        vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
+        bind_sets(kernels_.voxel_accumulate(), slot->voxel_set);
+        vkCmdDispatch(cmd, output_groups_x, output_groups_y, 1);
+        Barriers accumulated;
+        accumulated.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        accumulated.Record(cmd);
+    };
+    // The encode kernel from `source` into the colour target (with the voxel slot image and hash table
+    // when the voxel colour pass ran; PARTIALLY_BOUND leaves bindings 3 and 4 unwritten otherwise).
+    const auto record_encode = [&](VkImageView source) {
+        write_count = 0;
+        write_image(slot->encode_set, 0, color_view);
+        write_image(slot->encode_set, 1, source);
+        write_image(slot->encode_set, 2, internal_[kInternalAlbedo].view());
+        if (voxel_color)
+        {
+            write_image(slot->encode_set, kEncodeVoxelSlotsBinding, voxel_slots_.view());
+            write_buffer(slot->encode_set, kEncodeVoxelHashBinding, voxel_hash_.buffer());
+        }
+        vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
+        bind_sets(kernels_.upscale_encode(), slot->encode_set);
+        vkCmdDispatch(cmd, output_groups_x, output_groups_y, 1);
+    };
     timer_.Begin(cmd, frame.frame_number, safe);
     // Sky SH (host cubemap): one workgroup projects the cubemap into sky_sh_buffer_; the
     // barrier orders that write before the trace's reads. Inside the trace timestamps.
@@ -769,6 +864,18 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
             bind_sets(kernels_.cross_resolve(), slot->composite_set);
             vkCmdDispatch(cmd, groups_x, groups_y, 1);
         }
+        if (voxel_color && !upscaling)
+        {
+            // The composite (or the cross resolve) wrote the upscale input instead of the colour target:
+            // the voxel accumulate pass and the encode kernel write the target. Their time is part of
+            // composite_ms.
+            Barriers composited;
+            composited.Memory(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+            composited.Record(cmd);
+            record_voxel_accumulate(internal_[kInternalUpscaleIn].view());
+            record_encode(internal_[kInternalUpscaleIn].view());
+        }
         composite_timer_.End(cmd);
     }
 
@@ -830,16 +937,14 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
             constants.upscale_src_size[0] = output_width;
             constants.upscale_src_size[1] = output_height;
         }
-        write_count = 0;
-        write_image(slot->encode_set, 0, color_view);
-        write_image(slot->encode_set, 1,
-                    evaluated ? upscale_out_.view() : internal_[kInternalUpscaleIn].view());
-        write_image(slot->encode_set, 2, internal_[kInternalAlbedo].view());
-        vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
-        // NGX changed the command buffer state: everything is bound again.
-        bind_sets(kernels_.upscale_encode(), slot->encode_set);
-        vkCmdDispatch(cmd, (output_width + kWorkgroupSize - 1) / kWorkgroupSize,
-                      (output_height + kWorkgroupSize - 1) / kWorkgroupSize, 1);
+        // NGX changed the command buffer state: everything is bound again (by both passes below). The
+        // voxel accumulate pass reads the image that the encode reads; both inside the upscale timestamps.
+        const VkImageView source = evaluated ? upscale_out_.view() : internal_[kInternalUpscaleIn].view();
+        if (voxel_color)
+        {
+            record_voxel_accumulate(source);
+        }
+        record_encode(source);
         if (timed)
         {
             upscale_timer_.End(cmd);
@@ -869,6 +974,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     last_frame_ = frame.frame_number;
     has_rendered_ = true;
     last_mode_ = options.mode;
+    if (voxel_color)
+    {
+        voxel_slots_needs_init_ = false;
+        voxel_last_frame_ = frame.frame_number;
+    }
     if (lighting)
     {
         internal_needs_init_ = false;

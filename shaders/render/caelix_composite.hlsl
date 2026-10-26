@@ -34,6 +34,9 @@
 //   input (binding 9) instead of the host target (without the sRGB encode and the
 //   validation overlay; the motion view as it is); with the cross resolve the cross
 //   resolve does that. The upscaler and caelix_upscale_encode.hlsl write the host target.
+//   fc.voxel_color (experiment, docs/VOXEL_COLOR_EXPERIMENT.md; never with the motion or the validation
+//   view): the same redirect to the upscale input without an upscaler; caelix_voxel_accumulate.hlsl and
+//   caelix_upscale_encode.hlsl write the host target.
 //
 // Descriptors: render/caelix_composite_set.hlsl.
 #include "common/caelix_platform.hlsl"
@@ -140,7 +143,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         return;
     }
     CAELIX_BRANCH
-    if (fc.upscale != 0u)
+    if (fc.upscale != 0u || fc.voxel_color != 0u)
     {
         g_int_upscale_in[pixel] = CaelixUpscaleInput(color, hit ? 1.0f : 0.0f);
         return;

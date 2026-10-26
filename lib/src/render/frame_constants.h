@@ -5,9 +5,9 @@
 namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
-// together. One per render call, in the frame slot's host-visible buffer, which the five
+// together. One per render call, in the frame slot's host-visible buffer, which the six
 // frame-constant kernels (caelix_path_trace, caelix_composite, caelix_cross_resolve, caelix_sky_sh,
-// caelix_upscale_encode) read as a uniform buffer: the frame set (set kFrameSetIndex, binding
+// caelix_upscale_encode, caelix_voxel_accumulate) read as a uniform buffer: the frame set (set kFrameSetIndex, binding
 // kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 592 bytes.
 // Layout rule: the uniform block has DXC's default constant buffer layout, which gives these C
 // offsets only while every field sits at an offset that is a multiple of its size (float4 at 16,
@@ -81,12 +81,12 @@ struct FrameConstants
     uint32_t upscale;                   // 540  1 = the composite / cross resolve write upscale_in instead of the colour target
     uint64_t light_tree;                // 544  light tree descriptor (docs/LIGHT_TREE.md), 0 = no tree
     uint32_t light_nee_flags;           // 552  kLightNee*: the light NEE of this frame (0 = off)
-    uint32_t pad_556;                   // 556
+    uint32_t voxel_slot_mask;           // 556  voxel hash slots - 1 (a power of two - 1; voxel_color = 1 only)
     uint64_t reverse_tables;            // 560  u16 reverse table pool base (group-local position -> dense id, 0xFFFF none)
     uint64_t group_grids;               // 568  u32 group grid pool base (group index or 0xFFFFFFFF)
     uint64_t subsurface_table;          // 576  (sss_albedo, sss_probability) rows (16 B) by block code (experiment sss-expr)
     uint32_t pad_584;                   // 584
-    uint32_t pad_588;                   // 588
+    uint32_t voxel_color;               // 588  1 = the per-voxel colour pass runs (experiment, docs/VOXEL_COLOR_EXPERIMENT.md)
 };
 static_assert(sizeof(FrameConstants) == 592);
 static_assert(offsetof(FrameConstants, size) == 64);
@@ -125,11 +125,11 @@ static_assert(offsetof(FrameConstants, upscaler) == 536);
 static_assert(offsetof(FrameConstants, upscale) == 540);
 static_assert(offsetof(FrameConstants, light_tree) == 544);
 static_assert(offsetof(FrameConstants, light_nee_flags) == 552);
-static_assert(offsetof(FrameConstants, pad_556) == 556);
+static_assert(offsetof(FrameConstants, voxel_slot_mask) == 556);
 static_assert(offsetof(FrameConstants, reverse_tables) == 560);
 static_assert(offsetof(FrameConstants, group_grids) == 568);
 static_assert(offsetof(FrameConstants, subsurface_table) == 576);
-static_assert(offsetof(FrameConstants, pad_588) == 588);
+static_assert(offsetof(FrameConstants, voxel_color) == 588);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).
@@ -153,7 +153,7 @@ constexpr uint32_t kLightNeeOn = 1u << 0;
 constexpr uint32_t kLightNeeMis = 1u << 1;
 
 // The frame set: one descriptor set layout with one binding, the frame slot's FrameConstants as a
-// uniform buffer (range sizeof(FrameConstants), offset 0). Bound as set kFrameSetIndex by the five
+// uniform buffer (range sizeof(FrameConstants), offset 0). Bound as set kFrameSetIndex by the six
 // frame-constant kernels (each keeps its own set 0); they have no push constants.
 constexpr uint32_t kFrameSetIndex = 1;
 constexpr uint32_t kFrameConstantsBinding = 0;

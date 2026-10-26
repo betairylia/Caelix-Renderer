@@ -86,7 +86,7 @@ size_t caelix_abi_c99_touch(void)
                  sizeof(caelix_sky_cubemap_at_152) + sizeof(caelix_upscaler_at_176) + sizeof(upscaler_query) +
                  sizeof(upscaler_result) + sizeof(upscaler_info) + sizeof(upscaler) + sizeof(quality) +
                  sizeof(reason) + upscale_flags + CAELIX_RENDER_FLAG_SUBSURFACE +
-                 CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER;
+                 CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER + CAELIX_RENDER_FLAG_VOXEL_COLOR;
     /* Take the address of every function so a declaration typo fails to compile. Casts between
        function pointer types are valid C; the pointers are never called. */
     CaelixLightNeeOptions nee_options = {1, CAELIX_LIGHT_NEE_FLAG_NO_MIS, {0, 0}};

@@ -583,6 +583,8 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             .on_hover_text("materials with sss_probability > 0 run the lattice walk (experiment)");
         ui.add_enabled(lighting && settings.sss, egui::Checkbox::new(&mut settings.sss_entry_jitter, "SSS entry jitter"))
             .on_hover_text("the walk starts at a voxel jittered over the hit face (no per-voxel steps)");
+        ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.voxel_color, "voxel colour (V)"))
+            .on_hover_text("every pixel shows the mean colour of its first-hit voxel (experiment)");
         ui.add_enabled(
             settings.mode == Mode::Pt && settings.upscaler == Upscaler::DlssSr,
             egui::Checkbox::new(&mut settings.upscale_auto_exposure, "auto exposure (SR)"),

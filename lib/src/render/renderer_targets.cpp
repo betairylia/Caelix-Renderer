@@ -4,9 +4,11 @@
 #include "core/log.h"
 #include "render/frame_constants.h"
 #include "render/renderer_internal.h"
+#include "render/voxel_color_layout.h"
 #include "scene/scene.h"
 
 #include <algorithm>
+#include <bit>
 #include <iterator>
 #include <utility>
 
@@ -73,13 +75,15 @@ void Renderer::AddSlot()
     const VkDevice device = device_.device();
     auto slot = std::make_unique<FrameSlot>();
     slot->index = static_cast<uint32_t>(slots_.size());
-    // Five sets: trace, composite, sky SH (each has one sampled image and one sampler), the
-    // upscale encode set (storage images only) and the frame set (one uniform buffer).
-    constexpr uint32_t kSetCount = 5;
-    const VkDescriptorPoolSize sizes[5] = {
-        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-         kTargetCount + kTraceInternalCount + kCompositeStorageCount + kEncodeBindingCount},
+    // Six sets: trace, composite, sky SH (each has one sampled image and one sampler), the
+    // upscale encode set (storage images and the voxel hash buffer), the voxel set (TLAS, storage
+    // images, the voxel hash buffer) and the frame set (one uniform buffer).
+    constexpr uint32_t kSetCount = 6;
+    const VkDescriptorPoolSize sizes[6] = {
+        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2},  // trace, voxel
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kTargetCount + kTraceInternalCount + kCompositeStorageCount +
+                                               kEncodeStorageImageCount + kVoxelStorageImageCount},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},  // encode, voxel
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 3},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
@@ -100,7 +104,7 @@ void Renderer::AddSlot()
     FrameSlot& added = *slots_.back();
     const VkDescriptorSetLayout layouts[kSetCount] = {kernels_.trace_layout(), kernels_.composite_layout(),
                                                       kernels_.sky_layout(), kernels_.encode_layout(),
-                                                      kernels_.frame_layout()};
+                                                      kernels_.voxel_layout(), kernels_.frame_layout()};
     VkDescriptorSet sets[kSetCount] = {};
     VkDescriptorSetAllocateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     set_info.descriptorPool = added.pool;
@@ -116,7 +120,8 @@ void Renderer::AddSlot()
     added.composite_set = sets[1];
     added.sky_set = sets[2];
     added.encode_set = sets[3];
-    added.frame_set = sets[4];
+    added.voxel_set = sets[4];
+    added.frame_set = sets[5];
     VmaAllocationCreateInfo allocation_info{};
     allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
     allocation_info.flags =
@@ -296,6 +301,41 @@ bool Renderer::EnsureInternalTargets(uint32_t width, uint32_t height, uint64_t f
     return true;
 }
 
+void Renderer::EnsureVoxelColor(uint32_t width, uint32_t height, uint64_t frame)
+{
+    if (voxel_slots_.valid() && voxel_slots_.width() == width && voxel_slots_.height() == height)
+    {
+        return;
+    }
+    if (voxel_slots_.valid())
+    {
+        RetiredVoxelColor retired;
+        retired.frame = voxel_last_frame_;
+        retired.slots = std::move(voxel_slots_);
+        retired.hash = std::move(voxel_hash_);
+        retired_voxel_.push_back(std::move(retired));
+        voxel_slot_count_ = 0;
+    }
+    // Half a slot per pixel (at least kVoxelMinSlots): a voxel covers several pixels where the effect is
+    // visible; where voxels are smaller than pixels the table fills, the inserts fail after kVoxelProbes
+    // probes and those pixels keep their colour (the mean of one pixel).
+    const uint64_t pixels = static_cast<uint64_t>(width) * height;
+    const uint64_t slots = std::max<uint64_t>(kVoxelMinSlots, std::bit_ceil(pixels) / 2);
+    GpuImage image(device_.allocator(), device_.device(), width, height, VK_FORMAT_R32_UINT,
+                   VK_IMAGE_USAGE_STORAGE_BIT, "voxel_slots");
+    VmaAllocationCreateInfo allocation_info{};
+    allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    GpuBuffer hash(device_.allocator(), device_.device(), slots * kVoxelSlotBytes,
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, allocation_info, false);
+    voxel_slots_ = std::move(image);
+    voxel_hash_ = std::move(hash);
+    voxel_slot_count_ = static_cast<uint32_t>(slots);
+    voxel_slots_needs_init_ = true;
+    voxel_last_frame_ = frame;
+    CAELIX_LOGI("renderer: voxel colour resources created at %ux%u (%u hash slots, %llu MiB)", width, height,
+                voxel_slot_count_, static_cast<unsigned long long>(slots * kVoxelSlotBytes >> 20));
+}
+
 void Renderer::FreeRetired(uint64_t safe_frame)
 {
     std::erase_if(retired_, [safe_frame](const RetiredImages& retired) {
@@ -305,6 +345,9 @@ void Renderer::FreeRetired(uint64_t safe_frame)
         return retired.frame <= safe_frame;
     });
     std::erase_if(retired_upscalers_, [safe_frame](const RetiredUpscaler& retired) {
+        return retired.frame <= safe_frame;
+    });
+    std::erase_if(retired_voxel_, [safe_frame](const RetiredVoxelColor& retired) {
         return retired.frame <= safe_frame;
     });
 }

@@ -47,7 +47,15 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // host colour target, 1 the source, 2 the internal albedo) writes the colour target; after
 // an NGX error the encode kernel reads the upscale input instead (nearest upscale). The
 // upscaler and upscale_out_ are created at the first upscaled render and recreated (the
-// old ones retired until safe) when any UpscalerDesc field changes. Sky cubemap
+// old ones retired until safe) when any UpscalerDesc field changes. Per-voxel colour
+// (CAELIX_RENDER_FLAG_VOXEL_COLOR, experiment docs/VOXEL_COLOR_EXPERIMENT.md; frames with a composite,
+// not the motion or NRD validation view): the composite (or the cross resolve) writes the upscale input
+// also without an upscaler; after it (or after the upscaler) the voxel accumulate kernel
+// (shaders/render/caelix_voxel_accumulate.hlsl, a fifth per-slot set: binding 0 the TLAS, 1 the source,
+// 2 the internal albedo, 3 the slot image, 4 the hash table) adds every output pixel's colour to the
+// hash slot of its camera ray's first-hit voxel in voxel_hash_ (cleared by a fill before the trace)
+// and stores the slot in voxel_slots_; the encode kernel then writes each pixel's slot mean. Both are
+// renderer-owned, at the output size, recreated (the old ones retired until safe) when it changes. Sky cubemap
 // (CaelixRenderOptions::sky, lighting modes): before the trace,
 // the sky SH kernel (shaders/render/caelix_sky_sh.hlsl, one workgroup, a third set:
 // binding 0 the cubemap, 1 the sampler) projects it onto 9 irradiance SH coefficients
@@ -62,7 +70,7 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // executor is created at the first denoised render and recreated (history lost)
 // when the size changes, the old one is destroyed once its last frame is safe.
 // Per-frame resources
-// live in a ring of slots (four descriptor sets + 592-byte constants buffer); a
+// live in a ring of slots (six descriptor sets + 592-byte constants buffer); a
 // slot is reused only when its frame is safe. The camera of each successful
 // render call is kept as the previous camera of the next one (motion targets). A
 // renderer renders at most once per frame number (last_frame_).
@@ -133,6 +141,7 @@ private:
         VkDescriptorSet composite_set = VK_NULL_HANDLE;  // composite
         VkDescriptorSet sky_set = VK_NULL_HANDLE;        // sky SH kernel
         VkDescriptorSet encode_set = VK_NULL_HANDLE;     // upscale encode kernel
+        VkDescriptorSet voxel_set = VK_NULL_HANDLE;      // voxel accumulate kernel (experiment)
         VkDescriptorSet frame_set = VK_NULL_HANDLE;      // frame set: `constants` as a uniform buffer
         GpuBuffer constants;                             // host-visible, mapped, one FrameConstants
     };
@@ -169,6 +178,12 @@ private:
         std::unique_ptr<Upscaler> upscaler;
         GpuImage output;
     };
+    struct RetiredVoxelColor
+    {
+        uint64_t frame = 0;  // the last frame that used them
+        GpuImage slots;
+        GpuBuffer hash;
+    };
     // The newest caelix_upscaler_query answer of this renderer (render calls re-query only when
     // the key changes).
     struct UpscaleQuery
@@ -203,7 +218,12 @@ private:
     // off, the primary mode, or a scene without a light tree, which is logged once); sets
     // light_nee_running_.
     uint32_t LightNeeFlags(bool lighting);
-    // Destroys retired internal targets, NRD executors and upscalers whose frame is <= safe_frame.
+    // Creates the voxel colour pass's slot image and hash table (voxel_slots_, voxel_hash_) when they
+    // are missing or have another size (width x height = the output size); the old ones are retired
+    // until `frame` is safe. Throws VulkanError when they cannot be allocated.
+    void EnsureVoxelColor(uint32_t width, uint32_t height, uint64_t frame);
+    // Destroys retired internal targets, NRD executors, upscalers and voxel colour resources whose frame
+    // is <= safe_frame.
     void FreeRetired(uint64_t safe_frame);
     // The render size of `upscaler` at `quality` for an output_width x output_height colour target
     // (renderer_upscale.cpp): CAELIX_OK and the size, or CAELIX_ERROR_UNSUPPORTED (logged once per
@@ -273,6 +293,13 @@ private:
     std::vector<RetiredUpscaler> retired_upscalers_;
     std::chrono::steady_clock::time_point upscale_last_time_{};
     bool upscale_unsupported_logged_ = false;  // the build has no upscaler: logged once
+    // Per-voxel colour (experiment, CAELIX_RENDER_FLAG_VOXEL_COLOR, docs/VOXEL_COLOR_EXPERIMENT.md).
+    GpuImage voxel_slots_;                 // R32_UINT, output size: each pixel's hash slot (kVoxelSlotInvalid = none)
+    GpuBuffer voxel_hash_;                 // voxel_slot_count_ slots of kVoxelSlotBytes, cleared every frame it is used
+    uint32_t voxel_slot_count_ = 0;        // a power of two
+    bool voxel_slots_needs_init_ = false;  // voxel_slots_ still in VK_IMAGE_LAYOUT_UNDEFINED
+    uint64_t voxel_last_frame_ = 0;        // the last frame that used voxel_slots_ / voxel_hash_
+    std::vector<RetiredVoxelColor> retired_voxel_;
     // Light NEE.
     CaelixLightNeeOptions light_nee_options_{};  // as set (validated)
     bool light_nee_running_ = false;             // the newest render call ran light NEE

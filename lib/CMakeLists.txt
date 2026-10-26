@@ -69,7 +69,8 @@ add_library(caelix_renderer SHARED
   src/render/renderer_render.cpp
   src/render/renderer_targets.cpp
   src/render/renderer_upscale.cpp
-  src/render/upscaler.h)
+  src/render/upscaler.h
+  src/render/voxel_color_layout.h)
 set_target_properties(caelix_renderer PROPERTIES OUTPUT_NAME caelix_renderer)
 target_include_directories(caelix_renderer
   PUBLIC ${PROJECT_SOURCE_DIR}/include
@@ -120,6 +121,7 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_material.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_light_tree_layout.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/common/caelix_hash_table.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/common/caelix_voxel_color.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_kernels.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_init.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_begin.hlsl
@@ -162,4 +164,5 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_cross_resolve.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_sky_sh.hlsl
-    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_upscale_encode.hlsl)
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_upscale_encode.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_voxel_accumulate.hlsl)

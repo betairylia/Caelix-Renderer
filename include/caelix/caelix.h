@@ -79,7 +79,9 @@ extern "C" {
    also without a bump. The subsurface experiment (branch sss-expr, docs/SSS_EXPERIMENT.md) replaced
    CaelixMaterial::pad by sss_anisotropy and sss_steps and appended sss_albedo and sss_probability (48 ->
    64 bytes, CaelixMaterialEntry 52 -> 68 bytes) and added CAELIX_RENDER_FLAG_SUBSURFACE, also without a
-   bump. A host built against an older version-2 header must be rebuilt (the library reads
+   bump. The voxel colour experiment (branch sss-voxel-color-expr, docs/VOXEL_COLOR_EXPERIMENT.md) added
+   CAELIX_RENDER_FLAG_VOXEL_COLOR (a new flag bit), also without a bump. A host built against an older
+   version-2 header must be rebuilt (the library reads
    and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -886,6 +888,18 @@ typedef enum CaelixDebugView
                                                 face) instead of the hit voxel; a start voxel that is
                                                 not an SSS voxel falls back to the hit voxel. Removes
                                                 the per-voxel brightness steps of SSS surfaces. */
+#define CAELIX_RENDER_FLAG_VOXEL_COLOR (1u << 7) /* lighting modes with a colour target (CAELIX_MODE_PATH_TRACE
+                                                and CAELIX_MODE_REFERENCE; CAELIX_MODE_PRIMARY ignores it;
+                                                experiment branch sss-voxel-color-expr,
+                                                docs/VOXEL_COLOR_EXPERIMENT.md): every pixel whose camera
+                                                ray first hits voxel V (transparent voxels included)
+                                                shows the mean final linear colour of all pixels of this
+                                                frame whose camera ray first hits V: one colour per
+                                                voxel. Misses keep their colour. Runs on the final colour
+                                                (after NRD, or on the upscaler's output at the output
+                                                size). Ignored for CAELIX_VIEW_MOTION and
+                                                CAELIX_VIEW_NRD_VALIDATION of CAELIX_MODE_PATH_TRACE (the
+                                                frame renders as without the flag). */
 
 /* A cubemap of the sky for the lighting modes, given per render call like a target. A cube image
    (VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, 6 layers in the Vulkan face order +X, -X, +Y, -Y, +Z,

@@ -232,6 +232,8 @@ pub struct RenderSettings {
     pub sss: bool,
     /// With `sss`: the walk's start voxel jittered over the hit face (CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER).
     pub sss_entry_jitter: bool,
+    /// Lighting modes: one mean colour per first-hit voxel (CAELIX_RENDER_FLAG_VOXEL_COLOR, experiment).
+    pub voxel_color: bool,
     /// Lighting modes: the sky where the primary ray misses.
     pub sky_on_miss: bool,
     /// Primary mode: Lambert shading of the albedo view.
@@ -317,6 +319,9 @@ impl RenderSettings {
             if self.sss_entry_jitter {
                 flags |= CAELIX_RENDER_FLAG_SSS_ENTRY_JITTER;
             }
+        }
+        if lighting && self.voxel_color {
+            flags |= CAELIX_RENDER_FLAG_VOXEL_COLOR;
         }
         // Without an upscaler the other upscaler fields are zero, so they do not restart the
         // reference accumulation (`same_options`). RESET_HISTORY is never needed from the host:

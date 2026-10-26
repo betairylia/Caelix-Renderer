@@ -58,7 +58,7 @@ RenderKernels::RenderKernels(Device& device)
     : device_(device)
 {
     static_assert(kTraceBindingCount <= kMaxSetBindings && kCompositeBindingCount <= kMaxSetBindings &&
-                      kEncodeBindingCount <= kMaxSetBindings,
+                      kEncodeBindingCount <= kMaxSetBindings && kVoxelBindingCount <= kMaxSetBindings,
                   "CreateSetLayout handles at most kMaxSetBindings bindings");
     const VkDevice vk_device = device.device();
     try
@@ -88,10 +88,23 @@ RenderKernels::RenderKernels(Device& device)
         const VkDescriptorType sky_types[2] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                                VK_DESCRIPTOR_TYPE_SAMPLER};
         sky_layout_ = CreateSetLayout(vk_device, 2, sky_types);
-        // Encode set: three storage images (host colour, source, internal albedo).
+        // Encode set: four storage images (host colour, source, internal albedo, voxel slots) and the
+        // voxel hash table.
+        static_assert(kEncodeVoxelSlotsBinding + 1 == kEncodeStorageImageCount &&
+                      kEncodeVoxelHashBinding == kEncodeStorageImageCount &&
+                      kEncodeVoxelHashBinding + 1 == kEncodeBindingCount);
         const VkDescriptorType encode_types[kEncodeBindingCount] = {
-            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
         encode_layout_ = CreateSetLayout(vk_device, kEncodeBindingCount, encode_types);
+        // Voxel set: the TLAS, three storage images (source, internal albedo, voxel slots), the voxel hash
+        // table.
+        static_assert(kVoxelSourceBinding == 1 && kVoxelAlbedoBinding == 2 && kVoxelSlotsBinding == 3 &&
+                      kVoxelHashBinding == 4 && kVoxelBindingCount == 5 && kVoxelStorageImageCount == 3);
+        const VkDescriptorType voxel_types[kVoxelBindingCount] = {
+            VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        voxel_layout_ = CreateSetLayout(vk_device, kVoxelBindingCount, voxel_types);
         // Frame set: binding 0 the frame slot's FrameConstants (uniform buffer), set kFrameSetIndex of
         // every kernel below. A uniform buffer is read-only, so the compiler may re-read a field
         // where it is used instead of keeping the whole struct live in registers across the traces
@@ -115,6 +128,7 @@ RenderKernels::RenderKernels(Device& device)
         cross_resolve_ = create("caelix_cross_resolve", composite_layout_);
         sky_sh_ = create("caelix_sky_sh", sky_layout_);
         upscale_encode_ = create("caelix_upscale_encode", encode_layout_);
+        voxel_accumulate_ = create("caelix_voxel_accumulate", voxel_layout_);
 
         // The sky sampler: trilinear, clamp to edge (a cube view samples across faces anyway),
         // every mip (the kernels clamp the lod to sky_max_lod).
@@ -153,12 +167,13 @@ RenderKernels::RenderKernels(Device& device)
         cross_resolve_ = ComputePipeline();
         sky_sh_ = ComputePipeline();
         upscale_encode_ = ComputePipeline();
+        voxel_accumulate_ = ComputePipeline();
         if (sky_sampler_ != VK_NULL_HANDLE)
         {
             vkDestroySampler(vk_device, sky_sampler_, nullptr);
         }
         for (const VkDescriptorSetLayout layout :
-             {trace_layout_, composite_layout_, sky_layout_, encode_layout_, frame_layout_})
+             {trace_layout_, composite_layout_, sky_layout_, encode_layout_, voxel_layout_, frame_layout_})
         {
             if (layout != VK_NULL_HANDLE)
             {
@@ -169,7 +184,8 @@ RenderKernels::RenderKernels(Device& device)
     }
     CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_path_trace_no_light_nee, "
                 "caelix_path_trace_sss, caelix_path_trace_sss_no_light_nee, "
-                "caelix_composite, caelix_cross_resolve, caelix_sky_sh, caelix_upscale_encode");
+                "caelix_composite, caelix_cross_resolve, caelix_sky_sh, caelix_upscale_encode, "
+                "caelix_voxel_accumulate");
 }
 
 RenderKernels::~RenderKernels()
@@ -188,6 +204,7 @@ RenderKernels::~RenderKernels()
     cross_resolve_ = ComputePipeline();
     sky_sh_ = ComputePipeline();
     upscale_encode_ = ComputePipeline();
+    voxel_accumulate_ = ComputePipeline();
     if (trace_layout_ != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorSetLayout(device, trace_layout_, nullptr);
@@ -203,6 +220,10 @@ RenderKernels::~RenderKernels()
     if (encode_layout_ != VK_NULL_HANDLE)
     {
         vkDestroyDescriptorSetLayout(device, encode_layout_, nullptr);
+    }
+    if (voxel_layout_ != VK_NULL_HANDLE)
+    {
+        vkDestroyDescriptorSetLayout(device, voxel_layout_, nullptr);
     }
     if (frame_layout_ != VK_NULL_HANDLE)
     {

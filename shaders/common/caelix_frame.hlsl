@@ -1,4 +1,5 @@
-// Per-frame constants of the trace, composite, cross resolve, sky SH and upscale encode kernels.
+// Per-frame constants of the trace, composite, cross resolve, sky SH, upscale encode and voxel accumulate
+// kernels.
 // Mirrors lib/src/render/frame_constants.h; change both together. 592 bytes, read as the uniform
 // buffer g_frame (common/caelix_frame_ubo.hlsl: set 1, binding 0).
 // Layout rule: the uniform block gets DXC's default constant buffer layout, which gives the C
@@ -79,12 +80,12 @@ struct CaelixFrameConstants
     uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear)
     uint64_t light_tree;            // 544  light tree descriptor (light/caelix_light_tree.hlsl), 0 = no tree
     uint light_nee_flags;           // 552  kLightNee*: the light NEE of this frame (0 = off)
-    uint pad_556;                   // 556
+    uint voxel_slot_mask;           // 556  voxel hash slots - 1 (common/caelix_voxel_color.hlsl; voxel_color = 1 only)
     uint64_t reverse_tables;        // 560  u16 reverse table pool base (group-local position -> dense id, 0xFFFF none)
     uint64_t group_grids;           // 568  u32 group grid pool base (group index or 0xFFFFFFFF)
     uint64_t subsurface_table;      // 576  (sss_albedo, sss_probability) rows (16 B) by block code (render/caelix_subsurface.hlsl)
     uint pad_584;                   // 584
-    uint pad_588;                   // 588 -> 592
+    uint voxel_color;               // 588  1 = per-voxel colour pass (experiment, docs/VOXEL_COLOR_EXPERIMENT.md) -> 592
 };
 
 // CaelixDebugView
@@ -154,6 +155,16 @@ float3 CaelixPrimaryDirection(CaelixFrameConstants fc, uint2 pixel)
     const float2 sample_position = CaelixSamplePosition(fc, pixel);
     const float2 ndc = float2(sample_position.x / float(fc.size.x) * 2.0f - 1.0f,
                               1.0f - sample_position.y / float(fc.size.y) * 2.0f);
+    return normalize(fc.right.xyz * (ndc.x * fc.tan_half_fov_y * fc.aspect) +
+                     fc.up.xyz * (ndc.y * fc.tan_half_fov_y) + fc.forward.xyz);
+}
+
+// The camera ray direction through the centre of OUTPUT pixel `pixel` (row 0 = the top row; the colour
+// target's size output_size), without the jitter: the view that an upscaler's output shows.
+float3 CaelixOutputCentreDirection(CaelixFrameConstants fc, uint2 pixel)
+{
+    const float2 ndc = float2((float(pixel.x) + 0.5f) / float(fc.output_size.x) * 2.0f - 1.0f,
+                              1.0f - (float(pixel.y) + 0.5f) / float(fc.output_size.y) * 2.0f);
     return normalize(fc.right.xyz * (ndc.x * fc.tan_half_fov_y * fc.aspect) +
                      fc.up.xyz * (ndc.y * fc.tan_half_fov_y) + fc.forward.xyz);
 }

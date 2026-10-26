@@ -18,7 +18,8 @@
 // kRenderFlagFlipY: the host colour target is written at the mirrored row; the taps read the
 // internal images at unflipped pixels (they are symmetric, so the flip does not change them).
 // fc.upscale (an upscaler runs): the result goes, linear and unflipped, to the upscale input
-// (binding 9) instead of the host target (no sRGB encode, no validation overlay).
+// (binding 9) instead of the host target (no sRGB encode, no validation overlay); so does
+// fc.voxel_color without an upscaler (experiment, docs/VOXEL_COLOR_EXPERIMENT.md).
 //
 // Inputs: the composite set (render/caelix_composite_set.hlsl): binding 8 the
 // composite's linear output, binding 7 the motion (w = flag), binding 0 the host colour.
@@ -77,7 +78,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         color = sum / weight;
     }
     CAELIX_BRANCH
-    if (fc.upscale != 0u)
+    if (fc.upscale != 0u || fc.voxel_color != 0u)
     {
         g_int_upscale_in[pixel] = CaelixUpscaleInput(color, centre.a);
         return;

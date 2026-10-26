@@ -218,6 +218,10 @@ struct Args {
     /// hit face; SSS surfaces then show per-voxel brightness steps). Default: entry jitter on.
     #[arg(long)]
     sss_no_entry_jitter: bool,
+    /// Lighting modes: per-voxel colour experiment (CAELIX_RENDER_FLAG_VOXEL_COLOR): every pixel shows the
+    /// mean colour of its first-hit voxel. V toggles it at run time.
+    #[arg(long)]
+    voxel_color: bool,
     /// Block encoding of the scene: packed (Caelix worlds) or block-id.
     #[arg(long, value_enum, default_value_t = Encoding::Packed)]
     encoding: Encoding,
@@ -1578,6 +1582,11 @@ impl ApplicationHandler for App {
                         if code == KeyCode::KeyP && !event.repeat {
                             log::info!("pose: {}", self.camera.pose_args());
                         }
+                        // V toggles the per-voxel colour experiment (--voxel-color).
+                        if code == KeyCode::KeyV && !event.repeat {
+                            self.settings.voxel_color = !self.settings.voxel_color;
+                            log::info!("voxel colour {}", if self.settings.voxel_color { "on" } else { "off" });
+                        }
                         // L opens the world with --load-on-key.
                         if code == KeyCode::KeyL && !event.repeat {
                             if let Err(e) = self.load_world_on_key() {
@@ -2000,7 +2009,7 @@ fn main() -> anyhow::Result<()> {
         "mode {mode:?}, bounces {}, transparent bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, \
          sun NEE {}, denoise {}, sky {}, fog density {} colour {:?}, emission scale {}, \
          upscaler {:?}, upscale quality {:?}, upscale preset {}, upscale auto exposure {}, jitter phases {}, \
-         subsurface {} entry jitter {}, window {}x{}",
+         subsurface {} entry jitter {}, voxel colour {}, window {}x{}",
         args.bounces,
         args.bounces_transparent,
         args.exposure,
@@ -2019,6 +2028,7 @@ fn main() -> anyhow::Result<()> {
         if args.jitter_phases == 0 { "auto".to_string() } else { args.jitter_phases.to_string() },
         !args.no_sss,
         !args.sss_no_entry_jitter,
+        args.voxel_color,
         args.size.0,
         args.size.1
     );
@@ -2051,6 +2061,7 @@ fn main() -> anyhow::Result<()> {
         checkerboard: !args.no_checkerboard,
         sss: !args.no_sss,
         sss_entry_jitter: !args.sss_no_entry_jitter,
+        voxel_color: args.voxel_color,
         sky_on_miss: !args.no_sky_on_miss,
         shading: !args.no_shading,
         exposure: args.exposure,

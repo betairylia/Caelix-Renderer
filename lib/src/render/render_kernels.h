@@ -13,7 +13,7 @@
 namespace caelix {
 
 // Descriptor bindings of the kernel sets, shared by the set layouts (RenderKernels)
-// and the descriptor writes (Renderer). Each of the five frame-constant kernels binds its
+// and the descriptor writes (Renderer). Each of the six frame-constant kernels binds its
 // own set below as set 0 and the frame set (binding kFrameConstantsBinding = the frame
 // slot's FrameConstants as a uniform buffer, render/frame_constants.h) as set
 // kFrameSetIndex.
@@ -33,10 +33,24 @@ constexpr uint32_t kTraceBindingCount = kTraceSkyBinding + 2;
 constexpr uint32_t kCompositeStorageCount = 10;  // bindings 0..9
 constexpr uint32_t kCompositeSkyBinding = kCompositeStorageCount;
 constexpr uint32_t kCompositeBindingCount = kCompositeSkyBinding + 2;
-// Encode set (caelix_upscale_encode, upscaled frames only): binding 0 the host colour target,
-// binding 1 the source (the upscaler's output, or the upscale input on the fallback), binding 2
-// the internal albedo (coverage in alpha).
-constexpr uint32_t kEncodeBindingCount = 3;
+// Encode set (caelix_upscale_encode, upscaled frames and frames with the voxel colour pass): binding 0
+// the host colour target, binding 1 the source (the upscaler's output, or the upscale input on the
+// fallback and without an upscaler), binding 2 the internal albedo (coverage in alpha), binding 3 the
+// voxel slot image and binding 4 the voxel hash table (storage buffer; both written only for frames
+// with the voxel colour pass, experiment docs/VOXEL_COLOR_EXPERIMENT.md).
+constexpr uint32_t kEncodeVoxelSlotsBinding = 3;
+constexpr uint32_t kEncodeVoxelHashBinding = 4;
+constexpr uint32_t kEncodeBindingCount = 5;
+constexpr uint32_t kEncodeStorageImageCount = 4;  // bindings 0..3
+// Voxel set (caelix_voxel_accumulate, the voxel colour experiment): binding 0 the TLAS, binding 1 the
+// source (the image the encode kernel reads), binding 2 the internal albedo, binding 3 the voxel slot
+// image (R32_UINT, output size), binding 4 the voxel hash table (storage buffer).
+constexpr uint32_t kVoxelSourceBinding = 1;
+constexpr uint32_t kVoxelAlbedoBinding = 2;
+constexpr uint32_t kVoxelSlotsBinding = 3;
+constexpr uint32_t kVoxelHashBinding = 4;
+constexpr uint32_t kVoxelBindingCount = 5;
+constexpr uint32_t kVoxelStorageImageCount = 3;  // bindings 1..3
 // The most bindings of one set (the arrays of CreateSetLayout).
 constexpr uint32_t kMaxSetBindings = 32;
 
@@ -77,10 +91,11 @@ struct NrdKernels
 // and borrowed by every Renderer and NrdExecutor of that device:
 // - the descriptor set layouts of the trace set, the composite set (also used by the
 //   cross resolve kernel), the sky SH set (binding 0 the cubemap, 1 the sampler), the
-//   encode set and the frame set (one uniform buffer), every binding PARTIALLY_BOUND;
+//   encode set, the voxel set and the frame set (one uniform buffer), every binding PARTIALLY_BOUND;
 // - the compute pipelines caelix_path_trace, caelix_path_trace_no_light_nee, caelix_path_trace_sss,
 //   caelix_path_trace_sss_no_light_nee,
-//   caelix_composite, caelix_cross_resolve, caelix_sky_sh and caelix_upscale_encode (set 0
+//   caelix_composite, caelix_cross_resolve, caelix_sky_sh, caelix_upscale_encode and
+//   caelix_voxel_accumulate (set 0
 //   their own set, set kFrameSetIndex the frame set; no push constants);
 // - the sky sampler (linear, mipmapped, clamp to edge) and the fallback sky cube (1 x 1
 //   RGBA8), bound in every sky binding when the host gives no cubemap. The first render
@@ -112,6 +127,10 @@ public:
     VkDescriptorSetLayout encode_layout() const
     {
         return encode_layout_;
+    }
+    VkDescriptorSetLayout voxel_layout() const
+    {
+        return voxel_layout_;
     }
     VkDescriptorSetLayout frame_layout() const
     {
@@ -153,6 +172,11 @@ public:
     {
         return upscale_encode_;
     }
+    // The voxel colour experiment's accumulate pass (shaders/render/caelix_voxel_accumulate.hlsl).
+    const ComputePipeline& voxel_accumulate() const
+    {
+        return voxel_accumulate_;
+    }
     VkSampler sky_sampler() const
     {
         return sky_sampler_;
@@ -186,6 +210,7 @@ private:
     VkDescriptorSetLayout composite_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout sky_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout encode_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout voxel_layout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout frame_layout_ = VK_NULL_HANDLE;  // the frame constants (uniform buffer)
     ComputePipeline trace_;                   // shaders/render/caelix_path_trace.hlsl, trace set
     ComputePipeline trace_no_light_nee_;      // caelix_path_trace_no_light_nee.hlsl, trace set
@@ -195,6 +220,7 @@ private:
     ComputePipeline cross_resolve_;           // shaders/render/caelix_cross_resolve.hlsl, composite set
     ComputePipeline sky_sh_;                  // shaders/render/caelix_sky_sh.hlsl, sky set
     ComputePipeline upscale_encode_;          // shaders/render/caelix_upscale_encode.hlsl, encode set
+    ComputePipeline voxel_accumulate_;        // shaders/render/caelix_voxel_accumulate.hlsl, voxel set
     VkSampler sky_sampler_ = VK_NULL_HANDLE;  // linear, mipmapped, clamp to edge
     GpuImage fallback_sky_;                   // 1 x 1 RGBA8 cube bound without a host cubemap
     bool fallback_sky_needs_init_ = true;     // fallback_sky_ still in VK_IMAGE_LAYOUT_UNDEFINED
