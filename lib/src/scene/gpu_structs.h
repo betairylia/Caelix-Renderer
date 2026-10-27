@@ -1,4 +1,6 @@
 #pragma once
+#include "scene/record_layout.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -129,6 +131,44 @@ static_assert(offsetof(FinalizePush, dirty_count) == 64);
 static_assert(offsetof(FinalizePush, light_codes) == 88);
 static_assert(sizeof(FinalizePush) == 104);
 static_assert(sizeof(FinalizePush) <= 128);  // the guaranteed minimum maxPushConstantsSize
+
+// One record copy of the record scatter kernel (shaders/scene/caelix_record_scatter.hlsl). 16 bytes.
+// Scene::UploadBricks writes the entries into blocks of kScatterBlockEntries in the staging ring.
+struct RecordScatterEntry
+{
+    uint32_t src_offset8;  // source offset / kRecordScatterSourceUnit (records are 8-byte aligned in the ring)
+    uint32_t flags;        // kScatterKeepBoundsWord
+    uint64_t dst_address;  // the record's device address
+};
+constexpr uint32_t kRecordScatterEntryBytes = 16;
+constexpr uint32_t kRecordScatterSourceUnit = 8;
+static_assert(sizeof(RecordScatterEntry) == kRecordScatterEntryBytes);
+static_assert(offsetof(RecordScatterEntry, src_offset8) == 0);
+static_assert(offsetof(RecordScatterEntry, flags) == 4);
+static_assert(offsetof(RecordScatterEntry, dst_address) == 8);
+// The destination's word 1 (kRecordBoundsWord) stays: the record was resident and its content is
+// replaced; the finalize kernel compares the old light state there with the new content.
+constexpr uint32_t kScatterKeepBoundsWord = 1u << 0;
+// Entries per block of the staging ring (64 KiB); one dispatch per block.
+constexpr uint32_t kScatterBlockEntries = 4096;
+// Kernel shape (the HLSL constants of the same names): records and threads per workgroup, and the
+// largest record (16-bit blocks) in 8-byte words.
+constexpr uint32_t kScatterRecordsPerGroup = 16;
+constexpr uint32_t kScatterThreadsPerGroup = 256;
+constexpr uint32_t kScatterMaxRecordWords8 =
+    (kRecordInfoWords + kRecordOccupancyWords + kBrickVoxels * sizeof(uint16_t) / kRecordWordBytes) *
+    kRecordWordBytes / kRecordScatterSourceUnit;
+static_assert(kScatterMaxRecordWords8 == 137);
+
+// Push constants of the record scatter kernel. 24 bytes.
+struct RecordScatterPush
+{
+    uint64_t list;           // RecordScatterEntry[count]
+    uint64_t source;         // base of the records' source: the ring (ReBAR path) or the bounce buffer
+    uint32_t count;          // entries
+    uint32_t record_words8;  // record_bytes / kRecordScatterSourceUnit
+};
+static_assert(sizeof(RecordScatterPush) == 24);
 
 // One AABB row: float3 min, float3 max (entity-local block coordinates). All NaN
 // = inactive primitive.

@@ -127,6 +127,7 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/hash/caelix_hash_finish.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_scene_lookup.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_finalize.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/scene/caelix_record_scatter.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/light/caelix_light_tree.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/light/records/caelix_light_tree_group.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/light/records/caelix_light_tree_size.hlsl

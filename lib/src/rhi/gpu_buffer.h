@@ -23,6 +23,13 @@ private:
     VkResult result_;
 };
 
+// Memory of a host upload buffer (GpuBuffer::HostUpload).
+enum class HostUploadMemory
+{
+    kHost,  // VMA AUTO with sequential host writes: system memory on a discrete GPU
+    kBar,   // DEVICE_LOCAL | HOST_VISIBLE required: VRAM that the CPU writes through the (resizable) BAR
+};
+
 // A VkBuffer with its VMA allocation. Move-only; the destructor frees both.
 // The caller is responsible for GPU lifetime: destroy a buffer only when no
 // pending GPU work uses it.
@@ -48,8 +55,11 @@ public:
     // SHADER_DEVICE_ADDRESS); its device address is queried.
     static GpuBuffer DeviceLocalWithUsage(VmaAllocator allocator, VkDevice device,
                                           VkDeviceSize size, VkBufferUsageFlags usage);
-    // A persistently mapped, host-visible upload buffer (transfer src).
-    static GpuBuffer HostUpload(VmaAllocator allocator, VkDevice device, VkDeviceSize size);
+    // A persistently mapped, host-visible upload buffer (transfer src) in `memory`. With
+    // `device_address`, the usage adds SHADER_DEVICE_ADDRESS and the address is queried.
+    static GpuBuffer HostUpload(VmaAllocator allocator, VkDevice device, VkDeviceSize size,
+                                HostUploadMemory memory = HostUploadMemory::kHost,
+                                bool device_address = false);
     // A persistently mapped, host-visible readback buffer (transfer dst, random host reads).
     static GpuBuffer HostReadback(VmaAllocator allocator, VkDevice device, VkDeviceSize size);
 
@@ -81,6 +91,9 @@ public:
     // Makes device writes in [offset, offset + size) visible to host reads (after the GPU work
     // that wrote them has completed). No-op on host-coherent memory.
     void InvalidateHostReads(VkDeviceSize offset, VkDeviceSize size) const;
+
+    // The memory type index of the allocation, its property flags and its heap index.
+    void DescribeMemory(uint32_t& type_index, VkMemoryPropertyFlags& flags, uint32_t& heap_index) const;
 
     void Reset();
 

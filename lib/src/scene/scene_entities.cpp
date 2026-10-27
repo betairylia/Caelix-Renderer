@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iterator>
 #include <new>
+#include <string>
 
 namespace caelix {
 namespace {
@@ -45,6 +46,66 @@ constexpr uint64_t kMaxGridCells = 1ull << 24;
 // Acceleration structures.
 constexpr uint64_t kDefaultScratchBytes = 128ull << 20;
 constexpr VkDeviceSize kInstancesInitialBytes = 1024 * kInstanceBytes;
+
+// Record upload path (README "Record upload path"). The BAR path needs a device-local, host-visible
+// heap of at least kMinBarHeapBytes: a BAR that was not resized is a 256 MiB heap shared with the
+// driver, and the ring does not go there.
+constexpr const char* kUploadPathVariable = "CAELIX_UPLOAD_PATH";
+constexpr VkDeviceSize kMinBarHeapBytes = 1ull << 30;
+constexpr VkMemoryPropertyFlags kBarMemoryFlags =
+    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+// A record scatter entry holds the ring offset / kRecordScatterSourceUnit in 32 bits.
+constexpr uint64_t kMaxStagingBytes = (1ull << 32) * kRecordScatterSourceUnit;
+static_assert(kMaxStagingBytes == 32ull << 30);
+
+enum class UploadPathRequest
+{
+    kAuto,
+    kBar,
+    kBounce,
+};
+
+// The largest device-local, host-visible heap and its free budget (budget - usage).
+void FindBarHeap(VmaAllocator allocator, VkDeviceSize& heap_bytes, VkDeviceSize& free_bytes)
+{
+    heap_bytes = 0;
+    free_bytes = 0;
+    const VkPhysicalDeviceMemoryProperties* properties = nullptr;
+    vmaGetMemoryProperties(allocator, &properties);
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+    vmaGetHeapBudgets(allocator, budgets);
+    for (uint32_t i = 0; i < properties->memoryTypeCount; ++i)
+    {
+        const VkMemoryType& type = properties->memoryTypes[i];
+        if ((type.propertyFlags & kBarMemoryFlags) != kBarMemoryFlags)
+        {
+            continue;
+        }
+        const VkDeviceSize size = properties->memoryHeaps[type.heapIndex].size;
+        if (size > heap_bytes)
+        {
+            const VmaBudget& budget = budgets[type.heapIndex];
+            heap_bytes = size;
+            free_bytes = budget.budget > budget.usage ? budget.budget - budget.usage : 0;
+        }
+    }
+}
+
+std::string MemoryFlagsText(VkMemoryPropertyFlags flags)
+{
+    std::string text;
+    const auto add = [&](VkMemoryPropertyFlags bit, const char* name) {
+        if ((flags & bit) != 0)
+        {
+            text += text.empty() ? std::string(name) : std::string("|") + name;
+        }
+    };
+    add(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "DEVICE_LOCAL");
+    add(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, "HOST_VISIBLE");
+    add(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, "HOST_COHERENT");
+    add(VK_MEMORY_PROPERTY_HOST_CACHED_BIT, "HOST_CACHED");
+    return text.empty() ? std::string("none") : text;
+}
 
 uint64_t PackGroupKey(int32_t gx, int32_t gy, int32_t gz)
 {
@@ -139,6 +200,39 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
                     static_cast<unsigned long long>(vk13.maxBufferSize));
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    if (staging_bytes > kMaxStagingBytes)
+    {
+        CAELIX_LOGE("caelix_scene_create: staging_bytes %llu is above the maximum of 32 GiB (a record "
+                    "scatter entry holds the ring offset / 8 in 32 bits)",
+                    static_cast<unsigned long long>(staging_bytes));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    // The record scatter kernel copies 8-byte words and sizes its word array for the largest record.
+    if (layout.record_bytes % kRecordScatterSourceUnit != 0 ||
+        layout.record_bytes / kRecordScatterSourceUnit > kScatterMaxRecordWords8)
+    {
+        CAELIX_LOGE("caelix_scene_create: record_bytes %u does not fit the record scatter kernel",
+                    layout.record_bytes);
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
+    UploadPathRequest request = UploadPathRequest::kAuto;
+    {
+        const std::string text = GetEnv(kUploadPathVariable);
+        if (text == "bar")
+        {
+            request = UploadPathRequest::kBar;
+        }
+        else if (text == "bounce")
+        {
+            request = UploadPathRequest::kBounce;
+        }
+        else if (!text.empty() && text != "auto")
+        {
+            CAELIX_LOGE("caelix_scene_create: %s = '%s' is not auto, bar or bounce", kUploadPathVariable,
+                        text.c_str());
+            return CAELIX_ERROR_INVALID_ARGUMENT;
+        }
+    }
 
     const VmaAllocator allocator = device.allocator();
     const VkDevice vk_device = device.device();
@@ -163,7 +257,81 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
     scene->entity_infos_ = GrowableBuffer(allocator, vk_device, kEntityInfoInitialBytes);
     scene->page_table_ = GrowableBuffer(allocator, vk_device, kPageTableInitialBytes);
     scene->dirty_buffer_ = GrowableBuffer(allocator, vk_device, kDirtyListInitialBytes);
-    scene->staging_ = StagingRing(allocator, vk_device, staging_bytes);
+    // The record upload path: the staging ring in resizable BAR memory when there is enough of it
+    // (auto) or when CAELIX_UPLOAD_PATH = bar; else in host memory with a device-local bounce buffer.
+    {
+        VkDeviceSize bar_heap_bytes = 0;
+        VkDeviceSize bar_free_bytes = 0;
+        FindBarHeap(allocator, bar_heap_bytes, bar_free_bytes);
+        std::string reason;
+        bool use_bar = false;
+        if (request == UploadPathRequest::kBar)
+        {
+            use_bar = true;
+            reason = std::string(kUploadPathVariable) + " = bar";
+        }
+        else if (request == UploadPathRequest::kBounce)
+        {
+            reason = std::string(kUploadPathVariable) + " = bounce";
+        }
+        else if (bar_heap_bytes < kMinBarHeapBytes)
+        {
+            reason = "auto: the largest device-local host-visible heap has " +
+                     std::to_string(bar_heap_bytes >> 20) + " MiB, below 1 GiB (no resizable BAR)";
+        }
+        else if (bar_free_bytes < staging_bytes)
+        {
+            reason = "auto: the resizable BAR heap has " + std::to_string(bar_free_bytes >> 20) +
+                     " MiB of free budget, less than the staging ring";
+        }
+        else
+        {
+            use_bar = true;
+            reason = "auto: resizable BAR heap of " + std::to_string(bar_heap_bytes >> 20) + " MiB";
+        }
+        if (use_bar)
+        {
+            try
+            {
+                scene->staging_ =
+                    StagingRing(allocator, vk_device, staging_bytes, HostUploadMemory::kBar, true);
+                scene->upload_path_ = UploadPath::kBar;
+            }
+            catch (const VulkanError&)
+            {
+                if (request == UploadPathRequest::kBar)
+                {
+                    CAELIX_LOGE("caelix_scene_create: %s = bar, but the staging ring (%llu bytes) could not "
+                                "be allocated in device-local host-visible memory",
+                                kUploadPathVariable, static_cast<unsigned long long>(staging_bytes));
+                    return CAELIX_ERROR_OUT_OF_MEMORY;
+                }
+                CAELIX_LOGW("caelix_scene_create: the staging ring (%llu bytes) could not be allocated in "
+                            "resizable BAR memory; the bounce path is used",
+                            static_cast<unsigned long long>(staging_bytes));
+                reason = "auto: the BAR allocation failed";
+                use_bar = false;
+            }
+        }
+        if (!use_bar)
+        {
+            scene->staging_ = StagingRing(allocator, vk_device, staging_bytes);
+            scene->bounce_ = GpuBuffer::DeviceLocalWithUsage(
+                allocator, vk_device, staging_bytes,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            scene->upload_path_ = UploadPath::kBounce;
+        }
+        uint32_t type_index = 0;
+        uint32_t heap_index = 0;
+        VkMemoryPropertyFlags flags = 0;
+        scene->staging_.gpu_buffer().DescribeMemory(type_index, flags, heap_index);
+        const std::string bounce_text =
+            use_bar ? std::string()
+                    : ", device-local bounce buffer of " + std::to_string(staging_bytes) + " bytes";
+        CAELIX_LOGI("scene upload path: %s (%s); staging ring in memory type %u (%s), heap %u%s",
+                    use_bar ? "ReBAR" : "bounce", reason.c_str(), type_index, MemoryFlagsText(flags).c_str(),
+                    heap_index, bounce_text.c_str());
+    }
     scene->materials_ = std::make_unique<MaterialTable>(d.encoding);
     scene->material_buffer_ = GpuBuffer::DeviceLocal(allocator, vk_device, MaterialTable::kBytes);
     scene->as_pool_.Init(allocator, vk_device);
@@ -176,6 +344,9 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
     const std::vector<uint32_t> finalize_spirv = LoadShader("caelix_finalize");
     scene->finalize_ = ComputePipeline(vk_device, finalize_spirv, sizeof(FinalizePush),
                                        "caelix_finalize");
+    const std::vector<uint32_t> scatter_spirv = LoadShader("caelix_record_scatter");
+    scene->record_scatter_ = ComputePipeline(vk_device, scatter_spirv, sizeof(RecordScatterPush),
+                                             "caelix_record_scatter");
     scene->flush_timer_ = GpuTimer(device);
     CAELIX_LOGI("scene created: staging %llu bytes, %u records per page (%llu bytes), group %u^3 "
                 "bricks, record %u bytes, %s encoding, build scratch %llu bytes",
@@ -649,9 +820,9 @@ void Scene::GetStats(CaelixSceneStats& out) const
     out.as_builds_pending = pending;
     out.material_table_bytes = material_buffer_.size();
     // Bricks that caelix_scene_upload_bricks accepts before the next flush, at most: the record
-    // space of the ring (capacity minus the row reserve) minus what is in use, in record spans
-    // as UploadBricks allocates them (record_bytes at kRecordAlignment). Wrap padding can make
-    // the real number smaller.
+    // space of the ring (capacity minus the row reserve, which also holds the record scatter
+    // entries) minus what is in use, in record spans as UploadBricks allocates them (record_bytes
+    // at kRecordAlignment). Wrap padding can make the real number smaller.
     const uint64_t capacity = staging_.capacity();
     const uint64_t record_space = capacity - std::min(capacity, StagingRing::RowReserveBytes(capacity));
     const uint64_t free_bytes = record_space - std::min(record_space, staging_.used());
@@ -659,6 +830,7 @@ void Scene::GetStats(CaelixSceneStats& out) const
         (static_cast<uint64_t>(layout_.record_bytes) + kRecordAlignment - 1) / kRecordAlignment *
         kRecordAlignment;
     out.upload_bricks_free = stride > 0 ? free_bytes / stride : 0;
+    out.upload_path = static_cast<uint64_t>(upload_path_);
 }
 
 CaelixResult Scene::QueryBrick(CaelixEntityId entity_id, CaelixBrickKey key,

@@ -502,6 +502,10 @@ TEST_CASE("push constants: the scene and light tree kernels have the C++ layouts
         CAELIX_FIELD(LightSortPush, gate_address), CAELIX_FIELD(LightSortPush, shift),
         CAELIX_FIELD(LightSortPush, block_count),
     };
+    const std::vector<Field> scatter = {
+        CAELIX_FIELD(RecordScatterPush, list),  CAELIX_FIELD(RecordScatterPush, source),
+        CAELIX_FIELD(RecordScatterPush, count), CAELIX_FIELD(RecordScatterPush, record_words8),
+    };
     const std::vector<Field> hash = {
         CAELIX_FIELD(HashPush, keys),             CAELIX_FIELD(HashPush, stack),
         CAELIX_FIELD(HashPush, counters),         CAELIX_FIELD(HashPush, payloads),
@@ -517,6 +521,7 @@ TEST_CASE("push constants: the scene and light tree kernels have the C++ layouts
         {"caelix_hash_maintain", &hash},
         {"caelix_hash_finish", &hash},
         {"caelix_finalize", &finalize},
+        {"caelix_record_scatter", &scatter},
         {"caelix_light_tree_size", &group},
         {"caelix_light_tree_scan", &group},
         {"caelix_light_tree_build", &group},
@@ -808,6 +813,12 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kBlockIdOpaqueMask),
         CAELIX_CONSTANT(kBlockIdIdMask),
         CAELIX_CONSTANT(kBlockIdFaceShift),
+        CAELIX_CONSTANT(kRecordScatterEntryBytes),
+        CAELIX_CONSTANT(kRecordScatterSourceUnit),
+        CAELIX_CONSTANT(kScatterKeepBoundsWord),
+        CAELIX_CONSTANT(kScatterRecordsPerGroup),
+        CAELIX_CONSTANT(kScatterThreadsPerGroup),
+        CAELIX_CONSTANT(kScatterMaxRecordWords8),
         // shaders/common/caelix_material.hlsl: lib/src/scene/material_table.h
         CAELIX_CONSTANT(kMaterialBytes),
         CAELIX_CONSTANT(kMaterialAlbedo),

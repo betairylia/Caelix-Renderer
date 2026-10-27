@@ -10,8 +10,10 @@ uint64_t AlignUp(uint64_t value, uint64_t alignment)
 
 }  // namespace
 
-StagingRing::StagingRing(VmaAllocator allocator, VkDevice device, uint64_t capacity)
-    : buffer_(GpuBuffer::HostUpload(allocator, device, capacity)), capacity_(capacity)
+StagingRing::StagingRing(VmaAllocator allocator, VkDevice device, uint64_t capacity,
+                         HostUploadMemory memory, bool device_address)
+    : buffer_(GpuBuffer::HostUpload(allocator, device, capacity, memory, device_address)),
+      capacity_(capacity)
 {
 }
 

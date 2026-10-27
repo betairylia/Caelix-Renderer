@@ -76,7 +76,8 @@ extern "C" {
    bits 18..30 (light face count, record stale; readers of the tight bounds mask bits 0..17), also
    without a bump. The light NEE step added CaelixLightNeeOptions, CAELIX_LIGHT_NEE_FLAG_NO_MIS,
    caelix_renderer_set_light_nee_options, CaelixLightNeeStats and caelix_renderer_get_light_nee_stats,
-   also without a bump. A host built against an older version-2 header must be rebuilt (the library reads
+   also without a bump. The record scatter step appended CaelixSceneStats::upload_path, also without
+   a bump. A host built against an older version-2 header must be rebuilt (the library reads
    and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -344,11 +345,13 @@ typedef struct CaelixFrameDesc
     uint64_t safe_frame_number; /* every frame <= this has completed on the GPU. 0 = none yet. */
 } CaelixFrameDesc;
 
-/* Records into the command buffer all copies from staging to the pools for everything uploaded or
-   removed since the previous flush, then the finalize kernel over the changed bricks and their
-   neighbours, then the acceleration structure builds (BLASes, then the TLAS), with barriers: one
-   before the copies (all earlier commands -> all commands), transfer -> compute before the kernel,
-   transfer and compute -> all later commands after it, BLAS builds -> TLAS build, and TLAS build ->
+/* Records into the command buffer the record scatter kernel (uploaded records -> record pages; on
+   the bounce path after one bulk copy, see CaelixSceneStats::upload_path) and all copies from
+   staging to the tables for everything uploaded or removed since the previous flush, then the
+   finalize kernel over the changed bricks and their neighbours, then the acceleration structure
+   builds (BLASes, then the TLAS), with barriers: one before the copies (all earlier commands -> all
+   commands), transfer and compute -> compute before the kernel, transfer and compute -> all later
+   commands after it, BLAS builds -> TLAS build, and TLAS build ->
    all later commands. When it records work, two timestamp queries bracket it (reported as
    CaelixGpuTimings::flush_ms). Recycles staging spans and acceleration structures whose
    frame <= safe. With nothing to do it records nothing. A frame_number that is not greater than the previous flush's,
@@ -366,7 +369,8 @@ CAELIX_API CaelixResult caelix_scene_recycle(CaelixScene* scene, uint64_t safe_f
 
 /* Fields are only appended. finalized_bricks_total .. grid_bytes were added to ABI version 2 by the
    finalize step, blas_count .. as_builds_pending by the acceleration structure step,
-   material_table_bytes by the materials step, upload_bricks_free by the plugin refactor step. */
+   material_table_bytes by the materials step, upload_bricks_free by the plugin refactor step,
+   upload_path by the record scatter step. */
 typedef struct CaelixSceneStats
 {
     uint32_t entities, groups;                              /* live entities and render groups */
@@ -392,6 +396,15 @@ typedef struct CaelixSceneStats
                                     reserve (wrap fragmentation can make the real number smaller;
                                     *consumed is the truth). Read it after a flush to size the next
                                     frame's uploads. */
+    uint64_t upload_path;        /* how uploaded records reach the record pages, chosen at scene
+                                    creation: 1 = ReBAR (the staging ring is in device-local,
+                                    host-visible memory; the record scatter kernel reads it),
+                                    2 = bounce (the ring is in host memory; one bulk copy to a
+                                    device-local bounce buffer of the ring's size first). The
+                                    environment variable CAELIX_UPLOAD_PATH = auto | bar | bounce,
+                                    read by caelix_scene_create, overrides the automatic choice
+                                    (ReBAR when a device-local host-visible heap of >= 1 GiB has room
+                                    for the ring). */
 } CaelixSceneStats;
 
 /* Fills *out. A NULL argument is ignored. */

@@ -14,8 +14,8 @@ namespace caelix {
 // Free(index) makes the record reusable IMMEDIATELY, before the GPU has stopped
 // reading it. That is safe because all GPU work on the pool runs on one queue in
 // submission order, and every flush starts with a barrier from all earlier
-// commands (shader reads included) to the transfer writes that overwrite a reused
-// record. An async transfer queue would break this assumption: frees would then
+// commands (shader reads included) to the writes of the record scatter kernel that
+// overwrite a reused record. An async transfer queue would break this assumption: frees would then
 // have to wait until the frame that last read the record has completed.
 class RecordPool
 {

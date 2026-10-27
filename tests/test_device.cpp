@@ -65,7 +65,7 @@ void LibraryLog(CaelixLogLevel level, const char* message, void* /*user_data*/)
     }
 }
 
-void CreateGpu(Gpu& gpu, const char* app_name)
+void CreateGpu(Gpu& gpu, const char* app_name, bool validation)
 {
     REQUIRE(volkInitialize() == VK_SUCCESS);
     const vkb::SystemInfo system = vkb::SystemInfo::get_system_info(vkGetInstanceProcAddr).value();
@@ -76,11 +76,14 @@ void CreateGpu(Gpu& gpu, const char* app_name)
     vkb::InstanceBuilder instance_builder(vkGetInstanceProcAddr);
     instance_builder.set_app_name(app_name)
         .require_api_version(1, 3, 0)
-        .set_headless(true)
-        .request_validation_layers(true)
-        .set_debug_messenger_severity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-                                      VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
-        .set_debug_callback(DebugCallback);
+        .set_headless(true);
+    if (validation)
+    {
+        instance_builder.request_validation_layers(true)
+            .set_debug_messenger_severity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                          VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+            .set_debug_callback(DebugCallback);
+    }
     // The upscalers' instance extensions (DLSS through NGX; none without CAELIX_DLSS), when the
     // instance supports them.
     uint32_t upscaler_instance_count = 0;

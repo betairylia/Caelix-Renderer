@@ -130,3 +130,15 @@ caelix_add_gpu_test(caelix_light_nee_test light_nee_test.cpp)
 add_dependencies(caelix_light_nee_test caelix_light_nee_probe_shaders)
 target_compile_definitions(caelix_light_nee_test PRIVATE
   CAELIX_TEST_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders")
+
+# Upload benchmark, not a test (no add_test): the record upload of a synthetic FractalCave (one slab of
+# 18,432 bricks re-uploaded per frame) with the flush GPU time from timestamps. --path auto|bar|bounce
+# sets CAELIX_UPLOAD_PATH; --no-validation for timings. Its own main() runs one Catch2 test case (the
+# helpers of test_device.h use Catch2 assertions).
+add_executable(caelix_upload_bench upload_bench.cpp)
+if(MSVC)
+  target_compile_options(caelix_upload_bench PRIVATE /W4)
+else()
+  target_compile_options(caelix_upload_bench PRIVATE -Wall -Wextra)
+endif()
+target_link_libraries(caelix_upload_bench PRIVATE caelix_test_device Catch2::Catch2)

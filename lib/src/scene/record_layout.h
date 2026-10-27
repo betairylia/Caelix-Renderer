@@ -12,7 +12,8 @@ constexpr uint32_t kRecordPosMask = 0xFFFFu;   // word 0: group-local brick posi
 constexpr uint32_t kRecordCoarseShift = 16;    // word 0: coarse occupancy byte
 constexpr uint32_t kRecordCoarseMask = 0xFFu;
 // Word 1 is GPU-owned: the finalize kernel reads its light state before it rewrites it, so an
-// upload that replaces a resident brick's content does not stage it (Scene::StageRecordCopy).
+// upload that replaces a resident brick's content does not copy it (Scene::StageRecordScatter,
+// kScatterKeepBoundsWord).
 constexpr uint32_t kRecordBoundsWord = 1;
 constexpr uint32_t kRecordBoundsAxisBits = 3;  // per bound coordinate
 constexpr uint32_t kRecordBoundsAxisMask = (1u << kRecordBoundsAxisBits) - 1u;

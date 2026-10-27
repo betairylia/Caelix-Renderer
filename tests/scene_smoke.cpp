@@ -3,10 +3,13 @@
 // creates the instance and the device the way a host would (tests/test_device.h).
 #include "test_device.h"
 
+#include <catch2/generators/catch_generators.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <random>
@@ -236,6 +239,11 @@ std::vector<BrickId> Sample(const Model& model, size_t count, uint32_t seed)
 
 TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]")
 {
+    // Both record upload paths (CAELIX_UPLOAD_PATH, read by caelix_scene_create): auto is ReBAR on a
+    // machine with a resizable BAR, bounce copies the ring into a device-local buffer first.
+    const char* const upload_path = GENERATE(as<const char*>{}, "auto", "bounce");
+    INFO("CAELIX_UPLOAD_PATH = " << upload_path);
+    REQUIRE(_putenv_s("CAELIX_UPLOAD_PATH", upload_path) == 0);
     caelix_set_log_callback(LibraryLog, nullptr);
 
     CaelixVersion version{};
@@ -254,19 +262,31 @@ TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]")
     scene_desc.records_per_page = 1024;
     CaelixScene* scene = nullptr;
     REQUIRE(caelix_scene_create(device, &scene_desc, &scene) == CAELIX_OK);
+    const uint64_t path = Stats(scene).upload_path;
+    std::printf("upload path %llu (1 = ReBAR, 2 = bounce)\n", static_cast<unsigned long long>(path));
+    REQUIRE((path == 1 || path == 2));
+    if (std::strcmp(upload_path, "bounce") == 0)
+    {
+        REQUIRE(path == 2);
+    }
     // The free staging stat of the empty ring: the record space (8 MiB minus the row reserve
-    // 8 MiB / 16 + 1 MiB) in 1096-byte records.
+    // 8 MiB / 16 + 8 MiB / 64 + 1 MiB) in 1096-byte records.
     const uint64_t initial_free = Stats(scene).upload_bricks_free;
     std::printf("upload_bricks_free of the empty ring: %llu\n",
                 static_cast<unsigned long long>(initial_free));
     REQUIRE(initial_free > 0);
-    REQUIRE(initial_free == ((8ull << 20) - (8ull << 20) / 16 - (1ull << 20)) / kRecordBytes);
+    REQUIRE(initial_free ==
+            ((8ull << 20) - (8ull << 20) / 16 - (8ull << 20) / 64 - (1ull << 20)) / kRecordBytes);
 
-    ExpectLibraryErrors(4, [&] {
+    ExpectLibraryErrors(5, [&] {
         CaelixScene* bad = nullptr;
         CaelixSceneDesc d{};
         d.staging_bytes = 1 << 20;
         REQUIRE(caelix_scene_create(device, &d, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+        REQUIRE(_putenv_s("CAELIX_UPLOAD_PATH", "fast") == 0);
+        d = CaelixSceneDesc{};
+        REQUIRE(caelix_scene_create(device, &d, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+        REQUIRE(_putenv_s("CAELIX_UPLOAD_PATH", upload_path) == 0);
         d = CaelixSceneDesc{};
         d.block_bytes = 4;
         REQUIRE(caelix_scene_create(device, &d, &bad) == CAELIX_ERROR_UNSUPPORTED);
@@ -590,5 +610,6 @@ TEST_CASE("scene upload, flush, removal and GPU readback", "[scene]")
     caelix_device_destroy(device);
     DestroyGpu(gpu);
     caelix_set_log_callback(nullptr, nullptr);
+    REQUIRE(_putenv_s("CAELIX_UPLOAD_PATH", "") == 0);  // removes the variable
     RequireNoMessages();
 }

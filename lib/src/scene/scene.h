@@ -113,6 +113,14 @@ struct Entity
     uint32_t life = 0;
 };
 
+// How the records of caelix_scene_upload_bricks reach the record pages; chosen at scene creation
+// (CaelixSceneStats::upload_path, README "Record upload path"). Both use the record scatter kernel.
+enum class UploadPath : uint32_t
+{
+    kBar = 1,     // the staging ring is device-local, host-visible memory; the kernel reads it
+    kBounce = 2,  // the ring is in host memory; one bulk copy fills a device-local bounce buffer first
+};
+
 class Scene
 {
 public:
@@ -223,11 +231,23 @@ private:
         uint16_t id;
         bool replaced;  // the brick was resident: the upload replaces the content of its record
     };
-    // The staged copies of one record in the current window (StageRecordCopy).
-    struct StagedRecord
+    // A block of kScatterBlockEntries RecordScatterEntry slots in the staging ring.
+    struct ScatterBlock
     {
-        size_t first;  // index in pending_ of the first region
-        bool full;     // one region of the whole record; else two that skip kRecordBoundsWord
+        uint64_t offset;  // in the ring
+        uint32_t count;   // entries written
+    };
+    // The scatter entry of one record in the current window (StageRecordScatter).
+    struct ScatterRef
+    {
+        uint32_t block;  // index in scatter_blocks_
+        uint32_t index;  // entry in the block
+        bool full;       // the whole record is copied; else its word 1 (kRecordBoundsWord) stays
+    };
+    // Ring bytes [begin, end) that hold records or scatter blocks of the current window.
+    struct UploadRange
+    {
+        uint64_t begin, end;
     };
     struct PendingFill
     {
@@ -299,8 +319,11 @@ private:
     void QueueNeighbors(CaelixEntityId entity, const CaelixBrickKey& key, uint32_t group_index);
 
     void WriteRecord(uint8_t* dst, uint32_t pos, const uint8_t* blocks) const;
-    // Stages the copy of a written record (at `src_offset` in the ring) into its pool slot.
-    void StageRecordCopy(const Placed& placed, VkDeviceSize src_offset);
+    // Writes (or rewrites) the scatter entry that copies a written record (at `src_offset` in the
+    // ring) into its pool slot. The last block of scatter_blocks_ has room for one more entry.
+    void StageRecordScatter(const Placed& placed, uint64_t src_offset);
+    // Appends ring bytes to upload_ranges_ (merged with the last range across small gaps).
+    void AddUploadRange(uint64_t offset, uint64_t bytes);
     // AABB range moves and fills of a group (no staging space needed).
     void PrepareGroupAabbs(Group& group);
     // Writes the dirty rows of one group (slot rows, info row, reverse words, NaN
@@ -315,6 +338,8 @@ private:
     // Builds the dispatch list from dirty_. Returns the number of entries staged.
     uint32_t StageDirtyList();
     bool EnsureNanRow();
+    // Bounce path: the bulk copy of upload_ranges_ into bounce_; then the record scatter dispatches.
+    void RecordScatter(VkCommandBuffer cmd);
     void RecordCopies(VkCommandBuffer cmd);
 
     // Light tree (scene_light.cpp).
@@ -364,10 +389,13 @@ private:
     GrowableBuffer dirty_buffer_;  // DirtyEntry list of the current flush
     uint32_t pages_staged_ = 0;
     StagingRing staging_;
+    UploadPath upload_path_ = UploadPath::kBounce;
+    GpuBuffer bounce_;  // bounce path: device local, the ring's size, the same offsets
     std::unique_ptr<MaterialTable> materials_;  // CPU copy of the material table
     GpuBuffer material_buffer_;                 // MaterialTable::kBytes, device local
     bool material_buffer_filled_ = false;       // the zero fill of the first flush was recorded
     ComputePipeline finalize_;
+    ComputePipeline record_scatter_;
     GpuTimer flush_timer_;  // brackets the work that a flush records
 
     // Light tree: null while disabled. A disabled tree lives until its last frame is safe.
@@ -398,8 +426,10 @@ private:
     uint64_t blas_count_ = 0;
     uint64_t as_builds_total_ = 0;
 
-    std::vector<StagedCopy> pending_;
-    ankerl::unordered_dense::map<uint32_t, StagedRecord> record_copies_;  // by record index, this window
+    std::vector<StagedCopy> pending_;  // table rows (records go through the scatter kernel)
+    std::vector<ScatterBlock> scatter_blocks_;                          // this window
+    ankerl::unordered_dense::map<uint32_t, ScatterRef> record_copies_;  // by record index, this window
+    std::vector<UploadRange> upload_ranges_;                            // this window
     std::vector<PendingFill> fills_;
     std::vector<VkBufferCopy> aabb_moves_;  // inside aabbs_.buffer()
     std::vector<RangeToFree> ranges_to_free_after_flush_;

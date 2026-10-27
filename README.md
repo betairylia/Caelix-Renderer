@@ -125,12 +125,13 @@ Scene model:
   dense 16-bit brick ids and its own range in one shared slot table buffer
   (16-byte rows: position and state, summary, record index, last used). The
   slot table buffer grows by doubling; offsets never change.
-- Staging ring: one host-visible buffer. `caelix_scene_upload_bricks` writes
+- Staging ring: one host-visible buffer (device-local too on the ReBAR path, see
+  "Record upload path"). `caelix_scene_upload_bricks` writes
   records into the ring and reports how many bricks it accepted in `consumed`.
   When `consumed < count`, flush and submit the frame, then upload the rest. The
-  last `capacity / 16 + 1 MiB` of the ring is reserved for table rows (slot
-  rows, reverse table words, info rows, grid cells, the page table and the
-  finalize list); records cannot use it.
+  last `capacity / 16 + capacity / 64 + 1 MiB` of the ring is reserved for table
+  rows (slot rows, reverse table words, info rows, grid cells, the page table and
+  the finalize list) and the record scatter entries; records cannot use it.
 
 ### Finalize kernel
 
@@ -179,6 +180,28 @@ addresses; the kernel has push constants only, no descriptor sets):
 All pools grow by doubling with a copy at the next flush, like the slot table.
 Small table updates are staged as runs that also cover short clean gaps,
 because every `vkCmdCopyBuffer` region has a fixed GPU cost.
+
+### Record upload path
+
+Uploaded records do not go through `vkCmdCopyBuffer`: one region per record costs about 1 us on the
+transfer engine (18,432 records = ~17 ms). `caelix_scene_upload_bricks` writes each record into the
+staging ring and a 16 B scatter entry (ring offset / 8, flags, destination address) into an entry
+block of the ring (4096 entries, 64 KiB, from the row reserve). The flush runs the record scatter
+kernel (`shaders/scene/caelix_record_scatter.hlsl`, one dispatch per block, 16 records per 256-thread
+workgroup) before the table copies. A record that replaces a resident brick keeps its word 1 (flag
+`kScatterKeepBoundsWord`). `caelix_scene_create` chooses one of two paths
+(`CaelixSceneStats::upload_path`):
+
+- ReBAR (1): the ring is in device-local, host-visible memory; the CPU writes records straight into
+  VRAM and the kernel reads the ring by device address. Chosen when a device-local, host-visible
+  heap of at least 1 GiB (a resized BAR; an unresized one is 256 MiB) has budget for the ring.
+- Bounce (2): the ring stays in host memory. The flush copies the ring ranges of the window's
+  records and entry blocks into a device-local bounce buffer at the same offsets (one
+  `vkCmdCopyBuffer` with few regions), and the kernel reads that. Extra VRAM: the ring's size.
+
+`CAELIX_UPLOAD_PATH` = `auto` | `bar` | `bounce` overrides the choice. `caelix_upload_bench`
+measures the whole flush (records, table copies, finalize, BLAS/TLAS) with 18,432 replaced records
+per frame on the RTX 5080: 15.3 ms with copy regions, 0.31 ms ReBAR, 1.19 ms bounce.
 
 ### Light tree
 
@@ -913,13 +936,19 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   layout moves a vector that crosses a 16-byte row (`float2` at 476 goes to 480) and gives an array
   of scalars a 16-byte stride, without any compile error. Two more cases: the push constant block of
   every scene, light tree and hash table kernel against its C++ struct, member by member and by
-  name (`FinalizePush`, `LightGroupPush`, `LightBvhPush`, `LightScanPush`, `LightSortPush`,
+  name (`FinalizePush`, `RecordScatterPush`, `LightGroupPush`, `LightBvhPush`, `LightScanPush`,
+  `LightSortPush`,
   `HashPush`), and every named constant of `shaders/common/caelix_record.hlsl`,
   `caelix_material.hlsl`, `caelix_light_tree_layout.hlsl` and `caelix_hash_table.hlsl` (the field
   offsets, bit fields and sizes the kernels address memory with) against the C++ constant of the
   same name in `lib/src/scene/record_layout.h`, `gpu_structs.h`, `material_table.h`,
   `light_tree_layout.h` and `lib/src/rhi/hash_table_layout.h`, whose static_asserts tie them to the
   structs.
+- `caelix_upload_bench` (not a ctest): a synthetic FractalCave (48 x 128 x 48 resident bricks, one
+  slab of 18,432 bricks re-uploaded per frame with toggled content); prints the flush GPU time
+  (mean, median, p95) and the CPU time of the upload and flush calls. Options `--path auto|bar|bounce`
+  (sets `CAELIX_UPLOAD_PATH`), `--bricks N`, `--frames N`, `--warmup N`, `--staging-mib N`,
+  `--no-validation` (use it for timings).
 - `caelix_light_tree_test`: the light tree (`docs/LIGHT_TREE.md` section 7) through the C ABI and a
   probe kernel (`tests/shaders/caelix_light_tree_probe.hlsl`, compiled by the test build into
   `build/shaders`): light faces, records and both BVHs against a CPU reference, normalisation,
@@ -1379,6 +1408,9 @@ to disable them for a run.
   This is the register count of the code that runs; an Nsight capture can show a different
   compile. On NVIDIA driver 610.88 "Local Memory Size" carries bit 36 as a flag: the spill size in
   bytes is the value minus 2^36. Without the extension (another host) nothing changes.
+- `CAELIX_UPLOAD_PATH`: `auto` (default), `bar` or `bounce`; the record upload path that
+  `caelix_scene_create` uses (see "Record upload path"). `bar` fails the creation with
+  `CAELIX_ERROR_OUT_OF_MEMORY` when the ring cannot be allocated in device-local, host-visible memory.
 - `CAELIX_LIB_DIR`: directory that contains `caelix_renderer.lib` and
   `caelix_renderer.dll`. Default: `<repo>/build/bin/Release`. The Rust host
   links the Release build only.

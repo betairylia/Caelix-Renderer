@@ -84,14 +84,25 @@ GpuBuffer GpuBuffer::DeviceLocalWithUsage(VmaAllocator allocator, VkDevice devic
     return GpuBuffer(allocator, device, size, usage, allocation_info, true);
 }
 
-GpuBuffer GpuBuffer::HostUpload(VmaAllocator allocator, VkDevice device, VkDeviceSize size)
+GpuBuffer GpuBuffer::HostUpload(VmaAllocator allocator, VkDevice device, VkDeviceSize size,
+                                HostUploadMemory memory, bool device_address)
 {
     VmaAllocationCreateInfo allocation_info{};
-    allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
+    // With SHADER_DEVICE_ADDRESS in the usage, VMA AUTO prefers device-local (BAR) memory;
+    // PREFER_HOST keeps the memory type of the plain upload buffer.
+    allocation_info.usage = device_address ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO;
     allocation_info.flags =
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    return GpuBuffer(allocator, device, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, allocation_info,
-                     false);
+    if (memory == HostUploadMemory::kBar)
+    {
+        allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        allocation_info.requiredFlags =
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    }
+    const VkBufferUsageFlags usage =
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+        (device_address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : VkBufferUsageFlags{0});
+    return GpuBuffer(allocator, device, size, usage, allocation_info, device_address);
 }
 
 GpuBuffer GpuBuffer::HostReadback(VmaAllocator allocator, VkDevice device, VkDeviceSize size)
@@ -126,6 +137,18 @@ void GpuBuffer::FlushHostWrites(VkDeviceSize offset, VkDeviceSize size) const
     {
         throw VulkanError("vmaFlushAllocation failed", result);
     }
+}
+
+void GpuBuffer::DescribeMemory(uint32_t& type_index, VkMemoryPropertyFlags& flags,
+                               uint32_t& heap_index) const
+{
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator_, allocation_, &info);
+    type_index = info.memoryType;
+    vmaGetMemoryTypeProperties(allocator_, type_index, &flags);
+    const VkPhysicalDeviceMemoryProperties* properties = nullptr;
+    vmaGetMemoryProperties(allocator_, &properties);
+    heap_index = properties->memoryTypes[type_index].heapIndex;
 }
 
 void GpuBuffer::Reset()

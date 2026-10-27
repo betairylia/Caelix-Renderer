@@ -4,6 +4,7 @@
 #include "core/log.h"
 #include "scene/scene_internal.h"
 
+#include <algorithm>
 #include <cstring>
 #include <new>
 #include <optional>
@@ -15,6 +16,13 @@ static_assert(RecordPool::kInvalidIndex == kInvalidRecord);
 
 // The group index is the instance's 24-bit instanceCustomIndex.
 constexpr size_t kMaxGroups = size_t{1} << 24;
+
+// One block of record scatter entries in the staging ring.
+constexpr uint64_t kScatterBlockBytes =
+    static_cast<uint64_t>(kScatterBlockEntries) * kRecordScatterEntryBytes;
+// Ring bytes between two upload spans that the bulk copy of the bounce path copies along instead of
+// starting a new region (alignment padding between a record run and a scatter block).
+constexpr uint64_t kUploadRangeMergeGap = 64;
 
 // Neighbour directions in face order: +X, -X, +Y, -Y, +Z, -Z.
 constexpr int32_t kDirections[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
@@ -268,53 +276,51 @@ void Scene::WriteRecord(uint8_t* dst, uint32_t pos, const uint8_t* blocks) const
     std::memcpy(dst, record, layout_.record_bytes);
 }
 
-void Scene::StageRecordCopy(const Placed& placed, VkDeviceSize src_offset)
+void Scene::StageRecordScatter(const Placed& placed, uint64_t src_offset)
 {
     // A new record (or a reused one: its old content belongs to another brick) is copied whole. A
     // resident record whose content is replaced keeps its word 1 (kRecordBoundsWord): the
     // finalize kernel compares the old light face count and stale bit there with the new content, so
     // a light brick that loses its lights still marks its group for the light tree. A record staged
-    // again in the same window rewrites its staged regions in place (the newest content wins); once
-    // it has a full copy in the window, it keeps one.
-    const VkBuffer page = records_.PageBuffer(placed.record);
-    const VkDeviceSize dst_offset = records_.PageOffset(placed.record);
-    constexpr VkDeviceSize kSkipBegin = kRecordBoundsWord * kRecordWordBytes;
-    constexpr VkDeviceSize kSkipEnd = kSkipBegin + kRecordWordBytes;
+    // again in the same window rewrites its entry in place (the newest content wins); once it has a
+    // full copy in the window, it keeps one.
     const auto found = record_copies_.find(placed.record);
     const bool full = !placed.replaced || (found != record_copies_.end() && found->second.full);
-    const StagedCopy whole{src_offset, page, dst_offset, layout_.record_bytes};
-    const StagedCopy head{src_offset, page, dst_offset, kSkipBegin};
-    const StagedCopy tail{src_offset + kSkipEnd, page, dst_offset + kSkipEnd,
-                          layout_.record_bytes - kSkipEnd};
-    if (found == record_copies_.end())
+    ScatterRef ref{};
+    if (found != record_copies_.end())
     {
-        record_copies_.emplace(placed.record, StagedRecord{pending_.size(), full});
-        if (full)
-        {
-            pending_.push_back(whole);
-        }
-        else
-        {
-            pending_.push_back(head);
-            pending_.push_back(tail);
-        }
-        return;
-    }
-    StagedRecord& copies = found->second;
-    if (full)
-    {
-        pending_[copies.first] = whole;
-        if (!copies.full)
-        {
-            pending_[copies.first + 1].size = 0;  // dropped by RecordCopies
-        }
-        copies.full = true;
+        found->second.full = full;
+        ref = found->second;
     }
     else
     {
-        pending_[copies.first] = head;
-        pending_[copies.first + 1] = tail;
+        ScatterBlock& block = scatter_blocks_.back();
+        ref = ScatterRef{static_cast<uint32_t>(scatter_blocks_.size() - 1), block.count, full};
+        ++block.count;
+        record_copies_.emplace(placed.record, ref);
     }
+    RecordScatterEntry entry{};
+    entry.src_offset8 = static_cast<uint32_t>(src_offset / kRecordScatterSourceUnit);
+    entry.flags = full ? 0u : kScatterKeepBoundsWord;
+    entry.dst_address =
+        records_.PageAddress(records_.page_of(placed.record)) + records_.PageOffset(placed.record);
+    // One copy of a local struct: the ring memory may be write-combined.
+    uint8_t* const slot = staging_.gpu_buffer().mapped() + scatter_blocks_[ref.block].offset +
+                          static_cast<uint64_t>(ref.index) * kRecordScatterEntryBytes;
+    std::memcpy(slot, &entry, sizeof(entry));
+}
+
+void Scene::AddUploadRange(uint64_t offset, uint64_t bytes)
+{
+    // Record spans and scatter blocks follow each other in the ring with at most alignment padding
+    // between them; a gap of up to kUploadRangeMergeGap is copied along instead of starting a region.
+    if (!upload_ranges_.empty() && offset >= upload_ranges_.back().begin &&
+        offset <= upload_ranges_.back().end + kUploadRangeMergeGap)
+    {
+        upload_ranges_.back().end = std::max(upload_ranges_.back().end, offset + bytes);
+        return;
+    }
+    upload_ranges_.push_back(UploadRange{offset, offset + bytes});
 }
 
 CaelixResult Scene::UploadBricks(CaelixEntityId entity, uint32_t count, const CaelixBrickKey* keys,
@@ -334,16 +340,30 @@ CaelixResult Scene::UploadBricks(CaelixEntityId entity, uint32_t count, const Ca
     const size_t brick_bytes = static_cast<size_t>(RecordLayout::kBlocksPerBrick) * layout_.block_bytes;
     for (uint32_t i = 0; i < count; ++i)
     {
+        // Room for the brick's scatter entry first, then its record: a ring without room for
+        // either stops the upload here (back-pressure), before the brick changes any state.
+        if (scatter_blocks_.empty() || scatter_blocks_.back().count == kScatterBlockEntries)
+        {
+            StagingRing::Span block;
+            if (!staging_.TryAllocate(kScatterBlockBytes, kRecordScatterEntryBytes,
+                                      StagingRing::Purpose::kRows, block))
+            {
+                break;
+            }
+            scatter_blocks_.push_back(ScatterBlock{block.offset, 0});
+            AddUploadRange(block.offset, kScatterBlockBytes);
+        }
         StagingRing::Span span;
         if (!staging_.TryAllocate(layout_.record_bytes, kRecordAlignment,
                                   StagingRing::Purpose::kRecords, span))
         {
             break;
         }
+        AddUploadRange(span.offset, layout_.record_bytes);
         const Location loc = Locate(keys[i]);
         const Placed placed = PlaceBrick(entity, loc);
         WriteRecord(span.data, loc.pos, block_bytes + i * brick_bytes);
-        StageRecordCopy(placed, span.offset);
+        StageRecordScatter(placed, span.offset);
         // The brick and its resident neighbours are finalized at the next flush.
         QueueFinalize(placed.group_index, placed.id);
         QueueNeighbors(entity, keys[i], placed.group_index);

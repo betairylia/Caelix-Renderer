@@ -70,8 +70,9 @@ kernels with the C++ push structs. Heap offsets and sizes count 16-byte **units*
 Scene record word 1 (`kRecordBoundsWord`): bits 0..17 the tight bounds (readers mask them), bits
 18..29 the light face count of the brick (`kLtRecordFaceCountShift` / `Mask`), bit 30 "light record
 stale" (`kLtRecordStaleBit`). Word 1 is GPU-owned: an upload that replaces a resident brick
-(`Scene::StageRecordCopy`) stages word 0 and words 2.. and leaves word 1 as it is, so the finalize
-kernel sees the old light state; a new or reused record is copied whole (word 1 = 0).
+(`Scene::StageRecordScatter`, flag `kScatterKeepBoundsWord`) copies word 0 and words 2.. and leaves
+word 1 as it is, so the finalize kernel sees the old light state; a new or reused record is copied
+whole (word 1 = 0).
 
 ### 2.1 Group block (in the light heap, section 4)
 

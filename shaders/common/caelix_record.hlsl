@@ -169,6 +169,24 @@ struct EntityInfo
 #define kEntityInfoPrevRow2 112
 static const uint kEntityInfoBytes = 128;
 
+// ---------------------------------------------------------------------------
+// Record scatter (scene/caelix_record_scatter.hlsl): copies the records that
+// caelix_scene_upload_bricks wrote into the staging ring (ReBAR path) or its device-local
+// bounce buffer (bounce path) to their record slots. One entry, 16 bytes, loaded as a uint4:
+//   x   source offset / kRecordScatterSourceUnit (records are 8-byte aligned in the ring)
+//   y   flags: kScatterKeepBoundsWord
+//   zw  the record's device address (low word in z)
+#define kRecordScatterEntryBytes 16
+#define kRecordScatterSourceUnit 8
+// The destination's word 1 (kRecordBoundsWord) stays: the finalize kernel compares the old light
+// state there with the new content of a replaced record.
+#define kScatterKeepBoundsWord 1u
+// Kernel shape: records and threads per workgroup. The largest record in 8-byte words sizes the
+// kernel's per-thread word array.
+#define kScatterRecordsPerGroup 16
+#define kScatterThreadsPerGroup 256
+#define kScatterMaxRecordWords8 (kRecordWords * kRecordWordBytes / kRecordScatterSourceUnit)
+
 // Block encodings (FinalizePush::encoding).
 static const uint kEncodingPacked = 0;
 static const uint kEncodingBlockId = 1;

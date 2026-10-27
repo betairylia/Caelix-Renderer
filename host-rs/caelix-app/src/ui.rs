@@ -380,6 +380,15 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
                 ("bricks resident", s.bricks_resident.to_string()),
                 ("records", format!("{:.1} MiB", mib(s.record_bytes))),
                 ("slot tables", format!("{:.1} MiB", mib(s.slot_table_bytes))),
+                (
+                    "upload path",
+                    match s.upload_path {
+                        1 => "ReBAR",
+                        2 => "bounce",
+                        _ => "?",
+                    }
+                    .to_string(),
+                ),
                 ("AS builds pending", s.as_builds_pending.to_string()),
             ],
         );

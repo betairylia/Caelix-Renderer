@@ -1,5 +1,5 @@
-// The per-frame flush: staging of the tables, copies, fills and the finalize
-// dispatch.
+// The per-frame flush: staging of the tables, the record scatter, copies, fills
+// and the finalize dispatch.
 #include "scene/scene.h"
 
 #include "core/log.h"
@@ -430,10 +430,50 @@ uint32_t Scene::StageDirtyList()
     return static_cast<uint32_t>(fit);
 }
 
+void Scene::RecordScatter(VkCommandBuffer cmd)
+{
+    VkDeviceAddress source = staging_.address();
+    if (upload_path_ == UploadPath::kBounce)
+    {
+        // The ring ranges of this window's records and scatter blocks go to the same offsets of the
+        // device-local bounce buffer in a few large regions (the per-region cost of the copy is what
+        // the kernel avoids); then the kernel reads VRAM instead of system memory over PCIe.
+        std::vector<VkBufferCopy> regions;
+        regions.reserve(upload_ranges_.size());
+        for (const UploadRange& range : upload_ranges_)
+        {
+            regions.push_back(VkBufferCopy{range.begin, range.begin, range.end - range.begin});
+        }
+        for (size_t i = 0; i < regions.size(); i += kMaxRegionsPerCopy)
+        {
+            const size_t n = std::min(kMaxRegionsPerCopy, regions.size() - i);
+            vkCmdCopyBuffer(cmd, staging_.buffer(), bounce_.buffer(), static_cast<uint32_t>(n),
+                            regions.data() + i);
+        }
+        MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        source = bounce_.address();
+    }
+    // ReBAR path: the kernel reads the ring directly; the host writes are visible to the device
+    // once the command buffer is submitted.
+    RecordScatterPush push{};
+    push.source = source;
+    push.record_words8 = layout_.record_bytes / kRecordScatterSourceUnit;
+    for (const ScatterBlock& block : scatter_blocks_)
+    {
+        if (block.count == 0)
+        {
+            continue;  // allocated, then the record did not fit
+        }
+        push.list = source + block.offset;
+        push.count = block.count;
+        const uint32_t groups = (block.count + kScatterRecordsPerGroup - 1) / kScatterRecordsPerGroup;
+        record_scatter_.Dispatch(cmd, &push, sizeof(push), groups);
+    }
+}
+
 void Scene::RecordCopies(VkCommandBuffer cmd)
 {
-    // Regions emptied by StageRecordCopy (a record that switched to one full copy) go first.
-    std::erase_if(pending_, [](const StagedCopy& copy) { return copy.size == 0; });
     // Sort by destination. The sort is stable, so among copies to the same
     // destination (a brick uploaded twice, or a record freed and reused in one
     // window) the last one staged stays last.
@@ -701,15 +741,17 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
         deferred_buffers_.push_back(DeferredBuffer{frame, std::move(*old)});
     }
 
+    const bool scatter = !record_copies_.empty();
     if (!pending_.empty() || !growth.empty() || !fills_.empty() || !aabb_moves_.empty() ||
-        dispatch_count > 0 || as_planned || light_pass || light_transfers)
+        dispatch_count > 0 || as_planned || light_pass || light_transfers || scatter)
     {
         staging_.FlushHostWrites();
         flush_timer_.Begin(cmd, frame, safe_frame_);
 
         // 6. Earlier commands complete before this flush writes: shader reads of reused
-        //    records and rows, and traversal of acceleration structures and builds of
-        //    earlier frames (in-place rebuilds and the reused scratch buffer).
+        //    records and rows, the previous record scatter's reads of the bounce buffer, and
+        //    traversal of acceleration structures and builds of earlier frames (in-place
+        //    rebuilds and the reused scratch buffer).
         MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -749,14 +791,22 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
             TransferBarrier(cmd);
         }
 
-        // 9. Staging -> pools and tables.
+        // 9. Staging -> record pages (the record scatter kernel), then staging -> tables (copies).
+        //    Their destinations are disjoint: no barrier between them.
+        VkPipelineStageFlags2 write_stages = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        VkAccessFlags2 write_access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        if (scatter)
+        {
+            RecordScatter(cmd);
+            write_stages |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            write_access |= VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        }
         RecordCopies(cmd);
 
         // 10. Finalize the dirty bricks, then later commands see everything.
         if (dispatch_count > 0)
         {
-            MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            MemoryBarrier(cmd, write_stages, write_access, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
             FinalizePush push{};
             push.page_table = page_table_.address();
@@ -790,8 +840,7 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
         }
         else
         {
-            MemoryBarrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            MemoryBarrier(cmd, write_stages, write_access, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         }
 
@@ -814,7 +863,9 @@ CaelixResult Scene::Flush(const CaelixFrameDesc& desc)
     // 12. Close the window.
     staging_.CloseFrame(frame);
     pending_.clear();
+    scatter_blocks_.clear();
     record_copies_.clear();
+    upload_ranges_.clear();
     fills_.clear();
     aabb_moves_.clear();
     nan_row_valid_ = false;

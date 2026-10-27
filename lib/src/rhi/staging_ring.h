@@ -17,20 +17,21 @@ namespace caelix {
 //
 // The last RowReserveBytes() are reserved for table rows (slot rows, reverse
 // table words, group and entity info rows, grid cells, page table entries and the
-// finalize dirty list): record uploads (Purpose::kRecords) may fill only
-// capacity - reserve, row writes (Purpose::kRows) may fill all of it. The reserve
-// scales with the capacity: every record that fits (1096 B) may need a 16 B slot
-// row, a 4 B reverse table word and dirty list entries of 16 B for itself and for
-// neighbours, i.e. about 68 B per record = capacity / 16; plus 1 MiB of slack for
-// full group rewrites and info rows. Dirty list entries that do not fit wait for
-// the next flush.
+// finalize dirty list) and the record scatter entries: record uploads
+// (Purpose::kRecords) may fill only capacity - reserve, row writes (Purpose::kRows)
+// may fill all of it. The reserve scales with the capacity: every record that fits
+// (1096 B) may need a 16 B slot row, a 4 B reverse table word and dirty list entries
+// of 16 B for itself and for neighbours, i.e. about 68 B per record = capacity / 16;
+// plus a 16 B record scatter entry (Scene::UploadBricks), capacity / 64; plus 1 MiB
+// of slack for full group rewrites and info rows. Dirty list entries that do not fit
+// wait for the next flush.
 class StagingRing
 {
 public:
     static constexpr uint64_t kRowReserveSlackBytes = 1ull << 20;
     static uint64_t RowReserveBytes(uint64_t capacity)
     {
-        return capacity / 16 + kRowReserveSlackBytes;
+        return capacity / 16 + capacity / 64 + kRowReserveSlackBytes;
     }
 
     enum class Purpose
@@ -46,7 +47,9 @@ public:
     };
 
     StagingRing() = default;
-    StagingRing(VmaAllocator allocator, VkDevice device, uint64_t capacity);
+    // The ring's memory: GpuBuffer::HostUpload(memory, device_address).
+    StagingRing(VmaAllocator allocator, VkDevice device, uint64_t capacity,
+                HostUploadMemory memory = HostUploadMemory::kHost, bool device_address = false);
 
     // Returns false when the ring has no room; nothing changes then.
     bool TryAllocate(uint64_t bytes, uint64_t alignment, Purpose purpose, Span& out);
@@ -59,6 +62,15 @@ public:
     VkBuffer buffer() const
     {
         return buffer_.buffer();
+    }
+    // The ring's device address; 0 when it was created without one.
+    VkDeviceAddress address() const
+    {
+        return buffer_.address();
+    }
+    const GpuBuffer& gpu_buffer() const
+    {
+        return buffer_;
     }
     uint64_t capacity() const
     {

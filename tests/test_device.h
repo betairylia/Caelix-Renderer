@@ -53,7 +53,8 @@ struct Gpu
 };
 
 // A Vulkan 1.3 device with every requirement of caelix_get_device_requirements.
-void CreateGpu(Gpu& gpu, const char* app_name);
+// `validation` = false creates no validation layer and no debug messenger (timing runs).
+void CreateGpu(Gpu& gpu, const char* app_name, bool validation = true);
 void DestroyGpu(Gpu& gpu);
 
 // Adopts the test device.
