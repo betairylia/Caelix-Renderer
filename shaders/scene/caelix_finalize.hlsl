@@ -128,6 +128,13 @@ void main(uint3 group_id : SV_GroupID, uint3 thread_id : SV_GroupThreadID)
     // 1. Thread 0 resolves the dirty entry; threads 0..15 and 0..2 reset the accumulators.
     if (t == 0)
     {
+        /*
+            uint4 entry: Dirty entry struct
+                .x  Render group index
+                .y  Dense brick ID (in group) to fill, pre-assigned by CPU
+                .z  Record pool (brick voxel data) index, essentially a shortcut?
+                .w  Reserved
+        */
         const uint4 entry = CAELIX_LOAD_U32x4(g_push.dirty_list + uint64_t(group_id.x) * kDirtyEntryBytes);
         const uint64_t info = g_push.group_infos + uint64_t(entry.x) * kGroupInfoBytes;
         const uint4 w0 = CAELIX_LOAD_U32x4(info);  // coord, entity (kGroupInfoCoord = 0)
