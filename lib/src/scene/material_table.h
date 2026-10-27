@@ -21,11 +21,16 @@ constexpr uint32_t kMaterialIor = 32;
 constexpr uint32_t kMaterialSssAnisotropy = 40;
 constexpr uint32_t kMaterialSssSteps = 44;
 constexpr uint32_t kSubsurfaceRowBytes = 16;
+// The SGGX table (experiment sss-expr, "SGGX foliage medium"): kSggxRowBytes per code = the struct's bytes
+// 64 .. 95, the rows (S xx, yy, zz, xy) at kSggxS0 and (S xz, yz, sggx_density, sggx_transmission) at kSggxS1.
+constexpr uint32_t kSggxRowBytes = 32;
+constexpr uint32_t kSggxS0 = 0;
+constexpr uint32_t kSggxS1 = 16;
 // Limits of the subsurface fields of an entry with sss_probability > 0 (docs/SSS_EXPERIMENT.md).
 constexpr uint32_t kMaterialSssMaxSteps = 4096;
 constexpr float kMaterialSssMaxAnisotropy = 0.99f;
-static_assert(sizeof(CaelixMaterial) == kMaterialBytes + kSubsurfaceRowBytes,
-              "CaelixMaterial is the main table row followed by the subsurface row");
+static_assert(sizeof(CaelixMaterial) == kMaterialBytes + kSubsurfaceRowBytes + kSggxRowBytes,
+              "CaelixMaterial is the main table row, the subsurface row and the SGGX row");
 static_assert(offsetof(CaelixMaterial, albedo) == kMaterialAlbedo);
 static_assert(offsetof(CaelixMaterial, emission) == kMaterialEmission);
 static_assert(offsetof(CaelixMaterial, ior) == kMaterialIor);
@@ -33,6 +38,9 @@ static_assert(offsetof(CaelixMaterial, sss_anisotropy) == kMaterialSssAnisotropy
 static_assert(offsetof(CaelixMaterial, sss_steps) == kMaterialSssSteps);
 static_assert(offsetof(CaelixMaterial, sss_albedo) == kMaterialBytes);
 static_assert(offsetof(CaelixMaterial, sss_probability) == kMaterialBytes + 12);
+static_assert(offsetof(CaelixMaterial, sggx_s) == kMaterialBytes + kSubsurfaceRowBytes + kSggxS0);
+static_assert(offsetof(CaelixMaterial, sggx_density) == kMaterialBytes + kSubsurfaceRowBytes + kSggxS1 + 8);
+static_assert(offsetof(CaelixMaterial, sggx_transmission) == kMaterialBytes + kSubsurfaceRowBytes + kSggxS1 + 12);
 
 // The CPU copy of a scene's material table: one CaelixMaterial per 16-bit block
 // code. The GPU holds it as two buffers, the main table and the subsurface table
@@ -50,7 +58,7 @@ class MaterialTable
 {
 public:
     static constexpr uint32_t kEntries = 65536;
-    static constexpr uint32_t kChunkEntries = 1024;  // upload granularity: 48 + 16 KiB
+    static constexpr uint32_t kChunkEntries = 1024;  // upload granularity: 48 + 16 + 32 KiB
     static constexpr uint32_t kChunks = kEntries / kChunkEntries;
     static_assert(kChunks == 64, "the dirty mask is one uint64_t");
     // The two GPU tables and one chunk of each.
@@ -58,8 +66,10 @@ public:
     static constexpr uint64_t kSubsurfaceBytes = static_cast<uint64_t>(kEntries) * kSubsurfaceRowBytes;
     static constexpr uint64_t kChunkMainBytes = static_cast<uint64_t>(kChunkEntries) * kMaterialBytes;
     static constexpr uint64_t kChunkSubsurfaceBytes = static_cast<uint64_t>(kChunkEntries) * kSubsurfaceRowBytes;
-    // Staging bytes of one chunk: its main rows, then its subsurface rows.
-    static constexpr uint64_t kChunkBytes = kChunkMainBytes + kChunkSubsurfaceBytes;
+    static constexpr uint64_t kSggxBytes = static_cast<uint64_t>(kEntries) * kSggxRowBytes;
+    static constexpr uint64_t kChunkSggxBytes = static_cast<uint64_t>(kChunkEntries) * kSggxRowBytes;
+    // Staging bytes of one chunk: its main rows, its subsurface rows, then its SGGX rows.
+    static constexpr uint64_t kChunkBytes = kChunkMainBytes + kChunkSubsurfaceBytes + kChunkSggxBytes;
 
     // Builds the built-in table of `encoding` (0 packed, 1 block-ID); every chunk is dirty.
     explicit MaterialTable(uint32_t encoding);
@@ -105,9 +115,10 @@ public:
     {
         dirty_chunks_ &= ~(1ull << chunk);
     }
-    // Writes chunk `chunk` as the GPU sees it: kChunkMainBytes of main rows to `main_rows`, then
-    // kChunkSubsurfaceBytes of subsurface rows to `subsurface_rows`.
-    void WriteGpuChunk(uint32_t chunk, uint8_t* main_rows, uint8_t* subsurface_rows) const;
+    // Writes chunk `chunk` as the GPU sees it: kChunkMainBytes of main rows to `main_rows`,
+    // kChunkSubsurfaceBytes of subsurface rows to `subsurface_rows` and kChunkSggxBytes of SGGX rows to
+    // `sggx_rows`.
+    void WriteGpuChunk(uint32_t chunk, uint8_t* main_rows, uint8_t* subsurface_rows, uint8_t* sggx_rows) const;
     // True when an OPAQUE code has sss_probability > 0 (the renderer then binds the trace kernels with
     // the subsurface walk). Kept up to date by Replace and Set; SetGlassPalette writes transparent
     // codes only, which never count.

@@ -205,6 +205,11 @@ public:
     {
         return subsurface_buffer_.address();
     }
+    // The GPU SGGX table: 65536 rows of kSggxRowBytes by block code (experiment, SGGX foliage medium).
+    VkDeviceAddress sggx_table_address() const
+    {
+        return sggx_buffer_.address();
+    }
     // The material table has an opaque entry with sss_probability > 0 (MaterialTable::has_subsurface).
     bool has_subsurface() const
     {
@@ -388,7 +393,8 @@ private:
     std::unique_ptr<MaterialTable> materials_;  // CPU copy of the material table
     GpuBuffer material_buffer_;                 // MaterialTable::kMainBytes, device local
     GpuBuffer subsurface_buffer_;               // MaterialTable::kSubsurfaceBytes, device local
-    bool material_buffer_filled_ = false;       // the zero fill of both tables in the first flush was recorded
+    GpuBuffer sggx_buffer_;                     // MaterialTable::kSggxBytes, device local
+    bool material_buffer_filled_ = false;       // the zero fill of the three tables in the first flush was recorded
     ComputePipeline finalize_;
     GpuTimer flush_timer_;  // brackets the work that a flush records
 

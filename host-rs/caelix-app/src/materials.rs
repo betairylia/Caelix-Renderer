@@ -5,13 +5,18 @@
 //! ```json
 //! [{ "id": 1, "albedo": [0.9, 0.9, 0.9], "smoothness": 1.0, "metallic": 1.0,
 //!    "emission": [0, 0, 0], "ior": 1.5, "extinction": 0.0, "transparent": false,
-//!    "sss_albedo": [1, 1, 1], "sss_probability": 0.0, "sss_steps": 16, "sss_anisotropy": 0.0 }]
+//!    "sss_albedo": [1, 1, 1], "sss_probability": 0.0, "sss_steps": 16, "sss_anisotropy": 0.0,
+//!    "sggx": { "kind": "surface", "axis": [0, 1, 0], "roughness": 0.3, "density": 0.5,
+//!              "transmission": 0.4 } }]
 //! ```
 //!
 //! Every field except `id` is optional (defaults: albedo 1, smoothness 0, metallic 0, emission 0,
 //! ior 1.5, extinction 0, transparent false, sss_albedo 1, sss_probability 0, sss_steps 16,
 //! sss_anisotropy 0). The `sss_*` fields are the subsurface walk of opaque entries (experiment branch
-//! sss-expr, `docs/SSS_EXPERIMENT.md`). Mapping to block codes (the block-ID encoding): an
+//! sss-expr, `docs/SSS_EXPERIMENT.md`). The optional `sggx` object makes an opaque SSS entry an SGGX
+//! foliage medium ("SGGX foliage medium" in that doc): `kind` "surface" (S = n n^T + r^2 (I - n n^T)),
+//! "fiber" (S = r^2 n n^T + (I - n n^T)) or "isotropic" (S = I), n = the normalized `axis`; defaults
+//! kind "surface", axis [0, 1, 0], roughness 0.3, density 1, transmission 0. Mapping to block codes (the block-ID encoding): an
 //! opaque entry goes to code `0x8000 | id` (id 0..32767), a transparent entry to code `id` (id
 //! 0..511). The rest of the table keeps the library's built-in content: the host reads every
 //! entry with `caelix_scene_get_material`, replaces the listed ones and writes the whole table.
@@ -92,7 +97,41 @@ fn parse_entry(entry: &Value) -> anyhow::Result<(usize, CaelixMaterial)> {
         sss_steps: unsigned(entry, "sss_steps", 16)?,
         sss_albedo: vec3(entry, "sss_albedo", [1.0; 3])?,
         sss_probability: number(entry, "sss_probability", 0.0)?,
+        sggx_s: [0.0; 6],
+        sggx_density: 0.0,
+        sggx_transmission: 0.0,
     };
+    let mut material = material;
+    if let Some(sggx) = entry.get("sggx") {
+        if !sggx.is_object() {
+            bail!("\"sggx\" is not an object");
+        }
+        let kind = match sggx.get("kind") {
+            None => "surface",
+            Some(value) => value.as_str().context("\"sggx.kind\" is not a string")?,
+        };
+        let axis = vec3(sggx, "axis", [0.0, 1.0, 0.0])?;
+        let length = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        if !(length > 0.0) {
+            bail!("\"sggx.axis\" has length 0");
+        }
+        let n = axis.map(|c| c / length);
+        let r = number(sggx, "roughness", 0.3)?;
+        // S = a n n^T + b (I - n n^T) as (xx, yy, zz, xy, xz, yz).
+        let (a, b) = match kind {
+            "surface" => (1.0, r * r),
+            "fiber" => (r * r, 1.0),
+            "isotropic" => (1.0, 1.0),
+            other => bail!("\"sggx.kind\" {other:?} is not surface, fiber or isotropic"),
+        };
+        let m = |i: usize, j: usize| {
+            let identity = if i == j { 1.0 } else { 0.0 };
+            a * n[i] * n[j] + b * (identity - n[i] * n[j])
+        };
+        material.sggx_s = [m(0, 0), m(1, 1), m(2, 2), m(0, 1), m(0, 2), m(1, 2)];
+        material.sggx_density = number(sggx, "density", 1.0)?;
+        material.sggx_transmission = number(sggx, "transmission", 0.0)?;
+    }
     Ok((code, material))
 }
 
@@ -113,6 +152,9 @@ pub fn apply(scene: *mut CaelixScene, path: &Path) -> anyhow::Result<()> {
         sss_steps: 0,
         sss_albedo: [0.0; 3],
         sss_probability: 0.0,
+        sggx_s: [0.0; 6],
+        sggx_density: 0.0,
+        sggx_transmission: 0.0,
     };
     let mut table = vec![empty; ENTRIES];
     for (code, slot) in table.iter_mut().enumerate() {

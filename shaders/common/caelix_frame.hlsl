@@ -85,7 +85,10 @@ struct CaelixFrameConstants
     uint64_t group_grids;           // 568  u32 group grid pool base (group index or 0xFFFFFFFF)
     uint64_t subsurface_table;      // 576  (sss_albedo, sss_probability) rows (16 B) by block code (render/caelix_subsurface.hlsl)
     uint pad_584;                   // 584
-    uint voxel_color;               // 588  1 = per-voxel colour pass (experiment, docs/VOXEL_COLOR_EXPERIMENT.md) -> 592
+    uint voxel_color;               // 588  1 = per-voxel colour pass (experiment, docs/VOXEL_COLOR_EXPERIMENT.md)
+    uint64_t sggx_table;            // 592  SGGX rows (32 B) by block code (render/caelix_subsurface.hlsl)
+    uint pad_600;                   // 600
+    uint pad_604;                   // 604 -> 608
 };
 
 // CaelixDebugView

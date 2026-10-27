@@ -35,6 +35,11 @@ static const uint kMaterialBytes = 48;
 #define kMaterialSssAnisotropy 40
 #define kMaterialSssSteps 44
 #define kSubsurfaceRowBytes 16
+// The SGGX table (CaelixFrameConstants::sggx_table, experiment sss-expr): kSggxRowBytes per code, rows
+// (S xx, yy, zz, xy) at kSggxS0 and (S xz, yz, sggx_density, sggx_transmission) at kSggxS1.
+#define kSggxRowBytes 32
+#define kSggxS0 0
+#define kSggxS1 16
 
 // Set by the kernel from CaelixFrameConstants::materials before the first lookup.
 static uint64_t g_materialTable;

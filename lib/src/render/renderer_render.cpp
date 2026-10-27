@@ -561,6 +561,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.reverse_tables = scene_.reverse_tables_address();
     constants.group_grids = scene_.group_grids_address();
     constants.subsurface_table = scene_.subsurface_table_address();
+    constants.sggx_table = scene_.sggx_table_address();
     if (voxel_color)
     {
         constants.voxel_color = 1;

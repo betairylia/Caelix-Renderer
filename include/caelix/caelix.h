@@ -80,7 +80,9 @@ extern "C" {
    CaelixMaterial::pad by sss_anisotropy and sss_steps and appended sss_albedo and sss_probability (48 ->
    64 bytes, CaelixMaterialEntry 52 -> 68 bytes) and added CAELIX_RENDER_FLAG_SUBSURFACE, also without a
    bump. The voxel colour experiment (branch sss-voxel-color-expr, docs/VOXEL_COLOR_EXPERIMENT.md) added
-   CAELIX_RENDER_FLAG_VOXEL_COLOR (a new flag bit), also without a bump. A host built against an older
+   CAELIX_RENDER_FLAG_VOXEL_COLOR (a new flag bit), also without a bump. The SGGX foliage step (branch
+   sss-expr) appended sggx_s, sggx_density and sggx_transmission to CaelixMaterial (64 -> 96 bytes,
+   CaelixMaterialEntry 68 -> 100 bytes), also without a bump. A host built against an older
    version-2 header must be rebuilt (the library reads
    and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -392,8 +394,8 @@ typedef struct CaelixSceneStats
     uint64_t as_builds_pending;    /* groups whose BLAS is out of date (waiting for finalization,
                                       scratch or ring space), plus 1 when the TLAS is out of date */
     uint64_t material_table_bytes; /* GPU size of the material table: the main table and, on the
-                                      experiment branch sss-expr, the subsurface table
-                                      (65536 * (48 + 16) = 4 MiB) */
+                                      experiment branch sss-expr, the subsurface and SGGX tables
+                                      (65536 * (48 + 16 + 32) = 6 MiB) */
     uint64_t upload_bricks_free; /* upper bound of the bricks that caelix_scene_upload_bricks accepts
                                     before the next flush, from the free staging space minus the row
                                     reserve (wrap fragmentation can make the real number smaller;
@@ -473,9 +475,9 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * upload has completed the GPU table is all zero (black, no emission).
  * ------------------------------------------------------------------------- */
 
-/* One material table entry. 64 bytes. All values are linear. The GPU keeps the first 48 bytes per code
-   in the main table and (sss_albedo, sss_probability) per code in a separate subsurface table (experiment
-   branch sss-expr), so the main kernels keep a 48-byte stride. */
+/* One material table entry. 96 bytes. All values are linear. The GPU keeps the first 48 bytes per code
+   in the main table, (sss_albedo, sss_probability) per code in a separate subsurface table and the 32 SGGX
+   bytes per code in an SGGX table (experiment branch sss-expr), so the main kernels keep a 48-byte stride. */
 typedef struct CaelixMaterial
 {
     float albedo[3];   /* diffuse / base colour; for a transparent medium its tint */
@@ -501,6 +503,15 @@ typedef struct CaelixMaterial
                               it is absorbed (the entry material's value) */
     float sss_albedo[3];   /* per-step survival colour of a voxel; each in [0, 1] when sss_probability > 0 */
     float sss_probability; /* p in [0, 1]; 0 = no subsurface scattering */
+    /* SGGX foliage medium (experiment branch sss-expr, docs/SSS_EXPERIMENT.md "SGGX foliage medium"). An
+       opaque entry with sggx_density > 0 (and sss_probability > 0) runs an SGGX walk instead of the lattice
+       walk: free flight through its voxels with extinction sggx_density * sqrt(w^T S w) per voxel unit, leaf
+       events that reflect or transmit (sss_albedo per event, sss_steps = the event cap); light can pass
+       through. The G-buffer keeps the opaque entry face. */
+    float sggx_s[6];         /* the SGGX matrix S (xx, yy, zz, xy, xz, yz), object space of the entity;
+                                positive definite when sggx_density > 0 */
+    float sggx_density;      /* >= 0; 0 = no SGGX (the lattice walk) */
+    float sggx_transmission; /* [0, 1] when sggx_density > 0: the chance that a leaf event transmits */
 } CaelixMaterial;
 
 /* Replaces the whole material table: entries [0, count) come from `entries`, entries [count, 65536)
@@ -508,7 +519,8 @@ typedef struct CaelixMaterial
    count <= 65536 (0 restores the default table).
    Every value must be finite, ior > 0, extinction >= 0, sss_probability in [0, 1] and, when
    sss_probability > 0, sss_steps in 1 .. 4096, every sss_albedo component in [0, 1] and sss_anisotropy
-   in [-0.99, 0.99]: an invalid entry returns
+   in [-0.99, 0.99], sggx_density >= 0 and, when sggx_density > 0, sss_probability > 0, sggx_transmission
+   in [0, 1] and S positive definite (xx > 0, xx yy - xy^2 > 0, det S > 0): an invalid entry returns
    CAELIX_ERROR_INVALID_ARGUMENT (logged, the table is unchanged). Entries of transparent codes with
    face bits are stored but never read. Packed scenes: a later caelix_scene_set_glass_palette
    rewrites the transparent codes. */
@@ -521,7 +533,7 @@ CAELIX_API CaelixResult caelix_scene_set_materials(CaelixScene* scene, const Cae
 CAELIX_API CaelixResult caelix_scene_set_glass_palette(CaelixScene* scene,
                                                        const CaelixMaterial* entries, uint32_t count);
 
-/* One entry of caelix_scene_set_material_entries: a 16-bit block code and its table entry. 68 bytes. */
+/* One entry of caelix_scene_set_material_entries: a 16-bit block code and its table entry. 100 bytes. */
 typedef struct CaelixMaterialEntry
 {
     uint32_t code; /* 0 .. 0xFFFF */

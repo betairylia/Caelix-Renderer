@@ -18,6 +18,9 @@
 // CAELIX_SUBSURFACE 1 only in the trace kernels caelix_path_trace_sss(_no_light_nee) (the renderer binds
 // them for lighting frames with the flag whose scene has an SSS material); the default 0 compiles
 // nothing of this file, so the main trace kernels keep their code.
+//
+// SGGX foliage (step 2): an entry material with sggx_density > 0 runs SggxWalk instead of the lattice
+// walk: free flight through an SGGX microflake medium, light can pass through (kSubsurfacePass).
 #ifndef CAELIX_SUBSURFACE_HLSL
 #define CAELIX_SUBSURFACE_HLSL
 
@@ -40,6 +43,10 @@ static const uint kSubsurfaceNone = 0;  // not an SSS material: the shade stands
 static const uint kSubsurfaceBsdf = 1;  // an SSS material whose draw chose the surface BSDF: the shade stands
 static const uint kSubsurfaceExit = 2;  // the walk left the medium: the shade is the exit vertex
 static const uint kSubsurfaceDead = 3;  // the walk reached its step cap: the path ends at this vertex
+static const uint kSubsurfacePass = 4;  // SGGX: the walk left the medium without an event: not a vertex,
+                                        // the ray continues from the exit on its line
+static const uint kSubsurfaceSggxExit = 5;  // SGGX: exit after events: a vertex whose bounce is the exit's
+                                            // direction (no lobe), lamp NEE without MIS
 
 // ---------------------------------------------------------------------------
 // The voxel cursor
@@ -263,16 +270,226 @@ bool SubsurfaceWalk(CaelixFrameConstants fc, TraceResult hit, float3 ray_directi
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// The SGGX foliage walk (docs/SSS_EXPERIMENT.md, "SGGX foliage medium")
+
+// Voxel crossings of one SGGX walk before it counts as dead; PASSes per path (TracePath).
+static const uint kSggxMaxVoxelSteps = 1024;
+static const uint kMaxPassThroughs = 16;
+
+// The SGGX matrix S of the table rows (S xx, yy, zz, xy) and (S xz, yz, density, transmission).
+struct SggxMatrix
+{
+    float xx, yy, zz, xy, xz, yz;
+};
+
+// w^T S w.
+float SggxQuadratic(SggxMatrix S, float3 a, float3 b)
+{
+    return a.x * b.x * S.xx + a.y * b.y * S.yy + a.z * b.z * S.zz + (a.x * b.y + a.y * b.x) * S.xy +
+           (a.x * b.z + a.z * b.x) * S.xz + (a.y * b.z + a.z * b.y) * S.yz;
+}
+
+// A visible normal of the SGGX distribution S for the unit direction wi (Heitz et al. 2015, appendix,
+// sample_VNDF; u1, u2 uniform in [0, 1)).
+float3 SggxSampleVisibleNormal(float3 wi, SggxMatrix S, float u1, float u2)
+{
+    const float r = sqrt(u1);
+    const float phi = K_TWO_PI * u2;
+    const float u = r * cos(phi);
+    const float v = r * sin(phi);
+    const float w = sqrt(max(1.0f - u * u - v * v, 0.0f));
+    float3 wk;
+    float3 wj;
+    OrthonormalBasis(wi, wk, wj);
+    const float S_kk = SggxQuadratic(S, wk, wk);
+    const float S_jj = SggxQuadratic(S, wj, wj);
+    const float S_ii = SggxQuadratic(S, wi, wi);
+    const float S_kj = SggxQuadratic(S, wk, wj);
+    const float S_ki = SggxQuadratic(S, wk, wi);
+    const float S_ji = SggxQuadratic(S, wj, wi);
+    const float sqrt_det_skji = sqrt(abs(S_kk * S_jj * S_ii - S_kj * S_kj * S_ii - S_ki * S_ki * S_jj -
+                                         S_ji * S_ji * S_kk + 2.0f * S_kj * S_ki * S_ji));
+    const float inv_sqrt_s_ii = rsqrt(max(S_ii, 1e-20f));
+    const float tmp = sqrt(max(S_jj * S_ii - S_ji * S_ji, 1e-20f));
+    const float3 Mk = float3(sqrt_det_skji / tmp, 0.0f, 0.0f);
+    const float3 Mj = float3(-inv_sqrt_s_ii * (S_ki * S_ji - S_kj * S_ii) / tmp, inv_sqrt_s_ii * tmp, 0.0f);
+    const float3 Mi = float3(inv_sqrt_s_ii * S_ki, inv_sqrt_s_ii * S_ji, inv_sqrt_s_ii * S_ii);
+    const float3 wm_kji = SafeNormalize(u * Mk + v * Mj + w * Mi);
+    return wm_kji.x * wk + wm_kji.y * wj + wm_kji.z * wi;
+}
+
+// A direction from the cosine lobe around the unit vector n (the diffuse lobe of ShadeVoxelHit).
+float3 SggxCosineAround(float3 n, inout uint rng)
+{
+    const float3 d = SafeNormalize(n + RandomUnitVector(rng));
+    return dot(d, d) > 0.0f ? d : n;
+}
+
+// The density of the SGGX medium of a raw block value (0 = none): row kSggxS1 .z of the SGGX table.
+float SggxDensity(CaelixFrameConstants fc, uint block)
+{
+    const uint64_t row = fc.sggx_table + uint64_t(CaelixMaterialCode(block)) * kSggxRowBytes + kSggxS1;
+    return asfloat(CAELIX_LOAD_U32x4(row).z);
+}
+
+// The SGGX walk from the face hit `hit` of a ray with world direction `ray_direction` (entry material
+// with sggx_density > 0): a continuous position p and direction d in the entity's object space, a 3D
+// DDA over its voxels with free flight. Per voxel: the distance l to its boundary along d, sigma_t =
+// density sqrt(d^T S d), a free distance s = -ln(1 - u) / sigma_t; s < l: a leaf event at p + s d
+// (weight *= sss_albedo, a visible normal wm of S for -d, then d = the cosine lobe around -wm with
+// probability sggx_transmission, else around wm); else p moves to the boundary and the cursor steps
+// across that face: an SSS voxel continues the walk, an opaque voxel without SSS is a wall (cosine around
+// the face normal back into the medium, counts as an event), anything else is the exit (origin = the
+// boundary point pushed off along the face normal, direction = d, both in world space). Every medium
+// parameter comes from the ENTRY material. Returns kSubsurfacePass (exit without events),
+// kSubsurfaceSggxExit (exit after >= 1 events) or kSubsurfaceDead (more than sss_steps events or more
+// than kSggxMaxVoxelSteps voxel crossings).
+uint SggxWalk(CaelixFrameConstants fc, TraceResult hit, float3 ray_direction, inout uint rng,
+              out float3 origin, out float3 normal, out float3 direction, out float3 weight)
+{
+    origin = float3(0.0f, 0.0f, 0.0f);
+    normal = float3(0.0f, 0.0f, 0.0f);
+    direction = float3(0.0f, 0.0f, 0.0f);
+    weight = float3(0.0f, 0.0f, 0.0f);
+    const SceneLookup s = FrameSceneLookup(fc);
+    MediumCursor c = MediumCursorFromHit(fc, s, hit);
+    const uint block = (hit.attrib >> 16) & 0xFFFFu;
+    const uint code = CaelixMaterialCode(block);
+    const uint steps = CAELIX_LOAD_U32(g_materialTable + uint64_t(code) * kMaterialBytes + kMaterialSssSteps);
+    const float3 a = asfloat(CAELIX_LOAD_U32x4(fc.subsurface_table + uint64_t(code) * kSubsurfaceRowBytes)).xyz;
+    const uint64_t sggx_row = fc.sggx_table + uint64_t(code) * kSggxRowBytes;
+    const float4 r0 = asfloat(CAELIX_LOAD_U32x4(sggx_row + kSggxS0));
+    const float4 r1 = asfloat(CAELIX_LOAD_U32x4(sggx_row + kSggxS1));
+    SggxMatrix S;
+    S.xx = r0.x;
+    S.yy = r0.y;
+    S.zz = r0.z;
+    S.xy = r0.w;
+    S.xz = r1.x;
+    S.yz = r1.y;
+    const float density = r1.z;
+    const float transmission = r1.w;
+    float3 p = hit.object_hit;
+    float3 d = SafeNormalize(EntityObjectDirectionById(fc, c.entity, ray_direction));
+    float3 w = float3(1.0f, 1.0f, 1.0f);
+    uint events = 0;
+    uint voxel_steps = 0;
+    CAELIX_LOOP
+    for (;;)
+    {
+        // Distance to the voxel boundary along d and the axis of that face.
+        const float3 lo = float3(c.voxel);
+        const float3 bound = float3(d.x >= 0.0f ? lo.x + 1.0f : lo.x, d.y >= 0.0f ? lo.y + 1.0f : lo.y,
+                                    d.z >= 0.0f ? lo.z + 1.0f : lo.z);
+        const float3 t3 = float3(abs(d.x) > 1e-8f ? (bound.x - p.x) / d.x : 1e30f,
+                                 abs(d.y) > 1e-8f ? (bound.y - p.y) / d.y : 1e30f,
+                                 abs(d.z) > 1e-8f ? (bound.z - p.z) / d.z : 1e30f);
+        uint axis = 0;
+        float l = t3.x;
+        if (t3.y < l)
+        {
+            axis = 1;
+            l = t3.y;
+        }
+        if (t3.z < l)
+        {
+            axis = 2;
+            l = t3.z;
+        }
+        l = max(l, 0.0f);
+        const float sigma_t = density * sqrt(max(SggxQuadratic(S, d, d), 0.0f));
+        const float free_distance = sigma_t > 0.0f ? -log(1.0f - RandomFloat01(rng)) / sigma_t : 1e30f;
+        if (free_distance < l)
+        {
+            // A leaf event inside the current voxel.
+            p += free_distance * d;
+            w *= a;
+            events += 1;
+            if (events > steps)
+            {
+                return kSubsurfaceDead;
+            }
+            const float u1 = RandomFloat01(rng);
+            const float u2 = RandomFloat01(rng);
+            const float3 wm = SggxSampleVisibleNormal(-d, S, u1, u2);
+            d = SggxCosineAround(RandomFloat01(rng) < transmission ? -wm : wm, rng);
+            continue;
+        }
+        // Across the boundary face.
+        p += l * d;
+        int3 delta = int3(0, 0, 0);
+        if (axis == 0)
+        {
+            p.x = bound.x;
+            delta.x = d.x >= 0.0f ? 1 : -1;
+        }
+        else if (axis == 1)
+        {
+            p.y = bound.y;
+            delta.y = d.y >= 0.0f ? 1 : -1;
+        }
+        else
+        {
+            p.z = bound.z;
+            delta.z = d.z >= 0.0f ? 1 : -1;
+        }
+        voxel_steps += 1;
+        if (voxel_steps > kSggxMaxVoxelSteps)
+        {
+            return kSubsurfaceDead;
+        }
+        MediumCursor next = c;
+        MediumStep(s, next, delta);
+        const uint next_block = MediumBlock(next);
+        float4 row;
+        if (SubsurfaceRow(fc, next_block, row))
+        {
+            c = next;
+            continue;
+        }
+        const float3 n = float3(delta);
+        if (IsOpaque(int(next_block)))
+        {
+            // A wall: back into the medium around the face normal; counts as an event.
+            w *= a;
+            events += 1;
+            if (events > steps)
+            {
+                return kSubsurfaceDead;
+            }
+            d = SggxCosineAround(-n, rng);
+            continue;
+        }
+        // The exit: on the ray's line (no lobe).
+        normal = EntityWorldDirectionById(fc, c.entity, n);
+        origin = EntityWorldPointById(fc, c.entity, p) + K_RAY_ORIGIN_PUSH_OFF * normal;
+        direction = SafeNormalize(EntityWorldDirectionById(fc, c.entity, d));
+        weight = w;
+        return events == 0 ? kSubsurfacePass : kSubsurfaceSggxExit;
+    }
+    return kSubsurfaceDead;
+}
+
 // The subsurface choice at a path vertex: the hit `hit` of a ray with world direction `ray_direction`,
 // after ShadeVoxelHit gave `shade`. An SSS material (SubsurfaceRow; `row` = its row, 0 otherwise) draws
 // one number of `rng`: below its sss_probability the walk runs and its exit replaces the vertex (albedo
 // = the walk's weight, the exit's bounce origin and direction, the diffuse lobe with roughness 1, and
 // `vertex_normal` = the exit normal); a dead walk sets the albedo to 0. Other materials draw nothing.
+// An entry material with sggx_density > 0 runs SggxWalk: kSubsurfacePass (albedo 1, the continuation as
+// bounce origin and direction), kSubsurfaceSggxExit (as an exit, but the bounce direction is the walk's
+// direction) or kSubsurfaceDead. `last_vertex` (no bounce left): the lattice walk is skipped (only the
+// emission counts there), the SGGX walk still runs (a PASS continues the path).
 uint SubsurfaceVertex(CaelixFrameConstants fc, TraceResult hit, float3 ray_direction, inout uint rng,
-                      inout CaelixShadeResult shade, inout float3 vertex_normal, out float4 row)
+                      inout CaelixShadeResult shade, inout float3 vertex_normal, out float4 row, bool last_vertex)
 {
     const uint block = (hit.attrib >> 16) & 0xFFFFu;
     if (!SubsurfaceRow(fc, block, row))
+    {
+        return kSubsurfaceNone;
+    }
+    const bool sggx = SggxDensity(fc, block) > 0.0f;
+    if (last_vertex && !sggx)
     {
         return kSubsurfaceNone;
     }
@@ -284,6 +501,23 @@ uint SubsurfaceVertex(CaelixFrameConstants fc, TraceResult hit, float3 ray_direc
     float3 normal;
     float3 direction;
     float3 weight;
+    CAELIX_BRANCH
+    if (sggx)
+    {
+        const uint kind = SggxWalk(fc, hit, ray_direction, rng, origin, normal, direction, weight);
+        if (kind == kSubsurfaceDead)
+        {
+            shade.albedo = float3(0.0f, 0.0f, 0.0f);
+            return kSubsurfaceDead;
+        }
+        shade.albedo = weight;
+        shade.bounce_origin = origin;
+        shade.bounce_direction = direction;
+        shade.specular_lobe = false;
+        shade.roughness = 1.0f;
+        vertex_normal = normal;
+        return kind;
+    }
     if (!SubsurfaceWalk(fc, hit, ray_direction, rng, origin, normal, direction, weight))
     {
         shade.albedo = float3(0.0f, 0.0f, 0.0f);

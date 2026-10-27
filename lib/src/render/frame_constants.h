@@ -8,7 +8,7 @@ namespace caelix {
 // together. One per render call, in the frame slot's host-visible buffer, which the six
 // frame-constant kernels (caelix_path_trace, caelix_composite, caelix_cross_resolve, caelix_sky_sh,
 // caelix_upscale_encode, caelix_voxel_accumulate) read as a uniform buffer: the frame set (set kFrameSetIndex, binding
-// kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 592 bytes.
+// kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 608 bytes.
 // Layout rule: the uniform block has DXC's default constant buffer layout, which gives these C
 // offsets only while every field sits at an offset that is a multiple of its size (float4 at 16,
 // uint64_t and uint2 at 8), no vector crosses a 16-byte row and every array element is 16 bytes (an
@@ -87,8 +87,11 @@ struct FrameConstants
     uint64_t subsurface_table;          // 576  (sss_albedo, sss_probability) rows (16 B) by block code (experiment sss-expr)
     uint32_t pad_584;                   // 584
     uint32_t voxel_color;               // 588  1 = the per-voxel colour pass runs (experiment, docs/VOXEL_COLOR_EXPERIMENT.md)
+    uint64_t sggx_table;                // 592  SGGX rows (32 B) by block code (experiment sss-expr, SGGX foliage medium)
+    uint32_t pad_600;                   // 600
+    uint32_t pad_604;                   // 604
 };
-static_assert(sizeof(FrameConstants) == 592);
+static_assert(sizeof(FrameConstants) == 608);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -130,6 +133,8 @@ static_assert(offsetof(FrameConstants, reverse_tables) == 560);
 static_assert(offsetof(FrameConstants, group_grids) == 568);
 static_assert(offsetof(FrameConstants, subsurface_table) == 576);
 static_assert(offsetof(FrameConstants, voxel_color) == 588);
+static_assert(offsetof(FrameConstants, sggx_table) == 592);
+static_assert(offsetof(FrameConstants, pad_604) == 604);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

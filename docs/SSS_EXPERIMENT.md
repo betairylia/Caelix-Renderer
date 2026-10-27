@@ -198,3 +198,23 @@ Result kinds: PASS (exit with 0 events), EXIT (>= 1 events), DEAD.
 - G-buffer / NRD: unchanged (the entry face; diffuse target, roughness 1). Known: through-foliage pixels
   smear under camera motion (accepted for the first test).
 - Shadow rays: foliage stays opaque (owner: ignore for now).
+
+### As built (SGGX, 2026-10-27; smoke test `Artifacts/sss-20261026/sggx/README.md`)
+
+- Code: `SggxWalk`, `SggxSampleVisibleNormal` (the paper's `sample_VNDF`), `SggxDensity` in
+  `shaders/render/caelix_subsurface.hlsl`; result kinds `kSubsurfacePass` / `kSubsurfaceSggxExit` /
+  `kSubsurfaceDead`; `kSggxMaxVoxelSteps` 1024, `kMaxPassThroughs` 16. GPU: `MaterialTable::kSggxBytes`
+  (2 MiB), `kSggxRowBytes` 32, rows `kSggxS0` / `kSggxS1`; the chunk upload writes the three tables from
+  one staging span; all three are zero-filled in the first flush. `material_table_bytes` = 6 MiB.
+- `NextEventAtVertex` gained `allow_mis` (the main kernels pass `true`; SGGX exit vertices `false`).
+- DEVIATION (unspecified defaults): host JSON `sggx.kind` defaults to "surface" and `sggx.density` to 1.
+- DEVIATION (validation detail): `sggx_transmission` in [0, 1] is checked only when `sggx_density > 0`,
+  like the other SGGX conditions; `sggx_density >= 0` and finite values are always checked.
+- Primary PASS: implemented by marking the primary shade specular for the NEE test (restored to the
+  diffuse lobe, roughness 1, for the G-buffer). With `bounce_count = 0` a primary PASS has no continuation
+  (the loop does not run): only the hit's emission counts.
+- Every SSS hit now loads the entry's SGGX row (density) before the branch draw (one 16-byte load).
+- KNOWN (smoke test): an exit into a voxel of another entity (foliage standing on a separate ground
+  entity) starts the continuation inside that entity's solid voxel: 7 black pixels along the hedge's
+  bottom edge in the wide view. Same limitation as the lattice walk ("the walk stays inside the hit
+  entity"); not fixed.

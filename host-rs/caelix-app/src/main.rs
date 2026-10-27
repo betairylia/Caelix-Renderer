@@ -227,7 +227,7 @@ struct Args {
     encoding: Encoding,
     /// A JSON material table (an array of {"id", "albedo", "smoothness", "metallic", "emission",
     /// "ior", "extinction", "transparent", "sss_albedo", "sss_probability", "sss_steps",
-    /// "sss_anisotropy"}), applied with caelix_scene_set_materials over the
+    /// "sss_anisotropy", "sggx": {"kind", "axis", "roughness", "density", "transmission"}}), applied with caelix_scene_set_materials over the
     /// built-in table. For block-ID worlds: an entry goes to code 0x8000 | id, or to code id with
     /// "transparent": true.
     #[arg(long, value_name = "PATH")]

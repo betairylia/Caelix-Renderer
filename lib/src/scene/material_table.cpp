@@ -118,7 +118,8 @@ bool MaterialTable::Valid(const CaelixMaterial& material, const char*& reason)
         !Finite(material.emission, 3) || !Finite(&material.metallic, 1) ||
         !Finite(&material.ior, 1) || !Finite(&material.extinction, 1) ||
         !Finite(&material.sss_anisotropy, 1) || !Finite(material.sss_albedo, 3) ||
-        !Finite(&material.sss_probability, 1))
+        !Finite(&material.sss_probability, 1) || !Finite(material.sggx_s, 6) ||
+        !Finite(&material.sggx_density, 1) || !Finite(&material.sggx_transmission, 1))
     {
         reason = "a value is not finite";
         return false;
@@ -157,6 +158,37 @@ bool MaterialTable::Valid(const CaelixMaterial& material, const char*& reason)
             material.sss_anisotropy > kMaterialSssMaxAnisotropy)
         {
             reason = "sss_anisotropy is outside [-0.99, 0.99]";
+            return false;
+        }
+    }
+    if (material.sggx_density < 0.0f)
+    {
+        reason = "sggx_density is negative";
+        return false;
+    }
+    if (material.sggx_density > 0.0f)
+    {
+        if (!(material.sss_probability > 0.0f))
+        {
+            reason = "sggx_density > 0 needs sss_probability > 0";
+            return false;
+        }
+        if (material.sggx_transmission < 0.0f || material.sggx_transmission > 1.0f)
+        {
+            reason = "sggx_transmission is outside [0, 1]";
+            return false;
+        }
+        // Sylvester's criterion on S (xx, yy, zz, xy, xz, yz), in double.
+        const double xx = material.sggx_s[0];
+        const double yy = material.sggx_s[1];
+        const double zz = material.sggx_s[2];
+        const double xy = material.sggx_s[3];
+        const double xz = material.sggx_s[4];
+        const double yz = material.sggx_s[5];
+        const double det = xx * (yy * zz - yz * yz) - xy * (xy * zz - yz * xz) + xz * (xy * yz - yy * xz);
+        if (!(xx > 0.0) || !(xx * yy - xy * xy > 0.0) || !(det > 0.0))
+        {
+            reason = "sggx_s is not positive definite";
             return false;
         }
     }
@@ -201,7 +233,8 @@ void MaterialTable::Set(uint32_t code, const CaelixMaterial& material)
     MarkDirty(code, code + 1);
 }
 
-void MaterialTable::WriteGpuChunk(uint32_t chunk, uint8_t* main_rows, uint8_t* subsurface_rows) const
+void MaterialTable::WriteGpuChunk(uint32_t chunk, uint8_t* main_rows, uint8_t* subsurface_rows,
+                                  uint8_t* sggx_rows) const
 {
     const uint32_t first = chunk * kChunkEntries;
     for (uint32_t i = 0; i < kChunkEntries; ++i)
@@ -210,6 +243,8 @@ void MaterialTable::WriteGpuChunk(uint32_t chunk, uint8_t* main_rows, uint8_t* s
         std::memcpy(main_rows + static_cast<size_t>(i) * kMaterialBytes, entry, kMaterialBytes);
         std::memcpy(subsurface_rows + static_cast<size_t>(i) * kSubsurfaceRowBytes, entry + kMaterialBytes,
                     kSubsurfaceRowBytes);
+        std::memcpy(sggx_rows + static_cast<size_t>(i) * kSggxRowBytes,
+                    entry + kMaterialBytes + kSubsurfaceRowBytes, kSggxRowBytes);
     }
 }
 

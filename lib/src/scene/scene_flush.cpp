@@ -333,6 +333,7 @@ void Scene::StageMaterials()
         // uninitialized memory. The fills are recorded before the copies of this flush.
         fills_.push_back(PendingFill{material_buffer_.buffer(), 0, material_buffer_.size(), 0});
         fills_.push_back(PendingFill{subsurface_buffer_.buffer(), 0, subsurface_buffer_.size(), 0});
+        fills_.push_back(PendingFill{sggx_buffer_.buffer(), 0, sggx_buffer_.size(), 0});
         material_buffer_filled_ = true;
     }
     const uint64_t dirty = materials_->dirty_chunks();
@@ -350,14 +351,20 @@ void Scene::StageMaterials()
                         "the next flush");
             return;
         }
-        // One span per chunk: its main table rows, then its subsurface table rows (two copies).
-        materials_->WriteGpuChunk(chunk, span.data, span.data + MaterialTable::kChunkMainBytes);
+        // One span per chunk: its main table rows, its subsurface rows, its SGGX rows (three copies).
+        uint8_t* const subsurface_rows = span.data + MaterialTable::kChunkMainBytes;
+        uint8_t* const sggx_rows = subsurface_rows + MaterialTable::kChunkSubsurfaceBytes;
+        materials_->WriteGpuChunk(chunk, span.data, subsurface_rows, sggx_rows);
         pending_.push_back(StagedCopy{span.offset, material_buffer_.buffer(),
                                       static_cast<VkDeviceSize>(chunk) * MaterialTable::kChunkMainBytes,
                                       MaterialTable::kChunkMainBytes});
         pending_.push_back(StagedCopy{span.offset + MaterialTable::kChunkMainBytes, subsurface_buffer_.buffer(),
                                       static_cast<VkDeviceSize>(chunk) * MaterialTable::kChunkSubsurfaceBytes,
                                       MaterialTable::kChunkSubsurfaceBytes});
+        pending_.push_back(StagedCopy{span.offset + MaterialTable::kChunkMainBytes + MaterialTable::kChunkSubsurfaceBytes,
+                                      sggx_buffer_.buffer(),
+                                      static_cast<VkDeviceSize>(chunk) * MaterialTable::kChunkSggxBytes,
+                                      MaterialTable::kChunkSggxBytes});
         materials_->MarkStaged(chunk);
     }
 }

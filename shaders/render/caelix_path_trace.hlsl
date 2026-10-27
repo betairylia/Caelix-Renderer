@@ -290,11 +290,13 @@ NeeCandidate LampCandidate(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint
 // n_r): the lamp candidate, the sun candidate when `sun` (the sun NEE runs at this vertex), the choice
 // between them and one shadow ray. Returns the demodulated radiance (the caller multiplies the
 // throughput) and the state of the segment that leaves the vertex.
-float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool sun, inout uint nee_rng,
-                         inout uint light_rng, out uint segment_light)
+// `allow_mis` false: the lamp NEE runs without MIS even when the frame has it (an SGGX exit vertex, whose
+// next segment is not drawn from the Lambert lobe; the main kernels always pass true).
+float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool sun, bool allow_mis,
+                         inout uint nee_rng, inout uint light_rng, out uint segment_light)
 {
     const uint point_seed = RandomU32(light_rng);
-    const bool mis = (fc.light_nee_flags & kLightNeeMis) != 0u;
+    const bool mis = allow_mis && (fc.light_nee_flags & kLightNeeMis) != 0u;
     // The lamp candidate stays live through the sun candidate's draw (cheap); the sun candidate is drawn
     // again from its saved state when it is kept (the lamp candidate's evaluation is the expensive one).
     const NeeCandidate lamp_candidate = LampCandidate(fc, x_r, n_r, point_seed, mis);
@@ -510,6 +512,10 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // next segment use that VERTEX normal. The primary returns the guide albedo lerp(albedo, sss_albedo, p)
 // and carries branch weight / guide in its throughput. A dead walk ends the path after the hit's
 // emission (at the primary: no NEE, no segment).
+// SGGX foliage (docs/SSS_EXPERIMENT.md, "SGGX foliage medium"): a PASS is not a vertex (no NEE, no bounce
+// used, at most kMaxPassThroughs per path): the ray continues from the exit on its line, its miss sees
+// the radiance along it with the sun disk, lamps weigh 1. An SGGX EXIT is a vertex whose next segment is
+// the walk's direction: its lamp NEE runs without MIS and its miss sees the radiance along the segment.
 CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
                             uint medium, inout uint rng, out float4 stochastic)
 {
@@ -530,12 +536,15 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     float3 throughput = 1.0f / max(0.001f, primary_shade.k);
 #if CAELIX_SUBSURFACE
     const bool subsurface = (fc.flags & kRenderFlagSubsurface) != 0u;
+    uint primary_walk = kSubsurfaceNone;
     CAELIX_BRANCH
     if (subsurface)
     {
         const float3 surface_albedo = primary_shade.albedo;
         float4 sss;
-        const uint state = SubsurfaceVertex(fc, surface, ray.Direction, rng, primary_shade, primary_normal, sss);
+        const uint state =
+            SubsurfaceVertex(fc, surface, ray.Direction, rng, primary_shade, primary_normal, sss, false);
+        primary_walk = state;
         if (state != kSubsurfaceNone)
         {
             // Demodulation by the guide albedo: the composite multiplies the stochastic radiance by it.
@@ -547,8 +556,16 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
                 stochastic = float4(0.0f, 0.0f, 0.0f, 0.0f);
                 return primary_shade;
             }
+            // A PASS is not a vertex: the specular flag skips the NEE below (restored after it).
+            if (state == kSubsurfacePass)
+            {
+                primary_shade.specular_lobe = true;
+            }
         }
     }
+    const bool primary_mis = primary_walk != kSubsurfaceSggxExit;
+#else
+    const bool primary_mis = true;
 #endif
     // Hit distance of the first stochastic segment (primary surface -> first bounce
     // hit) in world units; t_max when it reaches the sky, 0 when there is no segment
@@ -566,7 +583,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     CAELIX_BRANCH
     if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
     {
-        radiance += NextEventAtVertex(fc, primary_shade.bounce_origin, primary_normal, nee, nee_rng,
+        radiance += NextEventAtVertex(fc, primary_shade.bounce_origin, primary_normal, nee, primary_mis, nee_rng,
                                       light_rng, segment_light) * throughput;
         segment_sees_sun = !nee;
     }
@@ -580,6 +597,19 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         }
     }
 
+#if CAELIX_SUBSURFACE
+    // SGGX PASS / EXIT at the primary: the first segment runs on a line (its miss is the radiance along it);
+    // the G-buffer keeps the entry face's diffuse lobe.
+    uint pass_count = 0;
+    if (primary_walk == kSubsurfacePass || primary_walk == kSubsurfaceSggxExit)
+    {
+        segment_diffuse = false;
+        segment_roughness = 0.0f;
+        primary_shade.specular_lobe = false;
+        primary_shade.roughness = 1.0f;
+        pass_count = primary_walk == kSubsurfacePass ? 1u : 0u;
+    }
+#endif
     RayDesc bounce;
     bounce.Origin = primary_shade.bounce_origin;
     bounce.Direction = primary_shade.bounce_direction;
@@ -616,17 +646,21 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         // The normal of this vertex: NEE and the next segment's lobe (the exit normal after a walk).
         float3 vertex_normal = hit.normal;
 #if CAELIX_SUBSURFACE
-        // A vertex without a next segment skips the walk (only its emission counts).
-        bool walk_dead = false;
+        // A vertex without a next segment skips the lattice walk (only its emission counts); the SGGX walk
+        // still runs there (a PASS continues the path).
+        uint walk_state = kSubsurfaceNone;
         CAELIX_BRANCH
-        if (subsurface && bounce_index + 1u <= fc.bounce_count)
+        if (subsurface)
         {
             float4 sss;
-            walk_dead = SubsurfaceVertex(fc, hit, bounce.Direction, rng, shade, vertex_normal, sss) ==
-                        kSubsurfaceDead;
+            walk_state = SubsurfaceVertex(fc, hit, bounce.Direction, rng, shade, vertex_normal, sss,
+                                          bounce_index + 1u > fc.bounce_count);
         }
-#endif
+        // A PASS uses no bounce.
+        bounce_index += walk_state == kSubsurfacePass ? 0u : 1u;
+#else
         bounce_index += 1;
+#endif
 
         // A lamp's emission on a segment that left a lamp NEE vertex: the BSDF's MIS weight
         // (LampHitWeight); every other emission in full.
@@ -638,10 +672,29 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         }
         radiance += shade.emission * (throughput * emission_weight);
 #if CAELIX_SUBSURFACE
-        if (walk_dead)
+        if (walk_state == kSubsurfaceDead)
         {
             break;
         }
+        if (walk_state == kSubsurfacePass)
+        {
+            // Not a vertex: the ray continues on its line; the sun disk and lamp hits count in full.
+            pass_count += 1;
+            if (pass_count > kMaxPassThroughs)
+            {
+                break;
+            }
+            bounce.Origin = shade.bounce_origin;
+            bounce.Direction = shade.bounce_direction;
+            segment_sees_sun = true;
+            segment_light = 0u;
+            segment_diffuse = false;
+            segment_roughness = 0.0f;
+            continue;
+        }
+        const bool vertex_mis = walk_state != kSubsurfaceSggxExit;
+#else
+        const bool vertex_mis = true;
 #endif
         throughput *= shade.albedo / max(0.001f, shade.k);
 
@@ -650,8 +703,8 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         CAELIX_BRANCH
         if (light_nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
         {
-            const float3 nee_radiance = NextEventAtVertex(fc, shade.bounce_origin, vertex_normal, nee, nee_rng,
-                                                          light_rng, segment_light);
+            const float3 nee_radiance = NextEventAtVertex(fc, shade.bounce_origin, vertex_normal, nee, vertex_mis,
+                                                          nee_rng, light_rng, segment_light);
             radiance += nee_radiance * throughput;
             segment_sees_sun = !nee;
         }
@@ -679,6 +732,14 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         segment_normal = vertex_normal;
         segment_diffuse = !shade.specular_lobe;
         segment_roughness = shade.roughness;
+#if CAELIX_SUBSURFACE
+        // An SGGX exit's segment runs on the walk's direction: its miss is the radiance along it.
+        if (walk_state == kSubsurfaceSggxExit)
+        {
+            segment_diffuse = false;
+            segment_roughness = 0.0f;
+        }
+#endif
     }
     stochastic = float4(SanitizeRadiance(radiance), first_segment_t);
     return primary_shade;

@@ -9,8 +9,9 @@ typedef CaelixResult (*SceneCreateFn)(CaelixDevice*, const CaelixSceneDesc*, Cae
 
 size_t caelix_abi_c99_touch(void);
 
-/* CaelixMaterial is the GPU table layout: 64 bytes (C99 has no static_assert), the subsurface row at 48. */
-typedef char caelix_material_is_64_bytes[(sizeof(CaelixMaterial) == 64) ? 1 : -1];
+/* CaelixMaterial: 96 bytes (C99 has no static_assert), the subsurface row at 48, the SGGX row at 64. */
+typedef char caelix_material_is_96_bytes[(sizeof(CaelixMaterial) == 96) ? 1 : -1];
+typedef char caelix_material_sggx_at_64[(offsetof(CaelixMaterial, sggx_s) == 64) ? 1 : -1];
 typedef char caelix_material_sss_albedo_at_48[(offsetof(CaelixMaterial, sss_albedo) == 48) ? 1 : -1];
 /* CaelixRenderOptions is embedded by value in host packets (the Unity plugin): 192 bytes, the sky
    cubemap at offset 152, the upscaler fields from offset 176. */
@@ -55,7 +56,8 @@ size_t caelix_abi_c99_touch(void)
                                    1,
                                    CAELIX_MAX_BOUNCES_TRANSPARENT};
     CaelixMaterial material = {{1.0f, 1.0f, 1.0f}, 1.0f, {0.0f, 0.0f, 0.0f}, 0.0f, 1.55f, 0.0f,
-                               0.0f, 16u, {1.0f, 1.0f, 1.0f}, 0.0f};
+                               0.0f, 16u, {1.0f, 1.0f, 1.0f}, 0.0f, {1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f},
+                               0.0f, 0.0f};
     CaelixRenderTargets targets = {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}};
     CaelixGpuTimings timings = {0.0f, 0.0f, 0, 0.0f, 0.0f, 0.0f};
     CaelixUpscalerQueryDesc upscaler_query = {CAELIX_UPSCALER_DLSS_SR, CAELIX_UPSCALE_QUALITY, 1920, 1080};
@@ -81,7 +83,8 @@ size_t caelix_abi_c99_touch(void)
                  sizeof(level) + sizeof(result) + sizeof(camera) + sizeof(options) +
                  sizeof(targets) + sizeof(timings) + sizeof(view) + sizeof(renderer) +
                  sizeof(mode) + sizeof(nrd_info) + sizeof(read_bit) + sizeof(material) +
-                 sizeof(caelix_material_is_64_bytes) + sizeof(caelix_material_sss_albedo_at_48) +
+                 sizeof(caelix_material_is_96_bytes) + sizeof(caelix_material_sss_albedo_at_48) +
+                 sizeof(caelix_material_sggx_at_64) +
                  sizeof(caelix_render_options_is_192_bytes) +
                  sizeof(caelix_sky_cubemap_at_152) + sizeof(caelix_upscaler_at_176) + sizeof(upscaler_query) +
                  sizeof(upscaler_result) + sizeof(upscaler_info) + sizeof(upscaler) + sizeof(quality) +

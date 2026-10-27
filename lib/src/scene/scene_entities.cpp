@@ -167,6 +167,7 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
     scene->materials_ = std::make_unique<MaterialTable>(d.encoding);
     scene->material_buffer_ = GpuBuffer::DeviceLocal(allocator, vk_device, MaterialTable::kMainBytes);
     scene->subsurface_buffer_ = GpuBuffer::DeviceLocal(allocator, vk_device, MaterialTable::kSubsurfaceBytes);
+    scene->sggx_buffer_ = GpuBuffer::DeviceLocal(allocator, vk_device, MaterialTable::kSggxBytes);
     scene->as_pool_.Init(allocator, vk_device);
     scene->scratch_ = GpuBuffer::DeviceLocalWithUsage(
         allocator, vk_device, scratch_bytes,
@@ -648,7 +649,7 @@ void Scene::GetStats(CaelixSceneStats& out) const
         }
     }
     out.as_builds_pending = pending;
-    out.material_table_bytes = material_buffer_.size() + subsurface_buffer_.size();
+    out.material_table_bytes = material_buffer_.size() + subsurface_buffer_.size() + sggx_buffer_.size();
     // Bricks that caelix_scene_upload_bricks accepts before the next flush, at most: the record
     // space of the ring (capacity minus the row reserve) minus what is in use, in record spans
     // as UploadBricks allocates them (record_bytes at kRecordAlignment). Wrap padding can make
