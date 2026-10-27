@@ -421,6 +421,81 @@ K 11, L 12, M 13; RR D 4, E 5, F 6), `upscaleAutoExposure` (SR only). Properties
 - The status log (`statusLogInterval`) adds `upscale` to the GPU timings, `upscaler extensions`
   and, per live view with a query, "view v: upscaler u quality q WxH -> WxH (reason r)".
 
+## Packet v7 as built (2026-10-27)
+
+Packet version 7 mirrors the library's material compaction, voxel id, light tree and light NEE
+ABI in the plugin and in C#. Sizes (the plugin's `static_assert`s in `unity_bridge.cpp` and the C#
+constants in `CaelixNativeBridge.cs`, checked again by `Check()` with `Marshal.SizeOf` and
+`Marshal.OffsetOf`):
+
+| Struct | v6 | v7 | Change |
+| --- | --- | --- | --- |
+| `CaelixMaterial` | 48 | 112 | `pad[2]` replaced by `sss_model`, `sss_probability`, `sss_albedo[3]`, `sss_anisotropy`, `sss_steps`, `sss_params[8]`, `texture_set`, `connect_group`, `reserved` |
+| `CaelixMaterialEntry` | 52 | 116 | follows the material |
+| `CaelixRenderOptions` | 192 | 208 | `voxel_id_tmax` (offset 192) + `reserved_voxel_id[3]` |
+| `CaelixUnityFramePacket` | 80 | 96 | `CaelixLightOptions light` at offset 80 |
+| `CaelixUnityViewPacket` | 504 | 560 | options grew 16; `CaelixUnityTarget voxel_id` at 520, `CaelixLightNeeOptions light_nee` at 544 |
+| `CaelixUnityStatus` | 536 | 568 | `light_bricks` (536), `light_gpu_ms`, `light_enabled`, `light_nee_running`, `voxel_id_views` (556), `pad1`; 4 bytes of tail padding to the 8-byte alignment (C and C# agree) |
+
+Apply points:
+
+- Light tree options (session config, read with `CAELIX_UNITY_FRAME_RESET` only):
+  `caelix_scene_set_light_options(scene, &packet.light)` right after `caelix_scene_create`, before
+  the material entries and every record of the packet (the ABI wants them set before uploads). The
+  "reset while a scene exists" branch applies them too (the library refinalizes resident bricks).
+  A failure is a scene error (logged); the session goes on. The "session reset:" line prints them.
+- Light NEE options (per view, per frame): after `EnsureRenderer(view)` and before
+  `caelix_renderer_render`, `caelix_renderer_set_light_nee_options` runs when `packet.light_nee`
+  differs from what the view's renderer has (`g_rt.light_nee_applied[view]`) or that record is not
+  valid (a new renderer; cleared when the view's renderer or the scene is destroyed). A failure
+  counts as a failed event (`Fail`, logged) and the frame renders with the previous options.
+  After a successful render, `caelix_renderer_get_light_nee_stats().running` sets bit `view` of
+  `light_nee_running`.
+- Voxel id target: `AccessOptionalTarget` at the COLOUR target's size in every case (also while
+  the view upscales: the library writes it at the output size), plus a format check (R32_UINT or
+  R32G32_UINT; another format is dropped with the same rate-limited warning as the other dropped
+  targets). Bit `view` of `voxel_id_views` says whether the newest render event passed it.
+- Light stats: `PublishSceneStats` (after every flush) copies `CaelixLightStats::light_bricks`,
+  `gpu_ms` and `enabled`; a scene release zeroes them.
+- The first-render log line adds "voxel id yes/no, light NEE <enabled>".
+
+C# (`CaelixNativeRenderer`, Inspector sections "Light Tree and Light NEE" and "Voxel Id"):
+
+| Field | Default | Scope | Meaning |
+| --- | --- | --- | --- |
+| `lightTree` | on | session | builds the light BVH over emissive voxels |
+| `lightMinEmission` | 0 | session | light voxel threshold before the emission scale; 0 = library default 20 |
+| `lightHeapMiB` | 0 | session | initial size of each light heap buffer; 0 = library default 16 MiB |
+| `lightNee` | on | live, per view | light NEE in the lighting modes (needs the tree) |
+| `lightNeeMis` | on | live, per view | balance heuristic; off = `CAELIX_LIGHT_NEE_FLAG_NO_MIS` |
+| `voxelIdTarget` | on | live, per view | one R32_UINT target per view at the camera size |
+| `voxelIdTMax` | 0 | live | hits farther than this are misses in the voxel id target and view; 0 = no limit |
+
+Properties `LightTree`, `LightMinEmission`, `LightHeapMiB`, `LightNee`, `LightNeeMis`,
+`VoxelIdTarget`, `VoxelIdTMax`, and `VoxelIdHandle(view)`. The session fixes the three light tree
+values in `BeginSession` and sends them in every frame packet (the plugin reads them with the reset
+only). A change during a session is logged once ("apply at the next session") and is NOT reverted
+(unlike the encoding and the material JSON). The "session started" log line and the periodic
+status line (`light tree`, `light bricks`, `light gpu ms`, `nee running`, `voxel id views`) show
+them. `DebugView.VoxelId = 11` (primary mode) mirrors `CAELIX_VIEW_VOXEL_ID`.
+
+`CaelixNativeViewTargets.Ensure(colour w, h, geometry w, h, view, voxelId)` allocates the voxel id
+target at the colour size when `voxelIdTarget` is on and releases it otherwise (both bump the target
+generation, so a release event precedes the next render). The feature imports it into the render
+graph when the view has it: the render pass declares it as a write, the present and motion passes
+as a read, and `BindTargets` sets the global texture `_CaelixNativeVoxelId` (shader property id
+`VoxelIdTexId`) next to the other four. The present shader does not read it; it is there for a
+later post-process of the camera.
+
+Material JSON (`CaelixNativeMaterialJson`): optional keys `sss_model` (clamped 0..255),
+`sss_probability` (0..1), `sss_albedo` (3 values, each clamped 0..1, else 0), `sss_anisotropy`
+(-1..1), `sss_steps` (0..255), `sss_params` (the first 8 values; a longer array warns once per
+asset), `texture_set` and `connect_group` (0..65535); `reserved` = 0. An absent key is 0.
+
+Not done in this step: no Editor validation (the plugin and the C# assembly compile, the sizes
+match; nothing ran in Unity), and the voxel id texture has no consumer yet. Light NEE options do
+not take part in the reference mode's reset check (both settings converge to the same image).
+
 ## Open questions for the owner
 
 1. (answered) Loading time: "Load on startup" on the plugin importer; P1 verifies it.

@@ -93,6 +93,13 @@ struct State
     std::atomic<float> upscale_ms{0.0f};
     std::atomic<uint64_t> timings_frame{0};
     std::atomic<uint32_t> timings_view{0};
+    // The light tree after the newest flush (CaelixLightStats), and per view bits of the newest
+    // render: bit v = view v ran the light NEE / passed a voxel id target.
+    std::atomic<uint64_t> light_bricks{0};
+    std::atomic<float> light_gpu_ms{0.0f};
+    std::atomic<uint32_t> light_enabled{0};
+    std::atomic<uint32_t> light_nee_running{0};
+    std::atomic<uint32_t> voxel_id_views{0};
     // The newest upscaler query of each view (CaelixUnityStatus::upscalers). Written on the render
     // thread when a view's query key changes, read by caelix_unity_status; the mutex keeps the key
     // and the result of one entry together.

@@ -40,9 +40,10 @@
  *     one view's renderer (the camera is gone), or destroy every renderer and the scene (a session
  *     ends, or starts: see CAELIX_UNITY_FRAME_RESET).
  *
- * Sessions: the scene's block encoding, its material table and its staging ring size are fixed
- * for a session. A session starts with a frame packet that carries CAELIX_UNITY_FRAME_RESET and the
- * session config (encoding, staging size, material entries), preceded by a release event with
+ * Sessions: the scene's block encoding, its material table, its staging ring size and its light
+ * tree options are fixed for a session. A session starts with a frame packet that carries
+ * CAELIX_UNITY_FRAME_RESET and the session config (encoding, staging size, material entries, light
+ * tree options), preceded by a release event with
  * CAELIX_UNITY_RELEASE_SCENE; it ends with another such release event (C# issues it when its
  * component is disabled, so the plugin holds no scene between Play sessions). A material or
  * encoding change during a session is a C# error, not a reset.
@@ -94,8 +95,11 @@ extern "C" {
    reset config, sky cubemap target, no material mode, no per-packet encoding, 8 views.
    Version 6: CaelixRenderOptions carries the upscaler fields (view packet 488 -> 504 bytes), the
    geometry targets have the render size while a view upscales, and CaelixUnityStatus grew
-   upscale_ms, upscaler_extensions and upscalers[] (280 -> 536 bytes). */
-#define CAELIX_UNITY_PACKET_VERSION 6u
+   upscale_ms, upscaler_extensions and upscalers[] (280 -> 536 bytes).
+   Version 7: CaelixMaterial 48 -> 112 bytes (SSS and texture fields), CaelixRenderOptions +16
+   (voxel_id_tmax), view packet gains the voxel id target and the light NEE options, frame packet
+   gains the light tree options, status gains light and voxel id fields. */
+#define CAELIX_UNITY_PACKET_VERSION 7u
 
 /* Number of views (CaelixUnityViewPacket::view). Each view has its own renderer over the shared
    scene. C# gives every camera that renders through the plugin its own view. */
@@ -171,13 +175,14 @@ typedef struct CaelixUnityUpload
                                        CAELIX_UNITY_RELEASE_SCENE that C# issues right before it
                                        destroyed the previous one; when the plugin still has a
                                        scene here it logs an error, removes every entity and
-                                       restores the built-in materials instead), then the material
-                                       entries are applied, then the records. */
+                                       restores the built-in materials instead), then the light
+                                       options and the material entries are applied, then the
+                                       records. */
 
-/* One frame event. 80 bytes, followed in the same memory block by the records it points at;
+/* One frame event. 96 bytes, followed in the same memory block by the records it points at;
    total_bytes covers all of it. Offsets are bytes from the packet start. Apply order on the render
-   thread: reset (scene creation + material entries), the entity records in list order, the brick
-   removes, the uploads, then the flush. */
+   thread: reset (scene creation + light options + material entries), the entity records in list
+   order, the brick removes, the uploads, then the flush. */
 typedef struct CaelixUnityFramePacket
 {
     CaelixUnityPacketHeader header; /* kind CAELIX_UNITY_PACKET_FRAME */
@@ -201,6 +206,13 @@ typedef struct CaelixUnityFramePacket
     uint32_t uploads_offset;
     uint32_t brick_count;     /* the bricks of every upload record together (C# accounting) */
     uint32_t pad;
+
+    /* Session config, read only with CAELIX_UNITY_FRAME_RESET: the light tree options of the scene
+       (caelix.h "Light tree"). Applied with caelix_scene_set_light_options right after the scene is
+       created (or emptied, see CAELIX_UNITY_FRAME_RESET) and before any record of the packet: the
+       library wants them set before bricks are uploaded. enabled 0 = no light tree. A failure is
+       logged and the session goes on without the tree. */
+    CaelixLightOptions light;
 } CaelixUnityFramePacket;
 
 /* ---------------------------------------------------------------------------------------------
@@ -210,11 +222,12 @@ typedef struct CaelixUnityFramePacket
 /* CaelixUnityViewPacket::flags */
 #define CAELIX_UNITY_VIEW_REPORT_TIMINGS 1u /* this view's GPU timings go to CaelixUnityStatus */
 
-/* One render event. 504 bytes (488 before the DLSS step grew CaelixRenderOptions). The plugin
-   accesses every present target (AccessTexture); a target that AccessTexture refuses, without
-   STORAGE usage, or of another size than expected is dropped (logged a few times) and the frame
-   renders without it. The expected size of depth, motion and albedo is the colour target's size,
-   or the upscaler's render size when the frame is upscaled (see "Upscalers" at the top). */
+/* One render event. 560 bytes (488 in version 5, 504 in version 6). The plugin accesses every
+   present target (AccessTexture); a target that AccessTexture refuses, without STORAGE usage, or of
+   another size than expected is dropped (logged a few times) and the frame renders without it. The
+   expected size of depth, motion and albedo is the colour target's size, or the upscaler's render
+   size when the frame is upscaled (see "Upscalers" at the top); the voxel id target always has the
+   colour target's size. */
 typedef struct CaelixUnityViewPacket
 {
     CaelixUnityPacketHeader header; /* kind CAELIX_UNITY_PACKET_VIEW */
@@ -238,6 +251,16 @@ typedef struct CaelixUnityViewPacket
     CaelixUnityTarget sky;
     CaelixCamera camera;
     CaelixRenderOptions options; /* options.sky is written by the plugin (see `sky`) */
+    /* Optional: R32_UINT or R32G32_UINT with random write (STORAGE usage), the voxel hash of the
+       camera ray's first hit (CaelixRenderTargets::voxel_id; a miss is 0xFFFFFFFF). Its expected
+       size is the colour target's size in every case, also while the view upscales. Dropped like
+       the other optional targets (also for another format); the frame then renders without it. */
+    CaelixUnityTarget voxel_id;
+    /* The light NEE options of the view's renderer (caelix.h "Light NEE"). Applied with
+       caelix_renderer_set_light_nee_options when they differ from what the view's renderer has, and
+       on a new renderer; a failure is logged and counted, and the frame renders with the
+       renderer's previous options. */
+    CaelixLightNeeOptions light_nee;
 } CaelixUnityViewPacket;
 
 /* ---------------------------------------------------------------------------------------------
@@ -278,7 +301,8 @@ typedef struct CaelixUnityUpscalerStatus
                                              unsupported) */
 } CaelixUnityUpscalerStatus;
 
-/* Plugin state for C#. 536 bytes. Counters are monotonic. */
+/* Plugin state for C#. 568 bytes (the last 4 are the compiler's tail padding to the 8-byte
+   alignment). Counters are monotonic. */
 typedef struct CaelixUnityStatus
 {
     uint32_t size;                 /* sizeof(CaelixUnityStatus) */
@@ -347,6 +371,15 @@ typedef struct CaelixUnityStatus
 
     /* The newest upscaler query of each view (see "Upscalers" at the top). */
     CaelixUnityUpscalerStatus upscalers[CAELIX_UNITY_MAX_VIEWS];
+
+    /* Light tree (CaelixLightStats after the newest flush; 0 without a scene) and light NEE. */
+    uint64_t light_bricks;      /* CaelixLightStats::light_bricks */
+    float light_gpu_ms;         /* CaelixLightStats::gpu_ms */
+    uint32_t light_enabled;     /* CaelixLightStats::enabled */
+    uint32_t light_nee_running; /* bit v = the newest render of view v ran the light NEE
+                                   (CaelixLightNeeStats::running) */
+    uint32_t voxel_id_views;    /* bit v = the newest render event of view v passed a voxel id target */
+    uint32_t pad1;
 } CaelixUnityStatus;
 
 /* The UnityRenderingEventAndData callback for CommandBuffer.IssuePluginEventAndData. Never NULL. */

@@ -1,12 +1,12 @@
 // The plugin's C API for C# and the render-thread work of the plugin events.
 //
-// Packet version 6: three plugin events, each with its own packet kind (caelix_unity.h).
+// Packet version 7: three plugin events, each with its own packet kind (caelix_unity.h).
 //
 // Frame event (once per Unity frame, before any camera renders): applies the frame packet's scene
 // records (entities, brick removes, brick uploads) and flushes the scene. A packet with
 // CAELIX_UNITY_FRAME_RESET starts a session: it creates the scene with the packet's encoding and
-// staging size and applies its material entries first. The plugin holds no scene between
-// sessions: the release event with CAELIX_UNITY_RELEASE_SCENE destroys it.
+// staging size and applies its light tree options and material entries first. The plugin holds no
+// scene between sessions: the release event with CAELIX_UNITY_RELEASE_SCENE destroys it.
 //
 // Frame numbers: Unity's own, no conversion. The flush and every render of a Unity frame use
 // frame_number = currentFrameNumber and safe_frame_number = safeFrameNumber of the recording
@@ -19,7 +19,9 @@
 //
 // Render event (once per view per Unity frame): renders the view's renderer (created on the
 // view's first render event) over the shared scene into the packet's targets, with the sky
-// cubemap target when the packet has one. A path trace packet with an upscaler is upscaled when
+// cubemap target and the voxel id target when the packet has them, after applying the packet's
+// light NEE options to the renderer when they changed. A path trace packet with an upscaler is
+// upscaled when
 // the upscaler query (cached per view and key, published in CaelixUnityStatus::upscalers) says
 // supported and the geometry targets have the query's render size; otherwise the frame renders at
 // the colour size without the upscaler.
@@ -43,19 +45,29 @@ namespace {
 constexpr uint32_t kBlocksPerBrick = 512;
 constexpr uint32_t kNoScene = 0xFFFFFFFFu;
 
-// The sizes caelix_unity.h states, which C# mirrors.
+// The sizes caelix_unity.h states (packet version 7), which C# mirrors (CaelixNativeBridge.cs).
 static_assert(sizeof(CaelixUnityPacketHeader) == 24, "CaelixUnityPacketHeader is 24 bytes");
-static_assert(sizeof(CaelixUnityFramePacket) == 80, "CaelixUnityFramePacket is 80 bytes");
-// 504 since the DLSS step (CaelixRenderOptions grew 176 -> 192 bytes); the C# mirror must follow.
-static_assert(sizeof(CaelixUnityViewPacket) == 520, "CaelixUnityViewPacket is 520 bytes (interim: CaelixRenderOptions grew to 208; packet v7 restates it)");
+static_assert(sizeof(CaelixUnityFramePacket) == 96, "CaelixUnityFramePacket is 96 bytes");
+static_assert(sizeof(CaelixUnityViewPacket) == 560, "CaelixUnityViewPacket is 560 bytes");
 static_assert(sizeof(CaelixUnityReleasePacket) == 32, "CaelixUnityReleasePacket is 32 bytes");
-static_assert(sizeof(CaelixUnityStatus) == 536, "CaelixUnityStatus is 536 bytes");
+static_assert(sizeof(CaelixUnityStatus) == 568, "CaelixUnityStatus is 568 bytes");
 static_assert(sizeof(CaelixUnityUpscalerStatus) == 32, "CaelixUnityUpscalerStatus is 32 bytes");
+static_assert(sizeof(CaelixUnityTarget) == 24 && sizeof(CaelixCamera) == 152, "CaelixUnityTarget 24, CaelixCamera 152");
+static_assert(sizeof(CaelixMaterial) == 112, "CaelixMaterial is 112 bytes");
+static_assert(sizeof(CaelixMaterialEntry) == 116, "CaelixMaterialEntry is 116 bytes");
+static_assert(sizeof(CaelixRenderOptions) == 208, "CaelixRenderOptions is 208 bytes");
+static_assert(sizeof(CaelixLightOptions) == 16 && sizeof(CaelixLightNeeOptions) == 16,
+              "CaelixLightOptions and CaelixLightNeeOptions are 16 bytes");
+static_assert(offsetof(CaelixUnityFramePacket, light) == 80, "CaelixUnityFramePacket::light offset (C# mirrors it)");
+static_assert(offsetof(CaelixUnityViewPacket, voxel_id) == 520 && offsetof(CaelixUnityViewPacket, light_nee) == 544,
+              "CaelixUnityViewPacket offsets of the version 7 fields (C# mirrors them)");
 static_assert(offsetof(CaelixUnityStatus, upscaler_extensions) == 164 &&
                   offsetof(CaelixUnityStatus, upscale_ms) == 276 && offsetof(CaelixUnityStatus, upscalers) == 280,
               "CaelixUnityStatus offsets of the upscaler fields (C# mirrors them)");
+static_assert(offsetof(CaelixUnityStatus, light_bricks) == 536 && offsetof(CaelixUnityStatus, voxel_id_views) == 556,
+              "CaelixUnityStatus offsets of the light and voxel id fields (C# mirrors them)");
 static_assert(sizeof(CaelixUnityEntity) == 48 && sizeof(CaelixUnityBrickRemove) == 16 &&
-                  sizeof(CaelixUnityUpload) == 16 && sizeof(CaelixMaterialEntry) == 116,
+                  sizeof(CaelixUnityUpload) == 16,
               "record sizes of caelix_unity.h");
 
 struct Guid
@@ -107,6 +119,10 @@ struct RenderThreadState
     uint32_t access_logs = 0;
     uint64_t upscaler_logs = 0;
     UpscalerCache upscalers[CAELIX_UNITY_MAX_VIEWS];
+    // The light NEE options each view's renderer has (valid = set successfully on that renderer).
+    // Cleared when the view's renderer is created or destroyed.
+    CaelixLightNeeOptions light_nee_applied[CAELIX_UNITY_MAX_VIEWS] = {};
+    bool light_nee_valid[CAELIX_UNITY_MAX_VIEWS] = {};
 
     std::unordered_map<Guid, CaelixEntityId, GuidHash> entities;
     std::vector<CaelixEntityId> packet_ids;      // scratch: entity id per packet entity record
@@ -243,10 +259,20 @@ bool EnsureRenderer(uint32_t view)
             Fail(result, "caelix_renderer_create failed");
             return false;
         }
+        g_rt.light_nee_valid[view] = false;
         UpdateLiveViews();
         Log(LogLevel::Info, "renderer created for view %u", view);
     }
     return true;
+}
+
+// Forgets the per-view state of a destroyed renderer: its light NEE options and its status bits.
+void ForgetView(uint32_t view)
+{
+    State& state = GetState();
+    g_rt.light_nee_valid[view] = false;
+    state.light_nee_running.fetch_and(~(1u << view));
+    state.voxel_id_views.fetch_and(~(1u << view));
 }
 
 // Destroys every renderer and the scene and forgets the scene's contents. The device must be idle
@@ -254,10 +280,11 @@ bool EnsureRenderer(uint32_t view)
 void DestroySceneObjects()
 {
     State& state = GetState();
-    for (CaelixRenderer*& renderer : state.renderers)
+    for (uint32_t view = 0; view < CAELIX_UNITY_MAX_VIEWS; ++view)
     {
-        caelix_renderer_destroy(renderer);
-        renderer = nullptr;
+        caelix_renderer_destroy(state.renderers[view]);
+        state.renderers[view] = nullptr;
+        ForgetView(view);
     }
     caelix_scene_destroy(state.scene);
     state.scene = nullptr;
@@ -272,6 +299,9 @@ void DestroySceneObjects()
     state.bricks_resident.store(0);
     state.as_builds_pending.store(0);
     state.live_views.store(0);
+    state.light_bricks.store(0);
+    state.light_gpu_ms.store(0.0f);
+    state.light_enabled.store(0);
 }
 
 bool AccessTarget(const CaelixUnityTarget& target, UnityVulkanImage& image)
@@ -343,6 +373,25 @@ bool AccessOptionalTarget(const CaelixUnityTarget& target, const char* name, uin
     out.width = image.extent.width;
     out.height = image.extent.height;
     out.layout = static_cast<uint32_t>(image.layout);
+    return true;
+}
+
+// The voxel id target of a view packet: an optional target at the colour size whose format must be
+// R32_UINT or R32G32_UINT (dropped otherwise, logged like the other dropped targets).
+bool AccessVoxelIdTarget(const CaelixUnityTarget& target, uint32_t width, uint32_t height, CaelixTargetImage& out)
+{
+    if (!AccessOptionalTarget(target, "voxel id", width, height, out)) return false;
+    if (out.format != VK_FORMAT_R32_UINT && out.format != VK_FORMAT_R32G32_UINT)
+    {
+        if (g_rt.dropped_target_logs < 8)
+        {
+            ++g_rt.dropped_target_logs;
+            Log(LogLevel::Warning, "the voxel id target is dropped: VkFormat %u (expected R32_UINT or R32G32_UINT)",
+                out.format);
+        }
+        out = CaelixTargetImage{};
+        return false;
+    }
     return true;
 }
 
@@ -570,13 +619,16 @@ bool ResetSession(const CaelixUnityFramePacket& packet, const uint8_t* base)
         CaelixSceneDesc desc{};
         desc.encoding = packet.encoding;
         desc.staging_bytes = static_cast<uint64_t>(packet.staging_mib) << 20;  // 0 = the library default
-        const CaelixResult result = caelix_scene_create(state.device, &desc, &state.scene);
+        CaelixResult result = caelix_scene_create(state.device, &desc, &state.scene);
         if (result != CAELIX_OK)
         {
             state.scene = nullptr;
             Fail(result, "caelix_scene_create failed");
             return false;
         }
+        // Before any brick of the session (the ABI wants the options set before uploads).
+        result = caelix_scene_set_light_options(state.scene, &packet.light);
+        if (result != CAELIX_OK) SceneError(result, "caelix_scene_set_light_options failed");
         g_rt.scene_encoding = packet.encoding;
         state.scene_encoding.store(packet.encoding);
         state.scene_resets.fetch_add(1);
@@ -604,8 +656,11 @@ bool ResetSession(const CaelixUnityFramePacket& packet, const uint8_t* base)
             if (result != CAELIX_OK) SceneError(result, "caelix_scene_remove_entity failed (reset)");
         }
         g_rt.entities.clear();
-        const CaelixResult result = caelix_scene_set_materials(state.scene, nullptr, 0);
+        CaelixResult result = caelix_scene_set_materials(state.scene, nullptr, 0);
         if (result != CAELIX_OK) SceneError(result, "caelix_scene_set_materials(default) failed (reset)");
+        // The ABI allows a change at any time (resident bricks are finalized again).
+        result = caelix_scene_set_light_options(state.scene, &packet.light);
+        if (result != CAELIX_OK) SceneError(result, "caelix_scene_set_light_options failed (reset)");
     }
 
     if (!InPacket(packet, packet.materials_offset, packet.material_count, sizeof(CaelixMaterialEntry), 4))
@@ -619,9 +674,11 @@ bool ResetSession(const CaelixUnityFramePacket& packet, const uint8_t* base)
         if (result != CAELIX_OK) SceneError(result, "caelix_scene_set_material_entries failed");
     }
     Log(LogLevel::Info, "session reset: encoding %u, staging %u MiB (0 = library default), %u material "
-                        "entries, upload cap %llu bricks per frame packet",
+                        "entries, upload cap %llu bricks per frame packet, light tree %u (min emission %g, "
+                        "heap %llu bytes; 0 = library defaults)",
         g_rt.scene_encoding, packet.staging_mib, packet.material_count,
-        static_cast<unsigned long long>(state.upload_bricks_cap.load()));
+        static_cast<unsigned long long>(state.upload_bricks_cap.load()), packet.light.enabled,
+        static_cast<double>(packet.light.min_emission), static_cast<unsigned long long>(packet.light.heap_bytes));
     return true;
 }
 
@@ -785,6 +842,11 @@ void PublishSceneStats()
     state.blas_bytes.store(stats.blas_bytes);
     state.staging_bytes.store(stats.staging_bytes);
     state.upload_bricks_free.store(stats.upload_bricks_free);
+    CaelixLightStats light{};
+    caelix_scene_get_light_stats(state.scene, &light);
+    state.light_bricks.store(light.light_bricks);
+    state.light_gpu_ms.store(light.gpu_ms);
+    state.light_enabled.store(light.enabled);
     UpdateLiveViews();
     const bool busy = stats.as_builds_pending != 0 || stats.pending_bricks != 0;
     if (g_rt.scene_busy && !busy)
@@ -997,6 +1059,9 @@ void RenderEvent(void* data)
     AccessOptionalTarget(packet.depth, "depth", geometry_width, geometry_height, targets.depth);
     AccessOptionalTarget(packet.motion, "motion", geometry_width, geometry_height, targets.motion);
     AccessOptionalTarget(packet.albedo, "albedo", geometry_width, geometry_height, targets.albedo);
+    // The voxel id target has the colour size also while the view upscales.
+    const bool voxel_id =
+        AccessVoxelIdTarget(packet.voxel_id, color.extent.width, color.extent.height, targets.voxel_id);
     AccessSky(packet.sky, options.sky);
 
     UnityVulkanRecordingState recording{};
@@ -1038,13 +1103,36 @@ void RenderEvent(void* data)
         PublishConsumed(state.last_consumed_view_sequence, sequence);
         return;
     }
+    CaelixRenderer* renderer = state.renderers[packet.view];
+    const uint32_t view_bit = 1u << packet.view;
+
+    // The light NEE options: set when they differ from what the renderer has (or on a new
+    // renderer). A failure keeps the renderer's previous options; the frame still renders.
+    if (!g_rt.light_nee_valid[packet.view] ||
+        std::memcmp(&g_rt.light_nee_applied[packet.view], &packet.light_nee, sizeof(CaelixLightNeeOptions)) != 0)
+    {
+        const CaelixResult nee_result = caelix_renderer_set_light_nee_options(renderer, &packet.light_nee);
+        if (nee_result == CAELIX_OK)
+        {
+            g_rt.light_nee_applied[packet.view] = packet.light_nee;
+            g_rt.light_nee_valid[packet.view] = true;
+        }
+        else
+        {
+            Fail(nee_result, "caelix_renderer_set_light_nee_options failed (the frame renders with the previous "
+                             "light NEE options)");
+        }
+    }
+    if (voxel_id)
+        state.voxel_id_views.fetch_or(view_bit);
+    else
+        state.voxel_id_views.fetch_and(~view_bit);
 
     CaelixFrameDesc frame_desc{};
     frame_desc.command_buffer = reinterpret_cast<uint64_t>(recording.commandBuffer);
     frame_desc.frame_number = frame;
     frame_desc.safe_frame_number = safe;
-    const CaelixResult result = caelix_renderer_render(state.renderers[packet.view], &frame_desc, &targets,
-                                                       &packet.camera, &options);
+    const CaelixResult result = caelix_renderer_render(renderer, &frame_desc, &targets, &packet.camera, &options);
     PublishConsumed(state.last_consumed_view_sequence, sequence);
     if (result != CAELIX_OK)
     {
@@ -1054,6 +1142,12 @@ void RenderEvent(void* data)
         return;
     }
     state.renders.fetch_add(1);
+    CaelixLightNeeStats nee_stats{};
+    caelix_renderer_get_light_nee_stats(renderer, &nee_stats);
+    if (nee_stats.running != 0)
+        state.light_nee_running.fetch_or(view_bit);
+    else
+        state.light_nee_running.fetch_and(~view_bit);
     if ((packet.flags & CAELIX_UNITY_VIEW_REPORT_TIMINGS) != 0)
     {
         CaelixGpuTimings timings{};
@@ -1077,11 +1171,11 @@ void RenderEvent(void* data)
     {
         g_rt.logged_first_render = true;
         Log(LogLevel::Info, "first render: view %u, %ux%u, VkFormat %d, layout at access %d, Unity frame "
-                            "%llu (safe %llu), mode %u, sky cubemap %s, upscaler %s",
+                            "%llu (safe %llu), mode %u, sky cubemap %s, upscaler %s, voxel id %s, light NEE %u",
             packet.view, color.extent.width, color.extent.height, static_cast<int>(color.format),
             static_cast<int>(color.layout), static_cast<unsigned long long>(frame),
             static_cast<unsigned long long>(safe), options.mode, options.sky.image != 0 ? "yes" : "no",
-            UpscalerName(options.upscaler));
+            UpscalerName(options.upscaler), voxel_id ? "yes" : "no", packet.light_nee.enabled);
     }
 }
 
@@ -1136,6 +1230,7 @@ void ReleaseEvent(void* data)
         {
             caelix_renderer_destroy(state.renderers[packet.view]);
             state.renderers[packet.view] = nullptr;
+            ForgetView(packet.view);
             UpdateLiveViews();
             Log(LogLevel::Info, "renderer destroyed for view %u", packet.view);
         }
@@ -1282,5 +1377,10 @@ extern "C" CAELIX_UNITY_API void caelix_unity_status(CaelixUnityStatus* out)
         std::lock_guard<std::mutex> lock(state.upscalers_mutex);
         std::memcpy(status.upscalers, state.upscalers, sizeof(status.upscalers));
     }
+    status.light_bricks = state.light_bricks.load();
+    status.light_gpu_ms = state.light_gpu_ms.load();
+    status.light_enabled = state.light_enabled.load();
+    status.light_nee_running = state.light_nee_running.load();
+    status.voxel_id_views = state.voxel_id_views.load();
     *out = status;
 }
