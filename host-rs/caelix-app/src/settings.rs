@@ -31,10 +31,12 @@ pub enum View {
     Material,
     /// Path trace mode: the denoised specular radiance without the albedo.
     NrdSpec,
+    /// Primary mode: a colour per voxel (the voxel id key of the primary hit).
+    VoxelId,
 }
 
 impl View {
-    pub const ALL: [View; 11] = [
+    pub const ALL: [View; 12] = [
         View::Albedo,
         View::Normal,
         View::Depth,
@@ -46,6 +48,7 @@ impl View {
         View::Motion,
         View::Material,
         View::NrdSpec,
+        View::VoxelId,
     ];
 
     pub fn raw(self) -> u32 {
@@ -61,6 +64,7 @@ impl View {
             View::Motion => CaelixDebugView_CAELIX_VIEW_MOTION as u32,
             View::Material => CaelixDebugView_CAELIX_VIEW_MATERIAL as u32,
             View::NrdSpec => CaelixDebugView_CAELIX_VIEW_NRD_SPEC as u32,
+            View::VoxelId => CaelixDebugView_CAELIX_VIEW_VOXEL_ID as u32,
         }
     }
 
@@ -77,6 +81,7 @@ impl View {
             View::Motion => "motion (pt)",
             View::Material => "material",
             View::NrdSpec => "nrd spec (pt)",
+            View::VoxelId => "voxel id",
         }
     }
 
@@ -262,6 +267,10 @@ pub struct RenderSettings {
     pub upscale_preset: u32,
     /// DLSS SR: NGX auto exposure instead of the fixed exposure 1.0.
     pub upscale_auto_exposure: bool,
+    /// Every mode: pass a voxel id target (R32G32_UINT at the window size) to every render call.
+    pub voxel_id: bool,
+    /// Every mode: the voxel id target and view treat a hit farther than this as a miss (0 = no limit).
+    pub voxel_id_tmax: f32,
 }
 
 impl RenderSettings {
@@ -349,6 +358,8 @@ impl RenderSettings {
             upscale_quality: if upscaling { self.upscale_quality.raw() } else { 0 },
             upscale_preset: if upscaling { self.upscale_preset } else { 0 },
             upscale_flags,
+            voxel_id_tmax: self.voxel_id_tmax,
+            reserved_voxel_id: [0; 3],
         }
     }
 
@@ -392,4 +403,5 @@ pub fn same_options(a: &CaelixRenderOptions, b: &CaelixRenderOptions) -> bool {
         && a.upscale_quality == b.upscale_quality
         && a.upscale_preset == b.upscale_preset
         && a.upscale_flags == b.upscale_flags
+        && a.voxel_id_tmax == b.voxel_id_tmax
 }

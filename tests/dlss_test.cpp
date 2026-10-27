@@ -1,7 +1,8 @@
 // The DLSS upscalers (CaelixRenderOptions::upscaler, docs/DLSS.md) through the public C ABI:
 // the availability query, the jitter helpers, DLSS Super Resolution and Ray Reconstruction on the
 // sunlit floor + floating block scene of caelix_nrd_test (smoke tests against an accumulated
-// reference), argument checks, quality changes and the measured upscale cost at 1920x1080. Any
+// reference), argument checks, quality changes, the voxel id target at the output size (the dedicated
+// unjittered pass against a render without an upscaler) and the measured upscale cost at 1920x1080. Any
 // Vulkan validation message or library error/warning fails a case (CloseRig). Without DLSS in the
 // build, or without NGX on the machine, the GPU cases are skipped (the query reports why).
 #include "test_scenes.h"
@@ -182,6 +183,76 @@ CaelixResult RenderFrame(Rig& rig, CaelixRenderer* renderer, Target& color, cons
         }
     }
     if (readback)
+    {
+        DestroyReadback(rig.gpu, buffer);
+    }
+    return result;
+}
+
+// One frame with a colour target (not read back) and a voxel id target (R32G32_UINT; read back into
+// `ids` as two words per pixel when the call succeeds and `ids` is not null). Returns the render
+// call's result.
+CaelixResult RenderVoxelIds(Rig& rig, CaelixRenderer* renderer, Target& color, Target& id_target,
+                            const CaelixCamera& camera, const CaelixRenderOptions& options,
+                            std::vector<uint32_t>* ids)
+{
+    REQUIRE(id_target.format == VK_FORMAT_R32G32_UINT);
+    Readback buffer;
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(id_target.width) * id_target.height * 8;
+    if (ids != nullptr)
+    {
+        CreateReadback(rig.gpu, bytes, buffer);
+    }
+    CaelixResult result = CAELIX_OK;
+    const uint64_t frame = rig.frames.next++;
+    SubmitAndWait(rig.gpu, [&](VkCommandBuffer cmd) {
+        CaelixFrameDesc desc{};
+        desc.command_buffer = reinterpret_cast<uint64_t>(cmd);
+        desc.frame_number = frame;
+        desc.safe_frame_number = frame - 1;
+        REQUIRE(caelix_scene_flush(rig.scene, &desc) == CAELIX_OK);
+        CaelixRenderTargets targets{};
+        targets.color = color.desc();
+        targets.voxel_id = id_target.desc();
+        result = caelix_renderer_render(renderer, &desc, &targets, &camera, &options);
+        if (ids == nullptr || result != CAELIX_OK)
+        {
+            return;
+        }
+        VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = id_target.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dependency.imageMemoryBarrierCount = 1;
+        dependency.pImageMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(cmd, &dependency);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {id_target.width, id_target.height, 1};
+        vkCmdCopyImageToBuffer(cmd, id_target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.buffer, 1,
+                               &region);
+        CopyToHostBarrier(cmd);
+    });
+    REQUIRE(caelix_scene_recycle(rig.scene, frame) == CAELIX_OK);
+    if (result == CAELIX_OK)
+    {
+        color.layout = VK_IMAGE_LAYOUT_GENERAL;
+        id_target.layout = ids != nullptr ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        if (ids != nullptr)
+        {
+            const uint32_t* data = reinterpret_cast<const uint32_t*>(buffer.words);
+            ids->assign(data, data + static_cast<size_t>(id_target.width) * id_target.height * 2);
+        }
+    }
+    if (ids != nullptr)
     {
         DestroyReadback(rig.gpu, buffer);
     }
@@ -676,6 +747,111 @@ TEST_CASE("Upscaler arguments: target sizes, quality change, switching the upsca
     caelix_renderer_release_target_views(renderer);
     caelix_renderer_destroy(renderer);
     DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+TEST_CASE("voxel id with an upscaler: output size, unjittered dedicated pass")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_dlss_test", RigDesc(0, 0, 0));
+    constexpr uint32_t kWidth = 640;
+    constexpr uint32_t kHeight = 360;
+    const CaelixUpscalerQueryResult sr = Query(rig.device, CAELIX_UPSCALER_DLSS_SR, CAELIX_UPSCALE_QUALITY, kWidth, kHeight);
+    const CaelixUpscalerQueryResult rr = Query(rig.device, CAELIX_UPSCALER_DLSS_RR, CAELIX_UPSCALE_QUALITY, kWidth, kHeight);
+    if (sr.supported == 0)
+    {
+        std::printf("DLSS SR unsupported (%s): skipped\n", ReasonName(sr.reason));
+        CloseRig(rig);
+        SKIP("DLSS SR is not available on this machine or in this build");
+    }
+    UploadFloorAndBlock(rig);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    const CaelixCamera camera = FrontCamera(static_cast<float>(kWidth) / kHeight);
+    Target color = CreateTarget(rig.gpu, kWidth, kHeight, VK_FORMAT_R32G32B32A32_SFLOAT);
+    Target ids = CreateTarget(rig.gpu, kWidth, kHeight, VK_FORMAT_R32G32_UINT);
+    CaelixRenderOptions options = LightOptions(CAELIX_MODE_PATH_TRACE, 0, 1);
+    options.upscaler = CAELIX_UPSCALER_DLSS_SR;
+    options.upscale_quality = CAELIX_UPSCALE_QUALITY;
+
+    // 1. A voxel id target at the render size is refused; at the output size it is accepted.
+    {
+        Target render_ids = CreateTarget(rig.gpu, sr.render_width, sr.render_height, VK_FORMAT_R32G32_UINT);
+        ExpectLibraryErrors(1, [&] {
+            CHECK(RenderVoxelIds(rig, renderer, color, render_ids, camera, options, nullptr) ==
+                  CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        CHECK(RenderVoxelIds(rig, renderer, color, ids, camera, options, nullptr) == CAELIX_OK);
+        REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+        caelix_renderer_release_target_views(renderer);
+        DestroyTarget(rig.gpu, render_ids);
+    }
+
+    // 2. Three upscaled frames with the library's Halton jitter, then the same camera without an
+    //    upscaler and without jitter at the output size: the two key images are identical (the
+    //    dedicated pass traces the unjittered pixel centres). 3. The same with a voxel_id_tmax that
+    //    cuts the far floor.
+    const auto count_misses = [](const std::vector<uint32_t>& image) {
+        size_t misses = 0;
+        for (size_t i = 0; i < image.size(); i += 2)
+        {
+            misses += image[i] == 0xFFFFFFFFu && image[i + 1] == 0xFFFFFFFFu ? 1 : 0;
+        }
+        return misses;
+    };
+    const auto compare = [&](uint32_t upscaler, uint32_t render_width, float tmax) {
+        CaelixRenderOptions upscaled = options;
+        upscaled.upscaler = upscaler;
+        upscaled.voxel_id_tmax = tmax;
+        const uint32_t phases = caelix_upscaler_jitter_phases(upscaler, render_width, kWidth);
+        std::vector<uint32_t> with_upscaler;
+        CaelixCamera jittered = camera;
+        constexpr uint32_t kFrames = 3;
+        for (uint32_t i = 0; i < kFrames; ++i)
+        {
+            caelix_jitter_halton(i, phases, jittered.jitter);
+            upscaled.frame_seed = i;
+            REQUIRE(RenderVoxelIds(rig, renderer, color, ids, jittered, upscaled,
+                                   i + 1 == kFrames ? &with_upscaler : nullptr) == CAELIX_OK);
+        }
+        CHECK(UpscalerInfo(renderer).failed == 0);
+        CaelixRenderOptions plain = upscaled;
+        plain.upscaler = CAELIX_UPSCALER_NONE;
+        plain.upscale_quality = 0;
+        std::vector<uint32_t> without_upscaler;
+        REQUIRE(RenderVoxelIds(rig, renderer, color, ids, camera, plain, &without_upscaler) == CAELIX_OK);
+        REQUIRE(with_upscaler.size() == without_upscaler.size());
+        size_t differ = 0;
+        for (size_t i = 0; i < with_upscaler.size(); i += 2)
+        {
+            differ += with_upscaler[i] != without_upscaler[i] || with_upscaler[i + 1] != without_upscaler[i + 1] ? 1 : 0;
+        }
+        const size_t misses = count_misses(with_upscaler);
+        std::printf("voxel id %s, voxel_id_tmax %g: %zu of %u pixels differ from the unjittered render without an "
+                    "upscaler, %zu miss pixels\n",
+                    UpscalerName(upscaler), static_cast<double>(tmax), differ, kWidth * kHeight, misses);
+        CHECK(differ == 0);
+        return misses;
+    };
+    const size_t misses_unlimited = compare(CAELIX_UPSCALER_DLSS_SR, sr.render_width, 0.0f);
+    // The block's centre is about 50 units from the camera, the floor's far edge about 75.
+    const size_t misses_tmax = compare(CAELIX_UPSCALER_DLSS_SR, sr.render_width, 55.0f);
+    CHECK(misses_tmax > misses_unlimited);
+    CHECK(misses_tmax > 0);
+    if (rr.supported != 0)
+    {
+        compare(CAELIX_UPSCALER_DLSS_RR, rr.render_width, 0.0f);
+    }
+    else
+    {
+        std::printf("DLSS RR unsupported (%s): the RR comparison is skipped\n", ReasonName(rr.reason));
+    }
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    DestroyTarget(rig.gpu, ids);
     CloseRig(rig);
 }
 

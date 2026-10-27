@@ -80,8 +80,10 @@ extern "C" {
    a bump. The material compaction step grew CaelixMaterial from 48 to 112 bytes (pad[2] replaced
    by the subsurface fields sss_model .. sss_params, texture_set, connect_group and reserved; so
    CaelixMaterialEntry 52 -> 116 bytes) and doubled CaelixSceneStats::material_table_bytes (two GPU
-   tables), also without a bump. A host built against an older version-2 header must be rebuilt (the library reads
-   and writes the larger structs). */
+   tables), also without a bump. The voxel id step appended CaelixRenderTargets::voxel_id,
+   CaelixRenderOptions::voxel_id_tmax and reserved_voxel_id (192 -> 208 bytes) and added
+   CAELIX_VIEW_VOXEL_ID, also without a bump. A host built against an older version-2 header must be
+   rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
 typedef struct CaelixVersion
@@ -656,9 +658,9 @@ CAELIX_API uint64_t caelix_scene_get_light_tree(const CaelixScene* scene);
  * A renderer draws one scene. caelix_renderer_render records a compute dispatch that traces one
  * primary ray per pixel through the scene's TLAS with an inline ray query (VK_KHR_ray_query), runs
  * the brick DDA on every procedural candidate, and writes the result of the hit into the targets
- * that the host passes (CaelixRenderTargets): a colour image and the optional geometry targets
- * albedo, normal, depth, motion and view_z. Every target is optional, but at least one must be
- * present.
+ * that the host passes (CaelixRenderTargets): a colour image, the optional geometry targets
+ * albedo, normal, depth, motion and view_z, and the optional voxel id target. Every target is
+ * optional, but at least one must be present.
  *
  * Modes (CaelixRenderOptions::mode):
  *   CAELIX_MODE_PRIMARY    the colour target shows a debug view (CaelixDebugView) of the primary hit.
@@ -692,9 +694,9 @@ CAELIX_API uint64_t caelix_scene_get_light_tree(const CaelixScene* scene);
  * docs/DLSS.md): NVIDIA DLSS Super Resolution (CAELIX_UPSCALER_DLSS_SR, keeps NRD as the denoiser)
  * or DLSS Ray Reconstruction (CAELIX_UPSCALER_DLSS_RR, replaces NRD). The renderer then traces at
  * the RENDER size and the upscaler writes the OUTPUT size:
- *   - the colour target has the output size; every other present target (albedo, normal, depth,
- *     motion, view_z) has the render size that caelix_upscaler_query reports for that upscaler,
- *     quality and output size. A mismatch returns CAELIX_ERROR_INVALID_ARGUMENT with a log line
+ *   - the colour target and the voxel id target have the output size; every other present target
+ *     (albedo, normal, depth, motion, view_z) has the render size that caelix_upscaler_query reports
+ *     for that upscaler, quality and output size. A mismatch returns CAELIX_ERROR_INVALID_ARGUMENT with a log line
  *     naming the expected size. The internal targets have the render size. The output must be at
  *     least 64 x 32.
  *   - CAELIX_MODE_PRIMARY, CAELIX_MODE_REFERENCE and a render without a colour target ignore the
@@ -822,8 +824,8 @@ typedef enum CaelixDebugView
     CAELIX_VIEW_BRICK = 4,  /* hash colour of the brick of the hit (group and dense brick id) */
     CAELIX_VIEW_STEPS = 5,  /* heat map of the procedural candidates of the ray, 0 .. 64 */
     /* Views 6, 7, 8 and 10 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo view
-       for them, CAELIX_MODE_REFERENCE ignores debug_view); view 9 to CAELIX_MODE_PRIMARY (the lighting
-       modes ignore it). */
+       for them, CAELIX_MODE_REFERENCE ignores debug_view); views 9 and 11 to CAELIX_MODE_PRIMARY (the
+       lighting modes ignore them). */
     CAELIX_VIEW_NRD_VALIDATION = 6, /* NRD's validation layer (CommonSettings::enableValidation) blended
                                        over the image by its alpha (after the sRGB encode); the normal
                                        image when the frame was not denoised */
@@ -840,9 +842,14 @@ typedef enum CaelixDebugView
                                        and 50 % with white for an emissive entry (any emission > 0);
                                        an air code is magenta. Lambert-shaded with
                                        CAELIX_RENDER_FLAG_SHADING. */
-    CAELIX_VIEW_NRD_SPEC = 10       /* CAELIX_MODE_PATH_TRACE: the denoised specular radiance without
+    CAELIX_VIEW_NRD_SPEC = 10,      /* CAELIX_MODE_PATH_TRACE: the denoised specular radiance without
                                        the albedo (the raw specular radiance when the frame was not
                                        denoised), exposure applied; like CAELIX_VIEW_NRD_DIFF */
+    CAELIX_VIEW_VOXEL_ID = 11       /* CAELIX_MODE_PRIMARY: a pastel hash colour of the voxel key of the
+                                       primary hit (word 0 of the voxel id target's value, see
+                                       CaelixRenderTargets::voxel_id), no shading; a miss and a hit
+                                       farther than voxel_id_tmax are sky_color. The lighting modes
+                                       ignore it. */
 } CaelixDebugView;
 
 /* CaelixRenderOptions::flags */
@@ -939,10 +946,10 @@ typedef enum CaelixUpscaleQuality
 #define CAELIX_UPSCALE_FLAG_AUTO_EXPOSURE (1u << 1) /* DLSS SR: NGX auto exposure instead of a fixed
                                                        exposure of 1 (the colour is already exposed) */
 
-/* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. */
+/* Zero-initialized options are valid: CAELIX_MODE_PRIMARY, the albedo view, no flags. 208 bytes. */
 typedef struct CaelixRenderOptions
 {
-    uint32_t debug_view; /* CaelixDebugView; read in CAELIX_MODE_PRIMARY (views 0..5, 9) and
+    uint32_t debug_view; /* CaelixDebugView; read in CAELIX_MODE_PRIMARY (views 0..5, 9, 11) and
                             CAELIX_MODE_PATH_TRACE (views 6, 7, 8, 10), checked in every mode */
     uint32_t flags;      /* CAELIX_RENDER_FLAG_* */
     float sun_dir[3];    /* world-space direction TOWARD the sun; the library normalizes it ((0, 1, 0)
@@ -1015,6 +1022,10 @@ typedef struct CaelixRenderOptions
                                  NVSDK_NGX_RayReconstruction_Hint_Render_Preset_*), set as the hint
                                  of the chosen quality mode */
     uint32_t upscale_flags;   /* CAELIX_UPSCALE_FLAG_* */
+    float voxel_id_tmax;      /* every mode: the voxel id target (CaelixRenderTargets::voxel_id) and the
+                                 voxel id debug view treat a hit farther than this along the camera ray
+                                 as a miss; 0 = no limit. Must be finite and >= 0. */
+    uint32_t reserved_voxel_id[3]; /* reserved, pass 0 */
 } CaelixRenderOptions;
 
 /* The images of one render call. A target is PRESENT when its `image` is nonzero; an absent target
@@ -1060,26 +1071,42 @@ typedef struct CaelixRenderTargets
     /* R32_SFLOAT. Linear view depth dot(hit - position, forward) (NRD's IN_VIEWZ); a miss is
        CaelixRenderOptions::miss_view_z. */
     CaelixTargetImage view_z;
+    /* R32_UINT (x = hash word 0) or R32G32_UINT (x = hash word 0, y = an independent hash word 1).
+       Hashes of (entity id, entity-local integer voxel position) of the camera ray's FIRST hit,
+       transparent voxels included: every pixel of one voxel shares the key, and two voxels share a
+       key only on a hash collision (2^-32 per pair per word). A miss, a hit farther than
+       CaelixRenderOptions::voxel_id_tmax along the camera ray, and every pixel before the scene's
+       first TLAS build are 0xFFFFFFFF in every channel (never a valid key).
+       Size: without an upscaler the common size of the targets. With an upscaler (see "Upscalers")
+       the OUTPUT size (the colour target's): a separate dispatch at the output size writes it from
+       the UNJITTERED centre ray of each output pixel, so it pairs with the upscaled colour (the
+       primary trace stays jittered). Without an upscaler the trace writes it from the primary ray
+       (with the camera jitter). Every mode writes it (CAELIX_MODE_PRIMARY and CAELIX_MODE_REFERENCE
+       ignore the upscaler, so there it has the common size). CAELIX_RENDER_FLAG_FLIP_Y applies. */
+    CaelixTargetImage voxel_id;
 } CaelixRenderTargets;
 
 /* Records the frame's rendering into frame->command_buffer: one barrier per present target from its
    layout to GENERAL (one vkCmdPipelineBarrier2), the trace dispatch (8 x 8 pixels per workgroup)
    between two timestamps, in the lighting modes a barrier and the composite dispatch (8 x 8, also
-   between two timestamps), and one barrier from the writes to all later commands. Before the
+   between two timestamps), and one barrier from the writes to all later commands. With an upscaler
+   and a voxel id target, a second dispatch (8 x 8, at the output size) after the trace writes the
+   voxel id target; it lies inside the trace timestamps (trace_ms). Before the
    scene's first TLAS build the dispatch traces nothing and writes the miss values. The renderer
    creates one image view per target image and caches it (16 views; the least recently used view
    is destroyed once its last frame is safe). A successful call stores the camera as the previous
    camera of the next call.
    Returns CAELIX_ERROR_INVALID_ARGUMENT for a null argument, no present target, a present target
    without format or size, present targets of different sizes, one image in two targets, a geometry
-   target format outside its list above, an unknown debug view, an unknown mode, a bounce_count above
+   or voxel id target format outside its list above, an unknown debug view, an unknown mode, a bounce_count above
    CAELIX_MAX_BOUNCES, a bounce_count_transparent above CAELIX_MAX_BOUNCES_TRANSPARENT, a frame number
    not above safe_frame_number, a frame number not above this renderer's previous successful call's
    (one render per renderer per frame), a ninth frame in flight,
    a sky image (CaelixRenderOptions::sky) with format VK_FORMAT_UNDEFINED, size 0, mip_levels 0 or
-   layout VK_IMAGE_LAYOUT_UNDEFINED, a negative or non-finite fog_density or emission_scale, an
-   unknown upscaler, and with an active upscaler an unknown upscale_quality, an output below 64 x 32
-   or a target that does not have its expected size (see "Upscalers");
+   layout VK_IMAGE_LAYOUT_UNDEFINED, a negative or non-finite fog_density, emission_scale or
+   voxel_id_tmax, an unknown upscaler, and with an active upscaler an unknown upscale_quality, an
+   output below 64 x 32 or a target that does not have its expected size (see "Upscalers"; the voxel
+   id target must have the output size);
    CAELIX_ERROR_OUT_OF_MEMORY when the internal targets of the lighting modes or the NRD instance
    cannot be allocated (nothing is recorded); CAELIX_ERROR_UNSUPPORTED when a target format
    cannot be written as a storage image without a format qualifier, or when the requested upscaler
@@ -1158,7 +1185,8 @@ CAELIX_API void caelix_renderer_release_target_views(CaelixRenderer* renderer);
 typedef struct CaelixGpuTimings
 {
     float trace_ms;        /* the trace dispatch of that frame (with a sky cubemap, the sky SH
-                              dispatch before it too) */
+                              dispatch before it too; with an upscaler and a voxel id target, the
+                              voxel id dispatch after it too) */
     float flush_ms;        /* caelix_scene_flush of that frame; 0 when the flush recorded no work */
     uint64_t frame_number; /* the frame the values belong to; 0 = none yet */
     float composite_ms;    /* the composite dispatch of that frame; 0 when it had none (primary mode) */

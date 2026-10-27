@@ -1,5 +1,7 @@
 // Renderer::Render: validation, descriptors, frame constants, barriers and the
-// pass sequence (sky SH, trace, NRD, composite, upscaler, encode).
+// pass sequence (sky SH, trace, voxel id, NRD, composite, upscaler, encode). The voxel id
+// pass runs only with an upscaler and a voxel id target: it writes that target at the output
+// size from unjittered pixel-centre rays (without an upscaler the trace writes it).
 #include "render/renderer.h"
 
 #include "core/log.h"
@@ -17,12 +19,13 @@
 namespace caelix {
 namespace {
 
-// [numthreads(8, 8, 1)] in caelix_path_trace.hlsl, caelix_composite.hlsl and caelix_upscale_encode.hlsl.
+// [numthreads(8, 8, 1)] in caelix_path_trace.hlsl, caelix_voxel_id.hlsl, caelix_composite.hlsl and
+// caelix_upscale_encode.hlsl.
 constexpr uint32_t kWorkgroupSize = 8;
 // The smallest output of an upscaler (DLSS: 64 x 32).
 constexpr uint32_t kMinUpscaleOutputWidth = 64;
 constexpr uint32_t kMinUpscaleOutputHeight = 32;
-constexpr uint32_t kDebugViewCount = 11;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_NRD_SPEC
+constexpr uint32_t kDebugViewCount = 12;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_VOXEL_ID
 constexpr uint32_t kModeCount = 3;
 constexpr float kDefaultSunAngularRadius = 0.00873f;  // 0.5 degrees
 
@@ -193,6 +196,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                     static_cast<double>(options.emission_scale));
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    if (!std::isfinite(options.voxel_id_tmax) || options.voxel_id_tmax < 0.0f)
+    {
+        CAELIX_LOGE("%s: voxel_id_tmax %g must be finite and >= 0", kFunction,
+                    static_cast<double>(options.voxel_id_tmax));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
     if (options.sky.image != 0 &&
         (options.sky.format == VK_FORMAT_UNDEFINED || options.sky.size == 0 ||
          options.sky.mip_levels == 0 || options.sky.layout == VK_IMAGE_LAYOUT_UNDEFINED))
@@ -211,8 +220,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     const bool lighting = options.mode != CAELIX_MODE_PRIMARY;
     // The host's sky cubemap (lighting modes only; the primary mode never samples the sky).
     const bool sky = lighting && options.sky.image != 0;
-    // The upscaler (path trace mode with a colour target): the colour target has the output size,
-    // every other present target and the internal targets the render size of the query.
+    // The upscaler (path trace mode with a colour target): the colour and voxel id targets have the
+    // output size, every other present target and the internal targets the render size of the query.
     const bool upscaling = options.mode == CAELIX_MODE_PATH_TRACE && targets.color.image != 0 &&
                            options.upscaler != CAELIX_UPSCALER_NONE;
     uint32_t render_width = 0;
@@ -243,9 +252,10 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         ray_reconstruction ? (options.flags & ~CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) : options.flags;
 
     // The present targets (image != 0), in binding order.
-    const CaelixTargetImage* const all[kTargetCount] = {&targets.color, &targets.albedo,
-                                                        &targets.normal, &targets.depth,
-                                                        &targets.motion, &targets.view_z};
+    const CaelixTargetImage* const all[kTargetCount] = {&targets.color,  &targets.albedo, &targets.normal,
+                                                        &targets.depth,  &targets.motion, &targets.view_z,
+                                                        &targets.voxel_id};
+    static_assert(kTargetVoxelIdIndex == 6, "`all` lists the voxel id target at index 6");
     uint32_t present[kTargetCount];  // indices into `all`
     uint32_t present_count = 0;
     uint32_t mask = 0;
@@ -264,15 +274,17 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         }
         if (upscaling)
         {
-            const uint32_t expected_width = i == 0 ? targets.color.width : render_width;
-            const uint32_t expected_height = i == 0 ? targets.color.height : render_height;
+            const bool output_size = i == 0 || i == kTargetVoxelIdIndex;
+            const uint32_t expected_width = output_size ? targets.color.width : render_width;
+            const uint32_t expected_height = output_size ? targets.color.height : render_height;
             if (target.width != expected_width || target.height != expected_height)
             {
                 CAELIX_LOGE("%s: the %s target is %ux%u; with upscaler %u at quality %u it must be %ux%u (the "
-                            "render size of caelix_upscaler_query for the %ux%u colour target)",
+                            "%s for the %ux%u colour target)",
                             kFunction, spec.name, target.width, target.height, options.upscaler,
-                            options.upscale_quality, expected_width, expected_height, targets.color.width,
-                            targets.color.height);
+                            options.upscale_quality, expected_width, expected_height,
+                            output_size ? "output size" : "render size of caelix_upscaler_query",
+                            targets.color.width, targets.color.height);
                 return CAELIX_ERROR_INVALID_ARGUMENT;
             }
         }
@@ -564,6 +576,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.target_mask = mask;
     constants.miss_depth = options.miss_depth;
     constants.miss_view_z = options.miss_view_z;
+    constants.voxel_id_tmax = options.voxel_id_tmax;
     constants.has_tlas = tlas != VK_NULL_HANDLE ? 1u : 0u;
     // Lighting.
     const uint32_t accum_count = restart_accumulation ? 0u : accum_count_;
@@ -683,6 +696,17 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     const ComputePipeline& trace = light_nee_flags != 0 ? kernels_.trace() : kernels_.trace_no_light_nee();
     bind_sets(trace, slot->set);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
+    // Voxel id (an upscaler and a voxel id target): the target at the output size from unjittered
+    // pixel-centre rays, so that it pairs with the upscaled colour; the trace skipped it (fc.upscale).
+    // Same set (binding 7 holds the target's view). It reads only the TLAS and the scene tables, so
+    // nothing orders it after the trace; the final barrier covers its writes. Inside the trace
+    // timestamps.
+    if (upscaling && targets.voxel_id.image != 0)
+    {
+        bind_sets(kernels_.voxel_id(), slot->set);
+        vkCmdDispatch(cmd, (output_width + kWorkgroupSize - 1) / kWorkgroupSize,
+                      (output_height + kWorkgroupSize - 1) / kWorkgroupSize, 1);
+    }
     timer_.End(cmd);
 
     // NRD (path trace mode with denoising). Its first dispatch waits for the trace's

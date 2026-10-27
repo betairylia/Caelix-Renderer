@@ -5,9 +5,9 @@
 namespace caelix {
 
 // CPU mirror of CaelixFrameConstants in shaders/common/caelix_frame.hlsl; change both
-// together. One per render call, in the frame slot's host-visible buffer, which the five
+// together. One per render call, in the frame slot's host-visible buffer, which the six
 // frame-constant kernels (caelix_path_trace, caelix_composite, caelix_cross_resolve, caelix_sky_sh,
-// caelix_upscale_encode) read as a uniform buffer: the frame set (set kFrameSetIndex, binding
+// caelix_upscale_encode, caelix_voxel_id) read as a uniform buffer: the frame set (set kFrameSetIndex, binding
 // kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 576 bytes.
 // Layout rule: the uniform block has DXC's default constant buffer layout, which gives these C
 // offsets only while every field sits at an offset that is a multiple of its size (float4 at 16,
@@ -67,7 +67,7 @@ struct FrameConstants
     uint64_t materials;                 // 440  packed hot material entry (32 B) by block code, 65536 entries
     float hit_dist_params[4];           // 448  REBLUR hit distance normalization A, B, C (w unused), = ReblurSettings
     uint32_t cross_resolve;             // 464  1 = the composite writes the resolve image, the cross resolve the target
-    uint32_t pad_468;                   // 468
+    float voxel_id_tmax;                // 468  CaelixRenderOptions::voxel_id_tmax: voxel id beyond it = miss (0 = no limit)
     float jitter[2];                    // 472  CaelixCamera::jitter (pixels, y down)
     float fog_color[4];                 // 480  rgb = fog radiance, w = fog density per unit (0 = no fog)
     uint64_t sky_sh;                    // 496  address of 9 float4 (rgb, 0): irradiance SH coefficients (sky_cubemap = 1)
@@ -109,6 +109,7 @@ static_assert(offsetof(FrameConstants, bounce_count_transparent) == 436);
 static_assert(offsetof(FrameConstants, materials) == 440);
 static_assert(offsetof(FrameConstants, hit_dist_params) == 448);
 static_assert(offsetof(FrameConstants, cross_resolve) == 464);
+static_assert(offsetof(FrameConstants, voxel_id_tmax) == 468);
 static_assert(offsetof(FrameConstants, jitter) == 472);
 static_assert(offsetof(FrameConstants, fog_color) == 480);
 static_assert(offsetof(FrameConstants, sky_sh) == 496);
@@ -138,6 +139,7 @@ constexpr uint32_t kTargetNormal = 1u << 2;
 constexpr uint32_t kTargetDepth = 1u << 3;
 constexpr uint32_t kTargetMotion = 1u << 4;
 constexpr uint32_t kTargetViewZ = 1u << 5;
+constexpr uint32_t kTargetVoxelId = 1u << 6;
 constexpr uint32_t kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
 
 // FrameConstants::light_nee_flags (docs/LIGHT_NEE.md; the macros of shaders/common/caelix_frame.hlsl):
@@ -148,7 +150,7 @@ constexpr uint32_t kLightNeeOn = 1u << 0;
 constexpr uint32_t kLightNeeMis = 1u << 1;
 
 // The frame set: one descriptor set layout with one binding, the frame slot's FrameConstants as a
-// uniform buffer (range sizeof(FrameConstants), offset 0). Bound as set kFrameSetIndex by the five
+// uniform buffer (range sizeof(FrameConstants), offset 0). Bound as set kFrameSetIndex by the six
 // frame-constant kernels (each keeps its own set 0); they have no push constants.
 constexpr uint32_t kFrameSetIndex = 1;
 constexpr uint32_t kFrameConstantsBinding = 0;

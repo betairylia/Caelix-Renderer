@@ -68,7 +68,7 @@ target_compile_definitions(caelix_material_test PRIVATE
 # has no DLSS.
 caelix_add_gpu_test(caelix_dlss_test dlss_test.cpp)
 
-# The GPU layouts shared by C++ and HLSL, no GPU: the frame constants' uniform block in the five
+# The GPU layouts shared by C++ and HLSL, no GPU: the frame constants' uniform block in the six
 # compiled frame-constant kernels against lib/src/render/frame_constants.h (fails when a member offset
 # or an array stride of DXC's constant buffer layout differs from the C struct), the push constant
 # blocks of the scene and light tree kernels against their C++ structs by member name, and every named

@@ -4,7 +4,9 @@
 //
 // Every mode writes the host's geometry targets that are present
 // (CaelixFrameConstants::target_mask): albedo, normal, device depth, motion and
-// linear view depth. With kRenderFlagFlipY every HOST target write goes to the
+// linear view depth, and the voxel id target (VoxelIdHash of the camera ray's first
+// hit, before the delta chain) unless an upscaler runs (then caelix_voxel_id.hlsl
+// writes it at the output size). With kRenderFlagFlipY every HOST target write goes to the
 // mirrored row (CaelixOutputPixel) and the host motion's y is negated; the ray,
 // the random stream and the internal targets use the unflipped pixel.
 //   kModePrimary:   the colour target gets a debug view of the primary hit.
@@ -42,10 +44,10 @@
 //                   bounce that misses receives the irradiance SH / pi that
 //                   caelix_sky_sh.hlsl projected before this dispatch
 //                   (SkyDiffuseMiss, SkySpecularMiss).
-//                   The internal device depth (binding 14, the host depth target's
+//                   The internal device depth (binding 15, the host depth target's
 //                   expression; the upscaler's depth) is written in every lighting
 //                   frame; with fc.upscaler = kUpscalerDlssRr the four DLSS RR guides
-//                   (bindings 15..18): diffuse albedo albedo * (1 - metallic) (sky 0.5),
+//                   (bindings 16..19): diffuse albedo albedo * (1 - metallic) (sky 0.5),
 //                   specular albedo EnvBRDFApprox2(lerp(0.04, albedo, metallic),
 //                   roughness^2, N.V) (sky 0), world normal + linear roughness (sky 0) and
 //                   the hit distance of the first bounce segment (sky and no segment 65504),
@@ -59,15 +61,16 @@
 // binding 0; no push constants); the
 // scene's tables (page table, slot rows, group infos, entity infos) are read by
 // caelix_scene_trace.hlsl. The descriptors are the TLAS (binding 0, declared by
-// caelix_scene_trace.hlsl), the six host targets (bindings 1..6, no format
+// caelix_scene_trace.hlsl), the seven host targets (bindings 1..7, no format
 // qualifier: format Unknown in SPIR-V, needs shaderStorageImageWriteWithoutFormat,
-// so every write is a float4 and the image keeps the components its format has)
-// and the internal targets of the lighting modes (bindings 7..18, fixed formats),
-// the sky cubemap (binding 19, sampled image) and its sampler (binding 20). Every
+// so every write is a float4 (uint4 for the voxel id target) and the image keeps the
+// components its format has) and the internal targets of the lighting modes (bindings
+// 8..19, fixed formats), the sky cubemap (binding 20, sampled image) and its sampler
+// (binding 21). Every
 // binding is PARTIALLY_BOUND:
 // the library writes only the TLAS (when the scene has one), the present targets
 // and, in the lighting modes, the internal targets, and the kernel touches a
-// binding only then (has_tlas, target_mask, mode). Bindings 19 and 20 are written
+// binding only then (has_tlas, target_mask, mode). Bindings 20 and 21 are written
 // every frame (the host's cubemap, or a 1 x 1 fallback cube that is never sampled
 // because sky_cubemap is 0).
 #include "common/caelix_platform.hlsl"
@@ -79,8 +82,8 @@
 // The frame constants (g_frame, set 1).
 #include "common/caelix_frame_ubo.hlsl"
 // The sky cubemap and its sampler (caelix_shading.hlsl declares them).
-#define CAELIX_SKY_BINDING_IMAGE 19
-#define CAELIX_SKY_BINDING_SAMPLER 20
+#define CAELIX_SKY_BINDING_IMAGE 20
+#define CAELIX_SKY_BINDING_SAMPLER 21
 #include "render/caelix_shading.hlsl"
 // The light tree and the light NEE's near field and MIS weight (docs/LIGHT_NEE.md).
 #include "light/caelix_light_tree.hlsl"
@@ -95,19 +98,21 @@ CAELIX_BINDING(3, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_normal;
 CAELIX_BINDING(4, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_depth;
 CAELIX_BINDING(5, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_motion;
 CAELIX_BINDING(6, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<float4> g_view_z;
+// R32_UINT or R32G32_UINT (the library checks the format).
+CAELIX_BINDING(7, 0) CAELIX_FORMAT_UNKNOWN RWTexture2D<uint4> g_voxel_id;
 // Internal targets of the lighting modes (lib/src/render/renderer.h, InternalTargets).
-CAELIX_BINDING(7, 0) CAELIX_FORMAT("r32f") RWTexture2D<float4> g_int_view_z;
-CAELIX_BINDING(8, 0) CAELIX_FORMAT("rgb10a2") RWTexture2D<float4> g_int_normal_roughness;
-CAELIX_BINDING(9, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_motion;
-CAELIX_BINDING(10, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_albedo;
-CAELIX_BINDING(11, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_deterministic;
-CAELIX_BINDING(12, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_diff;
-CAELIX_BINDING(13, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_spec;
-CAELIX_BINDING(14, 0) CAELIX_FORMAT("r32f") RWTexture2D<float4> g_int_depth;
-CAELIX_BINDING(15, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_diffuse_albedo;
-CAELIX_BINDING(16, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_specular_albedo;
-CAELIX_BINDING(17, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_rr_normal_roughness;
-CAELIX_BINDING(18, 0) CAELIX_FORMAT("r16f") RWTexture2D<float4> g_int_rr_hit_dist;
+CAELIX_BINDING(8, 0) CAELIX_FORMAT("r32f") RWTexture2D<float4> g_int_view_z;
+CAELIX_BINDING(9, 0) CAELIX_FORMAT("rgb10a2") RWTexture2D<float4> g_int_normal_roughness;
+CAELIX_BINDING(10, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_motion;
+CAELIX_BINDING(11, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_albedo;
+CAELIX_BINDING(12, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_deterministic;
+CAELIX_BINDING(13, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_diff;
+CAELIX_BINDING(14, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_spec;
+CAELIX_BINDING(15, 0) CAELIX_FORMAT("r32f") RWTexture2D<float4> g_int_depth;
+CAELIX_BINDING(16, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_diffuse_albedo;
+CAELIX_BINDING(17, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_specular_albedo;
+CAELIX_BINDING(18, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_rr_normal_roughness;
+CAELIX_BINDING(19, 0) CAELIX_FORMAT("r16f") RWTexture2D<float4> g_int_rr_hit_dist;
 
 static const float kRayTMax = 1e30f;
 static const uint kStepsHeatMax = 64;
@@ -630,6 +635,15 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     return primary_shade;
 }
 
+// The voxel id of the camera ray's first hit (the voxel id target's value): VoxelIdHash, or
+// 0xFFFFFFFF in both words for a miss and for a hit farther than fc.voxel_id_tmax (0 = no limit).
+uint2 VoxelIdOrMiss(CaelixFrameConstants fc, TraceResult primary)
+{
+    return primary.hit && (fc.voxel_id_tmax <= 0.0f || primary.T <= fc.voxel_id_tmax)
+               ? VoxelIdHash(fc, primary)
+               : uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
+}
+
 // The material debug view (kViewMaterial): the table's albedo, mixed with blue for
 // a transparent code and with white for an emissive entry; air is magenta.
 float3 MaterialViewColor(uint block)
@@ -749,6 +763,12 @@ void main(uint3 thread_id : SV_DispatchThreadID)
             color = primary.candidates == 0 ? fc.sky_color.xyz
                                             : HeatMap(float(primary.candidates) / float(kStepsHeatMax));
         }
+        else if (fc.debug_view == kViewVoxelId)
+        {
+            // The voxel id target's key (word 0) as a colour, no shading; beyond voxel_id_tmax the sky.
+            const uint2 key = VoxelIdOrMiss(fc, primary);
+            color = key.x != 0xFFFFFFFFu ? Pastel(key.x) : fc.sky_color.xyz;
+        }
         else if (hit)
         {
             if (fc.debug_view == kViewNormal)
@@ -812,6 +832,13 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     if ((targets & kTargetViewZ) != 0u)
     {
         g_view_z[out_pixel] = float4(hit ? view_z : fc.miss_view_z, 0.0f, 0.0f, 0.0f);
+    }
+    CAELIX_BRANCH
+    if ((targets & kTargetVoxelId) != 0u && fc.upscale == 0u)
+    {
+        // With an upscaler the caelix_voxel_id kernel writes this target at the output size.
+        // The key is the camera ray's first hit (`primary`), not the delta chain's surface.
+        g_voxel_id[out_pixel] = uint4(VoxelIdOrMiss(fc, primary), 0u, 0u);
     }
 
     // Motion: the host target and the internal one of the lighting modes.

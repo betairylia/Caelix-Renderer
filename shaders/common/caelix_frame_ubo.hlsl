@@ -1,5 +1,5 @@
-// The frame set of the five frame-constant kernels (caelix_path_trace, caelix_composite,
-// caelix_cross_resolve, caelix_sky_sh, caelix_upscale_encode): set 1 (kFrameSetIndex in
+// The frame set of the six frame-constant kernels (caelix_path_trace, caelix_composite,
+// caelix_cross_resolve, caelix_sky_sh, caelix_upscale_encode, caelix_voxel_id): set 1 (kFrameSetIndex in
 // lib/src/render/frame_constants.h), binding 0 = the frame slot's CaelixFrameConstants as a uniform
 // buffer. Each kernel's main reads `CaelixFrameConstants fc = g_frame;`. Set 0 is the kernel's own
 // set; the kernels have no push constants.

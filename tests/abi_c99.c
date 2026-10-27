@@ -13,9 +13,10 @@ size_t caelix_abi_c99_touch(void);
    no static_assert). */
 typedef char caelix_material_is_112_bytes[(sizeof(CaelixMaterial) == 112) ? 1 : -1];
 typedef char caelix_material_entry_is_116_bytes[(sizeof(CaelixMaterialEntry) == 116) ? 1 : -1];
-/* CaelixRenderOptions is embedded by value in host packets (the Unity plugin): 192 bytes, the sky
-   cubemap at offset 152, the upscaler fields from offset 176. */
-typedef char caelix_render_options_is_192_bytes[(sizeof(CaelixRenderOptions) == 192) ? 1 : -1];
+/* CaelixRenderOptions is embedded by value in host packets (the Unity plugin): 208 bytes, the sky
+   cubemap at offset 152, the upscaler fields from offset 176, voxel_id_tmax at 192. */
+typedef char caelix_render_options_is_208_bytes[(sizeof(CaelixRenderOptions) == 208) ? 1 : -1];
+typedef char caelix_voxel_id_tmax_at_192[(offsetof(CaelixRenderOptions, voxel_id_tmax) == 192) ? 1 : -1];
 typedef char caelix_sky_cubemap_at_152[(offsetof(CaelixRenderOptions, sky) == 152) ? 1 : -1];
 typedef char caelix_upscaler_at_176[(offsetof(CaelixRenderOptions, upscaler) == 176) ? 1 : -1];
 /* The light NEE options and stats: 16 bytes each. */
@@ -70,7 +71,7 @@ size_t caelix_abi_c99_touch(void)
     CaelixNrdInfo nrd_info = {4, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     CaelixDeviceFeatureBits read_bit = CAELIX_FEATURE_STORAGE_IMAGE_READ_WITHOUT_FORMAT;
     CaelixRenderMode mode = CAELIX_MODE_REFERENCE;
-    CaelixDebugView view = CAELIX_VIEW_NRD_SPEC;
+    CaelixDebugView view = CAELIX_VIEW_VOXEL_ID;
     CaelixRenderer* renderer = NULL;
     CaelixEntityId entity = CAELIX_INVALID_ENTITY;
     CaelixLogCallback log_callback = NULL;
@@ -84,7 +85,7 @@ size_t caelix_abi_c99_touch(void)
                  sizeof(targets) + sizeof(timings) + sizeof(view) + sizeof(renderer) +
                  sizeof(mode) + sizeof(nrd_info) + sizeof(read_bit) + sizeof(material) +
                  sizeof(caelix_material_is_112_bytes) + sizeof(caelix_material_entry_is_116_bytes) +
-                 sizeof(caelix_render_options_is_192_bytes) +
+                 sizeof(caelix_render_options_is_208_bytes) + sizeof(caelix_voxel_id_tmax_at_192) +
                  sizeof(caelix_sky_cubemap_at_152) + sizeof(caelix_upscaler_at_176) + sizeof(upscaler_query) +
                  sizeof(upscaler_result) + sizeof(upscaler_info) + sizeof(upscaler) + sizeof(quality) +
                  sizeof(reason) + upscale_flags;

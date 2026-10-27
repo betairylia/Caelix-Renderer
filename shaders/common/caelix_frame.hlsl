@@ -1,11 +1,12 @@
-// Per-frame constants of the trace, composite, cross resolve, sky SH and upscale encode kernels.
+// Per-frame constants of the trace, composite, cross resolve, sky SH, upscale encode and voxel id
+// kernels.
 // Mirrors lib/src/render/frame_constants.h; change both together. 576 bytes, read as the uniform
 // buffer g_frame (common/caelix_frame_ubo.hlsl: set 1, binding 0).
 // Layout rule: the uniform block gets DXC's default constant buffer layout, which gives the C
 // offsets only while every field sits at an offset that is a multiple of its size, no vector
 // crosses a 16-byte row and every array element is 16 bytes (an array of scalars or 2-vectors
 // would get a 16-byte stride). The test caelix_frame_layout_test (tests/frame_layout_test.cpp)
-// reads the uniform block of the five compiled kernels and fails on any member offset or array
+// reads the uniform block of the six compiled kernels and fails on any member offset or array
 // stride that differs from the C layout: run ctest after every change of this struct.
 #ifndef CAELIX_FRAME_HLSL
 #define CAELIX_FRAME_HLSL
@@ -65,7 +66,7 @@ struct CaelixFrameConstants
     uint64_t materials;             // 440  packed hot material entry (32 B) by block code (common/caelix_material.hlsl)
     float4 hit_dist_params;         // 448  REBLUR hit distance normalization A, B, C (w unused)
     uint cross_resolve;             // 464  1 = composite -> resolve image -> caelix_cross_resolve -> colour
-    uint pad_468;                   // 468
+    float voxel_id_tmax;            // 468  voxel id target / view: a hit farther than this is a miss (0 = no limit)
     float2 jitter;                  // 472  CaelixCamera::jitter: sub-pixel offset of the primary sample (pixels, y down)
     float4 fog_color;               // 480  rgb = fog radiance, w = fog density per unit (0 = no fog)
     uint64_t sky_sh;                // 496  address of 9 float4 (rgb, 0): irradiance SH coefficients, valid when sky_cubemap = 1
@@ -96,6 +97,7 @@ static const uint kViewNrdDiff = 7;        // path trace mode: denoised diffuse 
 static const uint kViewMotion = 8;         // path trace mode: the motion vector of the primary hit
 static const uint kViewMaterial = 9;       // primary mode: the material table's albedo, tinted by kind
 static const uint kViewNrdSpec = 10;       // path trace mode: denoised specular radiance
+static const uint kViewVoxelId = 11;       // primary mode: pastel colour of the voxel id of the primary hit
 
 // CaelixUpscaler
 static const uint kUpscalerNone = 0;
@@ -115,7 +117,7 @@ static const uint kRenderFlagDeltaCheckerboard = 1u << 3;
 static const uint kRenderFlagFlipY = 1u << 4;
 
 // CaelixFrameConstants::light_nee_flags (lib/src/render/frame_constants.h). Macros: a static const here
-// would add constants to the four other frame-constant kernels, which never read them.
+// would add constants to the five other frame-constant kernels, which never read them.
 #define kLightNeeOn (1u << 0)
 #define kLightNeeMis (1u << 1)
 
@@ -126,6 +128,7 @@ static const uint kTargetNormal = 1u << 2;
 static const uint kTargetDepth = 1u << 3;
 static const uint kTargetMotion = 1u << 4;
 static const uint kTargetViewZ = 1u << 5;
+static const uint kTargetVoxelId = 1u << 6;
 static const uint kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
 
 // The sample position of pixel `pixel` in pixels (row 0 = the top row, y down): the pixel centre

@@ -155,6 +155,7 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_nee.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace_no_light_nee.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_voxel_id.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_output.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite_set.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_composite.hlsl

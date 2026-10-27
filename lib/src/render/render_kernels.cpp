@@ -63,8 +63,8 @@ RenderKernels::RenderKernels(Device& device)
     const VkDevice vk_device = device.device();
     try
     {
-        // Trace set: binding 0 the TLAS, bindings 1..6 the host targets, 7..18 the
-        // internal targets, 19 the sky cubemap, 20 its sampler. Every binding is
+        // Trace set: binding 0 the TLAS, bindings 1..7 the host targets, 8..19 the
+        // internal targets, 20 the sky cubemap, 21 its sampler. Every binding is
         // PARTIALLY_BOUND (descriptorBindingPartiallyBound, a device requirement): a render
         // call writes only the TLAS when there is one, the targets that are present, the
         // internal targets in the lighting modes and the sky bindings, and the kernel
@@ -109,6 +109,7 @@ RenderKernels::RenderKernels(Device& device)
         };
         trace_ = create("caelix_path_trace", trace_layout_);
         trace_no_light_nee_ = create("caelix_path_trace_no_light_nee", trace_layout_);
+        voxel_id_ = create("caelix_voxel_id", trace_layout_);
         composite_ = create("caelix_composite", composite_layout_);
         cross_resolve_ = create("caelix_cross_resolve", composite_layout_);
         sky_sh_ = create("caelix_sky_sh", sky_layout_);
@@ -145,6 +146,7 @@ RenderKernels::RenderKernels(Device& device)
         // here (the pipelines and the image destroy themselves).
         trace_ = ComputePipeline();
         trace_no_light_nee_ = ComputePipeline();
+        voxel_id_ = ComputePipeline();
         composite_ = ComputePipeline();
         cross_resolve_ = ComputePipeline();
         sky_sh_ = ComputePipeline();
@@ -163,7 +165,7 @@ RenderKernels::RenderKernels(Device& device)
         }
         throw;
     }
-    CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_path_trace_no_light_nee, "
+    CAELIX_LOGI("render kernels created: caelix_path_trace, caelix_path_trace_no_light_nee, caelix_voxel_id, "
                 "caelix_composite, caelix_cross_resolve, caelix_sky_sh, caelix_upscale_encode");
 }
 
@@ -177,6 +179,7 @@ RenderKernels::~RenderKernels()
     }
     trace_ = ComputePipeline();
     trace_no_light_nee_ = ComputePipeline();
+    voxel_id_ = ComputePipeline();
     composite_ = ComputePipeline();
     cross_resolve_ = ComputePipeline();
     sky_sh_ = ComputePipeline();

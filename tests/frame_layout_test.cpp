@@ -8,7 +8,7 @@
 // The test reads the .spv files of the build (CAELIX_SHADER_SPV_DIR, written by cmake/Shaders.cmake)
 // and parses the SPIR-V binary, and reads the HLSL sources (CAELIX_SHADER_SOURCE_DIR).
 //
-// For each of the frame-constant kernels (the five kernels and the trace variant) it finds the
+// For each of the frame-constant kernels (the six kernels and the trace variant) it finds the
 // variable of storage class Uniform whose pointee is a struct decorated Block (exactly one), checks
 // its DescriptorSet / Binding against kFrameSetIndex / kFrameConstantsBinding, recomputes the C
 // natural layout of the block's member sequence (each member aligned to its scalar size; arrays and
@@ -361,7 +361,8 @@ std::vector<std::string> CheckKernel(const std::string& name)
 TEST_CASE("frame constants: the uniform block of every frame-constant kernel has the C layout")
 {
     const char* const kernels[] = {"caelix_path_trace", "caelix_path_trace_no_light_nee", "caelix_composite",
-                                   "caelix_cross_resolve", "caelix_sky_sh", "caelix_upscale_encode"};
+                                   "caelix_cross_resolve", "caelix_sky_sh", "caelix_upscale_encode",
+                                   "caelix_voxel_id"};
     for (const char* kernel : kernels)
     {
         const std::vector<std::string> errors = CheckKernel(kernel);

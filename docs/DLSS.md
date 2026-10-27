@@ -85,14 +85,17 @@ CaelixRenderer
 Path trace mode, colour target present, `upscaler != NONE`. `size` = render size (the query's
 optimal size), `output_size` = the colour target's size.
 
-1. Validation: the colour target is the output size (at least 64 x 32); every other present
-   target has the render size (else `CAELIX_ERROR_INVALID_ARGUMENT`, the log names the expected
-   size); an unavailable upscaler returns `CAELIX_ERROR_UNSUPPORTED` before anything is
-   recorded.
+1. Validation: the colour target and the voxel id target are the output size (at least
+   64 x 32); every other present target has the render size (else
+   `CAELIX_ERROR_INVALID_ARGUMENT`, the log names the expected size); an unavailable upscaler
+   returns `CAELIX_ERROR_UNSUPPORTED` before anything is recorded.
 2. `EnsureInternalTargets(render size)`, NRD at render size for SR (`denoise` as before;
    never for RR), `EnsureUpscaler` (records the feature creation at the first frame of a desc).
 3. Trace (render size). Writes the internal device depth every lighting frame; with RR the four
-   guide images.
+   guide images. It skips the voxel id target (`fc.upscale = 1`): with a voxel id target the
+   voxel id kernel (`shaders/render/caelix_voxel_id.hlsl`, trace set, output size, 8 x 8) runs
+   right after it and writes the target from the UNJITTERED centre ray of each output pixel, so
+   that the key image pairs with the upscaled colour (`docs/VOXEL_ID.md`); inside `trace_ms`.
 4. SR: NRD as before.
 5. Composite (and the cross resolve when the delta checkerboard runs, SR only) with
    `fc.upscale = 1`: the final linear, exposed colour goes to the internal `upscale_in`
@@ -135,7 +138,8 @@ afterwards until the upscaler options change (like NRD).
 
 All are render size; the RR images exist in every lighting frame (cheap) and are written only
 when `fc.upscaler == 2`. The trace set grew to bindings 7..18 for the internal targets (sky 19,
-sampler 20; `CreateSetLayout` handles up to 32 bindings); the composite set has `upscale_in` at
+sampler 20; since the voxel id step the voxel id target is binding 7, the internal targets 8..19,
+sky 20, sampler 21; `CreateSetLayout` handles up to 32 bindings); the composite set has `upscale_in` at
 binding 9 (sky 10, sampler 11); the encode set is a fourth set per frame slot. Frame constants:
 544 bytes (`output_size` 520, `upscale_src_size` 528, `upscaler` 536, `upscale` 540).
 

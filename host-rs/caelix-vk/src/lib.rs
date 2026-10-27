@@ -25,12 +25,16 @@
 //!
 //! [`Context::create_sky_cubemap`] uploads a sky cubemap once (outside the frame
 //! loop); the image lives until [`Context::destroy_sky_cubemap`] or until the context is dropped.
+//! [`Context::create_storage_image`] creates a storage image for a render target that the caller
+//! passes to the library (the voxel id target); it lives until [`Context::destroy_storage_image`]
+//! or until the context is dropped.
 
 mod cubemap;
 mod debug;
 mod device;
 mod overlay;
 mod readback;
+mod storage_image;
 mod swapchain;
 
 use std::ffi::{c_void, CString};
@@ -40,6 +44,7 @@ use ash::vk::Handle;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 pub use cubemap::SkyCubemap;
+pub use storage_image::{StorageImage, FORMAT_R32G32_UINT};
 use swapchain::Swapchain;
 
 /// Number of frames the CPU may record ahead of the GPU.
@@ -192,7 +197,8 @@ pub struct Context {
     readback: Option<readback::PendingReadback>,
     /// The egui overlay renderer, after `init_overlay`. Dropped first in Drop.
     overlay: Option<overlay::Overlay>,
-    /// Images created by the context for the caller (the sky cubemap), destroyed in Drop.
+    /// Images created by the context for the caller (the sky cubemap, storage images), destroyed in
+    /// Drop.
     owned_images: Vec<cubemap::OwnedImage>,
 }
 

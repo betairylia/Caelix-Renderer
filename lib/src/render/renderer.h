@@ -32,9 +32,9 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // Two kernels. The trace kernel (shaders/render/caelix_path_trace.hlsl) reads the
 // scene's tables through buffer device addresses in the frame constants; the
 // TLAS and the images are its only descriptors (set 0: binding 0 acceleration
-// structure, bindings 1..6 the host targets colour, albedo, normal, depth,
-// motion, view_z, bindings 7..18 the internal targets of the lighting modes,
-// binding 19 the sky cubemap (sampled image), binding 20 its sampler; every
+// structure, bindings 1..7 the host targets colour, albedo, normal, depth,
+// motion, view_z, voxel_id, bindings 8..19 the internal targets of the lighting modes,
+// binding 20 the sky cubemap (sampled image), binding 21 its sampler; every
 // binding PARTIALLY_BOUND, so absent targets and a missing TLAS are simply
 // not written). In the lighting modes the composite kernel
 // (shaders/render/caelix_composite.hlsl, its own set: binding 0 the host colour target,
@@ -45,7 +45,10 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // colour target, the Upscaler (DlssUpscaler) writes upscale_out_ at the output size, and the
 // encode kernel (shaders/render/caelix_upscale_encode.hlsl, a fourth set: binding 0 the
 // host colour target, 1 the source, 2 the internal albedo) writes the colour target; after
-// an NGX error the encode kernel reads the upscale input instead (nearest upscale). The
+// an NGX error the encode kernel reads the upscale input instead (nearest upscale). With an
+// upscaler and a voxel id target, the voxel id kernel (shaders/render/caelix_voxel_id.hlsl, the
+// trace set) writes that target at the output size right after the trace, from unjittered
+// pixel-centre rays (inside the trace timestamps); without an upscaler the trace writes it. The
 // upscaler and upscale_out_ are created at the first upscaled render and recreated (the
 // old ones retired until safe) when any UpscalerDesc field changes. Sky cubemap
 // (CaelixRenderOptions::sky, lighting modes): before the trace,
@@ -97,7 +100,7 @@ private:
     static constexpr uint32_t kInitialSlots = 3;
     static constexpr uint32_t kMaxSlots = 8;
     static constexpr size_t kMaxCachedViews = 16;
-    // Internal targets of the lighting modes, in trace binding order (binding 7 + index;
+    // Internal targets of the lighting modes, in trace binding order (binding 8 + index;
     // from kInternalAccum on they are not in the trace set).
     enum Internal : uint32_t
     {

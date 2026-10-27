@@ -89,9 +89,17 @@ struct CaelixBrickHit
 
 struct AttributeData
 {
-    // (31) [matID:16] [reserved] [faceNormalFlags:6] (0)
+    // (31) [matID:16] [reserved:1] [cell:9] [faceNormalFlags:6] (0)
+    // cell = the hit voxel inside the brick, x | y << 3 | z << 6 (CaelixBrickCellIndex); readers of
+    // the face flags mask bits 0..5.
     uint matID_faceNormal;
 };
+
+// The 9-bit index of a voxel `cell` (0..7 per axis) inside its brick, as AttributeData stores it.
+inline uint CaelixBrickCellIndex(int3 cell)
+{
+    return uint(cell.x) | (uint(cell.y) << 3) | (uint(cell.z) << 6);
+}
 
 static half3 objectNormals[6] = {
     half3(1, 0, 0),
@@ -104,7 +112,7 @@ static half3 objectNormals[6] = {
 
 inline half3 UnpackObjectNormal(uint normalFlag)
 {
-    return objectNormals[firstbitlow(normalFlag)];
+    return objectNormals[firstbitlow(normalFlag & 0x3Fu)];
 }
 
 // Brick record loads. Every brick lives in the shared brick pool, so the three macros route
@@ -344,7 +352,8 @@ inline float CaelixTraceBrickRay(uint brickBase, float3 entryPositionInBrick, fl
 
             if (shouldTerminate)
             {
-                attrib.matID_faceNormal = (blockID << 16) + normalFlags;
+                // `cell` is the voxel whose block was read (the hit voxel).
+                attrib.matID_faceNormal = (uint(blockID) << 16) | (CaelixBrickCellIndex(cell) << 6) | normalFlags;
                 return entryT + T;
             }
         }

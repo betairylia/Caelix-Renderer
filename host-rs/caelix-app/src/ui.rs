@@ -565,6 +565,16 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             });
             ui.end_row();
 
+            ui.label("voxel id");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut settings.voxel_id, "Voxel id target")
+                    .on_hover_text("Pass an R32G32_UINT voxel id target at the window size to every render call.");
+                ui.label("Voxel id t max");
+                ui.add(DragValue::new(&mut settings.voxel_id_tmax).range(0.0..=1.0e6).speed(1.0))
+                    .on_hover_text("The voxel id target and view treat a hit farther than this as a miss (0 = no limit).");
+            });
+            ui.end_row();
+
             ui.label("bounces");
             ui.add_enabled(lighting, Slider::new(&mut settings.bounces, 0..=CAELIX_MAX_BOUNCES));
             ui.end_row();

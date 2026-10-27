@@ -3,7 +3,7 @@
 // binding 0) and reads the scene's tables (page table, slot rows, group infos,
 // entity infos) through the device addresses in CaelixFrameConstants. The
 // integrator above this file uses only TraceScene, TraceShadow, the entity
-// transform helpers and the block code in TraceResult::attrib; nothing above it
+// transform helpers, VoxelIdHash and the block code in TraceResult::attrib; nothing above it
 // knows what a record, a slot row or a group is.
 //
 // Instances: instanceCustomIndex (CandidateInstanceID()) is the scene-wide group
@@ -34,9 +34,10 @@ struct TraceResult
 {
     bool hit;
     float T;            // world distance (the ray direction is unit length)
-    uint attrib;        // AttributeData::matID_faceNormal: block << 16 | face flags
+    uint attrib;        // AttributeData::matID_faceNormal: block << 16 | cell << 6 | face flags
     uint group;         // scene-wide group index
     uint id;            // dense brick id in the group
+    uint cell;          // the hit voxel inside its brick, x | y << 3 | z << 6 (0 on a miss)
     uint candidates;    // procedural candidates visited
     float3 normal;      // world-space face normal
     float3 object_hit;  // entity-local block coordinates of the hit
@@ -79,6 +80,7 @@ TraceResult TraceScene(CaelixFrameConstants fc, RayDesc ray)
     r.hit = false;
     r.T = 0.0f;
     r.attrib = 0;
+    r.cell = 0;
     r.group = 0;
     r.id = 0;
     r.candidates = 0;
@@ -107,6 +109,7 @@ TraceResult TraceScene(CaelixFrameConstants fc, RayDesc ray)
             {
                 q.CommitProceduralPrimitiveHit(t);
                 r.attrib = attrib.matID_faceNormal;
+                r.cell = (attrib.matID_faceNormal >> 6) & 0x1FFu;
                 r.group = group;
                 r.id = id;
             }
@@ -155,6 +158,37 @@ bool TraceShadow(CaelixFrameConstants fc, RayDesc ray)
         }
     }
     return occluded;
+}
+
+// One word of the voxel id: avalanche hashes of the entity and the voxel's coordinates, chained
+// from `seed`; 0xFFFFFFFF (the miss value) becomes 0xFFFFFFFE.
+uint VoxelIdWord(uint seed, uint entity, int3 voxel)
+{
+    uint h = CaelixHashAvalanche(seed ^ entity);
+    h = CaelixHashAvalanche(h ^ uint(voxel.x));
+    h = CaelixHashAvalanche(h ^ uint(voxel.y));
+    h = CaelixHashAvalanche(h ^ uint(voxel.z));
+    return h == 0xFFFFFFFFu ? 0xFFFFFFFEu : h;
+}
+
+// The voxel id of a hit: two independent 32-bit hashes of (entity id, entity-local integer
+// voxel position); the voxel is the brick of the hit (group coordinate and slot row position,
+// as TraceCandidate derives the brick origin) plus the DDA cell of the hit. Neither word is
+// ever 0xFFFFFFFF (the miss value of the voxel id target).
+uint2 VoxelIdHash(CaelixFrameConstants fc, TraceResult r)
+{
+    const uint64_t info = fc.group_infos + uint64_t(r.group) * kGroupInfoBytes;
+    const uint4 w0 = CAELIX_LOAD_U32x4(info);  // coord, entity (kGroupInfoCoord = 0)
+    const uint slot_row_base = CAELIX_LOAD_U32(info + kGroupInfoSlotRowBase);
+    const uint row_x = CAELIX_LOAD_U32(fc.slot_tables + (uint64_t(slot_row_base) + r.id) * kSlotRowBytes);
+    const uint shift = fc.group_shift;
+    const int mask = int((1u << shift) - 1u);
+    const uint pos = SlotRowPos(row_x);
+    const int3 brick = int3(int(pos) & mask, int(pos >> shift) & mask, int(pos >> (2 * shift)) & mask);
+    const int3 cell = int3(int(r.cell & 7u), int((r.cell >> 3) & 7u), int((r.cell >> 6) & 7u));
+    const int3 voxel = (int3(w0.xyz) * int(1u << shift) + brick) * int(kBrickEdge) + cell;
+    const uint entity = w0.w;  // kGroupInfoEntity
+    return uint2(VoxelIdWord(0x9E3779B9u, entity, voxel), VoxelIdWord(0x85EBCA6Bu, entity, voxel));
 }
 
 // The entity that owns `group` (GroupInfo entity).

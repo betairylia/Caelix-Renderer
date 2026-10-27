@@ -8,17 +8,24 @@
 // sun found by bounce sampling only, and a shadow under a floating block; a host
 // sky cubemap (primary miss, SH irradiance of diffuse bounces), the fog of the air
 // and the emission scale against closed forms. Two renderers over one flush must
-// agree on the motion of a moving entity, and render once per frame each.
+// agree on the motion of a moving entity, and render once per frame each. The voxel id
+// target holds one key per voxel (two entities, both formats, voxel_id_tmax, flip y, the
+// primary-mode voxel id view).
 // Uses the public C ABI only.
 #include "test_scenes.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <map>
 #include <random>
+#include <set>
+#include <tuple>
 #include <vector>
 
 using namespace test;
@@ -55,9 +62,11 @@ uint32_t BytesPerPixel(VkFormat format)
         case VK_FORMAT_R8G8B8A8_UNORM:
         case VK_FORMAT_R32_SFLOAT:
         case VK_FORMAT_R16G16_SFLOAT:
+        case VK_FORMAT_R32_UINT:
             return 4;
         case VK_FORMAT_R16G16B16A16_SFLOAT:
         case VK_FORMAT_R32G32_SFLOAT:
+        case VK_FORMAT_R32G32_UINT:
             return 8;
         case VK_FORMAT_R32G32B32A32_SFLOAT:
             return 16;
@@ -115,6 +124,12 @@ struct Target
         std::memcpy(&value, at(x, y) + 2 * c, 2);
         return HalfToFloat(value);
     }
+    uint32_t U32(uint32_t x, uint32_t y, uint32_t c) const
+    {
+        uint32_t value = 0;
+        std::memcpy(&value, at(x, y) + 4 * c, 4);
+        return value;
+    }
 };
 
 // An image with the usages a target needs (STORAGE only) plus TRANSFER_SRC for the
@@ -165,6 +180,7 @@ enum TargetIndex
     kDepth,
     kMotion,
     kViewZ,
+    kVoxelId,
     kTargetCount
 };
 struct TargetSet
@@ -195,6 +211,7 @@ CaelixRenderTargets ToAbi(const TargetSet& set)
     out.depth = Abi(set.t[kDepth]);
     out.motion = Abi(set.t[kMotion]);
     out.view_z = Abi(set.t[kViewZ]);
+    out.voxel_id = Abi(set.t[kVoxelId]);
     return out;
 }
 
@@ -727,7 +744,10 @@ TEST_CASE("geometry targets: albedo, normal, depth, motion, view_z")
     caelix_renderer_destroy(renderer);
     for (int i = 0; i < kTargetCount; ++i)
     {
-        DestroyTarget(rig.gpu, *all.t[i]);
+        if (all.t[i] != nullptr)
+        {
+            DestroyTarget(rig.gpu, *all.t[i]);
+        }
     }
     CloseRig(rig);
 }
@@ -3295,6 +3315,372 @@ TEST_CASE("light NEE: lifecycle (entity and group reuse, a paused renderer, mode
     REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
     caelix_renderer_release_target_views(renderer);
     caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+namespace {
+
+// The voxel id test: the camera looks straight down (forward -Y, up +Z, right +X) with a
+// vertical field of view of 60 degrees.
+CaelixCamera LookDown60(float x, float height, float z)
+{
+    CaelixCamera camera = LookDownFrom(x, height, z);
+    camera.tan_half_fov_y = std::tan(30.0f * kPi / 180.0f);
+    NormalZProjection(camera.projection, camera.tan_half_fov_y, camera.aspect);
+    return camera;
+}
+
+// The voxel that the CPU expects at a pixel of the voxel id test: the floor of UploadFloor (entity
+// A, voxels x, z in [0, 64), top layer y = -1) and, with `entity_b`, the same bricks as entity B,
+// turned 180 degrees about Y with its origin at (0, 0, 64): local (x, y, z) -> world (-x, y, 64 - z).
+struct CpuVoxel
+{
+    enum Kind
+    {
+        kAmbiguous,  // within 1e-3 of a voxel border: either voxel is right
+        kMiss,
+        kHit
+    };
+    Kind kind = kAmbiguous;
+    int entity = 0;  // 0 = A, 1 = B
+    int x = 0;       // entity-local voxel
+    int y = 0;
+    int z = 0;
+
+    bool operator<(const CpuVoxel& o) const
+    {
+        return std::tie(entity, x, y, z) < std::tie(o.entity, o.x, o.y, o.z);
+    }
+};
+
+CpuVoxel FloorVoxel(const CaelixCamera& camera, uint32_t px, uint32_t py, bool entity_b)
+{
+    // The unjittered ray of the pixel centre (CaelixCamera's mapping) meets the floor top y = 0 at
+    // position + (right * ndc.x * t * aspect + up * ndc.y * t + forward) * height.
+    const double ndc_x = (px + 0.5) / kSize * 2.0 - 1.0;
+    const double ndc_y = 1.0 - (py + 0.5) / kSize * 2.0;
+    const double height = camera.position[1];
+    const double wx = camera.position[0] + ndc_x * camera.tan_half_fov_y * camera.aspect * height;
+    const double wz = camera.position[2] + ndc_y * camera.tan_half_fov_y * height;
+    const auto near_integer = [](double v) { return std::abs(v - std::round(v)) < 1e-3; };
+    CpuVoxel out;
+    if (near_integer(wx) || near_integer(wz))
+    {
+        return out;
+    }
+    REQUIRE(wz > 0.0);
+    REQUIRE(wz < 64.0);
+    REQUIRE(wx < 64.0);
+    out.y = -1;
+    if (wx >= 0.0)
+    {
+        out.kind = CpuVoxel::kHit;
+        out.x = static_cast<int>(std::floor(wx));
+        out.z = static_cast<int>(std::floor(wz));
+        return out;
+    }
+    if (!entity_b || wx < -64.0)
+    {
+        out.kind = CpuVoxel::kMiss;
+        return out;
+    }
+    out.kind = CpuVoxel::kHit;
+    out.entity = 1;
+    out.x = static_cast<int>(std::floor(-wx));
+    out.z = static_cast<int>(std::floor(64.0 - wz));
+    return out;
+}
+
+uint64_t VoxelKey(const Target& target, uint32_t x, uint32_t y)
+{
+    return (static_cast<uint64_t>(target.U32(x, y, 1)) << 32) | target.U32(x, y, 0);
+}
+
+constexpr uint64_t kVoxelMiss = ~0ull;
+
+// Checks a voxel id image (R32G32_UINT) against the CPU voxels: one key per CPU voxel, one CPU
+// voxel per key, the miss value exactly on the misses. Returns the number of distinct keys.
+size_t CheckVoxelIds(const Target& ids, const CaelixCamera& camera, bool entity_b, const char* label)
+{
+    std::map<CpuVoxel, std::set<uint64_t>> keys_of_voxel;
+    std::map<uint64_t, std::set<CpuVoxel>> voxels_of_key;
+    size_t misses = 0;
+    size_t bad_misses = 0;
+    size_t ambiguous = 0;
+    for (uint32_t y = 0; y < kSize; ++y)
+    {
+        for (uint32_t x = 0; x < kSize; ++x)
+        {
+            const CpuVoxel voxel = FloorVoxel(camera, x, y, entity_b);
+            const uint64_t key = VoxelKey(ids, x, y);
+            if (voxel.kind == CpuVoxel::kAmbiguous)
+            {
+                ++ambiguous;
+                continue;
+            }
+            if (voxel.kind == CpuVoxel::kMiss)
+            {
+                ++misses;
+                bad_misses += key != kVoxelMiss ? 1 : 0;
+                continue;
+            }
+            // Neither word of a hit is the miss value.
+            if (ids.U32(x, y, 0) == 0xFFFFFFFFu || ids.U32(x, y, 1) == 0xFFFFFFFFu)
+            {
+                ++bad_misses;
+                continue;
+            }
+            keys_of_voxel[voxel].insert(key);
+            voxels_of_key[key].insert(voxel);
+        }
+    }
+    size_t split_voxels = 0;
+    for (const auto& [voxel, keys] : keys_of_voxel)
+    {
+        split_voxels += keys.size() > 1 ? 1 : 0;
+    }
+    size_t shared_keys = 0;
+    for (const auto& [key, voxels] : voxels_of_key)
+    {
+        shared_keys += voxels.size() > 1 ? 1 : 0;
+    }
+    std::printf("voxel id %s: %zu CPU voxels, %zu GPU keys, %zu miss pixels, %zu ambiguous pixels, %zu wrong "
+                "miss/hit pixels, %zu voxels with two keys, %zu keys of two voxels\n",
+                label, keys_of_voxel.size(), voxels_of_key.size(), misses, ambiguous, bad_misses, split_voxels,
+                shared_keys);
+    CHECK(bad_misses == 0);
+    CHECK(split_voxels == 0);
+    CHECK(shared_keys == 0);
+    CHECK(keys_of_voxel.size() == voxels_of_key.size());
+    return voxels_of_key.size();
+}
+
+}  // namespace
+
+TEST_CASE("voxel id target: one key per voxel, miss value, tmax, both formats, entities, flip y, debug view")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target ids = CreateTarget(rig.gpu, VK_FORMAT_R32G32_UINT);
+    Target ids_x = CreateTarget(rig.gpu, VK_FORMAT_R32_UINT);
+    Target albedo = CreateTarget(rig.gpu, VK_FORMAT_R8G8B8A8_UNORM);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R8G8B8A8_UNORM);
+    // The camera above the floor's -X edge: the left half of the image misses entity A.
+    const CaelixCamera camera = LookDown60(0.0f, 12.0f, 32.0f);
+    const auto all_miss = [&](const Target& target) {
+        size_t hits = 0;
+        for (uint32_t y = 0; y < kSize; ++y)
+        {
+            for (uint32_t x = 0; x < kSize; ++x)
+            {
+                hits += VoxelKey(target, x, y) != kVoxelMiss ? 1 : 0;
+            }
+        }
+        return hits == 0;
+    };
+    const auto same_image = [](const Target& a, const Target& b) { return a.bytes == b.bytes; };
+    TargetSet set;
+    set.t[kAlbedo] = &albedo;
+    set.t[kVoxelId] = &ids;
+
+    // 0. Before the first TLAS every pixel is the miss value.
+    Render(rig, renderer, set, camera, Options(CAELIX_VIEW_ALBEDO));
+    CHECK(all_miss(ids));
+
+    // 1. Entity A: one key per voxel, the miss value on the misses, coverage agrees.
+    UploadFloor(rig);
+    Render(rig, renderer, set, camera, Options(CAELIX_VIEW_ALBEDO));
+    const size_t keys_a = CheckVoxelIds(ids, camera, false, "entity A");
+    CHECK(keys_a > 50);  // 7 x 14 voxels
+    size_t coverage_mismatch = 0;
+    for (uint32_t y = 0; y < kSize; ++y)
+    {
+        for (uint32_t x = 0; x < kSize; ++x)
+        {
+            const bool covered = albedo.at(x, y)[3] == 255;
+            const bool keyed = ids.U32(x, y, 0) != 0xFFFFFFFFu && ids.U32(x, y, 1) != 0xFFFFFFFFu;
+            const bool missed = VoxelKey(ids, x, y) == kVoxelMiss;
+            coverage_mismatch += (covered ? !keyed : !missed) ? 1 : 0;
+        }
+    }
+    CHECK(coverage_mismatch == 0);
+    const Target unflipped = ids;
+
+    // 2. R32_UINT receives word 0 of the same keys; the path trace mode writes the same keys.
+    {
+        TargetSet single;
+        single.t[kVoxelId] = &ids_x;
+        Render(rig, renderer, single, camera, Options(CAELIX_VIEW_ALBEDO));
+        size_t differ = 0;
+        for (uint32_t y = 0; y < kSize; ++y)
+        {
+            for (uint32_t x = 0; x < kSize; ++x)
+            {
+                differ += ids_x.U32(x, y, 0) != unflipped.U32(x, y, 0) ? 1 : 0;
+            }
+        }
+        CHECK(differ == 0);
+        CaelixRenderOptions path_trace = Options(CAELIX_VIEW_ALBEDO);
+        path_trace.mode = CAELIX_MODE_PATH_TRACE;
+        path_trace.bounce_count = 0;
+        Render(rig, renderer, set, camera, path_trace);
+        CHECK(same_image(ids, unflipped));
+    }
+
+    // 3. voxel_id_tmax: half the camera height cuts every hit (the floor is 12 units away), 1000
+    //    cuts none.
+    {
+        CaelixRenderOptions options = Options(CAELIX_VIEW_ALBEDO);
+        options.voxel_id_tmax = 6.0f;
+        Render(rig, renderer, set, camera, options);
+        CHECK(all_miss(ids));
+        options.voxel_id_tmax = 1000.0f;
+        Render(rig, renderer, set, camera, options);
+        CHECK(same_image(ids, unflipped));
+    }
+
+    // 4. FLIP_Y: the key image is the row mirror of the unflipped one.
+    {
+        CaelixRenderOptions options = Options(CAELIX_VIEW_ALBEDO);
+        options.flags = CAELIX_RENDER_FLAG_FLIP_Y;
+        Render(rig, renderer, set, camera, options);
+        size_t differ = 0;
+        for (uint32_t y = 0; y < kSize; ++y)
+        {
+            for (uint32_t x = 0; x < kSize; ++x)
+            {
+                differ += VoxelKey(ids, x, kSize - 1 - y) != VoxelKey(unflipped, x, y) ? 1 : 0;
+            }
+        }
+        CHECK(differ == 0);
+    }
+
+    // 5. The primary-mode debug view: one colour per voxel, the sky on a miss and beyond tmax.
+    {
+        TargetSet view;
+        view.t[kColor] = &color;
+        view.t[kVoxelId] = &ids;
+        Render(rig, renderer, view, camera, Options(CAELIX_VIEW_VOXEL_ID));
+        std::map<CpuVoxel, std::set<uint32_t>> colours;
+        size_t bad_sky = 0;
+        for (uint32_t y = 0; y < kSize; ++y)
+        {
+            for (uint32_t x = 0; x < kSize; ++x)
+            {
+                const CpuVoxel voxel = FloorVoxel(camera, x, y, false);
+                if (voxel.kind == CpuVoxel::kMiss)
+                {
+                    bad_sky += IsSky(color.at(x, y)) ? 0 : 1;
+                }
+                else if (voxel.kind == CpuVoxel::kHit)
+                {
+                    uint32_t rgba = 0;
+                    std::memcpy(&rgba, color.at(x, y), 4);
+                    colours[voxel].insert(rgba);
+                }
+            }
+        }
+        size_t split = 0;
+        std::set<uint32_t> distinct;
+        for (const auto& [voxel, set_of_colours] : colours)
+        {
+            split += set_of_colours.size() > 1 ? 1 : 0;
+            distinct.insert(set_of_colours.begin(), set_of_colours.end());
+        }
+        std::printf("voxel id view: %zu voxels, %zu distinct colours, %zu voxels with two colours, %zu miss "
+                    "pixels not sky\n",
+                    colours.size(), distinct.size(), split, bad_sky);
+        CHECK(split == 0);
+        CHECK(bad_sky == 0);
+        CHECK(distinct.size() > colours.size() / 2);
+        CaelixRenderOptions options = Options(CAELIX_VIEW_VOXEL_ID);
+        options.voxel_id_tmax = 6.0f;
+        Render(rig, renderer, view, camera, options);
+        size_t not_sky = 0;
+        for (uint32_t y = 0; y < kSize; ++y)
+        {
+            for (uint32_t x = 0; x < kSize; ++x)
+            {
+                not_sky += IsSky(color.at(x, y)) ? 0 : 1;
+            }
+        }
+        CHECK(not_sky == 0);
+    }
+
+    // 6. Argument checks: a voxel id target in RGBA8, a negative or NaN voxel_id_tmax.
+    {
+        CaelixRenderTargets targets{};
+        targets.voxel_id = Abi(&color);
+        ExpectRenderError(rig, renderer, targets, camera, CAELIX_ERROR_INVALID_ARGUMENT);
+        targets.voxel_id = Abi(&ids);
+        for (const float tmax : {-1.0f, std::numeric_limits<float>::quiet_NaN()})
+        {
+            ExpectLibraryErrors(1, [&] {
+                CaelixFrameDesc desc{};
+                desc.command_buffer = 1;
+                desc.frame_number = rig.frames.next;
+                CaelixRenderOptions options = Options(CAELIX_VIEW_ALBEDO);
+                options.voxel_id_tmax = tmax;
+                REQUIRE(caelix_renderer_render(renderer, &desc, &targets, &camera, &options) ==
+                        CAELIX_ERROR_INVALID_ARGUMENT);
+            });
+        }
+    }
+
+    // 7. Entity B: the same bricks (the same entity-local voxels), turned 180 degrees about Y with its
+    //    origin at (0, 0, 64), so it fills the left half of the image with the voxels that entity A
+    //    shows on the right. No key of B equals a key of A.
+    {
+        CaelixEntityDesc desc{};
+        desc.position[2] = 64.0f;
+        desc.rotation[1] = 1.0f;  // 180 degrees about Y
+        CaelixEntityId entity_b = CAELIX_INVALID_ENTITY;
+        REQUIRE(caelix_scene_add_entity(rig.scene, &desc, &entity_b) == CAELIX_OK);
+        const CaelixEntityId saved = rig.entity;
+        rig.entity = entity_b;
+        UploadFloor(rig);
+        rig.entity = saved;
+        Render(rig, renderer, set, camera, Options(CAELIX_VIEW_ALBEDO));
+        CheckVoxelIds(ids, camera, true, "entities A and B");
+        std::set<uint64_t> keys_of[2];
+        std::set<std::array<int, 3>> local_of[2];
+        for (uint32_t y = 0; y < kSize; ++y)
+        {
+            for (uint32_t x = 0; x < kSize; ++x)
+            {
+                const CpuVoxel voxel = FloorVoxel(camera, x, y, true);
+                if (voxel.kind == CpuVoxel::kHit)
+                {
+                    keys_of[voxel.entity].insert(VoxelKey(ids, x, y));
+                    local_of[voxel.entity].insert({voxel.x, voxel.y, voxel.z});
+                }
+            }
+        }
+        size_t shared_local = 0;
+        for (const std::array<int, 3>& local : local_of[0])
+        {
+            shared_local += local_of[1].count(local);
+        }
+        size_t shared_keys = 0;
+        for (const uint64_t key : keys_of[0])
+        {
+            shared_keys += keys_of[1].count(key);
+        }
+        std::printf("voxel id entities: A %zu keys, B %zu keys, %zu local voxels seen in both, %zu shared keys\n",
+                    keys_of[0].size(), keys_of[1].size(), shared_local, shared_keys);
+        CHECK(shared_local > 50);
+        CHECK(shared_keys == 0);
+    }
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, ids);
+    DestroyTarget(rig.gpu, ids_x);
+    DestroyTarget(rig.gpu, albedo);
     DestroyTarget(rig.gpu, color);
     CloseRig(rig);
 }

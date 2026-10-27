@@ -403,13 +403,14 @@ flush builds the TLAS that the render binds.
   block coordinates as a parameter instead of deriving it from word 0 and the
   render group macros; `half` = float, `UNITY_BRANCH` -> `CAELIX_BRANCH`.
 - Inputs: two descriptor sets and no push constants. Set 0 is the kernel's own set: for the
-  trace kernel binding 0 the TLAS, bindings 1..6 the colour,
-  albedo, normal, depth, motion and view_z targets as storage images without a
-  format qualifier, bindings 7..18 the internal targets of the lighting modes
-  with fixed formats, binding 19 the sky cubemap as a sampled image and 20 its
-  sampler (`lib/src/render/render_kernels.h`). Set 1 is the frame set, shared by the five
+  trace kernel binding 0 the TLAS, bindings 1..7 the colour,
+  albedo, normal, depth, motion, view_z and voxel_id targets as storage images without a
+  format qualifier, bindings 8..19 the internal targets of the lighting modes
+  with fixed formats, binding 20 the sky cubemap as a sampled image and 21 its
+  sampler (`lib/src/render/render_kernels.h`; the voxel id kernel `caelix_voxel_id` binds the
+  same set). Set 1 is the frame set, shared by the six
   frame-constant kernels (`caelix_path_trace`, `caelix_composite`, `caelix_cross_resolve`,
-  `caelix_sky_sh`, `caelix_upscale_encode`): binding 0 the frame slot's 576-byte
+  `caelix_sky_sh`, `caelix_upscale_encode`, `caelix_voxel_id`): binding 0 the frame slot's 576-byte
   `CaelixFrameConstants` block as a uniform buffer (`g_frame`, `shaders/common/caelix_frame_ubo.hlsl`,
   `shaders/common/caelix_frame.hlsl`, `lib/src/render/frame_constants.h`; `kFrameSetIndex`).
   A uniform buffer is read-only, so the compiler re-reads a field where it is used instead of
@@ -734,6 +735,7 @@ is written on every render call, a miss included.
 | `depth` | R32F (storage image, not a depth attachment) | device depth clip.z / clip.w of `CaelixCamera::projection` | `options.miss_depth` |
 | `motion` | RG16F, RG32F, RGBA16F, RGBA32F | previous pixel - current pixel, in pixels of the current size; RGBA formats: z = 0, w = the delta checkerboard flag (1 = the pixel needs the cross resolve with its flagged neighbours) | (0, 0) |
 | `view_z` | R32F | linear view depth dot(hit - position, forward) | `options.miss_view_z` |
+| `voxel_id` | R32_UINT, R32G32_UINT | two independent 32-bit hashes of (entity, entity-local voxel) of the camera ray's first hit, transparent voxels included (`docs/VOXEL_ID.md`); with an upscaler it has the OUTPUT size and a separate unjittered pass writes it | 0xFFFFFFFF in every channel (also beyond `options.voxel_id_tmax`) |
 
 A host with its own deferred pipeline passes only the geometry targets
 ("G-buffer mode"): the library then writes no lighting at all.
@@ -930,7 +932,7 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   differ and nothing is flagged. On the slab (the second interface still
   random) the mean of 128 checkerboard frames is within 0.02 % of the
   stochastic reference.
-- `caelix_frame_layout_test`: no GPU. Reads `build/shaders/<kernel>.spv` of the five
+- `caelix_frame_layout_test`: no GPU. Reads `build/shaders/<kernel>.spv` of the six
   frame-constant kernels and the trace variant `caelix_path_trace_no_light_nee`, parses the SPIR-V binary (the Uniform variable whose struct is decorated
   `Block`; member `Offset`, `ArrayStride`, `MatrixStride`, `DescriptorSet` / `Binding`), recomputes
   the C natural layout of the same member sequence and fails on the first member whose offset
@@ -1005,13 +1007,16 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   (0, 64, -128) with pitch 15 and yaw 0.
 - `--fov <DEGREES>`: vertical field of view. Default 60.
 - `--mode <primary|pt|ref>`: the rendering mode. Default `pt`.
-- `--view <albedo|normal|depth|group|brick|steps|material|nrd-validation|nrd-diff|nrd-spec|motion>`:
-  the debug view; the first six and `material` (the material table's albedo,
-  transparent codes tinted blue, emitters white) in the primary mode,
+- `--view <albedo|normal|depth|group|brick|steps|material|voxel-id|nrd-validation|nrd-diff|nrd-spec|motion>`:
+  the debug view; the first six, `material` (the material table's albedo,
+  transparent codes tinted blue, emitters white) and `voxel-id` (one hash colour per voxel) in the primary mode,
   `nrd-validation` (NRD's validation layer), `nrd-diff` / `nrd-spec` (the
   denoised diffuse / specular radiance) and `motion` (the motion vector, see
   "Denoising") in `pt` mode. Default `albedo`.
 - `--no-denoise`: `pt` mode without NRD (the raw 1 spp image). Default: NRD on.
+- `--voxel-id`: pass a voxel id target (R32G32_UINT at the window size, recreated on a resize)
+  to every render call; the F1 Render window switches it. `--voxel-id-tmax <F>`: a hit farther
+  than F is a miss for the voxel id target and view (default 0 = no limit).
 - `--size <WxH>`: inner size of the window. Default 1280x720.
 - `--warmup <N>`: `pt` mode, take `--screenshot` N frames after the world is
   complete (at least 3), so that NRD's history is warm (64 for the artifacts).

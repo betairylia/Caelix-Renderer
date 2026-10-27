@@ -184,6 +184,13 @@ struct Args {
     /// Pt mode: no NRD denoising (the raw 1 sample per pixel image).
     #[arg(long)]
     no_denoise: bool,
+    /// Pass a voxel id target (R32G32_UINT at the window size, recreated on a resize) to every render
+    /// call (the F1 Render window switches it).
+    #[arg(long)]
+    voxel_id: bool,
+    /// The voxel id target and the voxel id view treat a hit farther than this as a miss (0 = no limit).
+    #[arg(long, value_name = "F", default_value_t = 0.0)]
+    voxel_id_tmax: f32,
     /// Inner size of the window in pixels, WIDTHxHEIGHT.
     #[arg(long, value_name = "WxH", value_parser = parse_size, default_value = "1280x720")]
     size: (u32, u32),
@@ -482,6 +489,8 @@ struct State {
     caelix_device: *mut CaelixDevice,
     /// Swapchain generation the renderer's cached image views belong to.
     views_generation: u64,
+    /// The voxel id target (RenderSettings::voxel_id), at the swapchain size; owned by `context`.
+    voxel_id: Option<caelix_vk::StorageImage>,
     context: caelix_vk::Context,
     window: Window,
 }
@@ -680,6 +689,7 @@ impl App {
             scene: ptr::null_mut(),
             caelix_device,
             views_generation,
+            voxel_id: None,
             context,
             window,
         };
@@ -946,6 +956,33 @@ impl App {
             // to capture.
             let export_capture = self.sequencer.advance(dt, world_ready, &mut self.camera);
 
+            // The voxel id target follows the setting and the swapchain size (a recreated image
+            // needs the renderer's cached views released first, after the device is idle).
+            let voxel_id_size = self.settings.voxel_id.then_some((frame.width, frame.height));
+            if state.voxel_id.map(|image| (image.width, image.height)) != voxel_id_size {
+                if let Some(old) = state.voxel_id.take() {
+                    state.context.wait_idle();
+                    // SAFETY: the renderer is live and the device is idle.
+                    unsafe { caelix_renderer_release_target_views(state.renderer) };
+                    state.context.destroy_storage_image(&old);
+                }
+                if let Some((width, height)) = voxel_id_size {
+                    let image = state
+                        .context
+                        .create_storage_image(width, height, caelix_vk::FORMAT_R32G32_UINT)
+                        .context("cannot create the voxel id target")?;
+                    log::info!("voxel id target: {width}x{height} R32G32_UINT");
+                    state.voxel_id = Some(image);
+                }
+            }
+            let voxel_id = state.voxel_id.map_or(NO_TARGET, |image| CaelixTargetImage {
+                image: image.image,
+                format: image.format,
+                width: image.width,
+                height: image.height,
+                // The contents are rewritten every frame.
+                layout: 0, // VK_IMAGE_LAYOUT_UNDEFINED
+            });
             let targets = CaelixRenderTargets {
                 color: CaelixTargetImage {
                     image: frame.image,
@@ -959,6 +996,7 @@ impl App {
                 depth: NO_TARGET,
                 motion: NO_TARGET,
                 view_z: NO_TARGET,
+                voxel_id,
             };
             let aspect = frame.width as f32 / frame.height.max(1) as f32;
             // Jitter: the library's Halton sequence while a supported upscaler is active, else none.
@@ -1978,6 +2016,12 @@ fn main() -> anyhow::Result<()> {
     if args.view == View::Material && mode != Mode::Primary {
         bail!("--view material needs --mode primary");
     }
+    if args.view == View::VoxelId && mode != Mode::Primary {
+        bail!("--view voxel-id needs --mode primary");
+    }
+    if !args.voxel_id_tmax.is_finite() || args.voxel_id_tmax < 0.0 {
+        bail!("--voxel-id-tmax {} must be a finite value >= 0", args.voxel_id_tmax);
+    }
     if !(4..=MAX_SKY_SIZE).contains(&args.sky_size) || !args.sky_size.is_power_of_two() {
         bail!("--sky-size {} must be a power of two in 4..{MAX_SKY_SIZE}", args.sky_size);
     }
@@ -2059,6 +2103,8 @@ fn main() -> anyhow::Result<()> {
         upscale_quality: args.upscale_quality,
         upscale_preset: args.upscale_preset,
         upscale_auto_exposure: args.upscale_auto_exposure,
+        voxel_id: args.voxel_id,
+        voxel_id_tmax: args.voxel_id_tmax,
     };
 
     if !(1..=120).contains(&args.test_edit_interval) {
