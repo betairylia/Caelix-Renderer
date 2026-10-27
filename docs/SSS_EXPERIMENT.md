@@ -135,3 +135,66 @@ The exit replaces the vertex: it is a diffuse vertex at the exit point with the 
 - FINDING -> FIX: a walk that always starts at the hit voxel gives every hit on one voxel face the same
   walk distribution: converged SSS surfaces showed per-voxel brightness steps (large flat faces). The
   entry jitter (Walk step 1) removes them (`Artifacts/sss-20261026/impl/`).
+
+## SGGX foliage medium (step 2, 2026-10-27)
+
+Owner idea: foliage that light can pass through, inside the same cheap walk. A material with
+`sggx_density > 0` (and `sss_probability > 0`) runs an SGGX walk instead of the lattice walk. The G-buffer
+keeps the opaque, surface-like foliage voxels; only the light passes. Owner: smoke tests only for now.
+
+SGGX (Heitz et al. 2015, https://research.nvidia.com/sites/default/files/pubs/2015-08_The-SGGX-microflake/sggx.pdf):
+a symmetric 3x3 matrix S describes how the leaf flakes in a voxel are turned. Projected area
+sigma(w) = sqrt(w^T S w); extinction = sggx_density x sigma(w) (per voxel unit). Visible normals have a
+closed-form sampler (paper, appendix: `sample_VNDF`).
+
+### Material
+
+C `CaelixMaterial` 64 -> 96 B: append `float sggx_s[6]` (S: xx, yy, zz, xy, xz, yz, object space of the
+entity), `float sggx_density` (0 = no SGGX, >= 0), `float sggx_transmission` (0..1: chance that a leaf
+event transmits instead of reflects). Validation when `sggx_density > 0`: S positive definite (Sylvester:
+xx > 0, xx yy - xy^2 > 0, det > 0), finite values, `sss_probability > 0`. GPU: a third table, 32 B per
+code (row 0: S xx, yy, zz, xy; row 1: xz, yz, density, transmission), address `sggx_table` in a new 16-byte
+frame constants row at 592 (FrameConstants 592 -> 608). Host JSON:
+`"sggx": {"kind": "surface" | "fiber" | "isotropic", "axis": [x, y, z], "roughness": r, "density": d,
+"transmission": t}` -> S = surface: n n^T + r^2 (I - n n^T); fiber: r^2 n n^T + (I - n n^T); isotropic: I
+(n = normalized axis; defaults axis [0, 1, 0], roughness 0.3, transmission 0).
+
+### Walk (`SggxWalk`, chosen by the ENTRY material's sggx_density > 0)
+
+State: continuous position p (object space, starts at object_hit), unit direction d (starts at the ray
+direction in object space), cursor (the hit voxel), weight w = 1, scatter event count, voxel step count.
+All medium parameters (S, density, transmission, sss_albedo, event cap) come from the ENTRY material; the
+per-voxel test stays "SSS voxel or not" (`SubsurfaceRow`).
+
+Per voxel (DDA along d):
+1. l = distance from p to the voxel boundary along d (the face with the smallest crossing distance).
+2. sigma_t = density x sqrt(d^T S d). Free distance s = -ln(1 - u) / sigma_t.
+3. s < l: SCATTER at p + s d. w *= sss_albedo; events += 1; events > sss_steps -> dead. New direction:
+   wm = sample_VNDF(wi = -d, S); with probability sggx_transmission d = cosine around -wm (through the
+   leaf), else d = cosine around wm (reflection). Continue in the same voxel from the new p.
+4. Else: p moves to the boundary, the cursor steps across that face (`MediumStep`, one axis).
+   - next voxel is an SSS voxel: continue;
+   - opaque without SSS (wall, e.g. a trunk): d = cosine around the face normal pointing back into the
+     medium, w *= sss_albedo, counts as an event;
+   - anything else (air, glass, absent brick): EXIT. Origin = p + push-off along the face normal (world),
+     direction = d (world). NOT the cosine lobe: an exit without events continues the ray on its line.
+5. Voxel steps > kSggxMaxVoxelSteps (1024): dead.
+
+Result kinds: PASS (exit with 0 events), EXIT (>= 1 events), DEAD.
+
+### Integration
+
+- PASS is not a path vertex: no NEE, no bounce used, w = 1; the ray continues from the exit along d.
+  After a PASS: the sky on a miss is the radiance along the ray (`SkyRadiance` family, not the irradiance
+  shortcut of `SkyDiffuseMiss`), the sun disk counts (segment_sees_sun = true: no NEE saw it), lamp hits
+  weigh 1 (segment_light = 0). At the primary: no NEE at the primary, throughput = 1 / guide, the loop
+  starts from the continuation. At most kMaxPassThroughs (16) PASSes per path (then the path ends).
+- EXIT: a path vertex at the exit point, as the lattice walk's exit (uses the vertex's bounce, NEE with the
+  exit face normal and Lambert), but the bounce direction is d. Because d is not drawn from the cosine
+  lobe: the next segment's miss uses the radiance along d, and the lamp NEE at this vertex runs WITHOUT MIS
+  (lamp hits of the next segment weigh 0, NEE alone counts the lamps; the sun disk stays excluded).
+- The last vertex of a path (no bounce left) still runs an SGGX walk: PASS continues the loop without a
+  bounce, EXIT / DEAD end the path (only the emission of the hit counts).
+- G-buffer / NRD: unchanged (the entry face; diffuse target, roughness 1). Known: through-foliage pixels
+  smear under camera motion (accepted for the first test).
+- Shadow rays: foliage stays opaque (owner: ignore for now).
