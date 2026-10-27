@@ -80,7 +80,7 @@ struct CaelixFrameConstants
     uint upscale;                   // 540  1 = composite / cross resolve write g_int_upscale_in (linear)
     uint64_t light_tree;            // 544  light tree descriptor (light/caelix_light_tree.hlsl), 0 = no tree
     uint light_nee_flags;           // 552  kLightNee*: the light NEE of this frame (0 = off)
-    uint pad_556;                   // 556
+    uint background;                // 556  1 = the composite writes g_background (composite binding 12) at misses
     uint64_t subsurface_table;      // 560  packed subsurface entry (32 B) by block code (common/caelix_material.hlsl)
     uint64_t pad_568;               // 568 -> 576
 };
@@ -130,6 +130,7 @@ static const uint kTargetMotion = 1u << 4;
 static const uint kTargetViewZ = 1u << 5;
 static const uint kTargetVoxelId = 1u << 6;
 static const uint kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
+static const uint kTargetDepthOutput = 1u << 17;  // the depth target has the output size: caelix_voxel_id writes it
 
 // The sample position of pixel `pixel` in pixels (row 0 = the top row, y down): the pixel centre
 // plus the camera jitter (CaelixCamera::jitter; 0 for a host without jitter).

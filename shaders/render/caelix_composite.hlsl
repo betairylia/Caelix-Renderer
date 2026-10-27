@@ -13,6 +13,9 @@
 //   (the host's cubemap at mip 0 when it gave one, else the procedural sky; plus the
 //   sun disk) with kRenderFlagSkyOnMiss, else 0; alpha = coverage; linear -> sRGB when the
 //   colour target is a UNORM format (output_srgb).
+//   fc.background (the host gave a background, docs/BACKGROUND.md): a miss is the
+//   background pixel (binding 12, read at the host pixel CaelixOutputPixel) as it is: no
+//   exposure, no sky, after the reference accumulation (which stores 0 at a miss).
 //   kModePathTrace, debug view kViewNrdValidation, denoised frame: NRD's validation
 //   layer (binding 6, RGBA8, a = opacity) is blended over the encoded colour.
 //   kModePathTrace, debug view kViewMotion: the motion of the primary hit (binding 7,
@@ -124,13 +127,20 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         {
             g_int_accum[pixel] = float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
-        if ((fc.flags & kRenderFlagSkyOnMiss) != 0u)
+        if (fc.background == 0u && (fc.flags & kRenderFlagSkyOnMiss) != 0u)
         {
             color = SkyRadiance(fc, CaelixPrimaryDirection(fc, pixel));
         }
     }
 
     color *= fc.exposure;
+    // The host background is final radiance in the host's units: it replaces the miss after the
+    // exposure. A delta chain that ends in the sky is a hit (coverage 1) and keeps its sky.
+    CAELIX_BRANCH
+    if (!hit && fc.background != 0u)
+    {
+        color = g_background.Load(int3(CaelixOutputPixel(fc, pixel), 0)).rgb;
+    }
 
     CAELIX_BRANCH
     if (fc.cross_resolve != 0u)

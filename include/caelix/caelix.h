@@ -82,7 +82,10 @@ extern "C" {
    CaelixMaterialEntry 52 -> 116 bytes) and doubled CaelixSceneStats::material_table_bytes (two GPU
    tables), also without a bump. The voxel id step appended CaelixRenderTargets::voxel_id,
    CaelixRenderOptions::voxel_id_tmax and reserved_voxel_id (192 -> 208 bytes) and added
-   CAELIX_VIEW_VOXEL_ID, also without a bump. A host built against an older version-2 header must be
+   CAELIX_VIEW_VOXEL_ID, also without a bump. The background step appended
+   CaelixRenderTargets::background (an input that the composite writes at camera-ray misses; 168 ->
+   192 bytes) and let the depth target have the output size under an upscaler (written by the
+   output-size pass), also without a bump. A host built against an older version-2 header must be
    rebuilt (the library reads and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -189,8 +192,9 @@ CAELIX_API void caelix_device_destroy(CaelixDevice* device);
  * Render targets
  * ------------------------------------------------------------------------- */
 
-/* An image that the library writes (see CaelixRenderTargets). The host owns it; the library only
-   creates and caches image views of it (see caelix_renderer_release_target_views). */
+/* An image of CaelixRenderTargets: a target that the library writes, or the background, which it
+   only reads. The host owns it; the library only creates and caches image views of it (see
+   caelix_renderer_release_target_views). */
 typedef struct CaelixTargetImage
 {
     uint64_t image;  /* VkImage */
@@ -660,7 +664,8 @@ CAELIX_API uint64_t caelix_scene_get_light_tree(const CaelixScene* scene);
  * the brick DDA on every procedural candidate, and writes the result of the hit into the targets
  * that the host passes (CaelixRenderTargets): a colour image, the optional geometry targets
  * albedo, normal, depth, motion and view_z, and the optional voxel id target. Every target is
- * optional, but at least one must be present.
+ * optional, but at least one must be present. The lighting modes also read an optional background
+ * image (CaelixRenderTargets::background), which the colour shows where the camera ray misses.
  *
  * Modes (CaelixRenderOptions::mode):
  *   CAELIX_MODE_PRIMARY    the colour target shows a debug view (CaelixDebugView) of the primary hit.
@@ -696,9 +701,13 @@ CAELIX_API uint64_t caelix_scene_get_light_tree(const CaelixScene* scene);
  * the RENDER size and the upscaler writes the OUTPUT size:
  *   - the colour target and the voxel id target have the output size; every other present target
  *     (albedo, normal, depth, motion, view_z) has the render size that caelix_upscaler_query reports
- *     for that upscaler, quality and output size. A mismatch returns CAELIX_ERROR_INVALID_ARGUMENT with a log line
- *     naming the expected size. The internal targets have the render size. The output must be at
- *     least 64 x 32.
+ *     for that upscaler, quality and output size, except the depth target, which may have EITHER
+ *     size (render size: the trace writes it from the jittered primary ray; output size: the
+ *     output-size pass writes it from the unjittered centre ray of each output pixel, so that it
+ *     pairs with the voxel id target and the upscaled colour). The background
+ *     (CaelixRenderTargets::background) has the render size: it fills the upscaler's input at the
+ *     misses. A mismatch returns CAELIX_ERROR_INVALID_ARGUMENT with a log line naming the expected
+ *     size. The internal targets have the render size. The output must be at least 64 x 32.
  *   - CAELIX_MODE_PRIMARY, CAELIX_MODE_REFERENCE and a render without a colour target ignore the
  *     upscaler (every present target then has one size, as without an upscaler).
  *   - DLSS RR ignores CaelixRenderOptions::denoise and forces CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD
@@ -742,7 +751,8 @@ CAELIX_API uint64_t caelix_scene_get_light_tree(const CaelixScene* scene);
  * Layout contract: every present target is received in its CaelixTargetImage::layout and left in
  * VK_IMAGE_LAYOUT_GENERAL. The last barrier of the render call makes the writes available to all
  * later commands (ALL_COMMANDS, memory read and write); the host transitions the images from
- * GENERAL for present or for its own use.
+ * GENERAL for present or for its own use. The background is not a target: the library never
+ * transitions it (as the sky cubemap).
  *
  * Previous frame: the renderer keeps the camera of its previous render call and uses it, with the
  * entity's previous transform (CaelixBrickInfo: prev_rows), for the motion target. The first render
@@ -1030,7 +1040,8 @@ typedef struct CaelixRenderOptions
 
 /* The images of one render call. A target is PRESENT when its `image` is nonzero; an absent target
    is not written. At least one target must be present, and every present target must have the same
-   width and height and a different image.
+   width and height and a different image (with an upscaler, see "Upscalers": the size of each
+   target's role). `background` is an input, not a target, with its own rules (below).
    Every present image needs STORAGE usage (the kernel writes it as a storage image without a format
    qualifier, so its format must support VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT with
    optimal tiling). It arrives in CaelixTargetImage::layout and is left in VK_IMAGE_LAYOUT_GENERAL.
@@ -1054,7 +1065,13 @@ typedef struct CaelixRenderTargets
        face normal (unit length), w = coverage. A miss is (0, 0, 0, 0). */
     CaelixTargetImage normal;
     /* R32_SFLOAT (a storage image, not a depth attachment). Device depth clip.z / clip.w of
-       CaelixCamera::projection at the hit; a miss is CaelixRenderOptions::miss_depth. */
+       CaelixCamera::projection at the hit; a miss is CaelixRenderOptions::miss_depth.
+       With an upscaler (see "Upscalers") it has EITHER the render size (the trace writes it from the
+       jittered primary ray, at the delta chain's distance, as without an upscaler) OR the output
+       size: then the output-size pass (the dispatch that writes the voxel id target) writes it from
+       the UNJITTERED centre ray of each output pixel, with the same formula, at the camera ray's
+       first hit (transparent voxels included, like the voxel id; no delta chain), and a miss is
+       miss_depth. CAELIX_RENDER_FLAG_FLIP_Y applies. */
     CaelixTargetImage depth;
     /* R16G16_SFLOAT or R32G32_SFLOAT; or R16G16B16A16_SFLOAT / R32G32B32A32_SFLOAT, which also receive
        z = 0 and w = the delta checkerboard flag (1 = this pixel traced one branch of the split at the
@@ -1084,14 +1101,35 @@ typedef struct CaelixRenderTargets
        (with the camera jitter). Every mode writes it (CAELIX_MODE_PRIMARY and CAELIX_MODE_REFERENCE
        ignore the upscaler, so there it has the common size). CAELIX_RENDER_FLAG_FLIP_Y applies. */
     CaelixTargetImage voxel_id;
+    /* An INPUT, not a target (docs/BACKGROUND.md): the host's own image behind the scene, read only.
+       Any colour format that supports sampled images (RGBA16F, RGBA8, RGBA32F, ...), SAMPLED usage.
+       The library creates and caches a 2D sampled view of it and never transitions it: `layout`
+       must be VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL or VK_IMAGE_LAYOUT_GENERAL, the image stays
+       in it for the whole render call, and the host's writes are visible to compute-shader reads.
+       Size: the RENDER size (with an upscaler the render size of caelix_upscaler_query, else the
+       common size of the targets). Lighting modes with a colour target only; the primary mode and a
+       render without a colour target ignore it (it is still checked).
+       Meaning: where the camera ray misses the scene (coverage 0, no delta chain), the colour target
+       receives background.rgb of the pixel instead of the procedural sky or black (alpha stays 0 =
+       coverage), with or without CAELIX_RENDER_FLAG_SKY_ON_MISS. A delta chain that ends in the
+       sky (coverage 1) keeps the sky of its direction. The background is final linear radiance in
+       the host's units: the exposure does NOT apply to it, the sRGB encode of a UNORM colour target
+       does, and the fog does not (misses are never fogged). CAELIX_MODE_REFERENCE accumulates the
+       scene only: the background replaces the output at the misses after the accumulation, so a
+       changing background does not enter the mean. With an upscaler it fills the upscaler's input at
+       the misses, so the upscaled silhouettes blend the scene with the background, not with black.
+       CAELIX_RENDER_FLAG_FLIP_Y applies (pixel (px, py) reads the background at the stored row
+       height - 1 - py, as the targets are written). image 0 = no background. */
+    CaelixTargetImage background;
 } CaelixRenderTargets;
 
 /* Records the frame's rendering into frame->command_buffer: one barrier per present target from its
    layout to GENERAL (one vkCmdPipelineBarrier2), the trace dispatch (8 x 8 pixels per workgroup)
    between two timestamps, in the lighting modes a barrier and the composite dispatch (8 x 8, also
    between two timestamps), and one barrier from the writes to all later commands. With an upscaler
-   and a voxel id target, a second dispatch (8 x 8, at the output size) after the trace writes the
-   voxel id target; it lies inside the trace timestamps (trace_ms). Before the
+   and a voxel id target or an output-size depth target, a second dispatch (the output-size pass,
+   8 x 8, at the output size) after the trace writes those targets; it lies inside the trace
+   timestamps (trace_ms). Before the
    scene's first TLAS build the dispatch traces nothing and writes the miss values. The renderer
    creates one image view per target image and caches it (16 views; the least recently used view
    is destroyed once its last frame is safe). A successful call stores the camera as the previous
@@ -1106,7 +1144,10 @@ typedef struct CaelixRenderTargets
    layout VK_IMAGE_LAYOUT_UNDEFINED, a negative or non-finite fog_density, emission_scale or
    voxel_id_tmax, an unknown upscaler, and with an active upscaler an unknown upscale_quality, an
    output below 64 x 32 or a target that does not have its expected size (see "Upscalers"; the voxel
-   id target must have the output size);
+   id target must have the output size, the depth target the render or the output size), a
+   background (CaelixRenderTargets::background) with format VK_FORMAT_UNDEFINED, a size other than
+   the render size, a layout other than SHADER_READ_ONLY_OPTIMAL or GENERAL, or the image of a
+   present target;
    CAELIX_ERROR_OUT_OF_MEMORY when the internal targets of the lighting modes or the NRD instance
    cannot be allocated (nothing is recorded); CAELIX_ERROR_UNSUPPORTED when a target format
    cannot be written as a storage image without a format qualifier, or when the requested upscaler

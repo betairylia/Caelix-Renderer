@@ -11,8 +11,10 @@
 // sky cubemap (sampled image: the host's cubemap or the renderer's fallback cube) and
 // binding 11 its sampler, declared by render/caelix_shading.hlsl through
 // CAELIX_SKY_BINDING_IMAGE / _SAMPLER, which this file defines: include it BEFORE
-// caelix_shading.hlsl. The frame constants are the uniform buffer g_frame (set 1, binding 0,
-// common/caelix_frame_ubo.hlsl; same block as the trace); no push constants.
+// caelix_shading.hlsl. Binding 12 the host background (sampled image at the render size,
+// read with Load; bound only when fc.background = 1). The frame constants are the uniform
+// buffer g_frame (set 1, binding 0, common/caelix_frame_ubo.hlsl; same block as the trace);
+// no push constants.
 #ifndef CAELIX_COMPOSITE_SET_HLSL
 #define CAELIX_COMPOSITE_SET_HLSL
 
@@ -34,6 +36,7 @@ CAELIX_BINDING(6, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_validation
 CAELIX_BINDING(7, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_motion;
 CAELIX_BINDING(8, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_resolve;
 CAELIX_BINDING(9, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_upscale_in;
+CAELIX_BINDING(12, 0) Texture2D<float4> g_background;
 
 // The value an upscaled frame stores in the upscale input: the linear colour (clamped to the FP16
 // range) and the coverage; no sRGB encode, no validation overlay, no flip.

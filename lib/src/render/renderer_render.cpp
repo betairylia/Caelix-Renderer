@@ -1,7 +1,8 @@
 // Renderer::Render: validation, descriptors, frame constants, barriers and the
-// pass sequence (sky SH, trace, voxel id, NRD, composite, upscaler, encode). The voxel id
-// pass runs only with an upscaler and a voxel id target: it writes that target at the output
-// size from unjittered pixel-centre rays (without an upscaler the trace writes it).
+// pass sequence (sky SH, trace, output-size pass, NRD, composite, upscaler, encode). The
+// output-size pass (caelix_voxel_id) runs only with an upscaler and a voxel id target or an
+// output-size depth target: it writes those at the output size from unjittered pixel-centre rays
+// (without an upscaler the trace writes them).
 #include "render/renderer.h"
 
 #include "core/log.h"
@@ -221,7 +222,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     // The host's sky cubemap (lighting modes only; the primary mode never samples the sky).
     const bool sky = lighting && options.sky.image != 0;
     // The upscaler (path trace mode with a colour target): the colour and voxel id targets have the
-    // output size, every other present target and the internal targets the render size of the query.
+    // output size, the depth target the render or the output size, every other present target and the
+    // internal targets the render size of the query.
     const bool upscaling = options.mode == CAELIX_MODE_PATH_TRACE && targets.color.image != 0 &&
                            options.upscaler != CAELIX_UPSCALER_NONE;
     uint32_t render_width = 0;
@@ -259,6 +261,9 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     uint32_t present[kTargetCount];  // indices into `all`
     uint32_t present_count = 0;
     uint32_t mask = 0;
+    // An upscaler and a depth target at the output size (not the render size): the output-size
+    // pass writes it. Equal sizes (DLAA) count as the render size: the trace writes it.
+    bool depth_at_output = false;
     for (uint32_t i = 0; i < kTargetCount; ++i)
     {
         const CaelixTargetImage& target = *all[i];
@@ -274,18 +279,34 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         }
         if (upscaling)
         {
-            const bool output_size = i == 0 || i == kTargetVoxelIdIndex;
-            const uint32_t expected_width = output_size ? targets.color.width : render_width;
-            const uint32_t expected_height = output_size ? targets.color.height : render_height;
-            if (target.width != expected_width || target.height != expected_height)
+            const bool at_render = target.width == render_width && target.height == render_height;
+            const bool at_output = target.width == targets.color.width && target.height == targets.color.height;
+            if (i == kTargetDepthIndex)
             {
-                CAELIX_LOGE("%s: the %s target is %ux%u; with upscaler %u at quality %u it must be %ux%u (the "
-                            "%s for the %ux%u colour target)",
-                            kFunction, spec.name, target.width, target.height, options.upscaler,
-                            options.upscale_quality, expected_width, expected_height,
-                            output_size ? "output size" : "render size of caelix_upscaler_query",
-                            targets.color.width, targets.color.height);
-                return CAELIX_ERROR_INVALID_ARGUMENT;
+                if (!at_render && !at_output)
+                {
+                    CAELIX_LOGE("%s: the depth target is %ux%u; with upscaler %u at quality %u it must be %ux%u "
+                                "(the render size of caelix_upscaler_query) or %ux%u (the output size)",
+                                kFunction, target.width, target.height, options.upscaler, options.upscale_quality,
+                                render_width, render_height, targets.color.width, targets.color.height);
+                    return CAELIX_ERROR_INVALID_ARGUMENT;
+                }
+                depth_at_output = !at_render;
+            }
+            else
+            {
+                const bool output_size = i == 0 || i == kTargetVoxelIdIndex;
+                if (output_size ? !at_output : !at_render)
+                {
+                    CAELIX_LOGE("%s: the %s target is %ux%u; with upscaler %u at quality %u it must be %ux%u "
+                                "(the %s for the %ux%u colour target)",
+                                kFunction, spec.name, target.width, target.height, options.upscaler,
+                                options.upscale_quality, output_size ? targets.color.width : render_width,
+                                output_size ? targets.color.height : render_height,
+                                output_size ? "output size" : "render size of caelix_upscaler_query",
+                                targets.color.width, targets.color.height);
+                    return CAELIX_ERROR_INVALID_ARGUMENT;
+                }
             }
         }
         else if (present_count > 0)
@@ -335,6 +356,10 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     {
         mask |= kTargetNormalUnorm;
     }
+    if (depth_at_output)
+    {
+        mask |= kTargetDepthOutput;
+    }
     // The render size (the size of the trace, the internal targets and every geometry target).
     const uint32_t width = upscaling ? render_width : all[present[0]]->width;
     const uint32_t height = upscaling ? render_height : all[present[0]]->height;
@@ -342,6 +367,41 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     const uint32_t output_width = has_color ? targets.color.width : width;
     const uint32_t output_height = has_color ? targets.color.height : height;
     const bool composite = lighting && has_color;
+    // The host's background (an input, checked in every mode; read by the composite only): the render
+    // size, a layout the library never changes, not one of the targets.
+    const CaelixTargetImage& background_image = targets.background;
+    if (background_image.image != 0)
+    {
+        if (background_image.format == VK_FORMAT_UNDEFINED)
+        {
+            CAELIX_LOGE("%s: the background needs a format", kFunction);
+            return CAELIX_ERROR_INVALID_ARGUMENT;
+        }
+        if (background_image.width != width || background_image.height != height)
+        {
+            CAELIX_LOGE("%s: the background is %ux%u; it must have the render size %ux%u", kFunction,
+                        background_image.width, background_image.height, width, height);
+            return CAELIX_ERROR_INVALID_ARGUMENT;
+        }
+        if (background_image.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+            background_image.layout != VK_IMAGE_LAYOUT_GENERAL)
+        {
+            CAELIX_LOGE("%s: the background is in VkImageLayout %u; it must be SHADER_READ_ONLY_OPTIMAL or "
+                        "GENERAL (the library never transitions it)",
+                        kFunction, background_image.layout);
+            return CAELIX_ERROR_INVALID_ARGUMENT;
+        }
+        for (uint32_t p = 0; p < present_count; ++p)
+        {
+            if (all[present[p]]->image == background_image.image)
+            {
+                CAELIX_LOGE("%s: the background and the %s target are the same image", kFunction,
+                            kTargetSpecs[present[p]].name);
+                return CAELIX_ERROR_INVALID_ARGUMENT;
+            }
+        }
+    }
+    const bool background = composite && background_image.image != 0;
     // The delta checkerboard (path trace mode only) needs the cross resolve after the composite.
     const bool cross_resolve = composite && options.mode == CAELIX_MODE_PATH_TRACE &&
                                (flags & CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) != 0;
@@ -598,6 +658,7 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     const double half_sin = std::sin(0.5 * static_cast<double>(sun_radius));
     constants.sun_solid_angle = static_cast<float>(4.0 * 3.14159265358979323846 * half_sin * half_sin);
     constants.output_srgb = IsUnormFormat(static_cast<VkFormat>(targets.color.format)) ? 1u : 0u;
+    constants.background = background ? 1u : 0u;
     constants.cross_resolve = cross_resolve ? 1u : 0u;
     constants.t_max = kTMax;
     // The kernels' REBLUR_FrontEnd_GetNormHitDist uses the same A, B, C as the denoiser.
@@ -696,12 +757,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     const ComputePipeline& trace = light_nee_flags != 0 ? kernels_.trace() : kernels_.trace_no_light_nee();
     bind_sets(trace, slot->set);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
-    // Voxel id (an upscaler and a voxel id target): the target at the output size from unjittered
-    // pixel-centre rays, so that it pairs with the upscaled colour; the trace skipped it (fc.upscale).
-    // Same set (binding 7 holds the target's view). It reads only the TLAS and the scene tables, so
-    // nothing orders it after the trace; the final barrier covers its writes. Inside the trace
-    // timestamps.
-    if (upscaling && targets.voxel_id.image != 0)
+    // The output-size pass (an upscaler and a voxel id target or an output-size depth target): those
+    // targets at the output size from unjittered pixel-centre rays, so that they pair with the
+    // upscaled colour; the trace skipped them (fc.upscale, kTargetDepthOutput). Same set (bindings 4
+    // and 7 hold the targets' views). It reads only the TLAS and the scene tables, so nothing orders
+    // it after the trace; the final barrier covers its writes. Inside the trace timestamps.
+    if (upscaling && (targets.voxel_id.image != 0 || depth_at_output))
     {
         bind_sets(kernels_.voxel_id(), slot->set);
         vkCmdDispatch(cmd, (output_width + kWorkgroupSize - 1) / kWorkgroupSize,
@@ -743,7 +804,8 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     // Composite (lighting modes with a colour target). Bindings 3 and 4 hold NRD's
     // outputs when this frame was denoised, else the raw radiance.
     // Binding 7 is the motion of the primary hit (CAELIX_VIEW_MOTION); 9 the upscale input
-    // (written instead of the colour target when an upscaler runs); 10 and 11 the sky.
+    // (written instead of the colour target when an upscaler runs); 10 and 11 the sky; 12 the
+    // host background (only when present: fc.background).
     if (composite)
     {
         write_count = 0;
@@ -758,6 +820,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
             write_image(slot->composite_set, 1 + i, internal_[composite_internals[i]].view());
         }
         write_sky(slot->composite_set, kCompositeSkyBinding);
+        if (background)
+        {
+            write_descriptor(slot->composite_set, kCompositeBackgroundBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                             {VK_NULL_HANDLE, BackgroundViewFor(background_image, frame.frame_number, safe),
+                              static_cast<VkImageLayout>(background_image.layout)});
+        }
         vkUpdateDescriptorSets(device_.device(), write_count, writes, 0, nullptr);
 
         Barriers between;

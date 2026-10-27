@@ -41,6 +41,31 @@ first. The ABI contract is `CaelixRenderTargets::voxel_id` in `include/caelix/ca
   byte-identical to the trace kernel's image of a render without an upscaler and with jitter 0 at
   the output size (same pinhole expression).
 
+## Output-size depth (2026-10-28)
+
+With an upscaler the depth target may have the render size or the OUTPUT size (any other size is
+`CAELIX_ERROR_INVALID_ARGUMENT`; equal sizes, as with DLAA, count as the render size).
+
+- Render size: the trace writes it from the jittered primary ray at the delta chain's distance, as
+  without an upscaler.
+- Output size: the renderer sets `kTargetDepthOutput` (`target_mask` bit 17), the trace skips the
+  depth write, and `caelix_voxel_id` (now "the output-size pass"; file and kernel name unchanged)
+  runs whenever an upscaler runs with a voxel id target OR an output-size depth target. It writes
+  the depth from the same unjittered centre ray as the key: the camera ray's FIRST hit (transparent
+  voxels included, no delta chain, no `voxel_id_tmax`), with the trace kernel's formula
+  (`rel = dir * T`, `view = (rel . right, rel . up, rel . forward, 1)`,
+  `depth = dot(projection[2], view) / dot(projection[3], view)`), `miss_depth` on a miss, flip y
+  applied. Each target is written only when its bit is set (`kTargetVoxelId`, `kTargetDepthOutput`).
+  Binding 4 of the trace set holds the depth target's view (written by the present-target loop).
+- So the depth pairs with the voxel id and the upscaled colour. Behind glass it differs from the
+  render-size depth (first transparent hit, not the chain's surface), as the voxel id does.
+- The internal depth for DLSS is unchanged (the trace still writes it at the render size).
+- `caelix_dlss_test` ("background and output-size depth with an upscaler"): after three jittered SR
+  frames the output-size depth is byte-identical to the trace's depth of an unjittered render without
+  an upscaler at the output size (0 of 230400 pixels differ); a render-size depth is still accepted,
+  a depth one pixel wider than the render size is refused.
+- Registers unchanged: `caelix_voxel_id` 56 + 16 B spill.
+
 ## Debug view
 
 `CAELIX_VIEW_VOXEL_ID` (11), primary mode: `Pastel(word 0)` of the primary hit, no shading; a

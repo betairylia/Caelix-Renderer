@@ -2,7 +2,8 @@
 // the availability query, the jitter helpers, DLSS Super Resolution and Ray Reconstruction on the
 // sunlit floor + floating block scene of caelix_nrd_test (smoke tests against an accumulated
 // reference), argument checks, quality changes, the voxel id target at the output size (the dedicated
-// unjittered pass against a render without an upscaler) and the measured upscale cost at 1920x1080. Any
+// unjittered pass against a render without an upscaler), the host background under SR and the depth
+// target at the output size, and the measured upscale cost at 1920x1080. Any
 // Vulkan validation message or library error/warning fails a case (CloseRig). Without DLSS in the
 // build, or without NGX on the machine, the GPU cases are skipped (the query reports why).
 #include "test_scenes.h"
@@ -116,10 +117,10 @@ void DestroyTarget(Gpu& gpu, Target& target)
     vkFreeMemory(gpu.device.device, target.memory, nullptr);
 }
 
-// One frame: flush, render into `color` (and `depth` when given), optionally read the RGBA32F
+// One frame: flush, render into `color` (and `view_z` when given), optionally read the RGBA32F
 // colour back. Returns the render call's result; nothing is read back unless it is CAELIX_OK.
 CaelixResult RenderFrame(Rig& rig, CaelixRenderer* renderer, Target& color, const CaelixCamera& camera,
-                         const CaelixRenderOptions& options, bool readback, Target* depth = nullptr)
+                         const CaelixRenderOptions& options, bool readback, Target* view_z = nullptr)
 {
     Readback buffer;
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(color.width) * color.height * 16;
@@ -138,9 +139,9 @@ CaelixResult RenderFrame(Rig& rig, CaelixRenderer* renderer, Target& color, cons
         REQUIRE(caelix_scene_flush(rig.scene, &desc) == CAELIX_OK);
         CaelixRenderTargets targets{};
         targets.color = color.desc();
-        if (depth != nullptr)
+        if (view_z != nullptr)
         {
-            targets.depth = depth->desc();
+            targets.view_z = view_z->desc();
         }
         result = caelix_renderer_render(renderer, &desc, &targets, &camera, &options);
         if (!readback || result != CAELIX_OK)
@@ -172,9 +173,9 @@ CaelixResult RenderFrame(Rig& rig, CaelixRenderer* renderer, Target& color, cons
     if (result == CAELIX_OK)
     {
         color.layout = readback ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
-        if (depth != nullptr)
+        if (view_z != nullptr)
         {
-            depth->layout = VK_IMAGE_LAYOUT_GENERAL;
+            view_z->layout = VK_IMAGE_LAYOUT_GENERAL;
         }
         if (readback)
         {
@@ -255,6 +256,97 @@ CaelixResult RenderVoxelIds(Rig& rig, CaelixRenderer* renderer, Target& color, T
     if (ids != nullptr)
     {
         DestroyReadback(rig.gpu, buffer);
+    }
+    return result;
+}
+
+// A target of RenderTargets: left in GENERAL, or read back into `bytes` (raw texels, row 0 = top,
+// `bytes_per_pixel` each) and left in TRANSFER_SRC_OPTIMAL.
+struct Written
+{
+    Target* target = nullptr;
+    std::vector<uint8_t>* bytes = nullptr;
+    uint32_t bytes_per_pixel = 0;
+};
+
+// One frame into `targets` (the caller builds them from Target::desc() and its background); `written`
+// lists the Target objects among them. Returns the render call's result; nothing is read back unless it
+// is CAELIX_OK.
+CaelixResult RenderTargets(Rig& rig, CaelixRenderer* renderer, const CaelixRenderTargets& targets,
+                           const std::vector<Written>& written, const CaelixCamera& camera,
+                           const CaelixRenderOptions& options)
+{
+    std::vector<Readback> buffers(written.size());
+    for (size_t i = 0; i < written.size(); ++i)
+    {
+        if (written[i].bytes != nullptr)
+        {
+            const Target& target = *written[i].target;
+            CreateReadback(rig.gpu, static_cast<VkDeviceSize>(target.width) * target.height * written[i].bytes_per_pixel,
+                           buffers[i]);
+        }
+    }
+    CaelixResult result = CAELIX_OK;
+    const uint64_t frame = rig.frames.next++;
+    SubmitAndWait(rig.gpu, [&](VkCommandBuffer cmd) {
+        CaelixFrameDesc desc{};
+        desc.command_buffer = reinterpret_cast<uint64_t>(cmd);
+        desc.frame_number = frame;
+        desc.safe_frame_number = frame - 1;
+        REQUIRE(caelix_scene_flush(rig.scene, &desc) == CAELIX_OK);
+        result = caelix_renderer_render(renderer, &desc, &targets, &camera, &options);
+        if (result != CAELIX_OK)
+        {
+            return;
+        }
+        for (size_t i = 0; i < written.size(); ++i)
+        {
+            if (written[i].bytes == nullptr)
+            {
+                continue;
+            }
+            const Target& target = *written[i].target;
+            VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = target.image;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dependency.imageMemoryBarrierCount = 1;
+            dependency.pImageMemoryBarriers = &barrier;
+            vkCmdPipelineBarrier2(cmd, &dependency);
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {target.width, target.height, 1};
+            vkCmdCopyImageToBuffer(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffers[i].buffer, 1,
+                                   &region);
+        }
+        CopyToHostBarrier(cmd);
+    });
+    REQUIRE(caelix_scene_recycle(rig.scene, frame) == CAELIX_OK);
+    for (size_t i = 0; i < written.size(); ++i)
+    {
+        Target& target = *written[i].target;
+        if (result == CAELIX_OK)
+        {
+            target.layout = written[i].bytes != nullptr ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+            if (written[i].bytes != nullptr)
+            {
+                const uint8_t* data = reinterpret_cast<const uint8_t*>(buffers[i].words);
+                written[i].bytes->assign(data, data + static_cast<size_t>(target.width) * target.height *
+                                                          written[i].bytes_per_pixel);
+            }
+        }
+        if (written[i].bytes != nullptr)
+        {
+            DestroyReadback(rig.gpu, buffers[i]);
+        }
     }
     return result;
 }
@@ -685,19 +777,20 @@ TEST_CASE("Upscaler arguments: target sizes, quality change, switching the upsca
     options.upscaler = CAELIX_UPSCALER_DLSS_SR;
     options.upscale_quality = CAELIX_UPSCALE_QUALITY;
 
-    // A geometry target at the output size (it must have the render size).
+    // A geometry target at the output size (it must have the render size; the depth target, which may
+    // have either, is checked in the output-size depth case).
     {
-        Target depth = CreateTarget(rig.gpu, kWidth, kHeight, VK_FORMAT_R32_SFLOAT);
+        Target view_z = CreateTarget(rig.gpu, kWidth, kHeight, VK_FORMAT_R32_SFLOAT);
         ExpectLibraryErrors(1, [&] {
-            CHECK(RenderFrame(rig, renderer, color, camera, options, false, &depth) == CAELIX_ERROR_INVALID_ARGUMENT);
+            CHECK(RenderFrame(rig, renderer, color, camera, options, false, &view_z) == CAELIX_ERROR_INVALID_ARGUMENT);
         });
         // At the render size it is accepted.
-        Target render_depth = CreateTarget(rig.gpu, quality.render_width, quality.render_height, VK_FORMAT_R32_SFLOAT);
-        CHECK(RenderFrame(rig, renderer, color, camera, options, false, &render_depth) == CAELIX_OK);
+        Target render_view_z = CreateTarget(rig.gpu, quality.render_width, quality.render_height, VK_FORMAT_R32_SFLOAT);
+        CHECK(RenderFrame(rig, renderer, color, camera, options, false, &render_view_z) == CAELIX_OK);
         REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
         caelix_renderer_release_target_views(renderer);
-        DestroyTarget(rig.gpu, depth);
-        DestroyTarget(rig.gpu, render_depth);
+        DestroyTarget(rig.gpu, view_z);
+        DestroyTarget(rig.gpu, render_view_z);
     }
     // An output below 64 x 32.
     {
@@ -852,6 +945,214 @@ TEST_CASE("voxel id with an upscaler: output size, unjittered dedicated pass")
     caelix_renderer_destroy(renderer);
     DestroyTarget(rig.gpu, color);
     DestroyTarget(rig.gpu, ids);
+    CloseRig(rig);
+}
+
+TEST_CASE("background and output-size depth with an upscaler")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_dlss_test", RigDesc(0, 0, 0));
+    constexpr uint32_t kWidth = 640;
+    constexpr uint32_t kHeight = 360;
+    const CaelixUpscalerQueryResult sr = Query(rig.device, CAELIX_UPSCALER_DLSS_SR, CAELIX_UPSCALE_QUALITY, kWidth, kHeight);
+    if (sr.supported == 0)
+    {
+        std::printf("DLSS SR unsupported (%s): skipped\n", ReasonName(sr.reason));
+        CloseRig(rig);
+        SKIP("DLSS SR is not available on this machine or in this build");
+    }
+    UploadFloorAndBlock(rig);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    const CaelixCamera camera = FrontCamera(static_cast<float>(kWidth) / kHeight);
+    Target color = CreateTarget(rig.gpu, kWidth, kHeight, VK_FORMAT_R32G32B32A32_SFLOAT);
+    Target ids = CreateTarget(rig.gpu, kWidth, kHeight, VK_FORMAT_R32G32_UINT);
+    Target output_depth = CreateTarget(rig.gpu, kWidth, kHeight, VK_FORMAT_R32_SFLOAT);
+    CaelixRenderOptions options = LightOptions(CAELIX_MODE_PATH_TRACE, 0, 1);
+    options.upscaler = CAELIX_UPSCALER_DLSS_SR;
+    options.upscale_quality = CAELIX_UPSCALE_QUALITY;
+    const float kBackground[3] = {0.2f, 0.5f, 0.8f};
+    const auto constant = [&](uint32_t width, uint32_t height) {
+        std::vector<float> rgba(static_cast<size_t>(width) * height * 4);
+        for (size_t i = 0; i < rgba.size(); i += 4)
+        {
+            rgba[i + 0] = kBackground[0];
+            rgba[i + 1] = kBackground[1];
+            rgba[i + 2] = kBackground[2];
+            rgba[i + 3] = 1.0f;
+        }
+        return rgba;
+    };
+    BackgroundImage background = CreateBackground(rig.gpu, sr.render_width, sr.render_height);
+    UploadBackground(rig.gpu, background, constant(sr.render_width, sr.render_height));
+    const uint32_t phases = caelix_upscaler_jitter_phases(CAELIX_UPSCALER_DLSS_SR, sr.render_width, kWidth);
+
+    // 1. A background at the output size is refused (it has the render size); at the render size it is
+    //    accepted.
+    {
+        BackgroundImage output_background = CreateBackground(rig.gpu, kWidth, kHeight);
+        UploadBackground(rig.gpu, output_background, constant(kWidth, kHeight));
+        CaelixRenderTargets targets{};
+        targets.color = color.desc();
+        targets.background = output_background.Abi();
+        ExpectLibraryErrors(1, [&] {
+            CHECK(RenderTargets(rig, renderer, targets, {{&color}}, camera, options) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        targets.background = background.Abi();
+        CHECK(RenderTargets(rig, renderer, targets, {{&color}}, camera, options) == CAELIX_OK);
+        REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+        caelix_renderer_release_target_views(renderer);
+        DestroyBackground(rig.gpu, output_background);
+    }
+
+    // 2. SR, the constant background, 3 frames with Halton jitter: every output pixel whose voxel id and
+    //    the neighbours' within 2 pixels (5 x 5) are misses is the background colour (DLSS of a constant is
+    //    the constant away from the silhouettes). The 3 x 3 neighbourhood is printed too: at 1.5x the
+    //    reconstruction still mixes the scene into pixels 2 output pixels from a hit (measured 6.4 %), from
+    //    3 pixels on the deviation is below 0.3 %.
+    {
+        std::vector<uint8_t> colour_bytes;
+        std::vector<uint8_t> id_bytes;
+        CaelixCamera jittered = camera;
+        constexpr uint32_t kFrames = 3;
+        for (uint32_t i = 0; i < kFrames; ++i)
+        {
+            caelix_jitter_halton(i, phases, jittered.jitter);
+            CaelixRenderOptions frame_options = options;
+            frame_options.frame_seed = i;
+            CaelixRenderTargets targets{};
+            targets.color = color.desc();
+            targets.voxel_id = ids.desc();
+            targets.background = background.Abi();
+            const bool last = i + 1 == kFrames;
+            REQUIRE(RenderTargets(rig, renderer, targets,
+                                  {{&color, last ? &colour_bytes : nullptr, 16}, {&ids, last ? &id_bytes : nullptr, 8}},
+                                  jittered, frame_options) == CAELIX_OK);
+        }
+        CHECK(UpscalerInfo(renderer).failed == 0);
+        const auto miss = [&](int x, int y) {
+            uint32_t words[2];
+            std::memcpy(words, id_bytes.data() + (static_cast<size_t>(y) * kWidth + x) * 8, 8);
+            return words[0] == 0xFFFFFFFFu && words[1] == 0xFFFFFFFFu;
+        };
+        // The pixels whose (2 r + 1)^2 neighbourhood is all misses, and their largest relative deviation.
+        const auto deviation = [&](int r, size_t& inside) {
+            inside = 0;
+            double max_deviation = 0.0;
+            for (int y = r; y + r < static_cast<int>(kHeight); ++y)
+            {
+                for (int x = r; x + r < static_cast<int>(kWidth); ++x)
+                {
+                    bool all_miss = true;
+                    for (int dy = -r; dy <= r && all_miss; ++dy)
+                    {
+                        for (int dx = -r; dx <= r && all_miss; ++dx)
+                        {
+                            all_miss = miss(x + dx, y + dy);
+                        }
+                    }
+                    if (!all_miss)
+                    {
+                        continue;
+                    }
+                    ++inside;
+                    float rgba[4];
+                    std::memcpy(rgba, colour_bytes.data() + (static_cast<size_t>(y) * kWidth + x) * 16, 16);
+                    for (int c = 0; c < 3; ++c)
+                    {
+                        max_deviation = std::max(
+                            max_deviation, std::abs(static_cast<double>(rgba[c]) - kBackground[c]) / kBackground[c]);
+                    }
+                }
+            }
+            return max_deviation;
+        };
+        size_t inside_3 = 0;
+        size_t inside_5 = 0;
+        const double deviation_3 = deviation(1, inside_3);
+        const double deviation_5 = deviation(2, inside_5);
+        std::printf("background under DLSS SR: max relative deviation from the background %.4f over %zu output "
+                    "pixels with a 5x5 miss neighbourhood (%.4f over %zu with 3x3, not checked)\n",
+                    deviation_5, inside_5, deviation_3, inside_3);
+        CHECK(inside_5 > 1000);
+        CHECK(deviation_5 < 0.02);
+    }
+
+    // 3. The depth target at the output size: written by the output-size pass from the unjittered pixel
+    //    centres, byte-identical to the depth of an unjittered render without an upscaler at the output
+    //    size. A depth target at the render size is still accepted, one at any other size refused.
+    {
+        std::vector<uint8_t> upscaled_depth;
+        CaelixCamera jittered = camera;
+        constexpr uint32_t kFrames = 3;
+        for (uint32_t i = 0; i < kFrames; ++i)
+        {
+            caelix_jitter_halton(i, phases, jittered.jitter);
+            CaelixRenderOptions frame_options = options;
+            frame_options.frame_seed = i;
+            CaelixRenderTargets targets{};
+            targets.color = color.desc();
+            targets.depth = output_depth.desc();
+            REQUIRE(RenderTargets(rig, renderer, targets,
+                                  {{&color}, {&output_depth, i + 1 == kFrames ? &upscaled_depth : nullptr, 4}},
+                                  jittered, frame_options) == CAELIX_OK);
+        }
+        CaelixRenderOptions plain = options;
+        plain.upscaler = CAELIX_UPSCALER_NONE;
+        plain.upscale_quality = 0;
+        std::vector<uint8_t> plain_depth;
+        {
+            CaelixRenderTargets targets{};
+            targets.color = color.desc();
+            targets.depth = output_depth.desc();
+            REQUIRE(RenderTargets(rig, renderer, targets, {{&color}, {&output_depth, &plain_depth, 4}}, camera,
+                                  plain) == CAELIX_OK);
+        }
+        REQUIRE(upscaled_depth.size() == plain_depth.size());
+        size_t differ = 0;
+        size_t misses = 0;
+        float max_difference = 0.0f;
+        for (size_t i = 0; i < upscaled_depth.size(); i += 4)
+        {
+            float a = 0.0f;
+            float b = 0.0f;
+            std::memcpy(&a, upscaled_depth.data() + i, 4);
+            std::memcpy(&b, plain_depth.data() + i, 4);
+            differ += std::memcmp(upscaled_depth.data() + i, plain_depth.data() + i, 4) != 0 ? 1 : 0;
+            misses += a == 1.0f ? 1 : 0;
+            max_difference = std::max(max_difference, std::abs(a - b));
+        }
+        std::printf("output-size depth under DLSS SR: %zu of %u pixels differ from the unjittered render without an "
+                    "upscaler (max difference %g), %zu miss pixels\n",
+                    differ, kWidth * kHeight, static_cast<double>(max_difference), misses);
+        CHECK(differ == 0);
+        CHECK(misses > 1000);
+        CHECK(misses < static_cast<size_t>(kWidth) * kHeight - 1000);
+
+        Target render_depth = CreateTarget(rig.gpu, sr.render_width, sr.render_height, VK_FORMAT_R32_SFLOAT);
+        Target odd_depth = CreateTarget(rig.gpu, sr.render_width + 1, sr.render_height, VK_FORMAT_R32_SFLOAT);
+        CaelixRenderTargets targets{};
+        targets.color = color.desc();
+        targets.depth = render_depth.desc();
+        CHECK(RenderTargets(rig, renderer, targets, {{&color}, {&render_depth}}, camera, options) == CAELIX_OK);
+        targets.depth = odd_depth.desc();
+        ExpectLibraryErrors(1, [&] {
+            CHECK(RenderTargets(rig, renderer, targets, {{&color}, {&odd_depth}}, camera, options) ==
+                  CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+        caelix_renderer_release_target_views(renderer);
+        DestroyTarget(rig.gpu, render_depth);
+        DestroyTarget(rig.gpu, odd_depth);
+    }
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    DestroyTarget(rig.gpu, ids);
+    DestroyTarget(rig.gpu, output_depth);
+    DestroyBackground(rig.gpu, background);
     CloseRig(rig);
 }
 

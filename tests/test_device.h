@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 namespace test {
 
@@ -100,6 +101,34 @@ struct Readback
 
 void CreateReadback(Gpu& gpu, VkDeviceSize size, Readback& out);
 void DestroyReadback(Gpu& gpu, Readback& readback);
+
+// A host background image (CaelixRenderTargets::background): RGBA32F, SAMPLED | TRANSFER_DST,
+// optimal tiling, device local.
+struct BackgroundImage
+{
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    CaelixTargetImage Abi() const
+    {
+        CaelixTargetImage out{};
+        out.image = reinterpret_cast<uint64_t>(image);
+        out.format = static_cast<uint32_t>(VK_FORMAT_R32G32B32A32_SFLOAT);
+        out.width = width;
+        out.height = height;
+        out.layout = static_cast<uint32_t>(layout);
+        return out;
+    }
+};
+BackgroundImage CreateBackground(Gpu& gpu, uint32_t width, uint32_t height);
+// Writes `rgba` (width * height * 4 floats, row 0 = top) through a staging buffer: the image goes to
+// TRANSFER_DST, receives the copy and ends in SHADER_READ_ONLY_OPTIMAL with the copy made visible to
+// compute-shader sampled reads (the host's duty for a background). Submits and waits.
+void UploadBackground(Gpu& gpu, BackgroundImage& background, const std::vector<float>& rgba);
+void DestroyBackground(Gpu& gpu, BackgroundImage& background);
 
 // Frame bookkeeping of a test host: every submit is waited for, so the frame
 // before the current one is always complete.

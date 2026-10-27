@@ -139,13 +139,15 @@ private:
         VkDescriptorSet frame_set = VK_NULL_HANDLE;      // frame set: `constants` as a uniform buffer
         GpuBuffer constants;                             // host-visible, mapped, one FrameConstants
     };
-    // A target's 2D storage view, or a sky cubemap's cube sampled view (cube = true, all
-    // mips). The key is image + format + cube + mip_levels.
+    // A target's 2D storage view, the background's 2D sampled view, or a sky cubemap's cube
+    // sampled view (cube = true, all mips). The key is image + format + cube + sampled +
+    // mip_levels (a storage and a sampled view of one image are two entries).
     struct CachedView
     {
         VkImage image = VK_NULL_HANDLE;
         VkFormat format = VK_FORMAT_UNDEFINED;
         bool cube = false;
+        bool sampled = false;  // SAMPLED usage (always for a cube), else STORAGE
         uint32_t mip_levels = 1;
         VkImageView view = VK_NULL_HANDLE;
         uint64_t last_frame = 0;
@@ -195,8 +197,11 @@ private:
     VkImageView ViewFor(const CaelixTargetImage& target, uint64_t frame, uint64_t safe_frame);
     // The cached cube view (sampled usage, every mip, 6 layers) of the host's sky cubemap.
     VkImageView SkyViewFor(const CaelixSkyCubemap& sky, uint64_t frame, uint64_t safe_frame);
-    // The cache behind both: the view of (image, format, cube, mip_levels), created on a miss.
-    VkImageView CachedViewFor(VkImage image, VkFormat format, bool cube, uint32_t mip_levels,
+    // The cached 2D view with sampled usage (mip 0, one layer) of the host's background.
+    VkImageView BackgroundViewFor(const CaelixTargetImage& background, uint64_t frame, uint64_t safe_frame);
+    // The cache behind the three: the view of (image, format, cube, sampled, mip_levels), created on
+    // a miss. A cube view is always sampled.
+    VkImageView CachedViewFor(VkImage image, VkFormat format, bool cube, bool sampled, uint32_t mip_levels,
                               uint64_t frame, uint64_t safe_frame);
     bool FormatSupported(VkFormat format);
     // Creates the internal targets when they are missing or have another size; the

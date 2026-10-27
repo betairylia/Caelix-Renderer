@@ -407,7 +407,8 @@ flush builds the TLAS that the render binds.
   albedo, normal, depth, motion, view_z and voxel_id targets as storage images without a
   format qualifier, bindings 8..19 the internal targets of the lighting modes
   with fixed formats, binding 20 the sky cubemap as a sampled image and 21 its
-  sampler (`lib/src/render/render_kernels.h`; the voxel id kernel `caelix_voxel_id` binds the
+  sampler (`lib/src/render/render_kernels.h`; the output-size pass `caelix_voxel_id`, which writes
+  the voxel id target and an output-size depth target under an upscaler, binds the
   same set). Set 1 is the frame set, shared by the six
   frame-constant kernels (`caelix_path_trace`, `caelix_composite`, `caelix_cross_resolve`,
   `caelix_sky_sh`, `caelix_upscale_encode`, `caelix_voxel_id`): binding 0 the frame slot's 576-byte
@@ -722,7 +723,7 @@ numbers: `Artifacts/native-renderer-step6b-20261014/`.
 
 ### Render targets and G-buffer mode
 
-`CaelixRenderTargets` has six targets. Each is optional: a target is present
+`CaelixRenderTargets` has seven targets and one input (`background`, below). Each target is optional: a target is present
 when its `image` is nonzero. At least one must be present; every present target
 must have the same size and a different image. Every pixel of a present target
 is written on every render call, a miss included.
@@ -732,10 +733,15 @@ is written on every render call, a miss included.
 | `color` | any storage format (RGBA8, BGRA8, RGBA16F, RGBA32F) | primary mode: the debug view (albedo, optionally Lambert shaded), alpha 1 everywhere; lighting modes: premultiplied colour, a = coverage (sRGB-encoded for UNORM formats) | primary: sky colour, alpha 1; lighting: the procedural sky (`CAELIX_RENDER_FLAG_SKY_ON_MISS`) or 0, alpha 0 |
 | `albedo` | RGBA8, RGBA16F | material albedo as stored in the block (sRGB), no shading; a = coverage | (0, 0, 0, 0) |
 | `normal` | RGBA16F, RGBA8_UNORM (stored as n * 0.5 + 0.5) | world-space face normal; w = coverage | (0, 0, 0, 0) |
-| `depth` | R32F (storage image, not a depth attachment) | device depth clip.z / clip.w of `CaelixCamera::projection` | `options.miss_depth` |
+| `depth` | R32F (storage image, not a depth attachment) | device depth clip.z / clip.w of `CaelixCamera::projection`; with an upscaler it has the render size (the trace writes it) or the OUTPUT size (the unjittered output-size pass writes it at the camera ray's first hit, `docs/VOXEL_ID.md`) | `options.miss_depth` |
 | `motion` | RG16F, RG32F, RGBA16F, RGBA32F | previous pixel - current pixel, in pixels of the current size; RGBA formats: z = 0, w = the delta checkerboard flag (1 = the pixel needs the cross resolve with its flagged neighbours) | (0, 0) |
 | `view_z` | R32F | linear view depth dot(hit - position, forward) | `options.miss_view_z` |
 | `voxel_id` | R32_UINT, R32G32_UINT | two independent 32-bit hashes of (entity, entity-local voxel) of the camera ray's first hit, transparent voxels included (`docs/VOXEL_ID.md`); with an upscaler it has the OUTPUT size and a separate unjittered pass writes it | 0xFFFFFFFF in every channel (also beyond `options.voxel_id_tmax`) |
+
+`CaelixRenderTargets::background` is an input, not a target: a host image at the render size
+(sampled, layout SHADER_READ_ONLY_OPTIMAL or GENERAL, never transitioned) that the lighting modes
+write into the colour at camera-ray misses instead of the sky, without the exposure and outside the
+reference mean, so that an upscaler receives a complete image (`docs/BACKGROUND.md`).
 
 A host with its own deferred pipeline passes only the geometry targets
 ("G-buffer mode"): the library then writes no lighting at all.

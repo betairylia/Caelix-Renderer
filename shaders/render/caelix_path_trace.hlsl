@@ -824,8 +824,9 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         device_depth = dot(fc.projection[2], view) / dot(fc.projection[3], view);
     }
     CAELIX_BRANCH
-    if ((targets & kTargetDepth) != 0u)
+    if ((targets & kTargetDepth) != 0u && (targets & kTargetDepthOutput) == 0u)
     {
+        // An output-size depth target (an upscaler runs) is written by the caelix_voxel_id kernel.
         g_depth[out_pixel] = float4(device_depth, 0.0f, 0.0f, 0.0f);
     }
     CAELIX_BRANCH

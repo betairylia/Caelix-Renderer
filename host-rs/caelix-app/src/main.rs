@@ -997,6 +997,7 @@ impl App {
                 motion: NO_TARGET,
                 view_z: NO_TARGET,
                 voxel_id,
+                background: NO_TARGET,
             };
             let aspect = frame.width as f32 / frame.height.max(1) as f32;
             // Jitter: the library's Halton sequence while a supported upscaler is active, else none.

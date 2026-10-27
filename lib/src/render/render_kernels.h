@@ -29,10 +29,12 @@ constexpr uint32_t kTraceBindingCount = kTraceSkyBinding + 2;
 // Composite set (also bound by the cross resolve kernel): binding 0 the host colour
 // target, bindings 1..8 internal targets (8 = the resolve image), binding 9 the upscale
 // input (the composite's linear output when an upscaler runs), binding 10 the sky
-// cubemap (sampled image), 11 its sampler.
+// cubemap (sampled image), 11 its sampler, 12 the host background (sampled image, read
+// with Load at the render size; written only when present).
 constexpr uint32_t kCompositeStorageCount = 10;  // bindings 0..9
 constexpr uint32_t kCompositeSkyBinding = kCompositeStorageCount;
-constexpr uint32_t kCompositeBindingCount = kCompositeSkyBinding + 2;
+constexpr uint32_t kCompositeBackgroundBinding = kCompositeSkyBinding + 2;
+constexpr uint32_t kCompositeBindingCount = kCompositeBackgroundBinding + 1;
 // Encode set (caelix_upscale_encode, upscaled frames only): binding 0 the host colour target,
 // binding 1 the source (the upscaler's output, or the upscale input on the fallback), binding 2
 // the internal albedo (coverage in alpha).
@@ -126,8 +128,8 @@ public:
     {
         return trace_no_light_nee_;
     }
-    // The voxel id target at the output size (frames with an upscaler and a voxel id target;
-    // shaders/render/caelix_voxel_id.hlsl, trace set).
+    // The output-size pass: the voxel id target and an output-size depth target (frames with an
+    // upscaler and either target; shaders/render/caelix_voxel_id.hlsl, trace set).
     const ComputePipeline& voxel_id() const
     {
         return voxel_id_;

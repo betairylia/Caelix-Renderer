@@ -81,7 +81,7 @@ struct FrameConstants
     uint32_t upscale;                   // 540  1 = the composite / cross resolve write upscale_in instead of the colour target
     uint64_t light_tree;                // 544  light tree descriptor (docs/LIGHT_TREE.md), 0 = no tree
     uint32_t light_nee_flags;           // 552  kLightNee*: the light NEE of this frame (0 = off)
-    uint32_t pad_556;                   // 556
+    uint32_t background;                // 556  1 = the composite writes the host background (composite binding 12) at misses
     uint64_t subsurface_table;          // 560  packed subsurface entry (32 B) by block code, 65536 entries
     uint64_t pad_568;                   // 568
 };
@@ -123,7 +123,7 @@ static_assert(offsetof(FrameConstants, upscaler) == 536);
 static_assert(offsetof(FrameConstants, upscale) == 540);
 static_assert(offsetof(FrameConstants, light_tree) == 544);
 static_assert(offsetof(FrameConstants, light_nee_flags) == 552);
-static_assert(offsetof(FrameConstants, pad_556) == 556);
+static_assert(offsetof(FrameConstants, background) == 556);
 static_assert(offsetof(FrameConstants, subsurface_table) == 560);
 static_assert(offsetof(FrameConstants, pad_568) == 568);
 
@@ -132,7 +132,7 @@ static_assert(offsetof(FrameConstants, pad_568) == 568);
 constexpr float kTMax = 1e4f;
 
 // FrameConstants::target_mask: one bit per present target (bit i = descriptor
-// binding i + 1), plus the encoding of the normal target.
+// binding i + 1), plus the encoding of the normal target and the size of the depth target.
 constexpr uint32_t kTargetColor = 1u << 0;
 constexpr uint32_t kTargetAlbedo = 1u << 1;
 constexpr uint32_t kTargetNormal = 1u << 2;
@@ -141,6 +141,9 @@ constexpr uint32_t kTargetMotion = 1u << 4;
 constexpr uint32_t kTargetViewZ = 1u << 5;
 constexpr uint32_t kTargetVoxelId = 1u << 6;
 constexpr uint32_t kTargetNormalUnorm = 1u << 16;  // the normal target stores n * 0.5 + 0.5
+// The depth target has the OUTPUT size (an upscaler runs): the output-size pass (caelix_voxel_id)
+// writes it, the trace does not.
+constexpr uint32_t kTargetDepthOutput = 1u << 17;
 
 // FrameConstants::light_nee_flags (docs/LIGHT_NEE.md; the macros of shaders/common/caelix_frame.hlsl):
 // kLightNeeOn = every diffuse NEE vertex draws a lamp point from the light tree and chooses between it

@@ -73,14 +73,15 @@ void Renderer::AddSlot()
     const VkDevice device = device_.device();
     auto slot = std::make_unique<FrameSlot>();
     slot->index = static_cast<uint32_t>(slots_.size());
-    // Five sets: trace, composite, sky SH (each has one sampled image and one sampler), the
-    // upscale encode set (storage images only) and the frame set (one uniform buffer).
+    // Five sets: trace, composite, sky SH (each has one sampled image and one sampler; the
+    // composite set also the background, a second sampled image), the upscale encode set (storage
+    // images only) and the frame set (one uniform buffer).
     constexpr uint32_t kSetCount = 5;
     const VkDescriptorPoolSize sizes[5] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
          kTargetCount + kTraceInternalCount + kCompositeStorageCount + kEncodeBindingCount},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 3},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
     };
@@ -191,22 +192,30 @@ VkImageView Renderer::ViewFor(const CaelixTargetImage& target, uint64_t frame,
                               uint64_t safe_frame)
 {
     return CachedViewFor(HandleFromU64<VkImage>(target.image), static_cast<VkFormat>(target.format),
-                         false, 1, frame, safe_frame);
+                         false, false, 1, frame, safe_frame);
 }
 
 VkImageView Renderer::SkyViewFor(const CaelixSkyCubemap& sky, uint64_t frame, uint64_t safe_frame)
 {
-    return CachedViewFor(HandleFromU64<VkImage>(sky.image), static_cast<VkFormat>(sky.format), true,
+    return CachedViewFor(HandleFromU64<VkImage>(sky.image), static_cast<VkFormat>(sky.format), true, true,
                          sky.mip_levels, frame, safe_frame);
 }
 
-VkImageView Renderer::CachedViewFor(VkImage image, VkFormat format, bool cube,
+VkImageView Renderer::BackgroundViewFor(const CaelixTargetImage& background, uint64_t frame,
+                                        uint64_t safe_frame)
+{
+    return CachedViewFor(HandleFromU64<VkImage>(background.image), static_cast<VkFormat>(background.format),
+                         false, true, 1, frame, safe_frame);
+}
+
+VkImageView Renderer::CachedViewFor(VkImage image, VkFormat format, bool cube, bool sampled,
                                     uint32_t mip_levels, uint64_t frame, uint64_t safe_frame)
 {
+    sampled = sampled || cube;
     for (CachedView& cached : views_)
     {
         if (cached.image == image && cached.format == format && cached.cube == cube &&
-            cached.mip_levels == mip_levels)
+            cached.sampled == sampled && cached.mip_levels == mip_levels)
         {
             cached.last_frame = frame;
             return cached.view;
@@ -217,11 +226,11 @@ VkImageView Renderer::CachedViewFor(VkImage image, VkFormat format, bool cube,
     view_info.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D;
     view_info.format = format;
     view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, cube ? 6u : 1u};
-    // A target's view is used as a storage image only, a cubemap's as a sampled image only
-    // (the image may have other usages whose format support differs, for example sRGB
-    // attachments).
+    // A target's view is used as a storage image only, a cubemap's and the background's as a
+    // sampled image only (the image may have other usages whose format support differs, for
+    // example sRGB attachments).
     VkImageViewUsageCreateInfo usage_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-    usage_info.usage = cube ? VK_IMAGE_USAGE_SAMPLED_BIT : VK_IMAGE_USAGE_STORAGE_BIT;
+    usage_info.usage = sampled ? VK_IMAGE_USAGE_SAMPLED_BIT : VK_IMAGE_USAGE_STORAGE_BIT;
     view_info.pNext = &usage_info;
     VkImageView view = VK_NULL_HANDLE;
     const VkResult result = vkCreateImageView(device_.device(), &view_info, nullptr, &view);
@@ -230,8 +239,9 @@ VkImageView Renderer::CachedViewFor(VkImage image, VkFormat format, bool cube,
         CAELIX_LOGE("vkCreateImageView failed: %d", static_cast<int>(result));
         throw VulkanError("vkCreateImageView failed", result);
     }
-    views_.push_back(CachedView{image, format, cube, mip_levels, view, frame});
-    CAELIX_LOGD("renderer: %s view created for image 0x%llx (%zu cached)", cube ? "cube" : "image",
+    views_.push_back(CachedView{image, format, cube, sampled, mip_levels, view, frame});
+    CAELIX_LOGD("renderer: %s view created for image 0x%llx (%zu cached)",
+                cube ? "cube" : (sampled ? "sampled image" : "image"),
                 static_cast<unsigned long long>(HandleToU64(image)), views_.size());
 
     // Over the cap: destroy the least recently used view whose last frame is safe.

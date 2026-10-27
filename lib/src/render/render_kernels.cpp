@@ -76,13 +76,14 @@ RenderKernels::RenderKernels(Device& device)
         trace_types[kTraceSkyBinding + 1] = VK_DESCRIPTOR_TYPE_SAMPLER;
         trace_layout_ = CreateSetLayout(vk_device, kTraceBindingCount, trace_types);
         // Composite set: binding 0 the host colour target, 1..8 internal targets, 9 the upscale
-        // input, 10 the sky cubemap, 11 its sampler. The cross resolve kernel uses the same layout
-        // and set.
+        // input, 10 the sky cubemap, 11 its sampler, 12 the host background. The cross resolve
+        // kernel uses the same layout and set.
         VkDescriptorType composite_types[kCompositeBindingCount];
         std::fill(composite_types, composite_types + kCompositeBindingCount,
                   VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         composite_types[kCompositeSkyBinding] = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         composite_types[kCompositeSkyBinding + 1] = VK_DESCRIPTOR_TYPE_SAMPLER;
+        composite_types[kCompositeBackgroundBinding] = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         composite_layout_ = CreateSetLayout(vk_device, kCompositeBindingCount, composite_types);
         // Sky SH set: binding 0 the host's cubemap, 1 the sampler.
         const VkDescriptorType sky_types[2] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,

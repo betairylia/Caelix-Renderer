@@ -10,7 +10,8 @@
 // and the emission scale against closed forms. Two renderers over one flush must
 // agree on the motion of a moving entity, and render once per frame each. The voxel id
 // target holds one key per voxel (two entities, both formats, voxel_id_tmax, flip y, the
-// primary-mode voxel id view).
+// primary-mode voxel id view). The host background replaces the camera-ray misses of the
+// lighting modes exactly (no exposure, outside the reference mean) and nothing else.
 // Uses the public C ABI only.
 #include "test_scenes.h"
 
@@ -186,6 +187,7 @@ enum TargetIndex
 struct TargetSet
 {
     Target* t[kTargetCount] = {};
+    const BackgroundImage* background = nullptr;  // CaelixRenderTargets::background; null = none
 };
 
 CaelixTargetImage Abi(const Target* target)
@@ -212,6 +214,10 @@ CaelixRenderTargets ToAbi(const TargetSet& set)
     out.motion = Abi(set.t[kMotion]);
     out.view_z = Abi(set.t[kViewZ]);
     out.voxel_id = Abi(set.t[kVoxelId]);
+    if (set.background != nullptr)
+    {
+        out.background = set.background->Abi();
+    }
     return out;
 }
 
@@ -3682,5 +3688,203 @@ TEST_CASE("voxel id target: one key per voxel, miss value, tmax, both formats, e
     DestroyTarget(rig.gpu, ids_x);
     DestroyTarget(rig.gpu, albedo);
     DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+namespace {
+
+// The background test: a host image of kSize x kSize, pixel (x, y) = (x / w + offset, y / h, blue, 1).
+std::vector<float> GradientBackground(float offset, float blue)
+{
+    std::vector<float> rgba(static_cast<size_t>(kSize) * kSize * 4);
+    for (uint32_t y = 0; y < kSize; ++y)
+    {
+        for (uint32_t x = 0; x < kSize; ++x)
+        {
+            float* p = rgba.data() + (static_cast<size_t>(y) * kSize + x) * 4;
+            p[0] = static_cast<float>(x) / kSize + offset;
+            p[1] = static_cast<float>(y) / kSize;
+            p[2] = blue;
+            p[3] = 1.0f;
+        }
+    }
+    return rgba;
+}
+
+// Counts the pixels of an RGBA32F colour image by coverage (alpha 0 = miss) and the misses whose rgb is
+// not the background pixel at the same stored position, or whose alpha is not exactly 0.
+struct MissCheck
+{
+    size_t misses = 0;
+    size_t hits = 0;
+    size_t wrong = 0;
+};
+MissCheck CheckMisses(const Target& color, const std::vector<float>& background)
+{
+    MissCheck out;
+    for (uint32_t y = 0; y < kSize; ++y)
+    {
+        for (uint32_t x = 0; x < kSize; ++x)
+        {
+            if (color.F32(x, y, 3) != 0.0f)
+            {
+                ++out.hits;
+                continue;
+            }
+            ++out.misses;
+            const float* expected = background.data() + (static_cast<size_t>(y) * kSize + x) * 4;
+            for (uint32_t c = 0; c < 3; ++c)
+            {
+                if (color.F32(x, y, c) != expected[c])
+                {
+                    ++out.wrong;
+                    break;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// Hit pixels (alpha 1 in `a`) whose 16 bytes differ between two RGBA32F images, plus every pixel whose
+// coverage differs.
+size_t HitDifferences(const Target& a, const Target& b)
+{
+    size_t differ = 0;
+    for (uint32_t y = 0; y < kSize; ++y)
+    {
+        for (uint32_t x = 0; x < kSize; ++x)
+        {
+            const bool hit = a.F32(x, y, 3) != 0.0f;
+            if (a.F32(x, y, 3) != b.F32(x, y, 3) || (hit && std::memcmp(a.at(x, y), b.at(x, y), 16) != 0))
+            {
+                ++differ;
+            }
+        }
+    }
+    return differ;
+}
+
+}  // namespace
+
+TEST_CASE("background: misses show the host image, hits do not, exposure and accumulation untouched, argument checks")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadFloor(rig);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+    Target plain = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+    const std::vector<float> pixels_a = GradientBackground(0.0f, 0.25f);
+    const std::vector<float> pixels_b = GradientBackground(0.5f, 2.0f);
+    BackgroundImage background_a = CreateBackground(rig.gpu, kSize, kSize);
+    BackgroundImage background_b = CreateBackground(rig.gpu, kSize, kSize);
+    UploadBackground(rig.gpu, background_a, pixels_a);
+    UploadBackground(rig.gpu, background_b, pixels_b);
+    // Above the floor's middle, looking along +Z: the upper half and the far band miss.
+    const CaelixCamera camera = LookPlusZ(32.0f, 6.0f, 2.0f);
+    const auto path_trace = [](uint32_t mode, uint32_t seed, uint32_t flags) {
+        CaelixRenderOptions options = LightOptions(mode, 2, seed);
+        options.flags = flags;
+        options.exposure = 2.0f;
+        return options;
+    };
+    TargetSet with;
+    with.t[kColor] = &color;
+    with.background = &background_a;
+    TargetSet without;
+    without.t[kColor] = &plain;
+
+    // 1. Every miss is the background pixel exactly (alpha 0), with and without SKY_ON_MISS; with
+    //    FLIP_Y the stored image still pairs pixel by pixel with the (equally stored) background.
+    Render(rig, renderer, with, camera, path_trace(CAELIX_MODE_PATH_TRACE, 11, CAELIX_RENDER_FLAG_SKY_ON_MISS));
+    const MissCheck sky_flag = CheckMisses(color, pixels_a);
+    const Target first = color;  // the readback only (the image stays `color`'s)
+    Render(rig, renderer, with, camera, path_trace(CAELIX_MODE_PATH_TRACE, 11, 0));
+    const MissCheck no_flag = CheckMisses(color, pixels_a);
+    Render(rig, renderer, with, camera,
+           path_trace(CAELIX_MODE_PATH_TRACE, 11, CAELIX_RENDER_FLAG_SKY_ON_MISS | CAELIX_RENDER_FLAG_FLIP_Y));
+    const MissCheck flipped = CheckMisses(color, pixels_a);
+    CHECK(sky_flag.misses > 10000);
+    CHECK(sky_flag.hits > 10000);
+    CHECK(sky_flag.wrong == 0);
+    CHECK(no_flag.misses == sky_flag.misses);
+    CHECK(no_flag.wrong == 0);
+    CHECK(flipped.misses == sky_flag.misses);
+    CHECK(flipped.wrong == 0);
+
+    // 2. The hits are the render without a background, bit for bit (same seed, exposure 2).
+    Render(rig, renderer, without, camera, path_trace(CAELIX_MODE_PATH_TRACE, 11, CAELIX_RENDER_FLAG_SKY_ON_MISS));
+    const size_t hit_differences = HitDifferences(first, plain);
+    CHECK(hit_differences == 0);
+    // Without a background the misses are the exposed sky, not the host image.
+    const MissCheck sky_misses = CheckMisses(plain, pixels_a);
+    CHECK(sky_misses.wrong == sky_misses.misses);
+
+    // 3. Reference mode, 4 frames, the background alternating A, B, A, B: the hits are the 4-frame mean of
+    //    the scene (the run without a background), the misses the last background (B).
+    constexpr uint32_t kFrames = 4;
+    for (uint32_t i = 0; i < kFrames; ++i)
+    {
+        CaelixRenderOptions options = path_trace(CAELIX_MODE_REFERENCE, 100 + i, CAELIX_RENDER_FLAG_SKY_ON_MISS);
+        options.reset_accumulation = i == 0 ? 1u : 0u;
+        with.background = i % 2 == 0 ? &background_a : &background_b;
+        Render(rig, renderer, with, camera, options, i + 1 == kFrames);
+    }
+    for (uint32_t i = 0; i < kFrames; ++i)
+    {
+        CaelixRenderOptions options = path_trace(CAELIX_MODE_REFERENCE, 100 + i, CAELIX_RENDER_FLAG_SKY_ON_MISS);
+        options.reset_accumulation = i == 0 ? 1u : 0u;
+        Render(rig, renderer, without, camera, options, i + 1 == kFrames);
+    }
+    const MissCheck reference = CheckMisses(color, pixels_b);
+    const size_t reference_differences = HitDifferences(color, plain);
+    CHECK(reference.misses == sky_flag.misses);
+    CHECK(reference.wrong == 0);
+    CHECK(reference_differences == 0);
+    with.background = &background_a;
+
+    // 4. Argument checks (every mode): a background of the wrong size, in layout UNDEFINED, without a
+    //    format, and one that is a target's image.
+    {
+        BackgroundImage small = CreateBackground(rig.gpu, kSize / 2, kSize / 2);
+        UploadBackground(rig.gpu, small, std::vector<float>(static_cast<size_t>(kSize / 2) * (kSize / 2) * 4, 0.5f));
+        CaelixRenderTargets targets{};
+        targets.color = Abi(&color);
+        targets.background = small.Abi();
+        ExpectRenderError(rig, renderer, targets, camera, CAELIX_ERROR_INVALID_ARGUMENT);
+        targets.background = background_a.Abi();
+        targets.background.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ExpectRenderError(rig, renderer, targets, camera, CAELIX_ERROR_INVALID_ARGUMENT);
+        targets.background = background_a.Abi();
+        targets.background.format = VK_FORMAT_UNDEFINED;
+        ExpectRenderError(rig, renderer, targets, camera, CAELIX_ERROR_INVALID_ARGUMENT);
+        targets.background = Abi(&color);
+        targets.background.layout = VK_IMAGE_LAYOUT_GENERAL;
+        ExpectRenderError(rig, renderer, targets, camera, CAELIX_ERROR_INVALID_ARGUMENT);
+        REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+        DestroyBackground(rig.gpu, small);
+    }
+
+    // 5. The primary mode ignores the background: the same image as without it.
+    Render(rig, renderer, with, camera, Options(CAELIX_VIEW_ALBEDO));
+    Render(rig, renderer, without, camera, Options(CAELIX_VIEW_ALBEDO));
+    const bool primary_unchanged = color.bytes == plain.bytes;
+    CHECK(primary_unchanged);
+
+    std::printf("background: %zu miss / %zu hit pixels; misses not the host image: %zu (sky flag), %zu (no flag), "
+                "%zu (flip y); hit pixels differing from the render without it: %zu; reference 4 frames: %zu "
+                "misses not the last image, %zu hits differing from the plain mean; primary mode unchanged: %s\n",
+                sky_flag.misses, sky_flag.hits, sky_flag.wrong, no_flag.wrong, flipped.wrong, hit_differences,
+                reference.wrong, reference_differences, primary_unchanged ? "yes" : "no");
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    DestroyTarget(rig.gpu, plain);
+    DestroyBackground(rig.gpu, background_a);
+    DestroyBackground(rig.gpu, background_b);
     CloseRig(rig);
 }

@@ -280,6 +280,126 @@ void DestroyReadback(Gpu& gpu, Readback& readback)
     vkFreeMemory(gpu.device.device, readback.memory, nullptr);
 }
 
+BackgroundImage CreateBackground(Gpu& gpu, uint32_t width, uint32_t height)
+{
+    const VkDevice device = gpu.device.device;
+    BackgroundImage out;
+    out.width = width;
+    out.height = height;
+    VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    info.extent = {width, height, 1};
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    REQUIRE(vkCreateImage(device, &info, nullptr, &out.image) == VK_SUCCESS);
+    VkMemoryRequirements requirements{};
+    vkGetImageMemoryRequirements(device, out.image, &requirements);
+    VkPhysicalDeviceMemoryProperties memory_properties{};
+    vkGetPhysicalDeviceMemoryProperties(gpu.device.physical_device.physical_device, &memory_properties);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount && type == UINT32_MAX; ++i)
+    {
+        if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+            (memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0)
+        {
+            type = i;
+        }
+    }
+    REQUIRE(type != UINT32_MAX);
+    VkMemoryAllocateInfo allocate_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate_info.allocationSize = requirements.size;
+    allocate_info.memoryTypeIndex = type;
+    REQUIRE(vkAllocateMemory(device, &allocate_info, nullptr, &out.memory) == VK_SUCCESS);
+    REQUIRE(vkBindImageMemory(device, out.image, out.memory, 0) == VK_SUCCESS);
+    return out;
+}
+
+void UploadBackground(Gpu& gpu, BackgroundImage& background, const std::vector<float>& rgba)
+{
+    const VkDevice device = gpu.device.device;
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(background.width) * background.height * 16;
+    REQUIRE(rgba.size() * sizeof(float) == bytes);
+    // A host-visible staging buffer (the readback helper's memory type, used as a copy source).
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    VkBufferCreateInfo buffer_info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    buffer_info.size = bytes;
+    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    REQUIRE(vkCreateBuffer(device, &buffer_info, nullptr, &staging) == VK_SUCCESS);
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(device, staging, &requirements);
+    VkPhysicalDeviceMemoryProperties memory_properties{};
+    vkGetPhysicalDeviceMemoryProperties(gpu.device.physical_device.physical_device, &memory_properties);
+    const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount && type == UINT32_MAX; ++i)
+    {
+        if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
+            (memory_properties.memoryTypes[i].propertyFlags & wanted) == wanted)
+        {
+            type = i;
+        }
+    }
+    REQUIRE(type != UINT32_MAX);
+    VkMemoryAllocateInfo allocate_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate_info.allocationSize = requirements.size;
+    allocate_info.memoryTypeIndex = type;
+    REQUIRE(vkAllocateMemory(device, &allocate_info, nullptr, &staging_memory) == VK_SUCCESS);
+    REQUIRE(vkBindBufferMemory(device, staging, staging_memory, 0) == VK_SUCCESS);
+    void* mapped = nullptr;
+    REQUIRE(vkMapMemory(device, staging_memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS);
+    std::memcpy(mapped, rgba.data(), static_cast<size_t>(bytes));
+    vkUnmapMemory(device, staging_memory);
+
+    SubmitAndWait(gpu, [&](VkCommandBuffer cmd) {
+        // Earlier sampled reads of the renderer (a previous frame) -> the copy.
+        VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_NONE;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;  // the contents are replaced
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = background.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dependency.imageMemoryBarrierCount = 1;
+        dependency.pImageMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(cmd, &dependency);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {background.width, background.height, 1};
+        vkCmdCopyBufferToImage(cmd, staging, background.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        // The copy -> the renderer's compute-shader sampled reads.
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier2(cmd, &dependency);
+    });
+    vkDestroyBuffer(device, staging, nullptr);
+    vkFreeMemory(device, staging_memory, nullptr);
+    background.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+void DestroyBackground(Gpu& gpu, BackgroundImage& background)
+{
+    vkDestroyImage(gpu.device.device, background.image, nullptr);
+    vkFreeMemory(gpu.device.device, background.memory, nullptr);
+    background = BackgroundImage{};
+}
+
 void FlushFrame(Gpu& gpu, CaelixScene* scene, Frames& frames)
 {
     const uint64_t frame = frames.next++;

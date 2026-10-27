@@ -30,6 +30,7 @@ constexpr TargetSpec kTargetSpecs[] = {
     {"colour", kTargetColor, {}},
     {"albedo", kTargetAlbedo, {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT}},
     {"normal", kTargetNormal, {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM}},
+    // With an upscaler the depth target has the render or the output size (kTargetDepthIndex).
     {"depth", kTargetDepth, {VK_FORMAT_R32_SFLOAT}},
     // RGBA formats also receive the delta checkerboard flag in w.
     {"motion", kTargetMotion, {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT}},
@@ -37,7 +38,8 @@ constexpr TargetSpec kTargetSpecs[] = {
     // With an upscaler the voxel id target has the output size (kTargetVoxelIdIndex).
     {"voxel_id", kTargetVoxelId, {VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT}},
 };
-// The index of the voxel id target in kTargetSpecs (binding kTargetVoxelIdIndex + 1).
+// The indices of the depth and voxel id targets in kTargetSpecs (binding index + 1).
+constexpr uint32_t kTargetDepthIndex = 3;
 constexpr uint32_t kTargetVoxelIdIndex = 6;
 
 // The internal targets in Renderer::Internal order. The formats match the
