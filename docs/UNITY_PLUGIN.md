@@ -624,3 +624,13 @@ with the new pass order.
 2. (answered by packet v6) Should the plugin's targets be camera-sized or allow a render scale now
    (for the later upscalers)? The colour target stays camera-sized; the geometry targets take the
    upscaler's render size (see "Packet v6 as built").
+
+### Layout fix (2026-10-28, after the first Editor run of v8)
+
+Unity's `UnityVulkanImage::layout` reports the TRACKED layout before the barrier, and it was 0
+(UNDEFINED) for every texture Unity handed over, the colour target included. The background and the
+sky cubemap were therefore dropped every frame ("layout 0 (neither SHADER_READ_ONLY_OPTIMAL nor
+GENERAL)"), the upscaler blended the procedural sky into the silhouettes (the bright rim), and the
+captured sky never reached the library. Now `AccessBackground` and `AccessSky` both use the
+pipeline-barrier access to `SHADER_READ_ONLY_OPTIMAL` (compute stage, shader read) and pass THAT
+layout to the library; the reported layout is ignored. The sky access was ObserveOnly before.

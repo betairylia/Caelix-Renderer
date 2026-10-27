@@ -430,11 +430,6 @@ bool AccessBackground(const CaelixUnityTarget& target, uint32_t width, uint32_t 
         std::snprintf(problem, sizeof(problem), "it is %ux%u, the frame expects %ux%u", image.extent.width,
                       image.extent.height, width, height);
     }
-    else if (image.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && image.layout != VK_IMAGE_LAYOUT_GENERAL)
-    {
-        std::snprintf(problem, sizeof(problem), "layout %d (neither SHADER_READ_ONLY_OPTIMAL nor GENERAL)",
-                      static_cast<int>(image.layout));
-    }
     if (problem[0] != '\0')
     {
         if (g_rt.dropped_target_logs < 8)
@@ -448,7 +443,10 @@ bool AccessBackground(const CaelixUnityTarget& target, uint32_t width, uint32_t 
     out.format = static_cast<uint32_t>(image.format);
     out.width = image.extent.width;
     out.height = image.extent.height;
-    out.layout = static_cast<uint32_t>(image.layout);
+    // The layout after Unity's barrier is the requested one. UnityVulkanImage::layout reports
+    // Unity's tracked layout BEFORE the barrier (observed: 0 = UNDEFINED for every texture it hands
+    // over, the colour target included), so it is not the layout the library must assume.
+    out.layout = static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     return true;
 }
 
@@ -595,11 +593,13 @@ void DecideUpscaler(uint32_t view, const CaelixUnityViewPacket& packet, uint32_t
     }
 }
 
-// The sky cubemap target of a view packet: observed (ObserveOnly records nothing and ignores the
-// layout, stage and access arguments, so the image stays in the layout Unity keeps it in) and
-// described in `sky`. An image that is not a 6-layer square cube, or whose layout the library cannot
-// sample in, is dropped for the frame (logged a few times): the renderer then uses the procedural
-// sky.
+// The sky cubemap target of a view packet: accessed with a pipeline barrier to
+// SHADER_READ_ONLY_OPTIMAL for compute-shader reads (a captured cube RenderTexture comes out of
+// Unity's render in an attachment layout; a Cubemap asset is already readable, the barrier is then
+// a no-op) and described in `sky`. The layout the library gets is the requested one, not the
+// tracked layout UnityVulkanImage reports (observed: 0 for every texture, see AccessBackground). An
+// image that is not a 6-layer square cube is dropped for the frame (logged a few times): the
+// renderer then uses the procedural sky.
 void AccessSky(const CaelixUnityTarget& target, CaelixSkyCubemap& sky)
 {
     sky = CaelixSkyCubemap{};
@@ -608,8 +608,9 @@ void AccessSky(const CaelixUnityTarget& target, CaelixSkyCubemap& sky)
     const VkImageSubresource subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
     UnityVulkanImage image{};
     char problem[96] = {};
-    if (!state.vulkan->AccessTexture(target.native_texture, &subresource, VK_IMAGE_LAYOUT_UNDEFINED, 0, 0,
-                                     kUnityVulkanResourceAccess_ObserveOnly, &image))
+    if (!state.vulkan->AccessTexture(target.native_texture, &subresource, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                     kUnityVulkanResourceAccess_PipelineBarrier, &image))
     {
         std::snprintf(problem, sizeof(problem), "AccessTexture refused it");
     }
@@ -618,11 +619,6 @@ void AccessSky(const CaelixUnityTarget& target, CaelixSkyCubemap& sky)
     {
         std::snprintf(problem, sizeof(problem), "not a cube (%d layers, %ux%u, %d mips)", image.layers,
                       image.extent.width, image.extent.height, image.mipCount);
-    }
-    else if (image.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && image.layout != VK_IMAGE_LAYOUT_GENERAL)
-    {
-        std::snprintf(problem, sizeof(problem), "layout %d (neither SHADER_READ_ONLY_OPTIMAL nor GENERAL)",
-                      static_cast<int>(image.layout));
     }
     if (problem[0] != '\0')
     {
@@ -637,7 +633,7 @@ void AccessSky(const CaelixUnityTarget& target, CaelixSkyCubemap& sky)
     }
     sky.image = reinterpret_cast<uint64_t>(image.image);
     sky.format = static_cast<uint32_t>(image.format);
-    sky.layout = static_cast<uint32_t>(image.layout);
+    sky.layout = static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);  // after the barrier
     sky.size = image.extent.width;
     sky.mip_levels = static_cast<uint32_t>(image.mipCount);
 }
