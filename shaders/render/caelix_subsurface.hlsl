@@ -337,8 +337,9 @@ float SggxDensity(CaelixFrameConstants fc, uint block)
 // with sggx_density > 0): a continuous position p and direction d in the entity's object space, a 3D
 // DDA over its voxels with free flight. Per voxel: the distance l to its boundary along d, sigma_t =
 // density sqrt(d^T S d), a free distance s = -ln(1 - u) / sigma_t; s < l: a leaf event at p + s d
-// (weight *= sss_albedo, a visible normal wm of S for -d, then d = the cosine lobe around -wm with
-// probability sggx_transmission, else around wm); else p moves to the boundary and the cursor steps
+// (with probability sggx_transmission it transmits: weight *= sggx_transmission_albedo, d = the cosine
+// lobe around -wm; else it reflects: weight *= sss_albedo, d = the cosine lobe around wm; wm = a visible
+// normal of S for -d); else p moves to the boundary and the cursor steps
 // across that face: an SSS voxel continues the walk, an opaque voxel without SSS is a wall (cosine around
 // the face normal back into the medium, counts as an event), anything else is the exit (origin = the
 // boundary point pushed off along the face normal, direction = d, both in world space). Every medium
@@ -361,6 +362,7 @@ uint SggxWalk(CaelixFrameConstants fc, TraceResult hit, float3 ray_direction, in
     const uint64_t sggx_row = fc.sggx_table + uint64_t(code) * kSggxRowBytes;
     const float4 r0 = asfloat(CAELIX_LOAD_U32x4(sggx_row + kSggxS0));
     const float4 r1 = asfloat(CAELIX_LOAD_U32x4(sggx_row + kSggxS1));
+    const float3 transmit_albedo = asfloat(CAELIX_LOAD_U32x4(sggx_row + kSggxS2)).xyz;
     SggxMatrix S;
     S.xx = r0.x;
     S.yy = r0.y;
@@ -402,9 +404,10 @@ uint SggxWalk(CaelixFrameConstants fc, TraceResult hit, float3 ray_direction, in
         const float free_distance = sigma_t > 0.0f ? -log(1.0f - RandomFloat01(rng)) / sigma_t : 1e30f;
         if (free_distance < l)
         {
-            // A leaf event inside the current voxel.
+            // A leaf event inside the current voxel: transmit or reflect, each with its own colour.
             p += free_distance * d;
-            w *= a;
+            const bool transmit = RandomFloat01(rng) < transmission;
+            w *= transmit ? transmit_albedo : a;
             events += 1;
             if (events > steps)
             {
@@ -413,7 +416,7 @@ uint SggxWalk(CaelixFrameConstants fc, TraceResult hit, float3 ray_direction, in
             const float u1 = RandomFloat01(rng);
             const float u2 = RandomFloat01(rng);
             const float3 wm = SggxSampleVisibleNormal(-d, S, u1, u2);
-            d = SggxCosineAround(RandomFloat01(rng) < transmission ? -wm : wm, rng);
+            d = SggxCosineAround(transmit ? -wm : wm, rng);
             continue;
         }
         // Across the boundary face.

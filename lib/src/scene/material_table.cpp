@@ -119,7 +119,8 @@ bool MaterialTable::Valid(const CaelixMaterial& material, const char*& reason)
         !Finite(&material.ior, 1) || !Finite(&material.extinction, 1) ||
         !Finite(&material.sss_anisotropy, 1) || !Finite(material.sss_albedo, 3) ||
         !Finite(&material.sss_probability, 1) || !Finite(material.sggx_s, 6) ||
-        !Finite(&material.sggx_density, 1) || !Finite(&material.sggx_transmission, 1))
+        !Finite(&material.sggx_density, 1) || !Finite(&material.sggx_transmission, 1) ||
+        !Finite(material.sggx_transmission_albedo, 3))
     {
         reason = "a value is not finite";
         return false;
@@ -177,6 +178,14 @@ bool MaterialTable::Valid(const CaelixMaterial& material, const char*& reason)
         {
             reason = "sggx_transmission is outside [0, 1]";
             return false;
+        }
+        for (int c = 0; c < 3; ++c)
+        {
+            if (material.sggx_transmission_albedo[c] < 0.0f || material.sggx_transmission_albedo[c] > 1.0f)
+            {
+                reason = "an sggx_transmission_albedo component is outside [0, 1]";
+                return false;
+            }
         }
         // Sylvester's criterion on S (xx, yy, zz, xy, xz, yz), in double.
         const double xx = material.sggx_s[0];
@@ -243,8 +252,10 @@ void MaterialTable::WriteGpuChunk(uint32_t chunk, uint8_t* main_rows, uint8_t* s
         std::memcpy(main_rows + static_cast<size_t>(i) * kMaterialBytes, entry, kMaterialBytes);
         std::memcpy(subsurface_rows + static_cast<size_t>(i) * kSubsurfaceRowBytes, entry + kMaterialBytes,
                     kSubsurfaceRowBytes);
-        std::memcpy(sggx_rows + static_cast<size_t>(i) * kSggxRowBytes,
-                    entry + kMaterialBytes + kSubsurfaceRowBytes, kSggxRowBytes);
+        uint8_t* const sggx_row = sggx_rows + static_cast<size_t>(i) * kSggxRowBytes;
+        std::memcpy(sggx_row, entry + kMaterialBytes + kSubsurfaceRowBytes, kSggxRowBytes);
+        // pad_sggx: the GPU row's last word is 0.
+        std::memset(sggx_row + kSggxRowBytes - sizeof(float), 0, sizeof(float));
     }
 }
 

@@ -151,7 +151,11 @@ closed-form sampler (paper, appendix: `sample_VNDF`).
 
 C `CaelixMaterial` 64 -> 96 B: append `float sggx_s[6]` (S: xx, yy, zz, xy, xz, yz, object space of the
 entity), `float sggx_density` (0 = no SGGX, >= 0), `float sggx_transmission` (0..1: chance that a leaf
-event transmits instead of reflects). Validation when `sggx_density > 0`: S positive definite (Sylvester:
+event transmits instead of reflects); follow-up (2026-10-27): `float sggx_transmission_albedo[3]` (the
+colour a TRANSMITTING leaf event keeps; reflecting events and walls keep `sss_albedo`; each in [0, 1] when
+`sggx_density > 0`), `float pad_sggx` -> 112 B, the GPU SGGX row 48 B with row 2 = (transmission_albedo, 0)
+at `kSggxS2` 32; host JSON `sggx.transmission_albedo`, default = the entry's `sss_albedo`. Validation when
+`sggx_density > 0`: S positive definite (Sylvester:
 xx > 0, xx yy - xy^2 > 0, det > 0), finite values, `sss_probability > 0`. GPU: a third table, 32 B per
 code (row 0: S xx, yy, zz, xy; row 1: xz, yz, density, transmission), address `sggx_table` in a new 16-byte
 frame constants row at 592 (FrameConstants 592 -> 608). Host JSON:
@@ -218,3 +222,7 @@ Result kinds: PASS (exit with 0 events), EXIT (>= 1 events), DEAD.
   entity) starts the continuation inside that entity's solid voxel: 7 black pixels along the hedge's
   bottom edge in the wide view. Same limitation as the lattice walk ("the walk stays inside the hit
   entity"); not fixed.
+- Follow-up 2026-10-27: `sggx_transmission_albedo` (112 B struct, 48 B GPU row). A leaf event draws the
+  transmit choice first, then `w *= transmit ? sggx_transmission_albedo : sss_albedo`; walls keep
+  `sss_albedo`. Smoke: `Artifacts/sss-20261026/sggx/README.md` ("Follow-up"). Its components must be finite
+  always (the general rule), the [0, 1] range is checked when `sggx_density > 0`.

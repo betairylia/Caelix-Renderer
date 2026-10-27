@@ -54,10 +54,10 @@ static_assert(sizeof(CaelixUnityUpscalerStatus) == 32, "CaelixUnityUpscalerStatu
 static_assert(offsetof(CaelixUnityStatus, upscaler_extensions) == 164 &&
                   offsetof(CaelixUnityStatus, upscale_ms) == 276 && offsetof(CaelixUnityStatus, upscalers) == 280,
               "CaelixUnityStatus offsets of the upscaler fields (C# mirrors them)");
-// CaelixMaterialEntry is 100 bytes on the subsurface experiment branch sss-expr (52 on main): the C#
+// CaelixMaterialEntry is 116 bytes on the subsurface experiment branch sss-expr (52 on main): the C#
 // mirror has NOT followed, the plugin is not used on that branch.
 static_assert(sizeof(CaelixUnityEntity) == 48 && sizeof(CaelixUnityBrickRemove) == 16 &&
-                  sizeof(CaelixUnityUpload) == 16 && sizeof(CaelixMaterialEntry) == 100,
+                  sizeof(CaelixUnityUpload) == 16 && sizeof(CaelixMaterialEntry) == 116,
               "record sizes of caelix_unity.h");
 
 struct Guid

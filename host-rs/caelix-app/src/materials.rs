@@ -7,7 +7,7 @@
 //!    "emission": [0, 0, 0], "ior": 1.5, "extinction": 0.0, "transparent": false,
 //!    "sss_albedo": [1, 1, 1], "sss_probability": 0.0, "sss_steps": 16, "sss_anisotropy": 0.0,
 //!    "sggx": { "kind": "surface", "axis": [0, 1, 0], "roughness": 0.3, "density": 0.5,
-//!              "transmission": 0.4 } }]
+//!              "transmission": 0.4, "transmission_albedo": [1.0, 0.85, 0.2] } }]
 //! ```
 //!
 //! Every field except `id` is optional (defaults: albedo 1, smoothness 0, metallic 0, emission 0,
@@ -16,7 +16,8 @@
 //! sss-expr, `docs/SSS_EXPERIMENT.md`). The optional `sggx` object makes an opaque SSS entry an SGGX
 //! foliage medium ("SGGX foliage medium" in that doc): `kind` "surface" (S = n n^T + r^2 (I - n n^T)),
 //! "fiber" (S = r^2 n n^T + (I - n n^T)) or "isotropic" (S = I), n = the normalized `axis`; defaults
-//! kind "surface", axis [0, 1, 0], roughness 0.3, density 1, transmission 0. Mapping to block codes (the block-ID encoding): an
+//! kind "surface", axis [0, 1, 0], roughness 0.3, density 1, transmission 0, transmission_albedo = the
+//! entry's sss_albedo (the colour a transmitting leaf event keeps). Mapping to block codes (the block-ID encoding): an
 //! opaque entry goes to code `0x8000 | id` (id 0..32767), a transparent entry to code `id` (id
 //! 0..511). The rest of the table keeps the library's built-in content: the host reads every
 //! entry with `caelix_scene_get_material`, replaces the listed ones and writes the whole table.
@@ -100,6 +101,8 @@ fn parse_entry(entry: &Value) -> anyhow::Result<(usize, CaelixMaterial)> {
         sggx_s: [0.0; 6],
         sggx_density: 0.0,
         sggx_transmission: 0.0,
+        sggx_transmission_albedo: [0.0; 3],
+        pad_sggx: 0.0,
     };
     let mut material = material;
     if let Some(sggx) = entry.get("sggx") {
@@ -131,6 +134,7 @@ fn parse_entry(entry: &Value) -> anyhow::Result<(usize, CaelixMaterial)> {
         material.sggx_s = [m(0, 0), m(1, 1), m(2, 2), m(0, 1), m(0, 2), m(1, 2)];
         material.sggx_density = number(sggx, "density", 1.0)?;
         material.sggx_transmission = number(sggx, "transmission", 0.0)?;
+        material.sggx_transmission_albedo = vec3(sggx, "transmission_albedo", material.sss_albedo)?;
     }
     Ok((code, material))
 }
@@ -155,6 +159,8 @@ pub fn apply(scene: *mut CaelixScene, path: &Path) -> anyhow::Result<()> {
         sggx_s: [0.0; 6],
         sggx_density: 0.0,
         sggx_transmission: 0.0,
+        sggx_transmission_albedo: [0.0; 3],
+        pad_sggx: 0.0,
     };
     let mut table = vec![empty; ENTRIES];
     for (code, slot) in table.iter_mut().enumerate() {

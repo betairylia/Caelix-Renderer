@@ -257,7 +257,7 @@ TEST_CASE("materials: packed table matches the old decode, the glass palette and
     CHECK(Same(Get(rig, 255 | (5u << 8)), vacuum));
 
     // Stats and argument checks.
-    CHECK(Stats(rig.scene).material_table_bytes == 65536ull * 96ull);
+    CHECK(Stats(rig.scene).material_table_bytes == 65536ull * 112ull);
     ExpectLibraryErrors(1, [&] {
         CaelixMaterial m{};
         CHECK(caelix_scene_get_material(rig.scene, 0x10000u, &m) == CAELIX_ERROR_INVALID_ARGUMENT);
@@ -486,6 +486,9 @@ TEST_CASE("materials: sparse entries over the current table")
         }
         leaf.material.sggx_density = 0.5f;
         leaf.material.sggx_transmission = 0.4f;
+        leaf.material.sggx_transmission_albedo[0] = 1.0f;
+        leaf.material.sggx_transmission_albedo[1] = 0.85f;
+        leaf.material.sggx_transmission_albedo[2] = 0.2f;
         REQUIRE(caelix_scene_set_material_entries(rig.scene, &leaf, 1) == CAELIX_OK);
         CHECK(Same(Get(rig, 0x8011), leaf.material));
         const auto expect_rejected = [&](CaelixMaterialEntry bad) {
@@ -502,6 +505,9 @@ TEST_CASE("materials: sparse entries over the current table")
         expect_rejected(bad);
         bad = leaf;
         bad.material.sss_probability = 0.0f;
+        expect_rejected(bad);
+        bad = leaf;
+        bad.material.sggx_transmission_albedo[1] = 1.2f;
         expect_rejected(bad);
         bad = leaf;
         bad.material.sggx_s[0] = 0.0f;  // xx = 0

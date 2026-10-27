@@ -82,7 +82,8 @@ extern "C" {
    bump. The voxel colour experiment (branch sss-voxel-color-expr, docs/VOXEL_COLOR_EXPERIMENT.md) added
    CAELIX_RENDER_FLAG_VOXEL_COLOR (a new flag bit), also without a bump. The SGGX foliage step (branch
    sss-expr) appended sggx_s, sggx_density and sggx_transmission to CaelixMaterial (64 -> 96 bytes,
-   CaelixMaterialEntry 68 -> 100 bytes), also without a bump. A host built against an older
+   CaelixMaterialEntry 68 -> 100 bytes), and its follow-up sggx_transmission_albedo and pad_sggx (96 ->
+   112 bytes, entry 116 bytes), also without a bump. A host built against an older
    version-2 header must be rebuilt (the library reads
    and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -395,7 +396,7 @@ typedef struct CaelixSceneStats
                                       scratch or ring space), plus 1 when the TLAS is out of date */
     uint64_t material_table_bytes; /* GPU size of the material table: the main table and, on the
                                       experiment branch sss-expr, the subsurface and SGGX tables
-                                      (65536 * (48 + 16 + 32) = 6 MiB) */
+                                      (65536 * (48 + 16 + 48) = 7 MiB) */
     uint64_t upload_bricks_free; /* upper bound of the bricks that caelix_scene_upload_bricks accepts
                                     before the next flush, from the free staging space minus the row
                                     reserve (wrap fragmentation can make the real number smaller;
@@ -475,8 +476,8 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * upload has completed the GPU table is all zero (black, no emission).
  * ------------------------------------------------------------------------- */
 
-/* One material table entry. 96 bytes. All values are linear. The GPU keeps the first 48 bytes per code
-   in the main table, (sss_albedo, sss_probability) per code in a separate subsurface table and the 32 SGGX
+/* One material table entry. 112 bytes. All values are linear. The GPU keeps the first 48 bytes per code
+   in the main table, (sss_albedo, sss_probability) per code in a separate subsurface table and the 48 SGGX
    bytes per code in an SGGX table (experiment branch sss-expr), so the main kernels keep a 48-byte stride. */
 typedef struct CaelixMaterial
 {
@@ -512,6 +513,9 @@ typedef struct CaelixMaterial
                                 positive definite when sggx_density > 0 */
     float sggx_density;      /* >= 0; 0 = no SGGX (the lattice walk) */
     float sggx_transmission; /* [0, 1] when sggx_density > 0: the chance that a leaf event transmits */
+    float sggx_transmission_albedo[3]; /* the colour a leaf event that TRANSMITS keeps (reflecting events
+                                          and walls keep sss_albedo); each in [0, 1] when sggx_density > 0 */
+    float pad_sggx;                    /* ignored (the GPU row stores 0) */
 } CaelixMaterial;
 
 /* Replaces the whole material table: entries [0, count) come from `entries`, entries [count, 65536)
@@ -520,7 +524,8 @@ typedef struct CaelixMaterial
    Every value must be finite, ior > 0, extinction >= 0, sss_probability in [0, 1] and, when
    sss_probability > 0, sss_steps in 1 .. 4096, every sss_albedo component in [0, 1] and sss_anisotropy
    in [-0.99, 0.99], sggx_density >= 0 and, when sggx_density > 0, sss_probability > 0, sggx_transmission
-   in [0, 1] and S positive definite (xx > 0, xx yy - xy^2 > 0, det S > 0): an invalid entry returns
+   in [0, 1], every sggx_transmission_albedo component in [0, 1] and S positive definite (xx > 0,
+   xx yy - xy^2 > 0, det S > 0): an invalid entry returns
    CAELIX_ERROR_INVALID_ARGUMENT (logged, the table is unchanged). Entries of transparent codes with
    face bits are stored but never read. Packed scenes: a later caelix_scene_set_glass_palette
    rewrites the transparent codes. */
@@ -533,7 +538,7 @@ CAELIX_API CaelixResult caelix_scene_set_materials(CaelixScene* scene, const Cae
 CAELIX_API CaelixResult caelix_scene_set_glass_palette(CaelixScene* scene,
                                                        const CaelixMaterial* entries, uint32_t count);
 
-/* One entry of caelix_scene_set_material_entries: a 16-bit block code and its table entry. 100 bytes. */
+/* One entry of caelix_scene_set_material_entries: a 16-bit block code and its table entry. 116 bytes. */
 typedef struct CaelixMaterialEntry
 {
     uint32_t code; /* 0 .. 0xFFFF */

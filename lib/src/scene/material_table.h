@@ -22,10 +22,12 @@ constexpr uint32_t kMaterialSssAnisotropy = 40;
 constexpr uint32_t kMaterialSssSteps = 44;
 constexpr uint32_t kSubsurfaceRowBytes = 16;
 // The SGGX table (experiment sss-expr, "SGGX foliage medium"): kSggxRowBytes per code = the struct's bytes
-// 64 .. 95, the rows (S xx, yy, zz, xy) at kSggxS0 and (S xz, yz, sggx_density, sggx_transmission) at kSggxS1.
-constexpr uint32_t kSggxRowBytes = 32;
+// 64 .. 111, the rows (S xx, yy, zz, xy) at kSggxS0, (S xz, yz, sggx_density, sggx_transmission) at kSggxS1
+// and (sggx_transmission_albedo, 0) at kSggxS2 (WriteGpuChunk stores 0 for pad_sggx).
+constexpr uint32_t kSggxRowBytes = 48;
 constexpr uint32_t kSggxS0 = 0;
 constexpr uint32_t kSggxS1 = 16;
+constexpr uint32_t kSggxS2 = 32;
 // Limits of the subsurface fields of an entry with sss_probability > 0 (docs/SSS_EXPERIMENT.md).
 constexpr uint32_t kMaterialSssMaxSteps = 4096;
 constexpr float kMaterialSssMaxAnisotropy = 0.99f;
@@ -41,6 +43,8 @@ static_assert(offsetof(CaelixMaterial, sss_probability) == kMaterialBytes + 12);
 static_assert(offsetof(CaelixMaterial, sggx_s) == kMaterialBytes + kSubsurfaceRowBytes + kSggxS0);
 static_assert(offsetof(CaelixMaterial, sggx_density) == kMaterialBytes + kSubsurfaceRowBytes + kSggxS1 + 8);
 static_assert(offsetof(CaelixMaterial, sggx_transmission) == kMaterialBytes + kSubsurfaceRowBytes + kSggxS1 + 12);
+static_assert(offsetof(CaelixMaterial, sggx_transmission_albedo) == kMaterialBytes + kSubsurfaceRowBytes + kSggxS2);
+static_assert(offsetof(CaelixMaterial, pad_sggx) == kMaterialBytes + kSubsurfaceRowBytes + kSggxS2 + 12);
 
 // The CPU copy of a scene's material table: one CaelixMaterial per 16-bit block
 // code. The GPU holds it as two buffers, the main table and the subsurface table
@@ -58,7 +62,7 @@ class MaterialTable
 {
 public:
     static constexpr uint32_t kEntries = 65536;
-    static constexpr uint32_t kChunkEntries = 1024;  // upload granularity: 48 + 16 + 32 KiB
+    static constexpr uint32_t kChunkEntries = 1024;  // upload granularity: 48 + 16 + 48 KiB
     static constexpr uint32_t kChunks = kEntries / kChunkEntries;
     static_assert(kChunks == 64, "the dirty mask is one uint64_t");
     // The two GPU tables and one chunk of each.
