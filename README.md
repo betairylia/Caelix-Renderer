@@ -409,7 +409,7 @@ flush builds the TLAS that the render binds.
   with fixed formats, binding 19 the sky cubemap as a sampled image and 20 its
   sampler (`lib/src/render/render_kernels.h`). Set 1 is the frame set, shared by the five
   frame-constant kernels (`caelix_path_trace`, `caelix_composite`, `caelix_cross_resolve`,
-  `caelix_sky_sh`, `caelix_upscale_encode`): binding 0 the frame slot's 560-byte
+  `caelix_sky_sh`, `caelix_upscale_encode`): binding 0 the frame slot's 576-byte
   `CaelixFrameConstants` block as a uniform buffer (`g_frame`, `shaders/common/caelix_frame_ubo.hlsl`,
   `shaders/common/caelix_frame.hlsl`, `lib/src/render/frame_constants.h`; `kFrameSetIndex`).
   A uniform buffer is read-only, so the compiler re-reads a field where it is used instead of
@@ -563,10 +563,13 @@ mean of the raw estimate.
 
 Design and owner decisions: `docs/STEP6D_MATERIALS_DELTA.md` (section "As built").
 
-- Material table: every scene has 65536 `CaelixMaterial` entries (48 bytes:
-  albedo, smoothness, emission, metallic, ior, extinction), one per 16-bit block
-  code, in a 3 MiB device-local buffer whose address is in the frame constants
-  (`materials`, offset 440). The kernels read it with `GET_MATERIAL(code)`
+- Material table: every scene has 65536 `CaelixMaterial` entries (112 bytes:
+  albedo, smoothness, emission, metallic, ior, extinction, plus subsurface and
+  texture fields that no kernel reads yet), one per 16-bit block code. The GPU
+  holds two packed tables (`docs/MATERIALS.md`): 32-byte hot entries of halves
+  in a 2 MiB device-local buffer whose address is in the frame constants
+  (`materials`, offset 440), and 32-byte subsurface entries in a second 2 MiB
+  buffer (`subsurface_table`, offset 560). The kernels read the hot table with `GET_MATERIAL(code)`
   (`shaders/common/caelix_material.hlsl`); a transparent code loses its face
   bits first. The CPU copy (`lib/src/scene/material_table.*`) is built per
   encoding at scene creation: packed = the old shader decode for opaque and
@@ -577,9 +580,10 @@ Design and owner decisions: `docs/STEP6D_MATERIALS_DELTA.md` (section "As built"
   `GetSharedGlass` default); block-ID = the pastel hash colours. The host
   replaces the whole table (`caelix_scene_set_materials`) or, in packed
   scenes, the glass palette (`caelix_scene_set_glass_palette`), and reads
-  entries with `caelix_scene_get_material`. Changed 48 KiB chunks are staged at
-  the next flush after everything else (lowest priority; a chunk that does not
-  fit waits); the first flush zero-fills the buffer.
+  entries with `caelix_scene_get_material`. Changed chunks of 1024 entries
+  (32 KiB per table, both tables together) are staged at the next flush after
+  everything else (lowest priority; a chunk that does not fit waits); the first
+  flush zero-fills both buffers.
 - Delta chain (`CaelixRenderOptions::bounce_count_transparent`, Unity default
   5, host default 5): after the primary hit, every smooth transparent hit
   (smoothness >= 0.99, not opaque) is an interface; up to that many are crossed.
@@ -931,7 +935,7 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   `Block`; member `Offset`, `ArrayStride`, `MatrixStride`, `DescriptorSet` / `Binding`), recomputes
   the C natural layout of the same member sequence and fails on the first member whose offset
   differs (printing the member index, its name and both offsets), on a stride that is not the
-  element size, on a block that does not end at `sizeof(FrameConstants)` (560) or that is not at
+  element size, on a block that does not end at `sizeof(FrameConstants)` (576) or that is not at
   set 1, binding 0. Run it after every change of `CaelixFrameConstants`: DXC's constant buffer
   layout moves a vector that crosses a 16-byte row (`float2` at 476 goes to 480) and gives an array
   of scalars a 16-byte stride, without any compile error. Two more cases: the push constant block of

@@ -333,7 +333,9 @@ CaelixResult Scene::Create(Device& device, const CaelixSceneDesc* desc,
                     heap_index, bounce_text.c_str());
     }
     scene->materials_ = std::make_unique<MaterialTable>(d.encoding);
-    scene->material_buffer_ = GpuBuffer::DeviceLocal(allocator, vk_device, MaterialTable::kBytes);
+    scene->material_buffer_ = GpuBuffer::DeviceLocal(allocator, vk_device, MaterialTable::kHotTableBytes);
+    scene->subsurface_buffer_ =
+        GpuBuffer::DeviceLocal(allocator, vk_device, MaterialTable::kSubsurfaceTableBytes);
     scene->as_pool_.Init(allocator, vk_device);
     scene->scratch_ = GpuBuffer::DeviceLocalWithUsage(
         allocator, vk_device, scratch_bytes,
@@ -818,7 +820,7 @@ void Scene::GetStats(CaelixSceneStats& out) const
         }
     }
     out.as_builds_pending = pending;
-    out.material_table_bytes = material_buffer_.size();
+    out.material_table_bytes = material_buffer_.size() + subsurface_buffer_.size();
     // Bricks that caelix_scene_upload_bricks accepts before the next flush, at most: the record
     // space of the ring (capacity minus the row reserve, which also holds the record scatter
     // entries) minus what is in use, in record spans as UploadBricks allocates them (record_bytes

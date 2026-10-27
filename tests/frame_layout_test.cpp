@@ -819,11 +819,17 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kScatterRecordsPerGroup),
         CAELIX_CONSTANT(kScatterThreadsPerGroup),
         CAELIX_CONSTANT(kScatterMaxRecordWords8),
-        // shaders/common/caelix_material.hlsl: lib/src/scene/material_table.h
+        // shaders/common/caelix_material.hlsl: lib/src/scene/material_pack.h (through material_table.h)
         CAELIX_CONSTANT(kMaterialBytes),
         CAELIX_CONSTANT(kMaterialAlbedo),
         CAELIX_CONSTANT(kMaterialEmission),
         CAELIX_CONSTANT(kMaterialIor),
+        CAELIX_CONSTANT(kMaterialSss),
+        CAELIX_CONSTANT(kMaterialTexture),
+        CAELIX_CONSTANT(kSubsurfaceBytes),
+        CAELIX_CONSTANT(kSubsurfaceAlbedo),
+        CAELIX_CONSTANT(kSubsurfaceSteps),
+        CAELIX_CONSTANT(kSubsurfaceParams),
         // shaders/common/caelix_light_tree_layout.hlsl: lib/src/light/light_tree_layout.h
         CAELIX_CONSTANT(kLtNone),
         CAELIX_CONSTANT(kLtTrees),

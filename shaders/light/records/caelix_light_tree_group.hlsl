@@ -19,7 +19,7 @@ struct LightGroupPush
     uint64_t page_table;      // record page addresses
     uint64_t slot_tables;     // slot row pool base
     uint64_t reverse_tables;  // reverse table pool base
-    uint64_t materials;       // CaelixMaterial by block code
+    uint64_t materials;       // packed hot material entry by block code (common/caelix_material.hlsl)
     uint64_t offsets;         // u32 per group: block size (size kernel), then new offset (scan kernel)
     uint64_t staged_flags;    // u32 per group: the CPU's kLtCpu* flags of this flush, 0 = nothing new
     uint records_per_page_shift;

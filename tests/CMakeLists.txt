@@ -57,6 +57,8 @@ caelix_add_gpu_test(caelix_nrd_test nrd_test.cpp)
 # The material table through the C ABI: the packed defaults against the old shader decode and
 # data/glass-palette.json, the glass palette, the block-ID table, argument checks.
 caelix_add_gpu_test(caelix_material_test material_test.cpp)
+# The packing section includes scene/material_pack.h (header-only) directly.
+target_include_directories(caelix_material_test PRIVATE ${PROJECT_SOURCE_DIR}/lib/src)
 target_compile_definitions(caelix_material_test PRIVATE
   CAELIX_GLASS_PALETTE_JSON="${PROJECT_SOURCE_DIR}/data/glass-palette.json")
 

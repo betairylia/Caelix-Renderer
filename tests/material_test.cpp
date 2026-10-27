@@ -7,9 +7,13 @@
 // - the glass palette can be replaced (packed only);
 // - block-ID: the pastel hash default, a full host table round trip, the rest of
 //   the table back to the default;
-// - invalid entries and arguments are rejected and leave the table unchanged.
+// - invalid entries and arguments are rejected and leave the table unchanged;
+// - the subsurface and texture fields round-trip exactly and their ranges are checked;
+// - the packing of the GPU entries (scene/material_pack.h, included directly).
 // The GPU side of the table (upload, lookups) is checked by caelix_trace_test.
 #include "test_scenes.h"
+
+#include "scene/material_pack.h"
 
 #include <cmath>
 #include <cstdio>
@@ -257,7 +261,7 @@ TEST_CASE("materials: packed table matches the old decode, the glass palette and
     CHECK(Same(Get(rig, 255 | (5u << 8)), vacuum));
 
     // Stats and argument checks.
-    CHECK(Stats(rig.scene).material_table_bytes == 65536ull * 48ull);
+    CHECK(Stats(rig.scene).material_table_bytes == 65536ull * 64ull);
     ExpectLibraryErrors(1, [&] {
         CaelixMaterial m{};
         CHECK(caelix_scene_get_material(rig.scene, 0x10000u, &m) == CAELIX_ERROR_INVALID_ARGUMENT);
@@ -272,9 +276,9 @@ TEST_CASE("materials: packed table matches the old decode, the glass palette and
         CaelixMaterial entries[3] = {Make(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 9.0f, 0.0f),
                                      Make(0.5f, 0.25f, 0.125f, 1.0f, 0.0f, 1.4f, 0.01f),
                                      Make(0.1f, 0.2f, 0.3f, 0.5f, 0.0f, 1.2f, 0.0f)};
-        entries[1].pad[0] = 7.0f;  // ignored, stored as 0
+        entries[1].reserved = 7u;  // ignored, stored as 0
         REQUIRE(caelix_scene_set_glass_palette(rig.scene, entries, 3) == CAELIX_OK);
-        entries[1].pad[0] = 0.0f;
+        entries[1].reserved = 0u;
         CHECK(Same(Get(rig, 1), entries[1]));
         CHECK(Same(Get(rig, 1 | (0x21u << 8)), entries[1]));
         CHECK(Same(Get(rig, 2), entries[2]));
@@ -445,4 +449,155 @@ TEST_CASE("materials: sparse entries over the current table")
 
     FlushOnce(rig);
     CloseRig(rig);
+}
+
+namespace {
+
+// A material with every subsurface and texture field set.
+CaelixMaterial FullMaterial()
+{
+    CaelixMaterial m = Make(0.3f, 0.6f, 0.9f, 0.25f, 0.5f, 1.45f, 0.02f, 3.0f);
+    m.emission[1] = 1.5f;
+    m.sss_model = 3u;
+    m.sss_probability = 0.75f;
+    m.sss_albedo[0] = 0.9f;
+    m.sss_albedo[1] = 0.5f;
+    m.sss_albedo[2] = 0.125f;
+    m.sss_anisotropy = -0.4f;
+    m.sss_steps = 200u;
+    for (int i = 0; i < 8; ++i)
+    {
+        m.sss_params[i] = 0.5f * static_cast<float>(i) - 1.0f;
+    }
+    m.texture_set = 0xBEEFu;
+    m.connect_group = 0x1234u;
+    return m;
+}
+
+}  // namespace
+
+TEST_CASE("materials: subsurface and texture fields round-trip; their ranges are checked")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_material_test", RigDesc(1, 0, 0));
+
+    CaelixMaterialEntry entry{};
+    entry.code = 0x8010;
+    entry.material = FullMaterial();
+    entry.material.reserved = 9u;  // ignored, stored as 0
+    REQUIRE(caelix_scene_set_material_entries(rig.scene, &entry, 1) == CAELIX_OK);
+    const CaelixMaterial expected = FullMaterial();
+    CHECK(Same(Get(rig, 0x8010), expected));
+
+    // Each invalid value is rejected and leaves the table unchanged.
+    struct Bad
+    {
+        const char* what;
+        void (*apply)(CaelixMaterial&);
+    };
+    const Bad bad[] = {
+        {"sss_probability 1.5", [](CaelixMaterial& m) { m.sss_probability = 1.5f; }},
+        {"sss_model 256", [](CaelixMaterial& m) { m.sss_model = 256u; }},
+        {"sss_albedo[1] -0.1", [](CaelixMaterial& m) { m.sss_albedo[1] = -0.1f; }},
+        {"sss_anisotropy 2", [](CaelixMaterial& m) { m.sss_anisotropy = 2.0f; }},
+        {"sss_steps 300", [](CaelixMaterial& m) { m.sss_steps = 300u; }},
+        {"texture_set 70000", [](CaelixMaterial& m) { m.texture_set = 70000u; }},
+        {"connect_group 70000", [](CaelixMaterial& m) { m.connect_group = 70000u; }},
+        {"emission[0] 70000", [](CaelixMaterial& m) { m.emission[0] = 70000.0f; }},
+        {"sss_params[7] NaN", [](CaelixMaterial& m) { m.sss_params[7] = std::numeric_limits<float>::quiet_NaN(); }},
+    };
+    for (const Bad& b : bad)
+    {
+        INFO(b.what);
+        CaelixMaterialEntry changed{};
+        changed.code = 0x8010;
+        changed.material = Make(0.1f, 0.1f, 0.1f, 0.0f, 0.0f, 1.5f, 0.0f);
+        b.apply(changed.material);
+        ExpectLibraryErrors(1, [&] {
+            CHECK(caelix_scene_set_material_entries(rig.scene, &changed, 1) == CAELIX_ERROR_INVALID_ARGUMENT);
+        });
+        CHECK(Same(Get(rig, 0x8010), expected));
+    }
+    // The edges of the ranges are valid.
+    {
+        CaelixMaterialEntry edge{};
+        edge.code = 0x8011;
+        edge.material = Make(1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.5f, 0.0f, 65504.0f);
+        edge.material.sss_model = 255u;
+        edge.material.sss_probability = 1.0f;
+        edge.material.sss_albedo[0] = 1.0f;
+        edge.material.sss_anisotropy = -1.0f;
+        edge.material.sss_steps = 255u;
+        edge.material.sss_params[0] = -65504.0f;
+        edge.material.texture_set = 0xFFFFu;
+        edge.material.connect_group = 0xFFFFu;
+        REQUIRE(caelix_scene_set_material_entries(rig.scene, &edge, 1) == CAELIX_OK);
+        CHECK(Same(Get(rig, 0x8011), edge.material));
+    }
+
+    FlushOnce(rig);
+    CloseRig(rig);
+}
+
+TEST_CASE("materials: packing of the GPU hot and subsurface entries")
+{
+    using caelix::FloatToHalf;
+    CHECK(FloatToHalf(1.0f) == 0x3C00);
+    CHECK(FloatToHalf(0.5f) == 0x3800);
+    CHECK(FloatToHalf(65504.0f) == 0x7BFF);
+    CHECK(FloatToHalf(-2.0f) == 0xC000);
+    CHECK(FloatToHalf(0.0f) == 0x0000);
+    CHECK(FloatToHalf(-0.0f) == 0x8000);
+    // Round to nearest even: 1 + 2^-11 is halfway between 0x3C00 and 0x3C01 -> 0x3C00 (even);
+    // 1 + 3 * 2^-11 is halfway between 0x3C01 and 0x3C02 -> 0x3C02 (even).
+    CHECK(FloatToHalf(1.0f + std::ldexp(1.0f, -11)) == 0x3C00);
+    CHECK(FloatToHalf(1.0f + 3.0f * std::ldexp(1.0f, -11)) == 0x3C02);
+    // Subnormal halves (units of 2^-24) and the clamps.
+    CHECK(FloatToHalf(std::ldexp(1.0f, -24)) == 0x0001);
+    CHECK(FloatToHalf(std::ldexp(1.0f, -25)) == 0x0000);
+    CHECK(FloatToHalf(std::ldexp(3.0f, -25)) == 0x0002);
+    CHECK(FloatToHalf(std::ldexp(1.0f, -14)) == 0x0400);
+    CHECK(FloatToHalf(70000.0f) == 0x7BFF);
+    CHECK(FloatToHalf(-70000.0f) == 0xFBFF);
+    CHECK(FloatToHalf(std::numeric_limits<float>::quiet_NaN()) == 0x7E00);
+
+    const CaelixMaterial m = FullMaterial();
+    auto h2 = [](float low, float high) {
+        return static_cast<uint32_t>(FloatToHalf(low)) | (static_cast<uint32_t>(FloatToHalf(high)) << 16);
+    };
+    uint32_t hot[8] = {};
+    caelix::PackMaterialHot(m, hot);
+    CHECK(hot[0] == h2(m.albedo[0], m.albedo[1]));
+    CHECK(hot[1] == h2(m.albedo[2], m.smoothness));
+    CHECK(hot[2] == h2(m.emission[0], m.emission[1]));
+    CHECK(hot[3] == h2(m.emission[2], m.metallic));
+    CHECK(hot[4] == h2(m.ior, m.extinction));
+    CHECK((hot[5] & 0xFFFFu) == FloatToHalf(m.sss_probability));
+    CHECK(((hot[5] >> 16) & 0xFFu) == m.sss_model);
+    CHECK((hot[5] >> 24) == 0u);
+    CHECK((hot[6] & 0xFFFFu) == m.texture_set);
+    CHECK((hot[6] >> 16) == m.connect_group);
+    CHECK(hot[7] == 0u);
+    // The byte offsets of the layout constants.
+    CHECK(caelix::kMaterialBytes == 32u);
+    CHECK(caelix::kMaterialAlbedo == 0u);
+    CHECK(caelix::kMaterialEmission == 2u * 4u);
+    CHECK(caelix::kMaterialIor == 4u * 4u);
+    CHECK(caelix::kMaterialSss == 5u * 4u);
+    CHECK(caelix::kMaterialTexture == 6u * 4u);
+
+    uint32_t sub[8] = {};
+    caelix::PackMaterialSubsurface(m, sub);
+    CHECK(sub[0] == h2(1.0f - m.sss_albedo[0], 1.0f - m.sss_albedo[1]));
+    CHECK(sub[1] == h2(1.0f - m.sss_albedo[2], m.sss_anisotropy));
+    CHECK(sub[2] == m.sss_steps);
+    CHECK(sub[3] == 0u);
+    for (int i = 0; i < 4; ++i)
+    {
+        CHECK(sub[4 + i] == h2(m.sss_params[2 * i], m.sss_params[2 * i + 1]));
+    }
+    CHECK(caelix::kSubsurfaceBytes == 32u);
+    CHECK(caelix::kSubsurfaceAlbedo == 0u);
+    CHECK(caelix::kSubsurfaceSteps == 2u * 4u);
+    CHECK(caelix::kSubsurfaceParams == 4u * 4u);
 }

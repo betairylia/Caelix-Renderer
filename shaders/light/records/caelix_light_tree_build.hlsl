@@ -225,8 +225,7 @@ void LtBuildBrick(SceneLookup lookup, uint64_t block, uint records_units_base, u
             continue;
         }
         const uint code = BlockMaterialCode(value, encoding);
-        const float weight = LtLuminance(
-            asfloat(CAELIX_LOAD_U32x4(materials + uint64_t(code) * kMaterialBytes + kMaterialEmission).xyz));
+        const float weight = LtLuminance(CaelixMaterialEmission(materials, code));
         bool kept = false;
         CAELIX_UNROLL
         for (uint f = 0; f < 6; ++f)

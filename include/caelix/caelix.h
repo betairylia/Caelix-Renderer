@@ -77,7 +77,10 @@ extern "C" {
    without a bump. The light NEE step added CaelixLightNeeOptions, CAELIX_LIGHT_NEE_FLAG_NO_MIS,
    caelix_renderer_set_light_nee_options, CaelixLightNeeStats and caelix_renderer_get_light_nee_stats,
    also without a bump. The record scatter step appended CaelixSceneStats::upload_path, also without
-   a bump. A host built against an older version-2 header must be rebuilt (the library reads
+   a bump. The material compaction step grew CaelixMaterial from 48 to 112 bytes (pad[2] replaced
+   by the subsurface fields sss_model .. sss_params, texture_set, connect_group and reserved; so
+   CaelixMaterialEntry 52 -> 116 bytes) and doubled CaelixSceneStats::material_table_bytes (two GPU
+   tables), also without a bump. A host built against an older version-2 header must be rebuilt (the library reads
    and writes the larger structs). */
 #define CAELIX_ABI_VERSION 2u
 
@@ -390,7 +393,8 @@ typedef struct CaelixSceneStats
     uint64_t as_builds_total;      /* BLAS and TLAS builds recorded so far */
     uint64_t as_builds_pending;    /* groups whose BLAS is out of date (waiting for finalization,
                                       scratch or ring space), plus 1 when the TLAS is out of date */
-    uint64_t material_table_bytes; /* GPU size of the material table (65536 * 48 = 3 MiB) */
+    uint64_t material_table_bytes; /* GPU size of the two material tables (hot + subsurface,
+                                      65536 * (32 + 32) = 4 MiB) */
     uint64_t upload_bricks_free; /* upper bound of the bricks that caelix_scene_upload_bricks accepts
                                     before the next flush, from the free staging space minus the row
                                     reserve (wrap fragmentation can make the real number smaller;
@@ -458,10 +462,18 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
 /* ---------------------------------------------------------------------------
  * Materials
  *
- * Every scene has a material table: 65536 CaelixMaterial entries, one per 16-bit block code, in a
- * device-local GPU buffer that the lighting modes read (Unity's g_Materials). A transparent code is
- * looked up with its face bits removed (code & id mask, see the encodings above), so only the entry
- * of the face-free code is used; an opaque code is looked up as it is.
+ * Every scene has a material table: 65536 CaelixMaterial entries, one per 16-bit block code. A
+ * transparent code is looked up with its face bits removed (code & id mask, see the encodings
+ * above), so only the entry of the face-free code is used; an opaque code is looked up as it is.
+ *
+ * CaelixMaterial is the host's view: all floats linear, and caelix_scene_get_material returns
+ * exactly what was set. The GPU holds two packed device-local tables per code (docs/MATERIALS.md):
+ * a 32-byte hot entry (albedo, smoothness, emission, metallic, ior, extinction, sss_probability,
+ * sss_model, texture_set, connect_group), which the lighting modes read once per bounce (Unity's
+ * g_Materials), and a 32-byte subsurface entry (sss_albedo, sss_anisotropy, sss_steps, sss_params),
+ * read only by the code that needs it. Every float is stored as an IEEE half, so a magnitude above
+ * 65504 is rejected and the GPU sees each value rounded to half precision. No kernel reads the
+ * subsurface fields, texture_set or connect_group yet: they are validated, stored and uploaded.
  *
  * Built-in content, by encoding:
  *   packed: an opaque code (bit 15) is albedo rgb5 / 31 (r = bits 14..10, g = 9..5, b = 4..0); an
@@ -479,7 +491,8 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * upload has completed the GPU table is all zero (black, no emission).
  * ------------------------------------------------------------------------- */
 
-/* One material table entry. 48 bytes, the layout of the GPU table. All values are linear. */
+/* One material table entry. 112 bytes. All values are linear. Every float must be finite with a
+   magnitude <= 65504 (the GPU stores halves). */
 typedef struct CaelixMaterial
 {
     float albedo[3];   /* diffuse / base colour; for a transparent medium its tint */
@@ -493,13 +506,24 @@ typedef struct CaelixMaterial
                           opaque entries for the Fresnel term of the specular chance) */
     float extinction;  /* transparent entries: per voxel unit; a segment of length t inside the medium
                           transmits exp(-(1 - albedo) * t * extinction). Must be >= 0. */
-    float pad[2];      /* ignored; stored as 0 */
+    uint32_t sss_model;     /* subsurface scattering model, 0..255: 0 = none. No kernel reads the SSS
+                               fields yet; they are stored and uploaded (the subsurface table) */
+    float sss_probability;  /* 0..1: probability that a path entering the voxel scatters */
+    float sss_albedo[3];    /* 0..1 per channel, per scattering step */
+    float sss_anisotropy;   /* -1..1 (Henyey-Greenstein g or the model's equivalent) */
+    uint32_t sss_steps;     /* 0..255: step cap of a walk */
+    float sss_params[8];    /* per-model parameters (meaning defined by the model; none yet) */
+    uint32_t texture_set;   /* 0..65535, reserved for textures: stored, never read */
+    uint32_t connect_group; /* 0..65535, reserved for connected textures: stored, never read */
+    uint32_t reserved;      /* ignored; stored as 0 */
 } CaelixMaterial;
 
 /* Replaces the whole material table: entries [0, count) come from `entries`, entries [count, 65536)
    get the built-in default of the scene's encoding (packed: with the current glass palette).
    count <= 65536 (0 restores the default table).
-   Every value must be finite, ior > 0 and extinction >= 0: an invalid entry returns
+   Every float must be finite with a magnitude <= 65504, ior > 0, extinction >= 0,
+   sss_model <= 255, sss_probability and every sss_albedo in [0, 1], sss_anisotropy in [-1, 1],
+   sss_steps <= 255, texture_set and connect_group <= 0xFFFF: an invalid entry returns
    CAELIX_ERROR_INVALID_ARGUMENT (logged, the table is unchanged). Entries of transparent codes with
    face bits are stored but never read. Packed scenes: a later caelix_scene_set_glass_palette
    rewrites the transparent codes. */
@@ -512,7 +536,7 @@ CAELIX_API CaelixResult caelix_scene_set_materials(CaelixScene* scene, const Cae
 CAELIX_API CaelixResult caelix_scene_set_glass_palette(CaelixScene* scene,
                                                        const CaelixMaterial* entries, uint32_t count);
 
-/* One entry of caelix_scene_set_material_entries: a 16-bit block code and its table entry. 52 bytes. */
+/* One entry of caelix_scene_set_material_entries: a 16-bit block code and its table entry. 116 bytes. */
 typedef struct CaelixMaterialEntry
 {
     uint32_t code; /* 0 .. 0xFFFF */

@@ -5,7 +5,9 @@ Usage: python -I tools/hlsl_materials_to_json.py <VoxelMaterials.hlsl> <out.json
 
 Mapping (Unity GetMaterial): MatTableOpaque[i] <-> code 0x8000 + i  -> {"id": i, "transparent": false}
                              MatTableTransparent[i] <-> code i      -> {"id": i, "transparent": true}
-Entries are written verbatim, including Unity's magenta fallback rows for unused ids."""
+Entries are written verbatim, including Unity's magenta fallback rows for unused ids.
+The host also reads the optional keys sss_model, sss_probability, sss_albedo, sss_anisotropy,
+sss_steps, sss_params, texture_set and connect_group (default 0); this tool does not write them."""
 import json, re, sys
 
 ROW = re.compile(r"\{\{\s*([^}]*)\}\s*,\s*\{\s*([^}]*)\}\s*,\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^}]+)\}")

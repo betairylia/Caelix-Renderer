@@ -330,8 +330,9 @@ void Scene::StageMaterials()
     if (!material_buffer_filled_)
     {
         // Until the chunks arrive, the kernels read zeros (black, no emission), not
-        // uninitialized memory. The fill is recorded before the copies of this flush.
+        // uninitialized memory. The fills are recorded before the copies of this flush.
         fills_.push_back(PendingFill{material_buffer_.buffer(), 0, material_buffer_.size(), 0});
+        fills_.push_back(PendingFill{subsurface_buffer_.buffer(), 0, subsurface_buffer_.size(), 0});
         material_buffer_filled_ = true;
     }
     const uint64_t dirty = materials_->dirty_chunks();
@@ -341,20 +342,29 @@ void Scene::StageMaterials()
         {
             continue;
         }
-        StagingRing::Span span;
-        if (!staging_.TryAllocate(MaterialTable::kChunkBytes, kRowAlignment,
-                                  StagingRing::Purpose::kRows, span))
+        // A chunk is staged in both tables or in neither: it stays dirty until both fit.
+        StagingRing::Span hot_span;
+        StagingRing::Span subsurface_span;
+        if (!staging_.TryAllocate(MaterialTable::kHotChunkBytes + MaterialTable::kSubsurfaceChunkBytes,
+                                  kRowAlignment, StagingRing::Purpose::kRows, hot_span))
         {
             CAELIX_LOGD("caelix_scene_flush: the staging ring is full; material table chunks wait for "
                         "the next flush");
             return;
         }
-        const VkDeviceSize offset = static_cast<VkDeviceSize>(chunk) * MaterialTable::kChunkBytes;
-        std::memcpy(span.data,
-                    reinterpret_cast<const uint8_t*>(materials_->data()) + offset,
-                    MaterialTable::kChunkBytes);
-        pending_.push_back(
-            StagedCopy{span.offset, material_buffer_.buffer(), offset, MaterialTable::kChunkBytes});
+        subsurface_span = hot_span;
+        subsurface_span.offset += MaterialTable::kHotChunkBytes;
+        subsurface_span.data = hot_span.data + MaterialTable::kHotChunkBytes;
+        const VkDeviceSize hot_offset = static_cast<VkDeviceSize>(chunk) * MaterialTable::kHotChunkBytes;
+        const VkDeviceSize subsurface_offset =
+            static_cast<VkDeviceSize>(chunk) * MaterialTable::kSubsurfaceChunkBytes;
+        std::memcpy(hot_span.data, materials_->hot_data() + hot_offset, MaterialTable::kHotChunkBytes);
+        std::memcpy(subsurface_span.data, materials_->subsurface_data() + subsurface_offset,
+                    MaterialTable::kSubsurfaceChunkBytes);
+        pending_.push_back(StagedCopy{hot_span.offset, material_buffer_.buffer(), hot_offset,
+                                      MaterialTable::kHotChunkBytes});
+        pending_.push_back(StagedCopy{subsurface_span.offset, subsurface_buffer_.buffer(),
+                                      subsurface_offset, MaterialTable::kSubsurfaceChunkBytes});
         materials_->MarkStaged(chunk);
     }
 }

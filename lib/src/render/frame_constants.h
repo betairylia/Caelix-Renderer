@@ -8,7 +8,7 @@ namespace caelix {
 // together. One per render call, in the frame slot's host-visible buffer, which the five
 // frame-constant kernels (caelix_path_trace, caelix_composite, caelix_cross_resolve, caelix_sky_sh,
 // caelix_upscale_encode) read as a uniform buffer: the frame set (set kFrameSetIndex, binding
-// kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 560 bytes.
+// kFrameConstantsBinding, shaders/common/caelix_frame_ubo.hlsl). 576 bytes.
 // Layout rule: the uniform block has DXC's default constant buffer layout, which gives these C
 // offsets only while every field sits at an offset that is a multiple of its size (float4 at 16,
 // uint64_t and uint2 at 8), no vector crosses a 16-byte row and every array element is 16 bytes (an
@@ -64,7 +64,7 @@ struct FrameConstants
     float sun_solid_angle;              // 428  2 pi (1 - sun_cos_radius): solid angle of the sun cone (NEE pdf 1 / it)
     uint32_t denoised;                  // 432  1 = NRD ran this frame: the composite reads its outputs (validation view)
     uint32_t bounce_count_transparent;  // 436  delta chain interfaces, 0..CAELIX_MAX_BOUNCES_TRANSPARENT
-    uint64_t materials;                 // 440  CaelixMaterial (48 B) by block code, 65536 entries
+    uint64_t materials;                 // 440  packed hot material entry (32 B) by block code, 65536 entries
     float hit_dist_params[4];           // 448  REBLUR hit distance normalization A, B, C (w unused), = ReblurSettings
     uint32_t cross_resolve;             // 464  1 = the composite writes the resolve image, the cross resolve the target
     uint32_t pad_468;                   // 468
@@ -82,8 +82,10 @@ struct FrameConstants
     uint64_t light_tree;                // 544  light tree descriptor (docs/LIGHT_TREE.md), 0 = no tree
     uint32_t light_nee_flags;           // 552  kLightNee*: the light NEE of this frame (0 = off)
     uint32_t pad_556;                   // 556
+    uint64_t subsurface_table;          // 560  packed subsurface entry (32 B) by block code, 65536 entries
+    uint64_t pad_568;                   // 568
 };
-static_assert(sizeof(FrameConstants) == 560);
+static_assert(sizeof(FrameConstants) == 576);
 static_assert(offsetof(FrameConstants, size) == 64);
 static_assert(offsetof(FrameConstants, page_table) == 88);
 static_assert(offsetof(FrameConstants, records_per_page_shift) == 120);
@@ -121,6 +123,8 @@ static_assert(offsetof(FrameConstants, upscale) == 540);
 static_assert(offsetof(FrameConstants, light_tree) == 544);
 static_assert(offsetof(FrameConstants, light_nee_flags) == 552);
 static_assert(offsetof(FrameConstants, pad_556) == 556);
+static_assert(offsetof(FrameConstants, subsurface_table) == 560);
+static_assert(offsetof(FrameConstants, pad_568) == 568);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.
 // Unity's K_T_MAX; it also fits the FP16 radiance targets (max 65504).

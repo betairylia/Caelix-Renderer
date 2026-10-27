@@ -14,6 +14,7 @@
 
 #include "scene/gpu_structs.h"
 #include "light/light_tree_layout.h"
+#include "scene/material_pack.h"
 #include "scene/record_layout.h"
 
 #include <algorithm>
@@ -311,17 +312,40 @@ struct Model
     uint32_t group_shift = 4;
     float min_emission = 20.0f;
     std::vector<float> luminance;  // by block code (the material table's entry of the canonical code)
+    // The face weight by block code: the luminance of the emission as the GPU hot table holds it
+    // (halves). The light voxel threshold uses `luminance` (the library's CPU light code set).
+    std::vector<float> weight;
     std::vector<EntityModel> entities;
 };
+
+// The float value of IEEE half bits.
+float HalfToFloat(uint16_t h)
+{
+    const float sign = (h & 0x8000u) != 0 ? -1.0f : 1.0f;
+    const int exponent = (h >> 10) & 31;
+    const int mantissa = h & 1023;
+    if (exponent == 0)
+    {
+        return sign * std::ldexp(static_cast<float>(mantissa), -24);
+    }
+    return sign * std::ldexp(static_cast<float>(1024 + mantissa), exponent - 25);
+}
 
 void ReadLuminance(CaelixScene* scene, Model& model)
 {
     model.luminance.assign(65536, 0.0f);
+    model.weight.assign(65536, 0.0f);
     for (uint32_t code = 0; code < 65536; ++code)
     {
         CaelixMaterial m{};
         REQUIRE(caelix_scene_get_material(scene, code, &m) == CAELIX_OK);
         model.luminance[code] = caelix::LightLuminance(m.emission);
+        float gpu_emission[3];
+        for (int c = 0; c < 3; ++c)
+        {
+            gpu_emission[c] = HalfToFloat(caelix::FloatToHalf(m.emission[c]));
+        }
+        model.weight[code] = caelix::LightLuminance(gpu_emission);
     }
 }
 
@@ -405,7 +429,7 @@ Reference BuildReference(const test::Rig& rig, const Model& model)
                     {
                         continue;
                     }
-                    RefFace face{e, key, vi, f, v, lum};
+                    RefFace face{e, key, vi, f, v, model.weight[code_of(v)]};
                     face.group = info.group_index;
                     face.id = info.group_local_id;
                     face.voxel_in_group = PackVoxel(static_cast<uint32_t>((key[0] & mask) * 8 + x),

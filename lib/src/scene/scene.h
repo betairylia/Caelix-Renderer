@@ -192,10 +192,16 @@ public:
     {
         return entity_infos_.address();
     }
-    // The GPU material table: 65536 CaelixMaterial entries by block code.
+    // The GPU material table: 65536 packed 32-byte hot entries by block code
+    // (scene/material_pack.h).
     VkDeviceAddress materials_address() const
     {
         return material_buffer_.address();
+    }
+    // The GPU subsurface table: 65536 packed 32-byte subsurface entries by block code.
+    VkDeviceAddress subsurface_address() const
+    {
+        return subsurface_buffer_.address();
     }
     uint32_t records_per_page_shift() const;
     uint32_t record_bytes() const
@@ -392,8 +398,9 @@ private:
     UploadPath upload_path_ = UploadPath::kBounce;
     GpuBuffer bounce_;  // bounce path: device local, the ring's size, the same offsets
     std::unique_ptr<MaterialTable> materials_;  // CPU copy of the material table
-    GpuBuffer material_buffer_;                 // MaterialTable::kBytes, device local
-    bool material_buffer_filled_ = false;       // the zero fill of the first flush was recorded
+    GpuBuffer material_buffer_;                 // MaterialTable::kHotTableBytes, device local
+    GpuBuffer subsurface_buffer_;               // MaterialTable::kSubsurfaceTableBytes, device local
+    bool material_buffer_filled_ = false;       // the zero fills of the first flush were recorded
     ComputePipeline finalize_;
     ComputePipeline record_scatter_;
     GpuTimer flush_timer_;  // brackets the work that a flush records

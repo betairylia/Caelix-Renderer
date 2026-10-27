@@ -31,7 +31,7 @@ static_assert(offsetof(CaelixRenderOptions, upscale_quality) == 180);
 static_assert(offsetof(CaelixRenderOptions, upscale_preset) == 184);
 static_assert(offsetof(CaelixRenderOptions, upscale_flags) == 188);
 static_assert(sizeof(CaelixRenderOptions) == 192);
-static_assert(sizeof(CaelixMaterialEntry) == 52);
+static_assert(sizeof(CaelixMaterialEntry) == 116);
 static_assert(offsetof(CaelixGpuTimings, upscale_ms) == 24);
 static_assert(sizeof(CaelixGpuTimings) == 32);
 static_assert(sizeof(CaelixUpscalerQueryDesc) == 16);

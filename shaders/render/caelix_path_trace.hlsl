@@ -234,11 +234,10 @@ NeeCandidate SunCandidate(CaelixFrameConstants fc, float3 normal, inout uint rng
     return c;
 }
 
-// The emission of a lamp voxel's block value (the material table's emission row times the scale).
+// The emission of a lamp voxel's block value (the material table's emission times the scale).
 float3 LampEmission(uint block)
 {
-    const uint64_t address = g_materialTable + uint64_t(CaelixMaterialCode(block)) * kMaterialBytes;
-    return asfloat(CAELIX_LOAD_U32x4(address + kMaterialEmission)).xyz * g_emissionScale;
+    return CaelixMaterialEmission(g_materialTable, CaelixMaterialCode(block)) * g_emissionScale;
 }
 
 // The lamp candidate of a vertex (receiver x_r, normal n_r): a light tree draw for the point receiver
@@ -699,6 +698,7 @@ void main(uint3 thread_id : SV_DispatchThreadID)
     }
     g_blockEncoding = fc.encoding;
     g_materialTable = fc.materials;
+    g_subsurfaceTable = fc.subsurface_table;
     g_emissionScale = fc.emission_scale;
 
     // Pixel -> ray. Row 0 is the top row of the image.

@@ -42,11 +42,24 @@ CaelixMaterial Opaque(float r, float g, float b)
     return m;
 }
 
-bool Finite(const float* values, size_t count)
+// Finite and within the half range (the GPU tables store halves).
+bool HalfRange(const float* values, size_t count)
 {
     for (size_t i = 0; i < count; ++i)
     {
-        if (!std::isfinite(values[i]))
+        if (!std::isfinite(values[i]) || std::fabs(values[i]) > kHalfMax)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool InRange(const float* values, size_t count, float lo, float hi)
+{
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (!(values[i] >= lo && values[i] <= hi))
         {
             return false;
         }
@@ -61,9 +74,11 @@ MaterialTable::MaterialTable(uint32_t encoding)
 {
     std::memcpy(palette_.data(), kDefaultGlassPalette, sizeof(kDefaultGlassPalette));
     entries_.resize(kEntries);
+    hot_.resize(static_cast<size_t>(kEntries) * kEntryWords);
+    subsurface_.resize(static_cast<size_t>(kEntries) * kEntryWords);
     for (uint32_t code = 0; code < kEntries; ++code)
     {
-        entries_[code] = BuiltIn(code);
+        Store(code, BuiltIn(code));
     }
 }
 
@@ -114,11 +129,13 @@ CaelixMaterial MaterialTable::BuiltIn(uint32_t code) const
 
 bool MaterialTable::Valid(const CaelixMaterial& material, const char*& reason)
 {
-    if (!Finite(material.albedo, 3) || !Finite(&material.smoothness, 1) ||
-        !Finite(material.emission, 3) || !Finite(&material.metallic, 1) ||
-        !Finite(&material.ior, 1) || !Finite(&material.extinction, 1))
+    if (!HalfRange(material.albedo, 3) || !HalfRange(&material.smoothness, 1) ||
+        !HalfRange(material.emission, 3) || !HalfRange(&material.metallic, 1) ||
+        !HalfRange(&material.ior, 1) || !HalfRange(&material.extinction, 1) ||
+        !HalfRange(&material.sss_probability, 1) || !HalfRange(material.sss_albedo, 3) ||
+        !HalfRange(&material.sss_anisotropy, 1) || !HalfRange(material.sss_params, 8))
     {
-        reason = "a value is not finite";
+        reason = "a value is not finite or its magnitude is above 65504 (the GPU stores halves)";
         return false;
     }
     if (!(material.ior > 0.0f))
@@ -131,7 +148,52 @@ bool MaterialTable::Valid(const CaelixMaterial& material, const char*& reason)
         reason = "extinction is negative";
         return false;
     }
+    if (material.sss_model > 0xFFu)
+    {
+        reason = "sss_model is above 255";
+        return false;
+    }
+    if (!InRange(&material.sss_probability, 1, 0.0f, 1.0f))
+    {
+        reason = "sss_probability is outside [0, 1]";
+        return false;
+    }
+    if (!InRange(material.sss_albedo, 3, 0.0f, 1.0f))
+    {
+        reason = "an sss_albedo channel is outside [0, 1]";
+        return false;
+    }
+    if (!InRange(&material.sss_anisotropy, 1, -1.0f, 1.0f))
+    {
+        reason = "sss_anisotropy is outside [-1, 1]";
+        return false;
+    }
+    if (material.sss_steps > 0xFFu)
+    {
+        reason = "sss_steps is above 255";
+        return false;
+    }
+    if (material.texture_set > 0xFFFFu)
+    {
+        reason = "texture_set is above 0xFFFF";
+        return false;
+    }
+    if (material.connect_group > 0xFFFFu)
+    {
+        reason = "connect_group is above 0xFFFF";
+        return false;
+    }
     return true;
+}
+
+void MaterialTable::Store(uint32_t code, const CaelixMaterial& material)
+{
+    CaelixMaterial& m = entries_[code];
+    m = material;
+    m.reserved = 0;
+    const size_t word = static_cast<size_t>(code) * kEntryWords;
+    PackMaterialHot(m, &hot_[word]);
+    PackMaterialSubsurface(m, &subsurface_[word]);
 }
 
 void MaterialTable::MarkDirty(uint32_t first_code, uint32_t end_code)
@@ -152,20 +214,14 @@ void MaterialTable::Replace(const CaelixMaterial* entries, uint32_t count)
 {
     for (uint32_t code = 0; code < kEntries; ++code)
     {
-        CaelixMaterial m = code < count ? entries[code] : BuiltIn(code);
-        m.pad[0] = 0.0f;
-        m.pad[1] = 0.0f;
-        entries_[code] = m;
+        Store(code, code < count ? entries[code] : BuiltIn(code));
     }
     MarkDirty(0, kEntries);
 }
 
 void MaterialTable::Set(uint32_t code, const CaelixMaterial& material)
 {
-    CaelixMaterial m = material;
-    m.pad[0] = 0.0f;
-    m.pad[1] = 0.0f;
-    entries_[code] = m;
+    Store(code, material);
     MarkDirty(code, code + 1);
 }
 
@@ -174,8 +230,7 @@ void MaterialTable::SetGlassPalette(const CaelixMaterial* entries, uint32_t coun
     for (uint32_t id = 1; id < count; ++id)
     {
         palette_[id] = entries[id];
-        palette_[id].pad[0] = 0.0f;
-        palette_[id].pad[1] = 0.0f;
+        palette_[id].reserved = 0;
     }
     // Transparent codes are 0x0000..0x3FFF: id = code & 0xFF, face bits 8..13.
     for (uint32_t code = 0; code < 0x4000u; ++code)
@@ -183,7 +238,7 @@ void MaterialTable::SetGlassPalette(const CaelixMaterial* entries, uint32_t coun
         const uint32_t id = code & 0xFFu;
         if (id >= 1 && id < count)
         {
-            entries_[code] = palette_[id];
+            Store(code, palette_[id]);
         }
     }
     MarkDirty(0, 0x4000u);
