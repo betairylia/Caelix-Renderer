@@ -521,6 +521,103 @@ draws the skybox through `RenderToCubemap` for a Reflection camera without a dep
 whether the cube is in a layout the plugin accepts (SHADER_READ_ONLY_OPTIMAL or GENERAL) when the
 view packet observes it. Use a skybox copy without the sun disk as `skyCaptureMaterial`.
 
+## Packet v8 as built (2026-10-28): Fix C compositing
+
+Problem: under an upscaler (DLSS) the native image showed black or white rims where voxels meet
+Unity's sky. The upscaler received an image with holes (misses were black), and the present used a
+blocky render-size coverage. Packet version 8 uses the library's background input
+(`docs/BACKGROUND.md`) and its output-size depth (`docs/VOXEL_ID.md` "Output-size depth").
+
+Sizes (`static_assert`s in `unity_bridge.cpp`, constants in `CaelixNativeBridge.cs`, checked by
+`Check()` with `Marshal.SizeOf` / `Marshal.OffsetOf`):
+
+| Struct | v7 | v8 | Change |
+| --- | --- | --- | --- |
+| `CaelixUnityViewPacket` | 560 | 584 | `CaelixUnityTarget background` at offset 560 |
+
+The other structs keep their v7 sizes. `CAELIX_UNITY_PACKET_VERSION` and `PacketVersion` are 8.
+
+Pass order of a camera frame (`CaelixNativeRendererFeature`):
+
+1. Unity's opaques, then Unity's skybox at the full resolution (as without the plugin).
+2. `RenderPass` at `AfterRenderingSkybox` (was `BeforeRenderingOpaques`): a blit pass
+   `renderGraph.AddBlitPass(resourceData.activeColorTexture, frame.Background, (1, 1), (0, 0),
+   passName: "Caelix Native Background")` (bilinear, `BlitFilterMode.ClampBilinear` is the default)
+   downsamples the camera colour into the view's background input at the geometry size; then the
+   unsafe pass issues the render event. It declares the background as a read, so the graph orders
+   the blit first. The pass sets `requiresIntermediateTexture = true` (it samples the camera colour,
+   so the camera must not render into the back buffer; if it still does, the blit is skipped and a
+   warning is logged once).
+3. `PresentPass` stage 0 at `AfterRenderingSkybox + 1` (was `AfterRenderingOpaques`).
+4. `MotionPass` at `AfterRenderingSkybox + 2` (only when URP renders motion vectors).
+5. `PresentPass` stage 1 (edges) at `AfterRenderingSkybox + 2`, enqueued only without the mask
+   mode.
+6. Unity's transparents and 3D UI, depth-tested against the depth the present wrote.
+
+Targets (`CaelixNativeViewTargets`, six per view):
+
+| Target | Format | Size | Note |
+| --- | --- | --- | --- |
+| colour | RGBA16F, random write | camera | at the misses the background (the upscaler output while upscaling) |
+| depth | R32F, random write | camera, in every case | while upscaling written by the library's output-size pass from unjittered centre rays (first hit, aligned with the voxel id) |
+| motion | RGBA16F, random write | geometry | unchanged |
+| albedo | RGBA8, random write | geometry | unchanged |
+| voxel id | R32_UINT, random write | camera | optional (`voxelIdTarget`), the present's mask |
+| background | RGBA16F, NO random write | geometry | input only: SAMPLED usage, filled by the blit |
+
+Geometry size = the upscaler's render size while the view upscales, else the camera size.
+`CaelixNativeTargetTexture.Create/Ensure` take `randomWrite` (default true).
+
+Plugin (`unity_bridge.cpp`):
+
+- `AccessImage(target, layout, access, image)` is the shared pipeline-barrier access
+  (`AccessTexture`, else `AccessRenderBufferTexture`). `AccessTarget` = GENERAL / shader write as
+  before.
+- `AccessBackground`: `AccessImage` with `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, compute shader
+  stage, `VK_ACCESS_SHADER_READ_BIT`. Requires `VK_IMAGE_USAGE_SAMPLED_BIT` (not STORAGE), the
+  geometry size, and a reported layout of SHADER_READ_ONLY_OPTIMAL or GENERAL; otherwise the input
+  is dropped (shares the rate-limited "dropped target" warning). Unity then tracks the image in
+  SHADER_READ_ONLY_OPTIMAL, and the next frame's blit transitions it from there. The library never
+  transitions it. It is accessed only in the lighting modes.
+- `RenderEvent`: the depth target is accessed at the COLOUR size; motion and albedo at the
+  geometry size. The first-render log line adds "background yes/no".
+- `DecideUpscaler`: a frame is upscaled when the motion, albedo and background inputs declare the
+  render size (the depth left this check: it has the colour size now).
+
+Present (`CaelixNativePresent.shader`): new inputs `Texture2D<uint> _CaelixNativeVoxelId`,
+`_CaelixUseVoxelIdMask`, `_CaelixMaskDilate`. `VoxelHit(uv, minCoverage)`:
+
+- Mask mode (`_CaelixUseVoxelIdMask` = 1): the pixel is a voxel when its voxel id is not
+  0xFFFFFFFF. With `_CaelixMaskDilate` = 1 (the view upscales this frame,
+  `CaelixNativeRenderer.ViewUpscales(view)`), also when one of its 8 neighbours (clamped to the
+  image) is a hit.
+- Otherwise: coverage (albedo.a) >= 0.99 in pass 0, >= 0.5 in the motion pass (the old rules).
+
+`FragPresent` writes `DisplayColor(uv).rgb` with alpha 1 and the depth target's value (now at the
+colour size, so point sampling by UV is exact) where `VoxelHit` is true. The ring pixels of the
+dilation carry the upscaler's blend of scene and background and the miss depth (far), so writing
+them is correct; pixels beyond the ring show Unity's own full-resolution skybox. The library's DLSS
+test measured scene colour in miss pixels up to 2 output pixels from a silhouette (6 % at distance
+2, 0.3 % at 3 and more); the one-pixel dilation is still the design, so pixels at distance 2 show
+Unity's sky. `FragMotion` uses the same `VoxelHit` rule. `FragPresentEdges` is unchanged and runs
+only without the mask mode.
+
+Mask mode is on when the view has a voxel id target AND `voxelIdTMax` is 0: a limit turns far
+voxels into misses in the voxel id, and the mask would hide them, so the present then falls back to
+the coverage rules and the edges pass. `BindTargets` sets `_CaelixUseVoxelIdMask` (only with a
+valid voxel id handle) and `_CaelixMaskDilate`.
+
+Consequences: the URP depth texture copy (`_CameraDepthTexture`) runs right after the skybox when
+the earliest depth reader is at that event (the present asks for motion vectors there), so it does
+not contain the voxels; the camera depth attachment does. The opaque texture copy runs after the
+`AfterRenderingSkybox` passes and now contains the native image.
+
+Not verified: nothing ran in the Unity Editor. The plugin builds (`caelix_unity` target) and the C#
+assembly compiles; the present shader was not compiled (dotnet does not compile shaders). Not
+checked in Unity: the blit into the imported background RenderTexture, the layout AccessTexture
+reports for it after the barrier, the look of the rims under DLSS, and the TAA / motion vector path
+with the new pass order.
+
 ## Open questions for the owner
 
 1. (answered) Loading time: "Load on startup" on the plugin importer; P1 verifies it.

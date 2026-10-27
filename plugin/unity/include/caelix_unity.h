@@ -68,11 +68,12 @@
  * key (upscaler, upscale_quality, colour target width and height) with caelix_upscaler_query. The
  * result is cached per view by that key (the first query of a device creates the NGX runtime) and
  * published in CaelixUnityStatus::upscalers[view]. The frame is upscaled when the query says
- * supported AND every present geometry target (depth, motion, albedo) has the query's render size;
- * otherwise the plugin clears options.upscaler for this frame (logged once per key), renders at the
- * colour size and accepts the geometry targets at the colour size. So C# learns the render size
- * from the status one frame after it first asks, allocates its geometry targets at that size, and
- * renders that first frame without the upscaler. The other modes ignore the upscaler.
+ * supported AND every present render-size input (the motion and albedo targets and the background)
+ * has the query's render size; otherwise the plugin clears options.upscaler for this frame (logged
+ * once per key), renders at the colour size and accepts those inputs at the colour size. So C#
+ * learns the render size from the status one frame after it first asks, allocates its render-size
+ * inputs at that size, and renders that first frame without the upscaler. The depth and voxel id
+ * targets have the colour size in every case. The other modes ignore the upscaler.
  */
 #include <stdint.h>
 #include <caelix/caelix.h>
@@ -98,8 +99,10 @@ extern "C" {
    upscale_ms, upscaler_extensions and upscalers[] (280 -> 536 bytes).
    Version 7: CaelixMaterial 48 -> 112 bytes (SSS and texture fields), CaelixRenderOptions +16
    (voxel_id_tmax), view packet gains the voxel id target and the light NEE options, frame packet
-   gains the light tree options, status gains light and voxel id fields. */
-#define CAELIX_UNITY_PACKET_VERSION 7u
+   gains the light tree options, status gains light and voxel id fields.
+   Version 8: the view packet gains the background input; the depth target has the colour size
+   (also while upscaling: the library's output-size pass writes it). */
+#define CAELIX_UNITY_PACKET_VERSION 8u
 
 /* Number of views (CaelixUnityViewPacket::view). Each view has its own renderer over the shared
    scene. C# gives every camera that renders through the plugin its own view. */
@@ -222,12 +225,13 @@ typedef struct CaelixUnityFramePacket
 /* CaelixUnityViewPacket::flags */
 #define CAELIX_UNITY_VIEW_REPORT_TIMINGS 1u /* this view's GPU timings go to CaelixUnityStatus */
 
-/* One render event. 560 bytes (488 in version 5, 504 in version 6). The plugin accesses every
-   present target (AccessTexture); a target that AccessTexture refuses, without STORAGE usage, or of
-   another size than expected is dropped (logged a few times) and the frame renders without it. The
-   expected size of depth, motion and albedo is the colour target's size, or the upscaler's render
-   size when the frame is upscaled (see "Upscalers" at the top); the voxel id target always has the
-   colour target's size. */
+/* One render event. 584 bytes (488 in version 5, 504 in version 6, 560 in version 7). The plugin
+   accesses every present target (AccessTexture); a target that AccessTexture refuses, without
+   STORAGE usage, or of another size than expected is dropped (logged a few times) and the frame
+   renders without it (the background input has its own rules, see `background`). The expected size
+   of motion, albedo and the background is the colour target's size, or the upscaler's render size
+   when the frame is upscaled (see "Upscalers" at the top); the depth and voxel id targets always
+   have the colour target's size. */
 typedef struct CaelixUnityViewPacket
 {
     CaelixUnityPacketHeader header; /* kind CAELIX_UNITY_PACKET_VIEW */
@@ -238,7 +242,9 @@ typedef struct CaelixUnityViewPacket
                                        without a release */
     uint32_t pad;
     CaelixUnityTarget color;  /* RGBA16F with random write (STORAGE usage); required */
-    CaelixUnityTarget depth;  /* R32F: device depth of camera.projection; optional; render size */
+    CaelixUnityTarget depth;  /* R32F: device depth of camera.projection; optional; R32F at the COLOUR
+                                 size in every case (while upscaling, the library's output-size pass
+                                 writes it from unjittered centre rays) */
     CaelixUnityTarget motion; /* RGBA16F: previous - current pixel, w = delta checkerboard flag; optional;
                                  render size */
     CaelixUnityTarget albedo; /* RGBA8 UNORM: albedo, a = coverage; optional; render size */
@@ -261,6 +267,16 @@ typedef struct CaelixUnityViewPacket
        on a new renderer; a failure is logged and counted, and the frame renders with the
        renderer's previous options. */
     CaelixLightNeeOptions light_nee;
+    /* Optional: the host's image behind the scene (CaelixRenderTargets::background, caelix.h), an
+       INPUT the library only reads: a texture with SAMPLED usage (no STORAGE usage needed) at the
+       geometry size (the upscaler's render size while the view upscales, else the colour size).
+       The plugin accesses it for shader reads (AccessTexture with a pipeline barrier to
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, compute shader stage, shader read) and passes it as
+       CaelixRenderTargets::background in the lighting modes (the primary mode ignores it). Dropped
+       (logged a few times) when AccessTexture refuses it, without SAMPLED usage, of another size, or
+       when the layout it reports is neither SHADER_READ_ONLY_OPTIMAL nor GENERAL; the frame then
+       renders without it (misses are black or the procedural sky). */
+    CaelixUnityTarget background;
 } CaelixUnityViewPacket;
 
 /* ---------------------------------------------------------------------------------------------

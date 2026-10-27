@@ -45,10 +45,10 @@ namespace {
 constexpr uint32_t kBlocksPerBrick = 512;
 constexpr uint32_t kNoScene = 0xFFFFFFFFu;
 
-// The sizes caelix_unity.h states (packet version 7), which C# mirrors (CaelixNativeBridge.cs).
+// The sizes caelix_unity.h states (packet version 8), which C# mirrors (CaelixNativeBridge.cs).
 static_assert(sizeof(CaelixUnityPacketHeader) == 24, "CaelixUnityPacketHeader is 24 bytes");
 static_assert(sizeof(CaelixUnityFramePacket) == 96, "CaelixUnityFramePacket is 96 bytes");
-static_assert(sizeof(CaelixUnityViewPacket) == 560, "CaelixUnityViewPacket is 560 bytes");
+static_assert(sizeof(CaelixUnityViewPacket) == 584, "CaelixUnityViewPacket is 584 bytes");
 static_assert(sizeof(CaelixUnityReleasePacket) == 32, "CaelixUnityReleasePacket is 32 bytes");
 static_assert(sizeof(CaelixUnityStatus) == 568, "CaelixUnityStatus is 568 bytes");
 static_assert(sizeof(CaelixUnityUpscalerStatus) == 32, "CaelixUnityUpscalerStatus is 32 bytes");
@@ -61,6 +61,8 @@ static_assert(sizeof(CaelixLightOptions) == 16 && sizeof(CaelixLightNeeOptions) 
 static_assert(offsetof(CaelixUnityFramePacket, light) == 80, "CaelixUnityFramePacket::light offset (C# mirrors it)");
 static_assert(offsetof(CaelixUnityViewPacket, voxel_id) == 520 && offsetof(CaelixUnityViewPacket, light_nee) == 544,
               "CaelixUnityViewPacket offsets of the version 7 fields (C# mirrors them)");
+static_assert(offsetof(CaelixUnityViewPacket, background) == 560,
+              "CaelixUnityViewPacket offset of the version 8 field (C# mirrors it)");
 static_assert(offsetof(CaelixUnityStatus, upscaler_extensions) == 164 &&
                   offsetof(CaelixUnityStatus, upscale_ms) == 276 && offsetof(CaelixUnityStatus, upscalers) == 280,
               "CaelixUnityStatus offsets of the upscaler fields (C# mirrors them)");
@@ -304,26 +306,24 @@ void DestroySceneObjects()
     state.light_enabled.store(0);
 }
 
-bool AccessTarget(const CaelixUnityTarget& target, UnityVulkanImage& image)
+// Accesses the image of a packet target with a pipeline barrier to `layout` for compute-shader
+// `access`: AccessTexture on the native texture, else AccessRenderBufferTexture on the render
+// buffer (logged once).
+bool AccessImage(const CaelixUnityTarget& target, VkImageLayout layout, VkAccessFlags access,
+                 UnityVulkanImage& image)
 {
     State& state = GetState();
     const VkImageSubresource subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
-    // PipelineBarrier: Unity records a barrier from its tracked layout and access to GENERAL /
-    // compute shader write and then tracks the image as GENERAL with that access. The library
-    // leaves the image in GENERAL with its writes available to all later commands, so Unity's
-    // tracked state stays true and its next use of the texture transitions from it correctly.
     if (target.native_texture != nullptr &&
-        state.vulkan->AccessTexture(target.native_texture, &subresource, VK_IMAGE_LAYOUT_GENERAL,
-                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                                    kUnityVulkanResourceAccess_PipelineBarrier, &image))
+        state.vulkan->AccessTexture(target.native_texture, &subresource, layout, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    access, kUnityVulkanResourceAccess_PipelineBarrier, &image))
     {
         return true;
     }
     if (target.native_render_buffer != nullptr &&
-        state.vulkan->AccessRenderBufferTexture(
-            static_cast<UnityRenderBuffer>(target.native_render_buffer), &subresource,
-            VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-            kUnityVulkanResourceAccess_PipelineBarrier, &image))
+        state.vulkan->AccessRenderBufferTexture(static_cast<UnityRenderBuffer>(target.native_render_buffer),
+                                                &subresource, layout, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, access,
+                                                kUnityVulkanResourceAccess_PipelineBarrier, &image))
     {
         if (!g_rt.logged_access_fallback)
         {
@@ -334,6 +334,15 @@ bool AccessTarget(const CaelixUnityTarget& target, UnityVulkanImage& image)
         return true;
     }
     return false;
+}
+
+// A target the library writes. PipelineBarrier: Unity records a barrier from its tracked layout and
+// access to GENERAL / compute shader write and then tracks the image as GENERAL with that access.
+// The library leaves the image in GENERAL with its writes available to all later commands, so
+// Unity's tracked state stays true and its next use of the texture transitions from it correctly.
+bool AccessTarget(const CaelixUnityTarget& target, UnityVulkanImage& image)
+{
+    return AccessImage(target, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, image);
 }
 
 // An optional geometry target of the packet: accessed and checked like the colour target, but a
@@ -395,6 +404,54 @@ bool AccessVoxelIdTarget(const CaelixUnityTarget& target, uint32_t width, uint32
     return true;
 }
 
+// The background input of a view packet (CaelixRenderTargets::background): the library only reads
+// it and never transitions it, so it is accessed with a pipeline barrier to SHADER_READ_ONLY_OPTIMAL
+// for compute-shader reads. Unity then tracks the image in that layout, and its next use of the
+// texture (the next frame's downsample blit) transitions from it. It needs SAMPLED usage, not
+// STORAGE. `width` x `height` is the geometry size (the render size while the view upscales). A
+// failure drops it (logged a few times, like the optional targets), also when the layout
+// AccessTexture reports is one the library refuses.
+bool AccessBackground(const CaelixUnityTarget& target, uint32_t width, uint32_t height, CaelixTargetImage& out)
+{
+    out = CaelixTargetImage{};
+    if (target.native_texture == nullptr && target.native_render_buffer == nullptr) return false;
+    UnityVulkanImage image{};
+    char problem[128] = {};
+    if (!AccessImage(target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, image))
+    {
+        std::snprintf(problem, sizeof(problem), "AccessTexture failed");
+    }
+    else if ((image.usage & VK_IMAGE_USAGE_SAMPLED_BIT) == 0)
+    {
+        std::snprintf(problem, sizeof(problem), "no SAMPLED usage");
+    }
+    else if (image.extent.width != width || image.extent.height != height)
+    {
+        std::snprintf(problem, sizeof(problem), "it is %ux%u, the frame expects %ux%u", image.extent.width,
+                      image.extent.height, width, height);
+    }
+    else if (image.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && image.layout != VK_IMAGE_LAYOUT_GENERAL)
+    {
+        std::snprintf(problem, sizeof(problem), "layout %d (neither SHADER_READ_ONLY_OPTIMAL nor GENERAL)",
+                      static_cast<int>(image.layout));
+    }
+    if (problem[0] != '\0')
+    {
+        if (g_rt.dropped_target_logs < 8)
+        {
+            ++g_rt.dropped_target_logs;
+            Log(LogLevel::Warning, "the background input is dropped: %s", problem);
+        }
+        return false;
+    }
+    out.image = reinterpret_cast<uint64_t>(image.image);
+    out.format = static_cast<uint32_t>(image.format);
+    out.width = image.extent.width;
+    out.height = image.extent.height;
+    out.layout = static_cast<uint32_t>(image.layout);
+    return true;
+}
+
 const char* UpscalerName(uint32_t upscaler)
 {
     switch (upscaler)
@@ -448,9 +505,10 @@ bool DeclaresSize(const CaelixUnityTarget& target, uint32_t width, uint32_t heig
 // Decides whether this frame of `view` is upscaled (see "Upscalers" in caelix_unity.h). With
 // options.upscaler set in the path trace mode it queries the upscaler for the key (upscaler,
 // quality, colour size), cached per view, and publishes the result. The frame is upscaled when the
-// query says supported and every present geometry target of the packet declares the query's render
+// query says supported and every present render-size input of the packet (motion, albedo,
+// background; the depth has the colour size since packet version 8) declares the query's render
 // size; otherwise options.upscaler is cleared for this frame (logged once per key). Writes the size
-// the geometry targets must have (render size or colour size) to geometry_width / geometry_height.
+// those inputs must have (render size or colour size) to geometry_width / geometry_height.
 void DecideUpscaler(uint32_t view, const CaelixUnityViewPacket& packet, uint32_t color_width,
                     uint32_t color_height, CaelixRenderOptions& options, uint32_t& geometry_width,
                     uint32_t& geometry_height)
@@ -503,9 +561,9 @@ void DecideUpscaler(uint32_t view, const CaelixUnityViewPacket& packet, uint32_t
 
     const uint32_t render_width = cache.result.render_width;
     const uint32_t render_height = cache.result.render_height;
-    if (!DeclaresSize(packet.depth, render_width, render_height) ||
-        !DeclaresSize(packet.motion, render_width, render_height) ||
-        !DeclaresSize(packet.albedo, render_width, render_height))
+    if (!DeclaresSize(packet.motion, render_width, render_height) ||
+        !DeclaresSize(packet.albedo, render_width, render_height) ||
+        !DeclaresSize(packet.background, render_width, render_height))
     {
         // The normal first frame of a key: C# reads the render size from the status and allocates
         // its geometry targets at that size for the next frame.
@@ -1056,12 +1114,17 @@ void RenderEvent(void* data)
     DecideUpscaler(packet.view, packet, color.extent.width, color.extent.height, options, geometry_width,
                    geometry_height);
     CaelixRenderTargets targets{};
-    AccessOptionalTarget(packet.depth, "depth", geometry_width, geometry_height, targets.depth);
+    // The depth target has the colour size also while the view upscales (the library's output-size
+    // pass writes it); motion and albedo have the geometry size.
+    AccessOptionalTarget(packet.depth, "depth", color.extent.width, color.extent.height, targets.depth);
     AccessOptionalTarget(packet.motion, "motion", geometry_width, geometry_height, targets.motion);
     AccessOptionalTarget(packet.albedo, "albedo", geometry_width, geometry_height, targets.albedo);
     // The voxel id target has the colour size also while the view upscales.
     const bool voxel_id =
         AccessVoxelIdTarget(packet.voxel_id, color.extent.width, color.extent.height, targets.voxel_id);
+    // The background input (lighting modes only; the library ignores it in the primary mode).
+    if (options.mode != CAELIX_MODE_PRIMARY)
+        AccessBackground(packet.background, geometry_width, geometry_height, targets.background);
     AccessSky(packet.sky, options.sky);
 
     UnityVulkanRecordingState recording{};
@@ -1171,11 +1234,13 @@ void RenderEvent(void* data)
     {
         g_rt.logged_first_render = true;
         Log(LogLevel::Info, "first render: view %u, %ux%u, VkFormat %d, layout at access %d, Unity frame "
-                            "%llu (safe %llu), mode %u, sky cubemap %s, upscaler %s, voxel id %s, light NEE %u",
+                            "%llu (safe %llu), mode %u, sky cubemap %s, upscaler %s, voxel id %s, background %s, "
+                            "light NEE %u",
             packet.view, color.extent.width, color.extent.height, static_cast<int>(color.format),
             static_cast<int>(color.layout), static_cast<unsigned long long>(frame),
             static_cast<unsigned long long>(safe), options.mode, options.sky.image != 0 ? "yes" : "no",
-            UpscalerName(options.upscaler), voxel_id ? "yes" : "no", packet.light_nee.enabled);
+            UpscalerName(options.upscaler), voxel_id ? "yes" : "no", targets.background.image != 0 ? "yes" : "no",
+            packet.light_nee.enabled);
     }
 }
 
