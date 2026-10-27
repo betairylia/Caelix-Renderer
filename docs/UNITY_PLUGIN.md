@@ -496,6 +496,31 @@ Not done in this step: no Editor validation (the plugin and the C# assembly comp
 match; nothing ran in Unity), and the voxel id texture has no consumer yet. Light NEE options do
 not take part in the reference mode's reset check (both settings converge to the same image).
 
+Sun sync and sky capture (2026-10-28, C# only, no packet change). Inspector sections "Sun Light"
+and "Sky Capture" of `CaelixNativeRenderer`. Sun: with `syncSunFromLight` (default on) and an
+enabled directional light (`sunLight`, else `RenderSettings.sun`), `ResolveSun` (in
+`CaelixNativeRenderer.Views.cs`) gives `sun_dir = -light.transform.forward` and `sun_radiance =
+E / (2 pi (1 - cos r))` with `E = light.color.linear * intensity` (times the colour temperature's
+RGB when the project uses colour temperatures) and `r = sunAngularRadiusDegrees` (0 = 0.5 degrees).
+The library's disk of constant radiance then gives a surface facing the sun the light's irradiance
+E. `BuildOptions` uses that direction for the lighting modes AND for the primary mode's Lambert
+direction; without a usable light (logged once per problem with verbose logging) the fields
+`sunDirection` / `primarySunDirection` / `sunRadiance` apply as before. Sky: with `skyCapture`
+(default on) and no `skyCubemap`, `UpdateSkyCapture` (first thing in `Tick`, before the cameras of
+the frame) renders the skybox (`skyCaptureMaterial`, swapped into `RenderSettings.skybox` for the
+call, else `RenderSettings.skybox`) with a hidden disabled camera (`CameraType.Reflection`, so the
+feature skips it; culling mask 0, no post-processing) and `Camera.RenderToCubemap(RenderTexture, 63)`
+into an RGBA16F cube RenderTexture of `skyCaptureSize` (default 128) with mips, then
+`GenerateMips()`. It captures on creation, every `skyCaptureInterval` frames (default 60) and when
+the sun direction turned by more than 0.1 degree. `SkyTarget` precedence: `skyCubemap` > the
+capture > `ReflectionProbe.defaultTexture` (with `skyFromReflectionProbe`) > the procedural sky.
+Every create, recreate (size change, lost texture) or destroy of the cube clears the cached native
+pointer and bumps the target generation, so the next view packet first releases every renderer's
+cached image views (they are keyed by `VkImage`). Not validated in the Editor yet: whether URP
+draws the skybox through `RenderToCubemap` for a Reflection camera without a depth buffer, and
+whether the cube is in a layout the plugin accepts (SHADER_READ_ONLY_OPTIMAL or GENERAL) when the
+view packet observes it. Use a skybox copy without the sun disk as `skyCaptureMaterial`.
+
 ## Open questions for the owner
 
 1. (answered) Loading time: "Load on startup" on the plugin importer; P1 verifies it.
