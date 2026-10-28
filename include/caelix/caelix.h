@@ -1264,7 +1264,7 @@ typedef struct CaelixLightNeeOptions
     uint32_t enabled;    /* 0 = off (the default), 1 = on */
     uint32_t flags;      /* CAELIX_LIGHT_NEE_FLAG_* */
     uint32_t hint_patch; /* the visibility hint's patch in pixels (one hint per patch x patch pixels):
-                            0 = the library default (2), else 1, 2 or 4 */
+                            0 = the library default (4), else 1, 2 or 4 */
     uint32_t reserved;   /* must be 0 */
 } CaelixLightNeeOptions; /* 16 bytes */
 

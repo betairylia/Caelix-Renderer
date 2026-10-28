@@ -150,7 +150,7 @@ typedef struct CaelixLightNeeOptions
 {
     uint32_t enabled;    /* 0 = off (the default), 1 = on */
     uint32_t flags;      /* CAELIX_LIGHT_NEE_FLAG_* */
-    uint32_t hint_patch; /* the visibility hint's patch in pixels: 0 = the library default (2), 1, 2 or 4 */
+    uint32_t hint_patch; /* the visibility hint's patch in pixels: 0 = the library default (4), 1, 2 or 4 */
     uint32_t reserved;   /* must be 0 */
 } CaelixLightNeeOptions; /* 16 bytes */
 
@@ -383,13 +383,60 @@ complement. The primary vertex always runs its NEE. Host `--bounce-nee-probabili
 Deviation: none (the "as if it ran" state is set before the draw instead of in an else branch; same
 result, fewer branches).
 
-### 12.3 Measurements (main agent; pending)
+### 12.3 Measurements (2026-10-28)
 
-Pending. Plan: patch size: bistro and emberdeep (and one more scene with sharp sun shadows) at 1080p,
-path trace mode without the denoiser, 100-frame means: 1-spp PSNR and 16 x 16 block PSNR against a
-1024-frame reference, for hint off / patch 1 / 2 / 4, plus trace ms. Pick the coarsest patch whose block
-PSNR is within 0.1 dB of patch 1 on every scene. Bounce budget: the same metrics for q = 1, 0.5, 0.25
-and the trace ms.
+RTX 5080, driver 610.88, Rust host, 1920x1080, path trace mode, no denoiser, 2 bounces, sun 2e4,1.9e4,1.8e4,
+light NEE on; per config two runs with `--warmup 64 --timing-frames 100` (100-frame trace means) at the
+screenshot frames 400 / 401, PSNR and 16 x 16 block PSNR (sRGB, peak 255) of that 1-spp frame against a
+1024-frame reference (hint off, q 1), and the linear mean ratio of a 512-frame accumulation against the
+reference (bias). `Artifacts/light-hint-budget-20261028/` (`summary.md`, `results.json`, the run logs and
+images, the script `measure.py`). The reference's own noise sets the bias floor (emberdeep 0.998 in every
+config).
+
+| scene | config | trace ms (2 runs) | PSNR dB | block PSNR dB | ratio 512 / ref |
+|---|---|---|---|---|---|
+| bistro | hint off | 7.94, 8.01 | 12.04 | 16.88 | 1.0001 |
+| bistro | patch 1 | 8.11, 8.03 | 12.30 | 17.44 | 1.0000 |
+| bistro | patch 2 | 7.94, 7.98 | 12.32 | 17.48 | 1.0000 |
+| bistro | patch 4 | 7.88, 7.93 | 12.33 | 17.52 | 1.0000 |
+| bistro | patch 2, q 0.5 | 7.50, 7.49 | 12.11 | 17.03 | 1.0000 |
+| bistro | patch 2, q 0.25 | 7.15, 7.16 | 12.01 | 16.69 | 1.0000 |
+| emberdeep | hint off | 7.05, 6.99 | 16.45 | 20.49 | 0.9978 |
+| emberdeep | patch 1 | 7.06, 7.03 | 16.60 | 20.75 | 0.9978 |
+| emberdeep | patch 2 | 7.04, 7.03 | 16.60 | 20.75 | 0.9979 |
+| emberdeep | patch 4 | 7.02, 7.03 | 16.60 | 20.75 | 0.9979 |
+| emberdeep | patch 2, q 0.5 | 6.67, 6.69 | 16.47 | 20.52 | 0.9978 |
+| emberdeep | patch 2, q 0.25 | 6.37, 6.37 | 16.39 | 20.36 | 0.9977 |
+| rootfall | hint off | 8.13, 8.18 | 13.07 | 19.53 | 1.0000 |
+| rootfall | patch 1 | 8.19, 8.19 | 13.08 | 19.55 | 1.0000 |
+| rootfall | patch 2 | 8.19, 8.16 | 13.08 | 19.55 | 1.0000 |
+| rootfall | patch 4 | 8.17, 8.17 | 13.08 | 19.54 | 1.0000 |
+| rootfall | patch 2, q 0.5 | 8.51, 8.45 | 12.91 | 19.15 | 1.0000 |
+| rootfall | patch 2, q 0.25 | 8.19, 8.17 | 12.84 | 18.85 | 1.0000 |
+
+Hint: +0.56 dB block PSNR on bistro (sun shadows and many lamps), +0.26 dB on emberdeep (the cave: the
+lamp channel), +0.02 dB on rootfall; no measurable cost; no bias. Patch 4 is within 0.1 dB of patch 1 on
+every scene (on bistro it is 0.08 dB better: the smoother hint), so the library default is 4
+(`kDefaultHintPatch`); patch 1 costs about 0.1 ms more on bistro (the write of 16x more texels).
+
+Bounce budget: q 0.5 saves 0.45 ms on bistro and 0.35 ms on emberdeep for -0.45 / -0.23 dB block PSNR;
+q 0.25 saves 0.8 / 0.65 ms for -0.8 / -0.4 dB; no bias. On rootfall q 0.5 is SLOWER (+0.3 ms) and q 0.25
+equal: a per-vertex decision leaves the lanes that skip their NEE idle while the other lanes of the wave
+trace (the wave's cost is its slowest lane), so the saving appears only where the skipped work is the
+lamp tree descent and the shadow ray of many lanes at once. A wave-coherent decision (the measurement hook
+`CAELIX_SPEC_BOUNCE_NEE_COHERENT`: one decision per 8 x 8 workgroup, frame and bounce) is measured below;
+it trades the per-ray white error for a per-frame blocky pattern of the bounce NEE's variance. Host
+default stays q 0.5; the owner decides on the coherent form.
+
+Coherent decision (`CAELIX_SPEC_BOUNCE_NEE_COHERENT`, the embedded kernel replaced through
+`CAELIX_SHADER_DIR`, patch 2, q 0.5, the same protocol): bistro 8.00 / 7.97 ms median (per vertex 7.50,
+q 1 7.96), emberdeep 6.89 / 6.90 (per vertex 6.68, q 1 7.03), rootfall 8.19 / 8.19 (per vertex 8.48, q 1
+8.18); PSNR / block PSNR within 0.03 dB of the per-vertex form. So the coherent decision removes the
+rootfall loss but also the bistro gain: the idle-lane hypothesis does not explain the numbers (the trace
+cost of a wave is not the shadow rays of its slowest lane alone). The per-vertex form stays (white error
+per ray); the hook stays for later experiments. Net: q 0.5 is worth 0.35 .. 0.45 ms where the bounce NEE
+is expensive (many lamps or long shadow rays) and nothing elsewhere; the owner may lower the host
+default to 1 if the -0.2 .. -0.45 dB matter more than the time.
 
 ### 12.4 Registers and tests
 

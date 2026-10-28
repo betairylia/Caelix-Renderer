@@ -2929,6 +2929,9 @@ namespace {
 constexpr uint16_t kWhiteLamp = 0x4000u | (15u << 10) | (15u << 6) | (15u << 2) | 3u;  // rgb4 1, strength 3
 constexpr int32_t kLampBoxInterior = 24;
 constexpr uint32_t kLampBoxImage = 128;
+// The library default of CaelixLightNeeOptions::hint_patch (kDefaultHintPatch in renderer_light.cpp; chosen by
+// the measurement of docs/LIGHT_NEE.md section 12.3).
+constexpr uint32_t kDefaultHintPatchExpected = 4;
 
 // A closed grey box around the interior [0, 24)^3 (walls 1 voxel thick) with: an opening of 6 x 6 in
 // the ceiling at x, z in [3, 8], its x <= 5 half covered by clear glass (the sun reaches the floor
@@ -3150,7 +3153,7 @@ TEST_CASE("light NEE: unbiased against the path tracer (lamps, sun, glass)")
             CHECK(stats.enabled == 1);
             CHECK(stats.running == 1);
             const bool hint = (v.flags & CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT) == 0;
-            CHECK(stats.hint_patch == (hint ? (v.hint_patch != 0 ? v.hint_patch : 2u) : 0u));
+            CHECK(stats.hint_patch == (hint ? (v.hint_patch != 0 ? v.hint_patch : kDefaultHintPatchExpected) : 0u));
             CHECK(c.ref_mean > 0.01);
             CHECK(c.ratio > 0.97);
             CHECK(c.ratio < 1.03);
@@ -3505,7 +3508,7 @@ TEST_CASE("light NEE: visibility hint converges and reprojects")
         }
     };
     hint_frames(64, camera);
-    CHECK(NeeStats(renderer).hint_patch == 2);
+    CHECK(NeeStats(renderer).hint_patch == kDefaultHintPatchExpected);
     bool g_valid = true;
     for (uint32_t y = 0; y < kImage; ++y)
     {

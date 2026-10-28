@@ -915,8 +915,19 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
                 segment_light = kSegmentLampNee | (mis ? kSegmentLampMis : 0u);
             }
             // q is never 0 (the renderer writes 1 for 0), and 1 / 1 is exactly 1; q = 1 draws no number.
+#ifdef CAELIX_SPEC_BOUNCE_NEE_COHERENT
+            // Measurement hook (docs/LIGHT_NEE.md section 12.3): the budget's decision per 8 x 8 workgroup,
+            // frame and bounce, so that a whole wave skips or runs its NEE together (no idle lanes); the
+            // per-frame pattern is spatially blocky. The sun stream still draws its number.
+            const uint coherent_seed = PcgHash((pixel.x >> 3) ^ ((pixel.y >> 3) << 12) ^ (fc.frame_seed * 0x9E3779B9u) ^
+                                               (bounce_index * 0x85EBCA6Bu));
+            const bool run = fc.bounce_nee_probability >= 1.0f ||
+                             (RandomFloat01(nee_rng) >= 2.0f || float(coherent_seed >> 8) * (1.0f / 16777216.0f) <
+                                                                    fc.bounce_nee_probability);
+#else
             const bool run =
                 fc.bounce_nee_probability >= 1.0f || RandomFloat01(nee_rng) < fc.bounce_nee_probability;
+#endif
             CAELIX_BRANCH
             if (run)
             {
@@ -992,7 +1003,8 @@ float3 MaterialViewColor(uint block)
 // which the renderer binds for frames without light NEE: the light NEE code holds registers and costs
 // occupancy even when its flags are 0). CAELIX_SPEC_NO_SUBSURFACE: no subsurface walk (kRenderFlagSubsurface
 // cleared; a measurement hook of the CAELIX_SUBSURFACE variants: the walk folds away, the SSS shadow ray
-// stays).
+// stays). CAELIX_SPEC_BOUNCE_NEE_COHERENT: the bounce NEE budget's decision per 8 x 8 workgroup,
+// frame and bounce instead of per vertex (TracePath; a measurement hook, docs/LIGHT_NEE.md section 12.3).
 void SpecializeFrameConstants(inout CaelixFrameConstants fc)
 {
 #ifdef CAELIX_SPEC_NO_PRIMARY_MODE

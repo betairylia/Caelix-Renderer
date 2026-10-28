@@ -11,7 +11,7 @@ namespace {
 constexpr uint32_t kKnownFlags = CAELIX_LIGHT_NEE_FLAG_NO_MIS | CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT;
 // The visibility hint's patch for CaelixLightNeeOptions::hint_patch 0 (docs/LIGHT_NEE.md section 12.3
 // chooses it by measurement).
-constexpr uint32_t kDefaultHintPatch = 2;
+constexpr uint32_t kDefaultHintPatch = 4;
 
 }  // namespace
 
