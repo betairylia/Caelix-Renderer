@@ -621,7 +621,6 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.subsurface_table = scene_.subsurface_address();
     constants.reverse_tables = scene_.reverse_tables_address();
     constants.group_grids = scene_.group_grids_address();
-    constants.subsurface_present = scene_.has_subsurface() ? 1u : 0u;
     // docs/LIGHT_NEE.md section 12: the visibility hint's patch (0 when it does not run) and the bounce
     // NEE budget.
     constants.hint_patch_shift = light_hint ? internal_hint_shift_ : 0u;

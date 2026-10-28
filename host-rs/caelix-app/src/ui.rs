@@ -604,7 +604,7 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
                 .on_hover_text("Bounce vertices run their NEE (sun and lamps) with this probability, scaled by 1 / p.");
         });
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.shadow_transmission, "shadow transmission"))
-            .on_hover_text("The primary vertex's shadow rays pass glass and SSS voxels, attenuated.");
+            .on_hover_text("The primary vertex's shadow rays pass glass, attenuated.");
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.subsurface, "subsurface scattering"))
             .on_hover_text("Vertices on SSS materials (sss_model 1) run the random walk with their sss_probability.");
         ui.add_enabled(

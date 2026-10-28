@@ -69,7 +69,7 @@ hint.g)`, section 12.1); any positive weights keep the estimator unbiased. The l
 candidate stays live through the sun's draw (its evaluation is the expensive one); a kept sun candidate
 is drawn again from its saved random state. One shadow ray toward the kept candidate (glass occludes,
 as for the sun NEE; at the primary vertex with `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` the ray passes
-glass and SSS voxels, attenuated, docs/SHADOW_TRANSMISSION.md). The segment that leaves the vertex sees the sky without the sun disk when the sun
+glass, attenuated, docs/SHADOW_TRANSMISSION.md). The segment that leaves the vertex sees the sky without the sun disk when the sun
 NEE runs (as without light NEE).
 
 ## 4. MIS with the BSDF path
@@ -131,8 +131,8 @@ frame-constant kernels.
 
 Registers (`CAELIX_PIPELINE_STATS=1`, RTX 5080, driver 610.88): `caelix_path_trace` 128 registers and
 16 bytes of spill (driver binary 174976 bytes, shared memory 2560 bytes), `caelix_path_trace_no_light_nee`
-96 and 48 bytes of spill (the shadow transmission step lifted both to 128 registers + 16 bytes,
-docs/SHADOW_TRANSMISSION.md section 8; since the subsurface step, which moved every SSS code path into the
+96 and 48 bytes of spill (the first shadow transmission step lifted both to 128 registers + 16 bytes,
+docs/SHADOW_TRANSMISSION.md "History"; since the subsurface step, which moved every SSS code path into the
 variants `caelix_path_trace_sss` and `caelix_path_trace_sss_no_light_nee`, they are again 128 + 16 bytes
 and 96 + 48 bytes: docs/SUBSURFACE.md section 6). Both equal the kernels of `18282cd`: the SPIR-V function bodies are the same
 instructions modulo id numbering, except the two flag bit values (`kLightNeeContribute` 2 -> `kLightNeeOn`

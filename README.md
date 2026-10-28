@@ -225,9 +225,10 @@ The light cells of the first version (removed 2026-10-24) are in its history sec
 Opaque materials with `sss_model` = `CAELIX_SSS_MODEL_HG`, `sss_probability` > 0 and `sss_steps` > 0
 are SSS voxels: with `CAELIX_RENDER_FLAG_SUBSURFACE` a path vertex on one runs, with probability
 `sss_probability`, a Henyey-Greenstein lattice walk through the voxels of its entity instead of the
-surface BSDF; the exit is a diffuse vertex (`shaders/render/caelix_subsurface.hlsl`). The transmissive
-shadow ray (`CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION`, [`docs/SHADOW_TRANSMISSION.md`](docs/SHADOW_TRANSMISSION.md))
-passes SSS voxels in a straight line. All subsurface code lives in the trace kernel variants
+surface BSDF; the exit is a diffuse vertex (`shaders/render/caelix_subsurface.hlsl`). SSS voxels occlude
+every shadow ray, also the transmissive one (`CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION`,
+[`docs/SHADOW_TRANSMISSION.md`](docs/SHADOW_TRANSMISSION.md), which passes glass only). All subsurface
+code lives in the trace kernel variants
 `caelix_path_trace_sss` and `caelix_path_trace_sss_no_light_nee` (`CAELIX_SUBSURFACE 1`); the renderer
 binds them for the lighting frames of a scene whose material table has an SSS entry, so the main
 kernels `caelix_path_trace` / `caelix_path_trace_no_light_nee` carry no SSS code:
@@ -581,8 +582,7 @@ Design and owner decisions: `docs/STEP6D_MATERIALS_DELTA.md` (section "As built"
 
 - Material table: every scene has 65536 `CaelixMaterial` entries (112 bytes:
   albedo, smoothness, emission, metallic, ior, extinction, plus subsurface
-  fields (read by the subsurface walk and the transmissive shadow ray,
-  `docs/SUBSURFACE.md`) and texture fields that no kernel reads yet), one per
+  fields (read by the subsurface walk, `docs/SUBSURFACE.md`) and texture fields that no kernel reads yet), one per
   16-bit block code. The GPU
   holds two packed tables (`docs/MATERIALS.md`; the artist-facing meaning of every
   value and recipes: `docs/MATERIAL_GUIDE.md`): 32-byte hot entries of halves
@@ -1081,8 +1081,8 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   primary ray misses.
 - `--no-sun-nee`: lighting modes, no sun next-event estimation (the 6a
   behaviour: the sun is found only by the bounce rays).
-- `--no-shadow-transmission`: lighting modes, the primary vertex's NEE shadow rays stop at glass and
-  SSS voxels again (by default they pass them, attenuated; `docs/SHADOW_TRANSMISSION.md`).
+- `--no-shadow-transmission`: lighting modes, the primary vertex's NEE shadow rays stop at glass again
+  (by default they pass glass, attenuated; SSS voxels always occlude; `docs/SHADOW_TRANSMISSION.md`).
 - `--no-sss`: lighting modes, no subsurface scattering walk (by default a vertex on an SSS material,
   `"sss_model": 1` in the `--materials` JSON, runs the walk with its `sss_probability`;
   `docs/SUBSURFACE.md`). The checkbox "subsurface scattering" in the render settings does the same.

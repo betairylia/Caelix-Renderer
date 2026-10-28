@@ -78,8 +78,8 @@ public:
         return encoding_;
     }
     // The table has an SSS entry: an opaque code with sss_model CAELIX_SSS_MODEL_HG, sss_probability > 0
-    // and sss_steps > 0 (docs/SUBSURFACE.md section 1). Transmissive shadow rays then pass SSS voxels
-    // (FrameConstants::subsurface_present).
+    // and sss_steps > 0 (docs/SUBSURFACE.md section 1). The renderer then binds the SSS trace kernel
+    // variants (docs/SUBSURFACE.md section 4).
     bool has_subsurface() const
     {
         return subsurface_count_ > 0;

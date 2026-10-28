@@ -237,7 +237,7 @@ pub struct RenderSettings {
     pub denoise: bool,
     /// Lighting modes: sun next-event estimation.
     pub sun_nee: bool,
-    /// Lighting modes: the primary vertex's NEE shadow rays pass glass and SSS voxels, attenuated.
+    /// Lighting modes: the primary vertex's NEE shadow rays pass glass, attenuated.
     pub shadow_transmission: bool,
     /// Lighting modes: the subsurface scattering walk at SSS material vertices.
     pub subsurface: bool,

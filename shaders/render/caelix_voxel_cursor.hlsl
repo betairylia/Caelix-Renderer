@@ -2,8 +2,7 @@
 // through the scene's record lookups (scene/caelix_scene_lookup.hlsl), and the entity transform
 // helpers by entity id. Data layer: render/caelix_scene_trace.hlsl includes this file after
 // TraceResult; the integrator above the boundary uses the cursor only through the functions below
-// (the transmissive shadow ray's straight SSS walk, TraceShadowTransmissive; the subsurface walk of
-// docs/SUBSURFACE.md).
+// (the subsurface walk of docs/SUBSURFACE.md).
 //
 // All coordinates are entity-local block coordinates (object space of the entity's instances; the
 // entity transforms are rigid, scale 1). A brick is the 8^3 block cube at voxel >> 3; an absent brick

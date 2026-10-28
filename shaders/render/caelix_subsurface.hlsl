@@ -22,9 +22,9 @@
 //
 // Compiled only with CAELIX_SUBSURFACE 1: the trace kernel variants caelix_path_trace_sss and
 // caelix_path_trace_sss_no_light_nee (render/caelix_path_trace_sss*.hlsl), which the renderer binds
-// for the lighting frames of a scene whose material table has an SSS entry. The default 0
-// (render/caelix_shadow_medium.hlsl) compiles nothing of this file, so the main trace kernels keep
-// their code.
+// for the lighting frames of a scene whose material table has an SSS entry. The default 0 (defined
+// below) compiles nothing of this file, so the main trace kernels keep their code. Shadow rays stop at
+// SSS voxels like at any opaque voxel (docs/SHADOW_TRANSMISSION.md).
 #ifndef CAELIX_SUBSURFACE_HLSL
 #define CAELIX_SUBSURFACE_HLSL
 

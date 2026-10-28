@@ -132,14 +132,14 @@ steps, it is absorbed (black).
   the block looks darker than a matte block of the same colour. Negative values keep the light at the
   surface.
 - `sss_steps`: the step cap. The typical depth the light reaches is about
-  `sqrt(sss_steps * (1 + g) / (1 - g))` voxels; this is also how far a shadow ray can pass through the
-  material. Examples: 8 steps, g 0: 2.8 voxels; 8 steps, g 0.7: 6.7; 6 steps, g 0.8: 7.3; 16 steps,
+  `sqrt(sss_steps * (1 + g) / (1 - g))` voxels. Examples: 8 steps, g 0: 2.8 voxels; 8 steps, g 0.7: 6.7; 6 steps, g 0.8: 7.3; 16 steps,
   g 0.9: 17. Each step costs time; 6..16 is the normal range.
 - A thick object needs a low g (0..0.3) and a high `sss_albedo` (0.9+) to stay bright. A thin object
   (leaves, petals, a lampshade) can take g 0.7..0.8 and 6..8 steps.
-- Shadows: the sun and the lamps pass through SSS blocks up to the depth above, tinted by `sss_albedo`
-  and scaled by `sss_probability`, so a leaf canopy casts a soft green shadow and a thin wax wall glows
-  from behind. A thin SSS object may look slightly too bright on its shadow side (known, accepted).
+- Shadows: SSS blocks cast hard shadows like any opaque block; shadow rays do not pass them. Light
+  reaches the shadow side only through the walk: a thin leaf or wax wall still glows from behind (the
+  walk carries the sun from the lit side), and the ground under a canopy gets the light that bounces
+  through the leaves (noisier than a direct shadow ray).
 - Cost: a scene with any SSS material runs the SSS kernels (small, fixed cost) plus the steps that
   actually walk. Leave `sss_model` at 0 (or leave the sss keys out) for every material that does not
   need it.

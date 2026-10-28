@@ -7,12 +7,7 @@
 //      device address, set per candidate; brickBase is passed as 0);
 //   3. CaelixTraceBrickPrimitiveCore takes the brick origin as a parameter
 //      instead of deriving it from word 0 and the render group macros;
-//   4. half = float (platform header), UNITY_BRANCH -> CAELIX_BRANCH;
-//   5. a compile-time `mode` (kBrickDda*) and an out flag `medium_seen` on the termination rule and
-//      the DDA: kBrickDdaClosest is Unity's rule (every existing caller; the mode folds at compile
-//      time, so that code does not change); the two shadow modes of the transmissive shadow ray
-//      (docs/SHADOW_TRANSMISSION.md) let transparent voxels, and in kBrickDdaShadowSssAware the opaque
-//      voxels that CaelixShadowPassesOpaque accepts, pass and report them in medium_seen.
+//   4. half = float (platform header), UNITY_BRANCH -> CAELIX_BRANCH.
 #ifndef CAELIX_BRICK_TRACE_INCLUDED
 #define CAELIX_BRICK_TRACE_INCLUDED
 
@@ -277,45 +272,10 @@ inline bool CaelixShouldTraceMicroOccupancy(uint64_t occ, half3 rayDir)
     return true;
 }
 
-// NATIVE: the DDA modes (change 5). Every caller passes a literal, so the mode folds at compile time.
-//   kBrickDdaClosest:       Unity's rule: an opaque voxel, or a transparent voxel entered through one of
-//                           its face bits (an interface), terminates.
-//   kBrickDdaShadowOpaque:  only opaque voxels terminate; a visited transparent voxel with a medium id
-//                           (id != 0) sets medium_seen. An air cell with face bits (id 0) does not.
-//   kBrickDdaShadowSssAware: as kBrickDdaShadowOpaque, and an opaque voxel for which
-//                           CaelixShadowPassesOpaque is true (an SSS voxel) does not terminate and sets
-//                           medium_seen.
-static const uint kBrickDdaClosest = 0;
-static const uint kBrickDdaShadowOpaque = 1;
-static const uint kBrickDdaShadowSssAware = 2;
-
-// NATIVE: defined by the including file (render/caelix_scene_trace.hlsl: ShadowVoxelIsSubsurface):
-// true when a shadow ray passes the opaque block value `block` (kBrickDdaShadowSssAware).
-bool CaelixShadowPassesOpaque(uint block);
-
-// NATIVE: `mode` and `medium_seen` (change 5).
-inline bool CaelixShouldTerminateBrickRay(uint index, int blockID, uint normalFlags, float entryT, uint mode,
-                                          inout bool medium_seen)
+inline bool CaelixShouldTerminateBrickRay(uint index, int blockID, uint normalFlags, float entryT)
 {
     bool shouldTerminate = IsOpaque(blockID);
-    // NATIVE: an SSS voxel passes the SSS-aware shadow ray (change 5).
-    CAELIX_BRANCH
-    if (mode == kBrickDdaShadowSssAware && shouldTerminate && CaelixShadowPassesOpaque(uint(blockID)))
-    {
-        medium_seen = true;
-        return false;
-    }
     CAELIX_BRANCH if (shouldTerminate) return shouldTerminate;  // NATIVE: was UNITY_BRANCH
-
-    // NATIVE: the shadow modes pass every transparent voxel; a medium (id != 0) is reported (change 5).
-    if (mode != kBrickDdaClosest)
-    {
-        if (CaelixTransparentId(uint(blockID)) != 0u)
-        {
-            medium_seen = true;
-        }
-        return false;
-    }
 
     // Transparency
     if (index == 0 && entryT == 0) return false;
@@ -336,8 +296,7 @@ inline int3 VRTStep(int3 cell, float3 tStart, float3 origin, float3 rayDir, half
     return int3(floor(currPos));
 }
 
-// NATIVE: `mode` and `medium_seen` (change 5).
-inline float CaelixTraceBrickRay(uint brickBase, float3 entryPositionInBrick, float3 rayDir, float entryT, uint entryNormal_coarseOccupancy, uint mode, inout bool medium_seen, out AttributeData attrib)
+inline float CaelixTraceBrickRay(uint brickBase, float3 entryPositionInBrick, float3 rayDir, float entryT, uint entryNormal_coarseOccupancy, out AttributeData attrib)
 {
     uint64_t occ = 0ull;
 
@@ -389,7 +348,7 @@ inline float CaelixTraceBrickRay(uint brickBase, float3 entryPositionInBrick, fl
             float T;
             uint normalFlags = CaelixBrickRayNormalFlags(rayStep, prevCell, tStart, rayDir, invDir, (entryNormal_coarseOccupancy >> 26), T);
             bool shouldTerminate = CaelixShouldTerminateBrickRay(
-                rayStep, blockID, normalFlags, entryT, mode, medium_seen);  // NATIVE: mode (change 5)
+                rayStep, blockID, normalFlags, entryT);
 
             if (shouldTerminate)
             {
@@ -413,9 +372,8 @@ inline float CaelixTraceBrickRay(uint brickBase, float3 entryPositionInBrick, fl
 // offset of the brick record inside the brick pool page the candidate's instance record names,
 // which is the buffer CAELIX_BRICKS_LOAD reads.
 // NATIVE: brickBase is 0 (the loads are relative to g_recordBase), and `brickOrigin` is the
-// entity-local block coordinate of the brick's corner, passed in by the caller. `mode` and
-// `medium_seen`: change 5.
-inline float CaelixTraceBrickPrimitiveCore(uint brickBase, float3 objectRayOrigin, float3 objectRayDir, float tCurrent, float3 brickOrigin, uint mode, inout bool medium_seen, out AttributeData attrib)
+// entity-local block coordinate of the brick's corner, passed in by the caller.
+inline float CaelixTraceBrickPrimitiveCore(uint brickBase, float3 objectRayOrigin, float3 objectRayDir, float tCurrent, float3 brickOrigin, out AttributeData attrib)
 {
     // attrib.matID_faceNormal = ((0x8001 & 0xFFFF) << 16) + (0b010000 >> 26);
     // return 10;
@@ -489,7 +447,7 @@ inline float CaelixTraceBrickPrimitiveCore(uint brickBase, float3 objectRayOrigi
     CaelixBrickHit result = CaelixMakeBrickMiss();
     return CaelixTraceBrickRay(brickBase, entryPositionInBrick, rayDir, t,
                                (normalFlags << 26) | CaelixGetCoarseOccupancy(brickInfo.x),
-                               mode, medium_seen, attrib);  // NATIVE: mode (change 5)
+                               attrib);
 }
 
 #endif

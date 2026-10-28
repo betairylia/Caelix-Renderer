@@ -25,7 +25,7 @@
 //                   With kRenderFlagSunNee every diffuse vertex also samples the
 //                   sun cone and traces a shadow ray (TracePath, SunNextEvent).
 //                   With kRenderFlagShadowTransmission the shadow rays of the PRIMARY
-//                   vertex (sun and lamps) pass transparent and SSS voxels in a
+//                   vertex (sun and lamps) pass transparent voxels in a
 //                   straight line (TraceShadowTransmissive, docs/SHADOW_TRANSMISSION.md).
 //                   With kRenderFlagSubsurface (only in the CAELIX_SUBSURFACE kernel variants
 //                   caelix_path_trace_sss*) a vertex on an SSS voxel may run the subsurface
@@ -701,7 +701,7 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // that leaves a specular-lobe vertex (no NEE there, transparent vertices included)
 // still sees the disk, so the sun is counted once on every path. Shadow rays treat
 // glass as opaque, except the primary vertex's with kRenderFlagShadowTransmission
-// (TraceShadowTransmissive: straight through transparent and SSS voxels, attenuated).
+// (TraceShadowTransmissive: straight through transparent voxels, attenuated).
 // Such a primary NEE CLAIMS the light it saw through the media: every segment after a
 // transparent (delta) bounce vertex, up to the first opaque vertex, sees the sky without
 // the sun disk (sun NEE) and carries kSegmentLampNee without the MIS bit (light NEE:
@@ -1002,8 +1002,8 @@ float3 MaterialViewColor(uint block)
 // (the build's kernel variant caelix_path_trace_no_light_nee, render/caelix_path_trace_no_light_nee.hlsl,
 // which the renderer binds for frames without light NEE: the light NEE code holds registers and costs
 // occupancy even when its flags are 0). CAELIX_SPEC_NO_SUBSURFACE: no subsurface walk (kRenderFlagSubsurface
-// cleared; a measurement hook of the CAELIX_SUBSURFACE variants: the walk folds away, the SSS shadow ray
-// stays). CAELIX_SPEC_BOUNCE_NEE_COHERENT: the bounce NEE budget's decision per 8 x 8 workgroup,
+// cleared; a measurement hook of the CAELIX_SUBSURFACE variants: the walk folds away).
+// CAELIX_SPEC_BOUNCE_NEE_COHERENT: the bounce NEE budget's decision per 8 x 8 workgroup,
 // frame and bounce instead of per vertex (TracePath; a measurement hook, docs/LIGHT_NEE.md section 12.3).
 void SpecializeFrameConstants(inout CaelixFrameConstants fc)
 {

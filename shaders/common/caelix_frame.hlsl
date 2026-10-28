@@ -86,8 +86,7 @@ struct CaelixFrameConstants
     uint64_t group_grids;           // 576  group grid pool (u32 group index by entity grid cell)
     float bounce_nee_probability;   // 584  bounce vertices run their NEE with this probability (scaled by 1 / it)
     uint hint_patch_shift;          // 588  log2 of the light NEE visibility hint's patch (0 when the hint is off)
-    uint subsurface_present;        // 592  1 = the material table has an SSS entry (kBrickDdaShadowSssAware)
-    uint pad_596;                   // 596
+    uint64_t pad_592;               // 592
     uint64_t pad_600;               // 600 -> 608
 };
 

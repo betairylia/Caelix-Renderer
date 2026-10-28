@@ -257,14 +257,14 @@ struct Args {
     /// bounce rays, as in step 6a).
     #[arg(long)]
     no_sun_nee: bool,
-    /// Lighting modes: the primary vertex's NEE shadow rays (sun and lamps) stop at glass and SSS
-    /// voxels again, as at the bounce vertices (by default they pass them in a straight line,
-    /// attenuated: tinted glass casts coloured shadows; docs/SHADOW_TRANSMISSION.md).
+    /// Lighting modes: the primary vertex's NEE shadow rays (sun and lamps) stop at glass again, as
+    /// at the bounce vertices (by default they pass glass in a straight line, attenuated: tinted
+    /// glass casts coloured shadows; docs/SHADOW_TRANSMISSION.md).
     #[arg(long)]
     no_shadow_transmission: bool,
     /// Lighting modes: no subsurface scattering walk (by default a path vertex on an SSS material,
     /// sss_model 1 in the materials JSON, runs the Henyey-Greenstein walk with probability
-    /// sss_probability; docs/SUBSURFACE.md). The shadow rays still pass SSS voxels.
+    /// sss_probability; docs/SUBSURFACE.md). SSS voxels occlude shadow rays.
     #[arg(long)]
     no_sss: bool,
     /// Lighting modes: a lat-long (equirectangular) sky image, .exr or .hdr, converted to a

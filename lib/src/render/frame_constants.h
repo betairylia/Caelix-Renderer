@@ -89,8 +89,7 @@ struct FrameConstants
                                         //      by 1 / it (1 = every vertex; docs/LIGHT_NEE.md section 12.2)
     uint32_t hint_patch_shift;          // 588  log2 of the light NEE visibility hint's patch (0, 1, 2; 0 when
                                         //      the hint does not run; docs/LIGHT_NEE.md section 12.1)
-    uint32_t subsurface_present;        // 592  1 = the material table has an SSS entry (Scene::has_subsurface)
-    uint32_t pad_596;                   // 596
+    uint64_t pad_592;                   // 592
     uint64_t pad_600;                   // 600 -> 608
 };
 static_assert(sizeof(FrameConstants) == 608);
@@ -137,7 +136,6 @@ static_assert(offsetof(FrameConstants, reverse_tables) == 568);
 static_assert(offsetof(FrameConstants, group_grids) == 576);
 static_assert(offsetof(FrameConstants, bounce_nee_probability) == 584);
 static_assert(offsetof(FrameConstants, hint_patch_shift) == 588);
-static_assert(offsetof(FrameConstants, subsurface_present) == 592);
 static_assert(offsetof(FrameConstants, pad_600) == 600);
 
 // Hit distance written for "no hit" (a bounce that reaches the sky) and the length of bounce rays.

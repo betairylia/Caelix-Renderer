@@ -7,11 +7,10 @@
 //     w6 texture_set | connect_group << 16 (u16 each), w7 0;
 //   subsurface table (CaelixFrameConstants::subsurface_table), 32 bytes per code:
 //     w0 (1 - sss_albedo.r) | (1 - sss_albedo.g), w1 (1 - sss_albedo.b) | sss_anisotropy,
-//     w2 sss_steps (8 bits) | shadow_length << 16, w3 sss_probability | sss_model << 16 (8 bits; a
+//     w2 sss_steps (8 bits; bits 8..31 reserved, 0), w3 sss_probability | sss_model << 16 (8 bits; a
 //     mirror of hot w5), w4..w7 sss_params[0..7] in pairs.
-// The per-bounce read is one hot entry; the subsurface table is read only by the code that needs it
-// (the transmissive shadow ray of render/caelix_shadow_medium.hlsl, the subsurface walk of
-// render/caelix_subsurface.hlsl; both only in the kernels compiled with CAELIX_SUBSURFACE 1).
+// The per-bounce read is one hot entry; the subsurface table is read only by the subsurface walk of
+// render/caelix_subsurface.hlsl (only in the kernels compiled with CAELIX_SUBSURFACE 1).
 // CaelixMaterialSssWord reads the hot entry's sss word alone (the walk's vertex test).
 // The CPU side builds and uploads both (lib/src/scene/material_table.*); the decode of packed
 // colours, the glass palette and the host's table all live there.
@@ -32,7 +31,7 @@ struct CaelixMaterial
     float metallic;
     float ior;
     float extinction;
-    float sss_probability;  // the shadow rays read the subsurface entry's mirror (w3) instead
+    float sss_probability;  // the subsurface walk reads the subsurface entry's mirror (w3) inside a run
     uint sss_model;         // kSssModel*
 };
 
@@ -41,7 +40,6 @@ struct CaelixSubsurface
     float3 one_minus_albedo;
     float anisotropy;
     uint steps;
-    float shadow_length;  // voxels: a transmissive shadow ray dies after this distance in SSS voxels
     float probability;    // sss_probability
     uint model;           // sss_model (kSssModel*)
     float params[8];
@@ -131,7 +129,6 @@ CaelixSubsurface CaelixGetSubsurface(uint blk)
     s.one_minus_albedo = float3(CaelixHalfLo(w0.x), CaelixHalfHi(w0.x), CaelixHalfLo(w0.y));
     s.anisotropy = CaelixHalfHi(w0.y);
     s.steps = w0.z & 0xFFu;
-    s.shadow_length = CaelixHalfHi(w0.z);
     s.probability = CaelixHalfLo(w0.w);  // w0.w = w3 (kSubsurfaceProbability)
     s.model = (w0.w >> 16) & 0xFFu;
     CAELIX_UNROLL

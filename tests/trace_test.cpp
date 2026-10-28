@@ -14,7 +14,7 @@
 // lighting modes exactly (no exposure, outside the reference mean) and nothing else. Shadow
 // transmission: the primary vertex's sun and lamp shadow rays through a tinted glass slab carry its
 // transmittance, the claim keeps the refracted BSDF path from counting the sun twice, an SSS slab
-// attenuates by sss_albedo^l and kills the ray beyond its shadow length. The light NEE visibility hint
+// occludes like any opaque voxel. The light NEE visibility hint
 // converges to the sun visibility of a lit and a shadowed floor pixel and follows a turning camera.
 // Uses the public C ABI only.
 #include "test_scenes.h"
@@ -4156,7 +4156,7 @@ TEST_CASE("background: misses show the host image, hits do not, exposure and acc
 
 // ---------------------------------------------------------------------------
 // Shadow transmission (docs/SHADOW_TRANSMISSION.md): the primary vertex's NEE shadow rays pass
-// tinted glass and SSS voxels in a straight line, attenuated; the claim keeps the refracted BSDF path
+// tinted glass in a straight line, attenuated; the claim keeps the refracted BSDF path
 // from counting the sun twice.
 
 namespace {
@@ -4184,7 +4184,7 @@ CaelixMaterialEntry TintGlassEntry()
     return e;
 }
 
-// An opaque SSS entry: albedo 0.5, model HG, sss_albedo 0.8, 16 steps at g = 0 (shadow length 4).
+// An opaque SSS entry: albedo 0.5, model HG, sss_albedo 0.8, 16 steps at g = 0.
 CaelixMaterialEntry SssEntry(float probability)
 {
     CaelixMaterialEntry e{};
@@ -4363,7 +4363,7 @@ TEST_CASE("shadow transmission: tinted glass slab")
     CloseShadowRig(s);
 }
 
-TEST_CASE("shadow transmission: SSS slab budget")
+TEST_CASE("shadow transmission: SSS slab occludes")
 {
     ShadowRig s;
     OpenShadowRig(s);
@@ -4387,40 +4387,28 @@ TEST_CASE("shadow transmission: SSS slab budget")
     const CaelixCamera plain = LookDownFrom(16.0f, 4.0f, 48.0f);
     const CaelixCamera open_floor = LookDownFrom(48.0f, 4.0f, 48.0f);
 
-    // Flag on, 1 bounce: the NEE ray through 2 SSS voxels keeps 0.8^2 (budget 2 / 4); through 6 it dies
-    // after 4 voxels (budget 1); the plain block occludes.
-    const std::array<double, 3> lit = TransmissionReference(s.rig, s.renderer, s.set, open_floor, 1, true, true, 256, 4000);
-    const std::array<double, 3> thin_t = TransmissionReference(s.rig, s.renderer, s.set, thin, 1, true, true, 256, 5000);
+    // Flag on, 1 bounce: the transmissive NEE ray stops at the SSS slab (2 or 6 voxels thick) exactly as
+    // at the plain opaque block; only the open floor is lit.
+    const std::array<double, 3> lit = TransmissionReference(s.rig, s.renderer, s.set, open_floor, 1, true, true, 64, 4000);
+    const std::array<double, 3> thin_t = TransmissionReference(s.rig, s.renderer, s.set, thin, 1, true, true, 64, 5000);
     const float thin_max = CentreMax(s.color, 64);
     const std::array<double, 3> thick_t = TransmissionReference(s.rig, s.renderer, s.set, thick, 1, true, true, 64, 6000);
     const float thick_max = CentreMax(s.color, 64);
     const std::array<double, 3> plain_t = TransmissionReference(s.rig, s.renderer, s.set, plain, 1, true, true, 64, 7000);
     const float plain_max = CentreMax(s.color, 64);
-    std::printf("shadow transmission, SSS slab (sss_albedo 0.8, shadow length 4), probability 1: lit %.5f; 2 voxels "
-                "ratio %.5f (expected 0.64, max pixel ratio %.5f); 6 voxels ratio %.6f (max %.6f); plain block "
-                "%.6f (max %.6f)\n",
-                lit[0], thin_t[0] / lit[0], thin_max / lit[0], thick_t[0] / lit[0], thick_max, plain_t[0],
-                plain_max);
+    std::printf("shadow transmission, SSS slab occludes: lit %.5f; 2 voxels %.6f (max %.6f); 6 voxels %.6f (max "
+                "%.6f); plain block %.6f (max %.6f)\n",
+                lit[0], thin_t[0], thin_max, thick_t[0], thick_max, plain_t[0], plain_max);
     CHECK(lit[0] > 0.1);
     for (uint32_t c = 0; c < 3; ++c)
     {
-        CHECK(std::abs(thin_t[c] / lit[c] / 0.64 - 1.0) < 0.05);
-        CHECK(thick_t[c] / lit[c] < 0.01);
+        CHECK(thin_t[c] == 0.0);
+        CHECK(thick_t[c] == 0.0);
         CHECK(plain_t[c] == 0.0);
     }
+    CHECK(thin_max == 0.0f);
     CHECK(thick_max == 0.0f);
     CHECK(plain_max == 0.0f);
-
-    // Probability 0.5: half of the light enters the medium (0.32).
-    const CaelixMaterialEntry half = SssEntry(0.5f);
-    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &half, 1) == CAELIX_OK);
-    const std::array<double, 3> half_t = TransmissionReference(s.rig, s.renderer, s.set, thin, 1, true, true, 256, 8000);
-    std::printf("shadow transmission, SSS slab, probability 0.5: 2 voxels ratio %.5f (expected 0.32)\n",
-                half_t[0] / lit[0]);
-    for (uint32_t c = 0; c < 3; ++c)
-    {
-        CHECK(std::abs(half_t[c] / lit[c] / 0.32 - 1.0) < 0.05);
-    }
 
     // Flag off: the SSS slab occludes like any opaque voxel.
     const std::array<double, 3> off = TransmissionReference(s.rig, s.renderer, s.set, thin, 1, true, false, 16, 9000);
