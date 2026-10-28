@@ -203,6 +203,13 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                     static_cast<double>(options.voxel_id_tmax));
         return CAELIX_ERROR_INVALID_ARGUMENT;
     }
+    // 0 = 1 (every bounce vertex runs its NEE); else in (0, 1]. NaN fails both comparisons.
+    if (!(options.bounce_nee_probability >= 0.0f && options.bounce_nee_probability <= 1.0f))
+    {
+        CAELIX_LOGE("%s: bounce_nee_probability %g must be 0 or in (0, 1]", kFunction,
+                    static_cast<double>(options.bounce_nee_probability));
+        return CAELIX_ERROR_INVALID_ARGUMENT;
+    }
     if (options.sky.image != 0 &&
         (options.sky.format == VK_FORMAT_UNDEFINED || options.sky.size == 0 ||
          options.sky.mip_levels == 0 || options.sky.layout == VK_IMAGE_LAYOUT_UNDEFINED))
@@ -248,10 +255,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
             return query;
         }
     }
-    // DLSS RR replaces NRD and must not see checkerboard rendering (RR guide 3.5).
+    // DLSS RR replaces NRD and must not see checkerboard rendering (RR guide 3.5). The transmissive
+    // shadow rays exist only in the lighting modes.
     const bool ray_reconstruction = upscaling && options.upscaler == CAELIX_UPSCALER_DLSS_RR;
     const uint32_t flags =
-        ray_reconstruction ? (options.flags & ~CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) : options.flags;
+        (ray_reconstruction ? (options.flags & ~CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) : options.flags) &
+        (lighting ? ~0u : ~CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION);
 
     // The present targets (image != 0), in binding order.
     const CaelixTargetImage* const all[kTargetCount] = {&targets.color,  &targets.albedo, &targets.normal,
@@ -591,6 +600,13 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.entity_infos = scene_.entity_infos_address();
     constants.materials = scene_.materials_address();
     constants.subsurface_table = scene_.subsurface_address();
+    constants.reverse_tables = scene_.reverse_tables_address();
+    constants.group_grids = scene_.group_grids_address();
+    constants.subsurface_present = scene_.has_subsurface() ? 1u : 0u;
+    // docs/LIGHT_NEE.md section 12: no consumer yet (the visibility hint and the bounce NEE budget).
+    constants.hint_patch_shift = 0u;
+    constants.bounce_nee_probability =
+        options.bounce_nee_probability == 0.0f ? 1.0f : options.bounce_nee_probability;
     constants.light_tree = scene_.light_tree_address();
     constants.light_nee_flags = light_nee_flags;
     constants.records_per_page_shift = scene_.records_per_page_shift();

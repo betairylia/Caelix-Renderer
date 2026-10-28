@@ -590,8 +590,32 @@ TEST_CASE("materials: packing of the GPU hot and subsurface entries")
     caelix::PackMaterialSubsurface(m, sub);
     CHECK(sub[0] == h2(1.0f - m.sss_albedo[0], 1.0f - m.sss_albedo[1]));
     CHECK(sub[1] == h2(1.0f - m.sss_albedo[2], m.sss_anisotropy));
-    CHECK(sub[2] == m.sss_steps);
-    CHECK(sub[3] == 0u);
+    // w2: the steps and the shadow length sqrt(steps (1 + g) / (1 - g)); w3: the mirror of hot w5.
+    CHECK((sub[2] & 0xFFFFu) == m.sss_steps);
+    CHECK((sub[2] >> 16) == FloatToHalf(std::sqrt(200.0f * (1.0f - 0.4f) / (1.0f + 0.4f))));
+    CHECK(sub[3] == (hot[5] & 0x00FFFFFFu));
+    CHECK((sub[3] & 0xFFFFu) == FloatToHalf(m.sss_probability));
+    CHECK(((sub[3] >> 16) & 0xFFu) == m.sss_model);
+    {
+        // The shadow length: 16 steps at g = 0 is 4 voxels; g clamps to [-0.95, 0.95]; no steps, no length.
+        CaelixMaterial s16 = m;
+        s16.sss_steps = 16u;
+        s16.sss_anisotropy = 0.0f;
+        CHECK(caelix::SubsurfaceShadowLength(s16) == 4.0f);
+        s16.sss_anisotropy = 1.0f;
+        CHECK(caelix::SubsurfaceShadowLength(s16) == std::sqrt(16.0f * (1.0f + 0.95f) / (1.0f - 0.95f)));
+        s16.sss_anisotropy = -1.0f;
+        CHECK(caelix::SubsurfaceShadowLength(s16) == std::sqrt(16.0f * (1.0f + -0.95f) / (1.0f - -0.95f)));
+        s16.sss_steps = 0u;
+        CHECK(caelix::SubsurfaceShadowLength(s16) == 0.0f);
+        uint32_t packed[8] = {};
+        caelix::PackMaterialSubsurface(s16, packed);
+        CHECK(packed[2] == 0u);
+        s16.sss_steps = 16u;
+        s16.sss_anisotropy = 0.0f;
+        caelix::PackMaterialSubsurface(s16, packed);
+        CHECK(packed[2] == (16u | (0x4400u << 16)));  // h(4) = 0x4400
+    }
     for (int i = 0; i < 4; ++i)
     {
         CHECK(sub[4 + i] == h2(m.sss_params[2 * i], m.sss_params[2 * i + 1]));
@@ -599,5 +623,6 @@ TEST_CASE("materials: packing of the GPU hot and subsurface entries")
     CHECK(caelix::kSubsurfaceBytes == 32u);
     CHECK(caelix::kSubsurfaceAlbedo == 0u);
     CHECK(caelix::kSubsurfaceSteps == 2u * 4u);
+    CHECK(caelix::kSubsurfaceProbability == 3u * 4u);
     CHECK(caelix::kSubsurfaceParams == 4u * 4u);
 }

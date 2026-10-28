@@ -1,6 +1,7 @@
 # Materials (as built)
 
-Status: material compaction step, 2026-10-27. The truth for the C side is `include/caelix/caelix.h`
+Status: material compaction step, 2026-10-27; subsurface entry words 2 and 3 since the shadow
+transmission step, 2026-10-28 (`docs/SHADOW_TRANSMISSION.md`). The truth for the C side is `include/caelix/caelix.h`
 ("Materials"); this page describes the layouts behind it. History of the table: `STEP6D_MATERIALS_DELTA.md`.
 
 ## Rule
@@ -8,9 +9,13 @@ Status: material compaction step, 2026-10-27. The truth for the C side is `inclu
 The per-bounce read is one 32-byte hot entry. Subsurface (SSS) and texture data live in side
 tables, read only by the code that needs them. The GPU stores floats as IEEE halves.
 
-No kernel reads the subsurface table, `sss_model`, `sss_probability`, `texture_set` or
-`connect_group` yet. They are validated, stored, uploaded and readable on the GPU
-(`CaelixGetSubsurface`, `CaelixMaterial::sss_probability` / `sss_model` in HLSL).
+The transmissive shadow ray (`CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION`,
+`shaders/render/caelix_shadow_medium.hlsl`) is the first reader of the subsurface table: an SSS voxel
+is an opaque code whose entry has `sss_model` = `CAELIX_SSS_MODEL_HG` (1), `sss_probability` > 0
+(and, for `MaterialTable::has_subsurface`, `sss_steps` > 0); the ray reads w0..w3 of its subsurface
+entry. No kernel reads `sss_params`, `texture_set` or `connect_group` yet; the subsurface walk comes
+with `docs/SUBSURFACE.md`. `MaterialTable` counts the SSS entries (`has_subsurface()`, exposed by
+`Scene::has_subsurface()` and as `FrameConstants::subsurface_present`).
 
 ## C ABI: `CaelixMaterial` (112 bytes)
 
@@ -25,7 +30,7 @@ The host's view: every float linear, and `caelix_scene_get_material` returns exa
 | 28 | `float metallic` | finite |
 | 32 | `float ior` | > 0 |
 | 36 | `float extinction` | >= 0 |
-| 40 | `uint32_t sss_model` | 0..255, 0 = none |
+| 40 | `uint32_t sss_model` | 0..255: `CAELIX_SSS_MODEL_NONE` 0, `CAELIX_SSS_MODEL_HG` 1; others act as none |
 | 44 | `float sss_probability` | 0..1 |
 | 48 | `float sss_albedo[3]` | 0..1 each |
 | 60 | `float sss_anisotropy` | -1..1 |
@@ -68,11 +73,16 @@ Subsurface entry, 32 bytes (`FrameConstants::subsurface_table`, offset 560; `Cae
 | --- | --- | --- |
 | w0 | 0 (`kSubsurfaceAlbedo`) | h(1 - sss_albedo.r) \| h(1 - sss_albedo.g) << 16 |
 | w1 | 4 | h(1 - sss_albedo.b) \| h(sss_anisotropy) << 16 |
-| w2 | 8 (`kSubsurfaceSteps`) | sss_steps (8 bits; bits 8..31 reserved, 0) |
-| w3 | 12 | 0 |
+| w2 | 8 (`kSubsurfaceSteps`) | sss_steps (8 bits; bits 8..15 reserved, 0) \| h(shadow_length) << 16 |
+| w3 | 12 (`kSubsurfaceProbability`) | h(sss_probability) \| sss_model << 16 (8 bits; bits 24..31 0): a mirror of hot w5 |
 | w4..w7 | 16 (`kSubsurfaceParams`) | h(sss_params[2i]) \| h(sss_params[2i + 1]) << 16 |
 
 The albedo is stored as one minus albedo: an albedo near 1 keeps more precision as a half.
+`shadow_length` = sqrt(sss_steps (1 + g) / (1 - g)) voxels with g = sss_anisotropy clamped to
+[-0.95, 0.95] (the RMS end-to-end distance of a persistent random walk; 0 when sss_steps is 0),
+computed by `SubsurfaceShadowLength` (`material_pack.h`). With w3 a voxel's whole SSS state is one
+16-byte load (w0..w3); the vertex test of the shadow DDA (`ShadowVoxelIsSubsurface`) loads w3 alone.
+`CaelixGetSubsurface` returns all of it (`shadow_length`, `probability`, `model`).
 
 `CaelixMaterialEmission(table, code)` reads only the emission (one 8-byte load); the light NEE
 (`LampEmission`) and the light tree build use it. The layout constants are mirrored in C++

@@ -77,6 +77,13 @@ public:
     {
         return encoding_;
     }
+    // The table has an SSS entry: an opaque code with sss_model CAELIX_SSS_MODEL_HG, sss_probability > 0
+    // and sss_steps > 0 (docs/SUBSURFACE.md section 1). Transmissive shadow rays then pass SSS voxels
+    // (FrameConstants::subsurface_present).
+    bool has_subsurface() const
+    {
+        return subsurface_count_ > 0;
+    }
 
     // Checks one entry (finite floats within the half range, ior > 0, extinction >= 0,
     // the subsurface and texture ranges of caelix.h). False: `reason` names the first problem.
@@ -106,8 +113,11 @@ public:
 private:
     // The built-in entry of `code` with the current glass palette.
     CaelixMaterial BuiltIn(uint32_t code) const;
-    // Stores `material` at `code` (reserved zeroed) and packs its GPU entries; does not mark dirty.
+    // Stores `material` at `code` (reserved zeroed), packs its GPU entries and keeps
+    // subsurface_count_; does not mark dirty.
     void Store(uint32_t code, const CaelixMaterial& material);
+    // The entry `material` at `code` is an SSS entry (see has_subsurface).
+    bool IsSubsurface(uint32_t code, const CaelixMaterial& material) const;
     void MarkDirty(uint32_t first_code, uint32_t end_code);
 
     uint32_t encoding_ = 0;
@@ -116,6 +126,7 @@ private:
     std::vector<uint32_t> hot_;                  // kEntries * kEntryWords: the GPU hot table
     std::vector<uint32_t> subsurface_;           // kEntries * kEntryWords: the GPU subsurface table
     uint64_t dirty_chunks_ = ~0ull;
+    uint32_t subsurface_count_ = 0;  // entries for which IsSubsurface holds
 };
 
 }  // namespace caelix

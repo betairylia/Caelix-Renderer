@@ -4,6 +4,8 @@
 // (shaders/common/caelix_material.hlsl). Header-only, so the tests can check the packing directly.
 #include "caelix/caelix.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -28,13 +30,20 @@ constexpr uint32_t kMaterialTexture = 24;
 // The GPU subsurface entry: 8 words.
 //   w0 @0  h(1 - sss_albedo.r) | h(1 - sss_albedo.g) << 16
 //   w1 @4  h(1 - sss_albedo.b) | h(sss_anisotropy) << 16
-//   w2 @8  sss_steps & 0xFF (bits 8..31 reserved, 0)
-//   w3 @12 0
+//   w2 @8  sss_steps & 0xFF | h(shadow length) << 16 (bits 8..15 reserved, 0; SubsurfaceShadowLength)
+//   w3 @12 h(sss_probability) | (sss_model & 0xFF) << 16 (a mirror of hot w5: one 16-byte load of
+//          w0..w3 gives a voxel's whole SSS state; bits 24..31 0)
 //   w4..w7 @16 h(sss_params[2i]) | h(sss_params[2i + 1]) << 16
 constexpr uint32_t kSubsurfaceBytes = 32;
 constexpr uint32_t kSubsurfaceAlbedo = 0;
 constexpr uint32_t kSubsurfaceSteps = 8;
+constexpr uint32_t kSubsurfaceProbability = 12;
 constexpr uint32_t kSubsurfaceParams = 16;
+// Bit position of the shadow length half in w2 and of the model in w3.
+constexpr uint32_t kSubsurfaceShadowLengthShift = 16;
+constexpr uint32_t kSubsurfaceModelShift = 16;
+// The anisotropy clamp of the shadow length (|g| -> 1 would make the length infinite).
+constexpr float kSubsurfaceShadowMaxAnisotropy = 0.95f;
 
 // The largest finite half.
 constexpr float kHalfMax = 65504.0f;
@@ -99,13 +108,29 @@ inline void PackMaterialHot(const CaelixMaterial& m, uint32_t out[8])
     out[7] = 0;
 }
 
+// The shadow length of `m` in voxels (docs/SHADOW_TRANSMISSION.md section 2): the RMS end-to-end
+// distance of a persistent random walk of sss_steps steps, sqrt(steps (1 + g) / (1 - g)) with g =
+// sss_anisotropy clamped to [-0.95, 0.95]; 0 when sss_steps is 0. A transmissive shadow ray dies
+// after this distance in SSS voxels.
+inline float SubsurfaceShadowLength(const CaelixMaterial& m)
+{
+    const uint32_t steps = m.sss_steps & 0xFFu;
+    if (steps == 0)
+    {
+        return 0.0f;
+    }
+    const float g = std::clamp(m.sss_anisotropy, -kSubsurfaceShadowMaxAnisotropy, kSubsurfaceShadowMaxAnisotropy);
+    return std::sqrt(static_cast<float>(steps) * (1.0f + g) / (1.0f - g));
+}
+
 // The subsurface entry of `m` (layout above).
 inline void PackMaterialSubsurface(const CaelixMaterial& m, uint32_t out[8])
 {
     out[0] = PackHalf2(1.0f - m.sss_albedo[0], 1.0f - m.sss_albedo[1]);
     out[1] = PackHalf2(1.0f - m.sss_albedo[2], m.sss_anisotropy);
-    out[2] = m.sss_steps & 0xFFu;
-    out[3] = 0;
+    out[2] = (m.sss_steps & 0xFFu) |
+             (static_cast<uint32_t>(FloatToHalf(SubsurfaceShadowLength(m))) << kSubsurfaceShadowLengthShift);
+    out[3] = static_cast<uint32_t>(FloatToHalf(m.sss_probability)) | ((m.sss_model & 0xFFu) << kSubsurfaceModelShift);
     for (uint32_t i = 0; i < 4; ++i)
     {
         out[4 + i] = PackHalf2(m.sss_params[2 * i], m.sss_params[2 * i + 1]);

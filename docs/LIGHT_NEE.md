@@ -64,7 +64,8 @@ unoccluded contributions (no visibility hint): `pick_sun = u w_sum < w_sun`, and
 contribution is multiplied by `w_sum / w_kept`. So `E = C_s V_s + C_l V_l` stays unbiased. The lamp
 candidate stays live through the sun's draw (its evaluation is the expensive one); a kept sun candidate
 is drawn again from its saved random state. One shadow ray toward the kept candidate (glass occludes,
-as for the sun NEE). The segment that leaves the vertex sees the sky without the sun disk when the sun
+as for the sun NEE; at the primary vertex with `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` the ray passes
+glass and SSS voxels, attenuated, docs/SHADOW_TRANSMISSION.md). The segment that leaves the vertex sees the sky without the sun disk when the sun
 NEE runs (as without light NEE).
 
 ## 4. MIS with the BSDF path
@@ -90,7 +91,9 @@ rounding of the two pdf walks (the draw multiplies its choices top-down, the eva
 measured: relative pdf difference at most 2.8e-7, weight sum within 1.4e-7 of 1). `LightNeeMisWeight`
 handles the degenerate inputs the same way on both sides: `cos_l <= 0` or a non-finite `p_sa` counts as
 `+inf` (NEE 1, BSDF 0), both densities 0 as NEE 0, BSDF 1. Segments that leave a specular or
-transparent vertex carry no state and count every emission.
+transparent vertex carry no state and count every emission, except after a transmissive primary NEE
+(the claim of docs/SHADOW_TRANSMISSION.md section 1: through transparent vertices the state stays
+`kSegmentLampNee` without the MIS bit).
 
 ## 5. The near field
 
@@ -122,7 +125,8 @@ frame-constant kernels.
 
 Registers (`CAELIX_PIPELINE_STATS=1`, RTX 5080, driver 610.88): `caelix_path_trace` 128 registers and
 16 bytes of spill (driver binary 174976 bytes, shared memory 2560 bytes), `caelix_path_trace_no_light_nee`
-96 and 48 bytes of spill. Both equal the kernels of `18282cd`: the SPIR-V function bodies are the same
+96 and 48 bytes of spill (since the shadow transmission step both are 128 registers + 16 bytes:
+docs/SHADOW_TRANSMISSION.md section 8). Both equal the kernels of `18282cd`: the SPIR-V function bodies are the same
 instructions modulo id numbering, except the two flag bit values (`kLightNeeContribute` 2 -> `kLightNeeOn`
 1, `kLightNeeMis` 8 -> 2); `Artifacts/light-nee-variants-20261024/cleanup/spirv/compare.txt`.
 

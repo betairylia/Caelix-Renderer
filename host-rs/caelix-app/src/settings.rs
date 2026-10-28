@@ -231,6 +231,8 @@ pub struct RenderSettings {
     pub denoise: bool,
     /// Lighting modes: sun next-event estimation.
     pub sun_nee: bool,
+    /// Lighting modes: the primary vertex's NEE shadow rays pass glass and SSS voxels, attenuated.
+    pub shadow_transmission: bool,
     /// Pt mode: the delta checkerboard at the first glass interface, with the cross resolve.
     pub checkerboard: bool,
     /// Lighting modes: the sky where the primary ray misses.
@@ -314,6 +316,9 @@ impl RenderSettings {
         if lighting && self.sun_nee {
             flags |= CAELIX_RENDER_FLAG_SUN_NEE;
         }
+        if lighting && self.shadow_transmission {
+            flags |= CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION;
+        }
         if self.mode == Mode::Pt && self.checkerboard {
             flags |= CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD;
         }
@@ -359,7 +364,9 @@ impl RenderSettings {
             upscale_preset: if upscaling { self.upscale_preset } else { 0 },
             upscale_flags,
             voxel_id_tmax: self.voxel_id_tmax,
-            reserved_voxel_id: [0; 3],
+            // 0 = every bounce vertex runs its NEE (docs/LIGHT_NEE.md section 12; no kernel reads it yet).
+            bounce_nee_probability: 0.0,
+            reserved: [0; 2],
         }
     }
 
@@ -404,4 +411,5 @@ pub fn same_options(a: &CaelixRenderOptions, b: &CaelixRenderOptions) -> bool {
         && a.upscale_preset == b.upscale_preset
         && a.upscale_flags == b.upscale_flags
         && a.voxel_id_tmax == b.voxel_id_tmax
+        && a.bounce_nee_probability == b.bounce_nee_probability
 }

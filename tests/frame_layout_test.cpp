@@ -830,7 +830,10 @@ TEST_CASE("layout constants: every HLSL layout constant equals the C++ constant 
         CAELIX_CONSTANT(kSubsurfaceBytes),
         CAELIX_CONSTANT(kSubsurfaceAlbedo),
         CAELIX_CONSTANT(kSubsurfaceSteps),
+        CAELIX_CONSTANT(kSubsurfaceProbability),
         CAELIX_CONSTANT(kSubsurfaceParams),
+        {"kSssModelNone", CAELIX_SSS_MODEL_NONE},
+        {"kSssModelHg", CAELIX_SSS_MODEL_HG},
         // shaders/common/caelix_light_tree_layout.hlsl: lib/src/light/light_tree_layout.h
         CAELIX_CONSTANT(kLtNone),
         CAELIX_CONSTANT(kLtTrees),

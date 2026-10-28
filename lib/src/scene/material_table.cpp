@@ -186,9 +186,17 @@ bool MaterialTable::Valid(const CaelixMaterial& material, const char*& reason)
     return true;
 }
 
+bool MaterialTable::IsSubsurface(uint32_t code, const CaelixMaterial& material) const
+{
+    return BlockIsOpaque(code, encoding_) && material.sss_model == CAELIX_SSS_MODEL_HG &&
+           material.sss_probability > 0.0f && material.sss_steps > 0;
+}
+
 void MaterialTable::Store(uint32_t code, const CaelixMaterial& material)
 {
     CaelixMaterial& m = entries_[code];
+    subsurface_count_ -= IsSubsurface(code, m) ? 1u : 0u;
+    subsurface_count_ += IsSubsurface(code, material) ? 1u : 0u;
     m = material;
     m.reserved = 0;
     const size_t word = static_cast<size_t>(code) * kEntryWords;

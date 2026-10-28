@@ -151,6 +151,9 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/light/bvh/caelix_light_bvh_finish.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_brick_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_scene_trace.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_ray.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_voxel_cursor.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shadow_medium.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_nee.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_path_trace.hlsl

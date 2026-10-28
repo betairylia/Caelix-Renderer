@@ -14,11 +14,13 @@ size_t caelix_abi_c99_touch(void);
 typedef char caelix_material_is_112_bytes[(sizeof(CaelixMaterial) == 112) ? 1 : -1];
 typedef char caelix_material_entry_is_116_bytes[(sizeof(CaelixMaterialEntry) == 116) ? 1 : -1];
 /* CaelixRenderOptions is embedded by value in host packets (the Unity plugin): 208 bytes, the sky
-   cubemap at offset 152, the upscaler fields from offset 176, voxel_id_tmax at 192. */
+   cubemap at offset 152, the upscaler fields from offset 176, voxel_id_tmax at 192,
+   bounce_nee_probability at 196. */
 typedef char caelix_render_options_is_208_bytes[(sizeof(CaelixRenderOptions) == 208) ? 1 : -1];
 typedef char caelix_voxel_id_tmax_at_192[(offsetof(CaelixRenderOptions, voxel_id_tmax) == 192) ? 1 : -1];
 typedef char caelix_sky_cubemap_at_152[(offsetof(CaelixRenderOptions, sky) == 152) ? 1 : -1];
 typedef char caelix_upscaler_at_176[(offsetof(CaelixRenderOptions, upscaler) == 176) ? 1 : -1];
+typedef char caelix_bounce_nee_probability_at_196[(offsetof(CaelixRenderOptions, bounce_nee_probability) == 196) ? 1 : -1];
 /* The light NEE options and stats: 16 bytes each. */
 typedef char caelix_light_nee_options_is_16_bytes[(sizeof(CaelixLightNeeOptions) == 16) ? 1 : -1];
 typedef char caelix_light_nee_stats_is_16_bytes[(sizeof(CaelixLightNeeStats) == 16) ? 1 : -1];
@@ -37,7 +39,8 @@ size_t caelix_abi_c99_touch(void)
     CaelixBrickInfo info = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     CaelixCamera camera = {{0.0f, 0.0f, 0.0f}, 0.0f, {1.0f, 0.0f, 0.0f}, 0.0f, {0.0f, 1.0f, 0.0f}, 0.0f, {0.0f, 0.0f, 1.0f}, 0.0f, 0.577f, 1.0f, 0.1f, 1000.0f, {1.732f, 0.0f, 0.0f, 0.0f, 0.0f, 1.732f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.1f, 0.0f}};
     CaelixRenderOptions options = {CAELIX_VIEW_ALBEDO,
-                                   CAELIX_RENDER_FLAG_SHADING | CAELIX_RENDER_FLAG_SKY_ON_MISS,
+                                   CAELIX_RENDER_FLAG_SHADING | CAELIX_RENDER_FLAG_SKY_ON_MISS |
+                                       CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION,
                                    {0.0f, 1.0f, 0.0f},
                                    0.0f,
                                    {0.5f, 0.7f, 0.9f},
@@ -56,7 +59,7 @@ size_t caelix_abi_c99_touch(void)
                                    {0.25f, 0.22f, 0.2f},
                                    1,
                                    CAELIX_MAX_BOUNCES_TRANSPARENT};
-    CaelixMaterial material = {{1.0f, 1.0f, 1.0f}, 1.0f, {0.0f, 0.0f, 0.0f}, 0.0f, 1.55f, 0.0f, 0u, 0.0f,
+    CaelixMaterial material = {{1.0f, 1.0f, 1.0f}, 1.0f, {0.0f, 0.0f, 0.0f}, 0.0f, 1.55f, 0.0f, CAELIX_SSS_MODEL_NONE, 0.0f,
                                {0.0f, 0.0f, 0.0f}, 0.0f, 0u, {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
                                0u, 0u, 0u};
     CaelixRenderTargets targets = {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}};
@@ -88,7 +91,8 @@ size_t caelix_abi_c99_touch(void)
                  sizeof(caelix_render_options_is_208_bytes) + sizeof(caelix_voxel_id_tmax_at_192) +
                  sizeof(caelix_sky_cubemap_at_152) + sizeof(caelix_upscaler_at_176) + sizeof(upscaler_query) +
                  sizeof(upscaler_result) + sizeof(upscaler_info) + sizeof(upscaler) + sizeof(quality) +
-                 sizeof(reason) + upscale_flags;
+                 sizeof(reason) + upscale_flags + sizeof(caelix_bounce_nee_probability_at_196) +
+                 CAELIX_SSS_MODEL_HG;
     /* Take the address of every function so a declaration typo fails to compile. Casts between
        function pointer types are valid C; the pointers are never called. */
     CaelixLightNeeOptions nee_options = {1, CAELIX_LIGHT_NEE_FLAG_NO_MIS, {0, 0}};

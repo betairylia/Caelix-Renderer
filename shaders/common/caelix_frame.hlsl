@@ -1,6 +1,6 @@
 // Per-frame constants of the trace, composite, cross resolve, sky SH, upscale encode and voxel id
 // kernels.
-// Mirrors lib/src/render/frame_constants.h; change both together. 576 bytes, read as the uniform
+// Mirrors lib/src/render/frame_constants.h; change both together. 608 bytes, read as the uniform
 // buffer g_frame (common/caelix_frame_ubo.hlsl: set 1, binding 0).
 // Layout rule: the uniform block gets DXC's default constant buffer layout, which gives the C
 // offsets only while every field sits at an offset that is a multiple of its size, no vector
@@ -82,7 +82,13 @@ struct CaelixFrameConstants
     uint light_nee_flags;           // 552  kLightNee*: the light NEE of this frame (0 = off)
     uint background;                // 556  1 = the composite writes g_background (composite binding 12) at misses
     uint64_t subsurface_table;      // 560  packed subsurface entry (32 B) by block code (common/caelix_material.hlsl)
-    uint64_t pad_568;               // 568 -> 576
+    uint64_t reverse_tables;        // 568  reverse table pool (u16 dense id by group-local brick position)
+    uint64_t group_grids;           // 576  group grid pool (u32 group index by entity grid cell)
+    float bounce_nee_probability;   // 584  bounce vertices run their NEE with this probability (no consumer yet)
+    uint hint_patch_shift;          // 588  log2 of the light NEE hint patch (no consumer yet, 0)
+    uint subsurface_present;        // 592  1 = the material table has an SSS entry (kBrickDdaShadowSssAware)
+    uint pad_596;                   // 596
+    uint64_t pad_600;               // 600 -> 608
 };
 
 // CaelixDebugView
@@ -115,6 +121,7 @@ static const uint kRenderFlagSkyOnMiss = 1u << 1;
 static const uint kRenderFlagSunNee = 1u << 2;
 static const uint kRenderFlagDeltaCheckerboard = 1u << 3;
 static const uint kRenderFlagFlipY = 1u << 4;
+static const uint kRenderFlagShadowTransmission = 1u << 6;
 
 // CaelixFrameConstants::light_nee_flags (lib/src/render/frame_constants.h). Macros: a static const here
 // would add constants to the five other frame-constant kernels, which never read them.

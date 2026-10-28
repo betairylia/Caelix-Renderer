@@ -257,6 +257,11 @@ struct Args {
     /// bounce rays, as in step 6a).
     #[arg(long)]
     no_sun_nee: bool,
+    /// Lighting modes: the primary vertex's NEE shadow rays (sun and lamps) stop at glass and SSS
+    /// voxels again, as at the bounce vertices (by default they pass them in a straight line,
+    /// attenuated: tinted glass casts coloured shadows; docs/SHADOW_TRANSMISSION.md).
+    #[arg(long)]
+    no_shadow_transmission: bool,
     /// Lighting modes: a lat-long (equirectangular) sky image, .exr or .hdr, converted to a
     /// mipmapped cubemap and used instead of the procedural sky (the Render window switches back).
     /// Orientation (world Y up): the image centre faces +Z, u grows toward +X, the top row is up;
@@ -2034,7 +2039,7 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!(
         "mode {mode:?}, bounces {}, transparent bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, \
-         sun NEE {}, denoise {}, sky {}, fog density {} colour {:?}, emission scale {}, \
+         sun NEE {}, shadow transmission {}, denoise {}, sky {}, fog density {} colour {:?}, emission scale {}, \
          upscaler {:?}, upscale quality {:?}, upscale preset {}, upscale auto exposure {}, jitter phases {}, \
          window {}x{}",
         args.bounces,
@@ -2043,6 +2048,7 @@ fn main() -> anyhow::Result<()> {
         !args.no_sky_on_miss,
         args.sun_radiance,
         !args.no_sun_nee,
+        !args.no_shadow_transmission,
         mode == Mode::Pt && !args.no_denoise,
         args.sky.as_deref().map_or_else(|| "procedural".into(), |p| p.display().to_string()),
         args.fog_density,
@@ -2082,6 +2088,7 @@ fn main() -> anyhow::Result<()> {
         bounces_transparent: args.bounces_transparent,
         denoise: !args.no_denoise,
         sun_nee: !args.no_sun_nee,
+        shadow_transmission: !args.no_shadow_transmission,
         checkerboard: !args.no_checkerboard,
         sky_on_miss: !args.no_sky_on_miss,
         shading: !args.no_shading,

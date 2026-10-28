@@ -16,7 +16,8 @@
 // fc.fog_color.w and radiance fc.fog_color.rgb on every segment that ends on a surface.
 //
 // Ported from Unity (Caelix/Runtime/Rendering/Shaders):
-//   Utils/Utils.hlsl                      K_T_MAX, K_RAY_ORIGIN_PUSH_OFF, FresnelReflectAmountOpaque,
+//   Utils/Utils.hlsl                      K_T_MAX, K_RAY_ORIGIN_PUSH_OFF (render/caelix_ray.hlsl),
+//                                         FresnelReflectAmountOpaque,
 //                                         FresnelReflectAmountTransparent
 //   Utils/BlueNoise.hlsl                  RandomFloat01 / RandomUnitVector semantics (inout state)
 //   PathTrace_full/CaelixPathTraceCommon.hlsl  CaelixShadeVoxelHit, AdvanceDeltaRay (interface),
@@ -33,6 +34,8 @@
 #include "common/caelix_frame.hlsl"
 #include "common/caelix_block.hlsl"
 #include "common/caelix_material.hlsl"
+// K_RAY_ORIGIN_PUSH_OFF.
+#include "render/caelix_ray.hlsl"
 
 #ifdef CAELIX_SKY_BINDING_IMAGE
 CAELIX_BINDING(CAELIX_SKY_BINDING_IMAGE, 0) TextureCube<float4> g_sky;
@@ -44,8 +47,6 @@ static float g_emissionScale;
 
 static const float K_PI = 3.1415926535f;
 static const float K_TWO_PI = 6.283185307f;
-// Unity Utils.hlsl: K_RAY_ORIGIN_PUSH_OFF 0.002 (world units along the normal).
-static const float K_RAY_ORIGIN_PUSH_OFF = 0.002f;
 // Largest finite FP16 value: radiance written to the RGBA16F targets is clamped to it.
 static const float kHalfMax = 65504.0f;
 

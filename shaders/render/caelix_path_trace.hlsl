@@ -24,6 +24,9 @@
 //                   caelix_composite.hlsl.
 //                   With kRenderFlagSunNee every diffuse vertex also samples the
 //                   sun cone and traces a shadow ray (TracePath, SunNextEvent).
+//                   With kRenderFlagShadowTransmission the shadow rays of the PRIMARY
+//                   vertex (sun and lamps) pass transparent and SSS voxels in a
+//                   straight line (TraceShadowTransmissive, docs/SHADOW_TRANSMISSION.md).
 //                   Before the shading, the delta chain (RunDeltaChain, Unity's
 //                   AdvanceDeltaRay loop) carries the camera ray through up to
 //                   bounce_count_transparent smooth transparent interfaces
@@ -152,7 +155,11 @@ bool PreviousPixel(CaelixFrameConstants fc, float3 p, out float2 pixel, out floa
 // 1 / omega) and a shadow ray. Returns the demodulated incident radiance of the
 // Lambert lobe, sun_radiance * omega * dot(N, L) / pi when L is unoccluded, else 0
 // (the albedo of the vertex is in the caller's throughput, as for the bounces).
-float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout uint rng)
+// `transmissive`: the shadow ray is TraceShadowTransmissive from the medium `medium` (the
+// transparent id the vertex lies in, 0 = air) and the radiance is multiplied by its
+// transmittance; else TraceShadow (any voxel occludes).
+float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, bool transmissive, uint medium,
+                    inout uint rng)
 {
     const float3 L = SampleSunDirection(fc, rng);
     const float cos_l = dot(normal, L);
@@ -165,11 +172,17 @@ float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, inout
     shadow.Direction = L;
     shadow.TMin = 0.0f;
     shadow.TMax = kRayTMax;
-    if (TraceShadow(fc, shadow))
+    float3 transmittance = float3(1.0f, 1.0f, 1.0f);
+    CAELIX_BRANCH
+    if (transmissive)
+    {
+        transmittance = TraceShadowTransmissive(fc, shadow, medium);
+    }
+    else if (TraceShadow(fc, shadow))
     {
         return float3(0.0f, 0.0f, 0.0f);
     }
-    return fc.sun_radiance.xyz * (fc.sun_solid_angle * cos_l * (1.0f / K_PI));
+    return fc.sun_radiance.xyz * (fc.sun_solid_angle * cos_l * (1.0f / K_PI)) * transmittance;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,9 +303,11 @@ NeeCandidate LampCandidate(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint
 // Next-event estimation at a diffuse vertex with light NEE (pushed-off receiver x_r, world normal
 // n_r): the lamp candidate, the sun candidate when `sun` (the sun NEE runs at this vertex), the choice
 // between them and one shadow ray. Returns the demodulated radiance (the caller multiplies the
-// throughput) and the state of the segment that leaves the vertex.
-float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool sun, inout uint nee_rng,
-                         inout uint light_rng, out uint segment_light)
+// throughput) and the state of the segment that leaves the vertex. `transmissive`: the shadow ray is
+// TraceShadowTransmissive from the medium `medium` and the kept candidate's radiance is multiplied by
+// its transmittance (the choice still uses the unoccluded contributions); else TraceShadow.
+float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool sun, bool transmissive,
+                         uint medium, inout uint nee_rng, inout uint light_rng, out uint segment_light)
 {
     const uint point_seed = RandomU32(light_rng);
     const bool mis = (fc.light_nee_flags & kLightNeeMis) != 0u;
@@ -327,10 +342,16 @@ float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool s
         shadow.Direction = c.direction;
         shadow.TMin = 0.0f;
         shadow.TMax = c.t_max;
-        const bool visible = c.t_max > 0.0f && !TraceShadow(fc, shadow);
+        const bool visible = c.t_max > 0.0f && (transmissive || !TraceShadow(fc, shadow));
         if (visible)
         {
-            radiance = c.contribution * (w_sum / (pick_sun ? w_sun : w_lamp));
+            float3 transmittance = float3(1.0f, 1.0f, 1.0f);
+            CAELIX_BRANCH
+            if (transmissive)
+            {
+                transmittance = TraceShadowTransmissive(fc, shadow, medium);
+            }
+            radiance = c.contribution * (w_sum / (pick_sun ? w_sun : w_lamp)) * transmittance;
         }
     }
     return radiance;
@@ -502,8 +523,15 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // segment that leaves such a vertex sees the sky without the sun disk; a segment
 // that leaves a specular-lobe vertex (no NEE there, transparent vertices included)
 // still sees the disk, so the sun is counted once on every path. Shadow rays treat
-// glass as opaque. NEE draws from its own random stream, so the BSDF path consumes
-// the same random numbers with NEE on or off.
+// glass as opaque, except the primary vertex's with kRenderFlagShadowTransmission
+// (TraceShadowTransmissive: straight through transparent and SSS voxels, attenuated).
+// Such a primary NEE CLAIMS the light it saw through the media: every segment after a
+// transparent (delta) bounce vertex, up to the first opaque vertex, sees the sky without
+// the sun disk (sun NEE) and carries kSegmentLampNee without the MIS bit (light NEE:
+// LampHitWeight counts a lamp the tree can sample beyond the near field as 0), so the
+// refracted BSDF path does not count that light a second time
+// (docs/SHADOW_TRANSMISSION.md section 1). NEE draws from its own random stream, so the
+// BSDF path consumes the same random numbers with NEE on or off.
 CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
                             uint medium, inout uint rng, out float4 stochastic)
 {
@@ -531,22 +559,29 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     bool segment_diffuse = !primary_shade.specular_lobe;
     float segment_roughness = primary_shade.roughness;
 
-    // NEE at the primary vertex (demodulated: throughput 1 / k).
+    // NEE at the primary vertex (demodulated: throughput 1 / k). With kRenderFlagShadowTransmission its
+    // shadow rays start in `medium` (an opaque primary leaves it unchanged) and pass the media; such an
+    // NEE claims the light it saw through them (`claim`, see above).
+    const bool transmissive = (fc.flags & kRenderFlagShadowTransmission) != 0u;
+    bool claim = false;
     bool segment_sees_sun = true;
     CAELIX_BRANCH
     if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
     {
-        radiance += NextEventAtVertex(fc, primary_shade.bounce_origin, surface.normal, nee, nee_rng,
-                                      light_rng, segment_light) * throughput;
+        radiance += NextEventAtVertex(fc, primary_shade.bounce_origin, surface.normal, nee, transmissive, medium,
+                                      nee_rng, light_rng, segment_light) * throughput;
         segment_sees_sun = !nee;
+        claim = transmissive;
     }
     else
     {
         CAELIX_BRANCH
         if (nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
         {
-            radiance += SunNextEvent(fc, primary_shade.bounce_origin, surface.normal, nee_rng) * throughput;
+            radiance += SunNextEvent(fc, primary_shade.bounce_origin, surface.normal, transmissive, medium,
+                                     nee_rng) * throughput;
             segment_sees_sun = false;
+            claim = transmissive;
         }
     }
 
@@ -580,9 +615,10 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
             first_segment_t = hit.T;
             first_segment = false;
         }
+        const uint hit_block = (hit.attrib >> 16) & 0xFFFFu;
         const CaelixShadeResult shade =
-            ShadeVoxelHit((hit.attrib >> 16) & 0xFFFFu, bounce.Origin + bounce.Direction * hit.T,
-                          bounce.Direction, hit.normal, rng, medium);
+            ShadeVoxelHit(hit_block, bounce.Origin + bounce.Direction * hit.T, bounce.Direction, hit.normal, rng,
+                          medium);
         bounce_index += 1;
 
         // A lamp's emission on a segment that left a lamp NEE vertex: the BSDF's MIS weight
@@ -598,11 +634,27 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
 
         segment_sees_sun = true;
         segment_light = 0u;
+        // The claim of a transmissive primary NEE: through a transparent vertex the next segment sees
+        // neither the sun disk (sun NEE) nor, beyond the near field, a lamp the light tree can sample
+        // (kSegmentLampNee without the MIS bit); an opaque vertex ends it before its own rule.
+        CAELIX_BRANCH
+        if (claim)
+        {
+            if (!IsOpaque(int(hit_block)))
+            {
+                segment_sees_sun = !nee;
+                segment_light = light_nee ? kSegmentLampNee : 0u;
+            }
+            else
+            {
+                claim = false;
+            }
+        }
         CAELIX_BRANCH
         if (light_nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
         {
-            const float3 nee_radiance = NextEventAtVertex(fc, shade.bounce_origin, hit.normal, nee, nee_rng,
-                                                          light_rng, segment_light);
+            const float3 nee_radiance = NextEventAtVertex(fc, shade.bounce_origin, hit.normal, nee, false, 0u,
+                                                          nee_rng, light_rng, segment_light);
             radiance += nee_radiance * throughput;
             segment_sees_sun = !nee;
         }
@@ -611,7 +663,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
             CAELIX_BRANCH
             if (nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
             {
-                radiance += SunNextEvent(fc, shade.bounce_origin, hit.normal, nee_rng) * throughput;
+                radiance += SunNextEvent(fc, shade.bounce_origin, hit.normal, false, 0u, nee_rng) * throughput;
                 segment_sees_sun = false;
             }
         }

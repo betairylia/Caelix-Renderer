@@ -192,6 +192,17 @@ public:
     {
         return entity_infos_.address();
     }
+    // The reverse table pool (u16 dense id by group-local brick position) and the group grid pool (u32
+    // group index by entity grid cell) of the record lookups (shaders/scene/caelix_scene_lookup.hlsl);
+    // the trace kernel's voxel cursor moves through them (shaders/render/caelix_voxel_cursor.hlsl).
+    VkDeviceAddress reverse_tables_address() const
+    {
+        return reverse_tables_.address();
+    }
+    VkDeviceAddress group_grids_address() const
+    {
+        return grids_.address();
+    }
     // The GPU material table: 65536 packed 32-byte hot entries by block code
     // (scene/material_pack.h).
     VkDeviceAddress materials_address() const
@@ -202,6 +213,12 @@ public:
     VkDeviceAddress subsurface_address() const
     {
         return subsurface_buffer_.address();
+    }
+    // The material table has an SSS entry (MaterialTable::has_subsurface): an opaque code with model
+    // CAELIX_SSS_MODEL_HG, sss_probability > 0 and sss_steps > 0.
+    bool has_subsurface() const
+    {
+        return materials_->has_subsurface();
     }
     uint32_t records_per_page_shift() const;
     uint32_t record_bytes() const

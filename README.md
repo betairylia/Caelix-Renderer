@@ -411,7 +411,7 @@ flush builds the TLAS that the render binds.
   the voxel id target and an output-size depth target under an upscaler, binds the
   same set). Set 1 is the frame set, shared by the six
   frame-constant kernels (`caelix_path_trace`, `caelix_composite`, `caelix_cross_resolve`,
-  `caelix_sky_sh`, `caelix_upscale_encode`, `caelix_voxel_id`): binding 0 the frame slot's 576-byte
+  `caelix_sky_sh`, `caelix_upscale_encode`, `caelix_voxel_id`): binding 0 the frame slot's 608-byte
   `CaelixFrameConstants` block as a uniform buffer (`g_frame`, `shaders/common/caelix_frame_ubo.hlsl`,
   `shaders/common/caelix_frame.hlsl`, `lib/src/render/frame_constants.h`; `kFrameSetIndex`).
   A uniform buffer is read-only, so the compiler re-reads a field where it is used instead of
@@ -943,7 +943,7 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   `Block`; member `Offset`, `ArrayStride`, `MatrixStride`, `DescriptorSet` / `Binding`), recomputes
   the C natural layout of the same member sequence and fails on the first member whose offset
   differs (printing the member index, its name and both offsets), on a stride that is not the
-  element size, on a block that does not end at `sizeof(FrameConstants)` (576) or that is not at
+  element size, on a block that does not end at `sizeof(FrameConstants)` (608) or that is not at
   set 1, binding 0. Run it after every change of `CaelixFrameConstants`: DXC's constant buffer
   layout moves a vector that crosses a 16-byte row (`float2` at 476 goes to 480) and gives an array
   of scalars a 16-byte stride, without any compile error. Two more cases: the push constant block of
@@ -1062,6 +1062,8 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   primary ray misses.
 - `--no-sun-nee`: lighting modes, no sun next-event estimation (the 6a
   behaviour: the sun is found only by the bounce rays).
+- `--no-shadow-transmission`: lighting modes, the primary vertex's NEE shadow rays stop at glass and
+  SSS voxels again (by default they pass them, attenuated; `docs/SHADOW_TRANSMISSION.md`).
 - `--sky <PATH>`: lighting modes, a lat-long (equirectangular) sky image,
   `.exr` or `.hdr`, converted on the CPU (`caelix-app/src/sky.rs`) to a
   mipmapped RGBA32F cubemap, uploaded once at start (`caelix-vk`

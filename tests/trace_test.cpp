@@ -11,7 +11,10 @@
 // agree on the motion of a moving entity, and render once per frame each. The voxel id
 // target holds one key per voxel (two entities, both formats, voxel_id_tmax, flip y, the
 // primary-mode voxel id view). The host background replaces the camera-ray misses of the
-// lighting modes exactly (no exposure, outside the reference mean) and nothing else.
+// lighting modes exactly (no exposure, outside the reference mean) and nothing else. Shadow
+// transmission: the primary vertex's sun and lamp shadow rays through a tinted glass slab carry its
+// transmittance, the claim keeps the refracted BSDF path from counting the sun twice, an SSS slab
+// attenuates by sss_albedo^l and kills the ray beyond its shadow length.
 // Uses the public C ABI only.
 #include "test_scenes.h"
 
@@ -3887,4 +3890,343 @@ TEST_CASE("background: misses show the host image, hits do not, exposure and acc
     DestroyBackground(rig.gpu, background_a);
     DestroyBackground(rig.gpu, background_b);
     CloseRig(rig);
+}
+
+// ---------------------------------------------------------------------------
+// Shadow transmission (docs/SHADOW_TRANSMISSION.md): the primary vertex's NEE shadow rays pass
+// tinted glass and SSS voxels in a straight line, attenuated; the claim keeps the refracted BSDF path
+// from counting the sun twice.
+
+namespace {
+
+// Packed codes of the shadow transmission scenes. The floor is white (rgb5 31, albedo exactly 1 in the
+// RGBA8 albedo target); the tinted glass, the SSS slab and the plain block get host entries.
+constexpr uint16_t kWhiteFloor = 0x8000u | (31u << 10) | (31u << 5) | 31u;
+constexpr uint16_t kTintGlass = 200;  // a reserved palette id (vacuum by default)
+constexpr uint16_t kSssCode = 0x8000u | (10u << 10) | (20u << 5) | 5u;
+constexpr uint16_t kPlainCode = 0x8000u | (20u << 10) | (10u << 5) | 5u;
+constexpr uint16_t kBlackWall = 0x8000u;  // rgb5 0: albedo 0
+constexpr float kTintAlbedo[3] = {1.0f, 0.5f, 0.25f};
+constexpr float kTintExtinction = 0.2f;
+constexpr float kTintThickness = 4.0f;
+
+// The tinted glass: albedo (1, 0.5, 0.25), extinction 0.2, ior 1.5, smoothness 1 (a delta interface).
+CaelixMaterialEntry TintGlassEntry()
+{
+    CaelixMaterialEntry e{};
+    e.code = kTintGlass;
+    Set3(e.material.albedo, kTintAlbedo);
+    e.material.smoothness = 1.0f;
+    e.material.ior = 1.5f;
+    e.material.extinction = kTintExtinction;
+    return e;
+}
+
+// An opaque SSS entry: albedo 0.5, model HG, sss_albedo 0.8, 16 steps at g = 0 (shadow length 4).
+CaelixMaterialEntry SssEntry(float probability)
+{
+    CaelixMaterialEntry e{};
+    e.code = kSssCode;
+    e.material.albedo[0] = e.material.albedo[1] = e.material.albedo[2] = 0.5f;
+    e.material.ior = 1.5f;
+    e.material.sss_model = CAELIX_SSS_MODEL_HG;
+    e.material.sss_probability = probability;
+    e.material.sss_albedo[0] = e.material.sss_albedo[1] = e.material.sss_albedo[2] = 0.8f;
+    e.material.sss_steps = 16u;
+    return e;
+}
+
+// The expected transmittance of the tinted slab, channel c: exp(-(1 - albedo) extinction thickness).
+double TintTransmittance(uint32_t c)
+{
+    return std::exp(-(1.0 - kTintAlbedo[c]) * kTintExtinction * kTintThickness);
+}
+
+// The sun NEE options of these tests (the sun straight up, 2 degrees, radiance 1000, black sky), with
+// 4 transparent bounces and the shadow transmission flag.
+CaelixRenderOptions TransmissionOptions(uint32_t mode, uint32_t bounces, uint32_t seed, bool nee,
+                                        bool transmission)
+{
+    CaelixRenderOptions options = SunOptions(mode, bounces, seed, nee);
+    options.bounce_count_transparent = 4;
+    if (transmission)
+    {
+        options.flags |= CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION;
+    }
+    return options;
+}
+
+// Reference mode over `frames` frames; the centre 64 x 64 mean of every channel afterwards.
+std::array<double, 3> TransmissionReference(Rig& rig, CaelixRenderer* renderer, TargetSet& set,
+                                            const CaelixCamera& camera, uint32_t bounces, bool nee,
+                                            bool transmission, uint32_t frames, uint32_t seed0)
+{
+    for (uint32_t i = 0; i < frames; ++i)
+    {
+        CaelixRenderOptions options = TransmissionOptions(CAELIX_MODE_REFERENCE, bounces, seed0 + i, nee, transmission);
+        options.reset_accumulation = i == 0 ? 1u : 0u;
+        Render(rig, renderer, set, camera, options, i + 1 == frames);
+    }
+    const Target& color = *set.t[kColor];
+    return {CentreMean(color, 64, 0), CentreMean(color, 64, 1), CentreMean(color, 64, 2)};
+}
+
+// A white floor of 64 x 64 blocks at y in [-8, 0) under air bricks up to y = 15 (the air cells next to
+// the slabs exist and report the glass exits).
+World ShadowFloorWorld()
+{
+    World world;
+    FillBox(world, 0, -8, 0, 63, -1, 63, kWhiteFloor);
+    FillBox(world, 0, 0, 0, 63, 15, 63, 0);
+    return world;
+}
+
+struct ShadowRig
+{
+    Rig rig;
+    CaelixRenderer* renderer = nullptr;
+    Target color;
+    TargetSet set;
+};
+
+void OpenShadowRig(ShadowRig& s)
+{
+    OpenRig(s.rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    REQUIRE(caelix_renderer_create(s.rig.device, s.rig.scene, &s.renderer) == CAELIX_OK);
+    s.color = CreateTarget(s.rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT);
+    s.set.t[kColor] = &s.color;
+}
+
+void CloseShadowRig(ShadowRig& s)
+{
+    REQUIRE(vkDeviceWaitIdle(s.rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(s.renderer);
+    caelix_renderer_destroy(s.renderer);
+    DestroyTarget(s.rig.gpu, s.color);
+    CloseRig(s.rig);
+}
+
+}  // namespace
+
+TEST_CASE("shadow transmission: tinted glass slab")
+{
+    ShadowRig s;
+    OpenShadowRig(s);
+    const CaelixMaterialEntry glass = TintGlassEntry();
+    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &glass, 1) == CAELIX_OK);
+    {
+        // A smooth tinted slab, 4 voxels thick (y in [8, 12)), over the x < 32 half of the floor, and a
+        // black wall under its edge (x = 32, y in [0, 8)): a bounce ray from under the slab that the glass
+        // reflects cannot reach the lit floor beside it (whose NEE would add the sun there).
+        World world = ShadowFloorWorld();
+        FillBox(world, 0, 8, 0, 31, 11, 63, kTintGlass);
+        FillBox(world, 32, 0, 0, 32, 7, 63, kBlackWall);
+        Upload(s.rig, world, KeysOf(world));
+        DrainBuilds(s.rig);
+    }
+    // Below the slab (camera at height 4): the floor under it, and the floor beside it.
+    const CaelixCamera under = LookDownFrom(16.0f, 4.0f, 32.0f);
+    const CaelixCamera beside = LookDownFrom(48.0f, 4.0f, 32.0f);
+
+    // 1. Flag on, sun NEE on, 1 bounce: the NEE sees the sun through the slab, times its transmittance;
+    //    the bounce rays that hit the slab from below cannot add the sun (the claim; 1 bounce ends there).
+    const std::array<double, 3> lit = TransmissionReference(s.rig, s.renderer, s.set, beside, 1, true, true, 256, 1000);
+    const std::array<double, 3> on = TransmissionReference(s.rig, s.renderer, s.set, under, 1, true, true, 256, 2000);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        const double ratio = on[c] / lit[c];
+        std::printf("shadow transmission, tinted slab, flag on, channel %u: under %.5f, beside %.5f, ratio %.5f, "
+                    "expected exp(-(1 - albedo) 0.2 4) = %.5f (ratio %.5f)\n",
+                    c, on[c], lit[c], ratio, TintTransmittance(c), ratio / TintTransmittance(c));
+        CHECK(lit[c] > 0.1);
+        CHECK(std::abs(ratio / TintTransmittance(c) - 1.0) < 0.05);
+    }
+
+    // 2. Flag off: the NEE shadow ray stops at the glass; the sun under the slab comes only from the
+    //    refracted BSDF path (floor -> slab bottom -> slab top -> the sun disk: 3 bounces, probability
+    //    sin^2 r per floor bounce, so 4096 frames). For a flat slab and a vertical sun that path carries
+    //    the same transmittance times the two Fresnel transmissions (1 - F)^2, F = ((1.5 - 1) / 2.5)^2 at
+    //    normal incidence (Schlick in the shader).
+    const double fresnel = std::pow((1.5 - 1.0) / (1.5 + 1.0), 2.0);
+    const std::array<double, 3> off = TransmissionReference(s.rig, s.renderer, s.set, under, 3, true, false, 4096, 10000);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        const double ratio = off[c] / lit[c];
+        const double expected = TintTransmittance(c) * (1.0 - fresnel) * (1.0 - fresnel);
+        std::printf("shadow transmission, tinted slab, flag off (refracted BSDF path only), channel %u: under "
+                    "%.5f, ratio %.5f, expected T (1 - F)^2 = %.5f (ratio %.5f; T alone %.5f)\n",
+                    c, off[c], ratio, expected, ratio / expected, ratio / TintTransmittance(c));
+        CHECK(std::abs(ratio / expected - 1.0) < 0.05);
+    }
+
+    // 3. Flag on with 3 bounces: the claim keeps the refracted path from adding the sun a second time.
+    const std::array<double, 3> on3 = TransmissionReference(s.rig, s.renderer, s.set, under, 3, true, true, 256, 3000);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        std::printf("shadow transmission, tinted slab, flag on, 3 bounces, channel %u: ratio %.5f (1 bounce "
+                    "%.5f)\n",
+                    c, on3[c] / lit[c], on[c] / lit[c]);
+        CHECK(std::abs(on3[c] / lit[c] / TintTransmittance(c) - 1.0) < 0.05);
+    }
+
+    // 4. Flag on, sun NEE off: nothing changes (no NEE, no claim): the same image as the flag off, bit for
+    //    bit, in the path trace mode over a few frames.
+    for (uint32_t frame = 0; frame < 4; ++frame)
+    {
+        Render(s.rig, s.renderer, s.set, under, TransmissionOptions(CAELIX_MODE_PATH_TRACE, 3, 500 + frame, false, false));
+        const std::vector<uint8_t> plain = s.color.bytes;
+        Render(s.rig, s.renderer, s.set, under, TransmissionOptions(CAELIX_MODE_PATH_TRACE, 3, 500 + frame, false, true));
+        CHECK(s.color.bytes == plain);
+    }
+
+    // 5. bounce_nee_probability: 0 and (0, 1] are accepted (no kernel reads it yet); others are rejected.
+    {
+        CaelixRenderOptions options = TransmissionOptions(CAELIX_MODE_PATH_TRACE, 1, 7, true, true);
+        options.bounce_nee_probability = 0.5f;
+        Render(s.rig, s.renderer, s.set, under, options);
+        for (const float bad : {-0.25f, 1.5f, std::numeric_limits<float>::quiet_NaN()})
+        {
+            ExpectLibraryErrors(1, [&] {
+                CaelixFrameDesc desc{};
+                desc.command_buffer = 1;
+                desc.frame_number = s.rig.frames.next;
+                const CaelixRenderTargets targets = ToAbi(s.set);
+                CaelixRenderOptions invalid = options;
+                invalid.bounce_nee_probability = bad;
+                REQUIRE(caelix_renderer_render(s.renderer, &desc, &targets, &under, &invalid) ==
+                        CAELIX_ERROR_INVALID_ARGUMENT);
+            });
+        }
+    }
+    CloseShadowRig(s);
+}
+
+TEST_CASE("shadow transmission: SSS slab budget")
+{
+    ShadowRig s;
+    OpenShadowRig(s);
+    CaelixMaterialEntry entries[2] = {SssEntry(1.0f), {}};
+    entries[1].code = kPlainCode;
+    entries[1].material.albedo[0] = entries[1].material.albedo[1] = entries[1].material.albedo[2] = 0.5f;
+    entries[1].material.ior = 1.5f;
+    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, entries, 2) == CAELIX_OK);
+    {
+        // From y = 8: an SSS slab 2 voxels thick over x < 32, z < 32; 6 voxels thick over x >= 32, z < 32;
+        // a plain opaque block over x < 32, z >= 32; nothing over x >= 32, z >= 32.
+        World world = ShadowFloorWorld();
+        FillBox(world, 0, 8, 0, 31, 9, 31, kSssCode);
+        FillBox(world, 32, 8, 0, 63, 13, 31, kSssCode);
+        FillBox(world, 0, 8, 32, 31, 9, 63, kPlainCode);
+        Upload(s.rig, world, KeysOf(world));
+        DrainBuilds(s.rig);
+    }
+    const CaelixCamera thin = LookDownFrom(16.0f, 4.0f, 16.0f);
+    const CaelixCamera thick = LookDownFrom(48.0f, 4.0f, 16.0f);
+    const CaelixCamera plain = LookDownFrom(16.0f, 4.0f, 48.0f);
+    const CaelixCamera open_floor = LookDownFrom(48.0f, 4.0f, 48.0f);
+
+    // Flag on, 1 bounce: the NEE ray through 2 SSS voxels keeps 0.8^2 (budget 2 / 4); through 6 it dies
+    // after 4 voxels (budget 1); the plain block occludes.
+    const std::array<double, 3> lit = TransmissionReference(s.rig, s.renderer, s.set, open_floor, 1, true, true, 256, 4000);
+    const std::array<double, 3> thin_t = TransmissionReference(s.rig, s.renderer, s.set, thin, 1, true, true, 256, 5000);
+    const float thin_max = CentreMax(s.color, 64);
+    const std::array<double, 3> thick_t = TransmissionReference(s.rig, s.renderer, s.set, thick, 1, true, true, 64, 6000);
+    const float thick_max = CentreMax(s.color, 64);
+    const std::array<double, 3> plain_t = TransmissionReference(s.rig, s.renderer, s.set, plain, 1, true, true, 64, 7000);
+    const float plain_max = CentreMax(s.color, 64);
+    std::printf("shadow transmission, SSS slab (sss_albedo 0.8, shadow length 4), probability 1: lit %.5f; 2 voxels "
+                "ratio %.5f (expected 0.64, max pixel ratio %.5f); 6 voxels ratio %.6f (max %.6f); plain block "
+                "%.6f (max %.6f)\n",
+                lit[0], thin_t[0] / lit[0], thin_max / lit[0], thick_t[0] / lit[0], thick_max, plain_t[0],
+                plain_max);
+    CHECK(lit[0] > 0.1);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        CHECK(std::abs(thin_t[c] / lit[c] / 0.64 - 1.0) < 0.05);
+        CHECK(thick_t[c] / lit[c] < 0.01);
+        CHECK(plain_t[c] == 0.0);
+    }
+    CHECK(thick_max == 0.0f);
+    CHECK(plain_max == 0.0f);
+
+    // Probability 0.5: half of the light enters the medium (0.32).
+    const CaelixMaterialEntry half = SssEntry(0.5f);
+    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &half, 1) == CAELIX_OK);
+    const std::array<double, 3> half_t = TransmissionReference(s.rig, s.renderer, s.set, thin, 1, true, true, 256, 8000);
+    std::printf("shadow transmission, SSS slab, probability 0.5: 2 voxels ratio %.5f (expected 0.32)\n",
+                half_t[0] / lit[0]);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        CHECK(std::abs(half_t[c] / lit[c] / 0.32 - 1.0) < 0.05);
+    }
+
+    // Flag off: the SSS slab occludes like any opaque voxel.
+    const std::array<double, 3> off = TransmissionReference(s.rig, s.renderer, s.set, thin, 1, true, false, 16, 9000);
+    CHECK(off[0] == 0.0);
+    CHECK(CentreMax(s.color, 64) == 0.0f);
+    CloseShadowRig(s);
+}
+
+TEST_CASE("shadow transmission: hard occluder and lamp candidate")
+{
+    ShadowRig s;
+    OpenShadowRig(s);
+    const CaelixLightOptions light{1, 0.0f, 0};  // the light tree with the default threshold
+    REQUIRE(caelix_scene_set_light_options(s.rig.scene, &light) == CAELIX_OK);
+    const CaelixMaterialEntry glass = TintGlassEntry();
+    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &glass, 1) == CAELIX_OK);
+    // A white floor (x, z in [0, 32)) under air bricks; a 2 x 2 lamp 30 units above the floor centre;
+    // the box x, z in [8, 24), y in [8, 12) between them holds the tinted glass, a plain opaque block, or
+    // air.
+    auto upload = [&](uint16_t box) {
+        World world;
+        FillBox(world, 0, -8, 0, 31, -1, 31, kWhiteFloor);
+        FillBox(world, 0, 0, 0, 31, 15, 31, 0);
+        FillBox(world, 8, 8, 8, 23, 11, 23, box);
+        FillBox(world, 15, 30, 15, 16, 30, 16, kWhiteLamp);
+        Upload(s.rig, world, KeysOf(world));
+        DrainBuilds(s.rig);
+        // The light tree is built at the flushes of the upload; one more flush settles the BVH.
+        FlushFrame(s.rig.gpu, s.rig.scene, s.rig.frames);
+    };
+    SetLightNee(s.renderer, 1, 0);
+    const CaelixCamera camera = LookDownFrom(16.0f, 4.0f, 16.0f);
+    // Lamps only (no sun radiance), light NEE with MIS, 1 bounce, the flag on.
+    auto accumulate = [&](uint32_t frames, uint32_t seed0) {
+        for (uint32_t i = 0; i < frames; ++i)
+        {
+            CaelixRenderOptions options = GlassOptions(CAELIX_MODE_REFERENCE, 1, 4, seed0 + i);
+            options.flags = CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION;
+            options.reset_accumulation = i == 0 ? 1u : 0u;
+            Render(s.rig, s.renderer, s.set, camera, options, i + 1 == frames);
+        }
+        return std::array<double, 3>{CentreMean(s.color, 64, 0), CentreMean(s.color, 64, 1),
+                                     CentreMean(s.color, 64, 2)};
+    };
+
+    upload(kTintGlass);
+    CaelixLightStats light_stats{};
+    caelix_scene_get_light_stats(s.rig.scene, &light_stats);
+    REQUIRE(light_stats.light_bricks >= 1);
+    const std::array<double, 3> through = accumulate(256, 100);
+    REQUIRE(NeeStats(s.renderer).running == 1);
+    upload(kGreyFloor);
+    const std::array<double, 3> blocked = accumulate(64, 200);
+    const float blocked_max = CentreMax(s.color, 64);
+    upload(0);
+    const std::array<double, 3> open = accumulate(256, 300);
+    std::printf("shadow transmission, lamp: open %.5f %.5f %.5f; behind the plain block %.6f (max %.6f)\n", open[0],
+                open[1], open[2], blocked[0], blocked_max);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        const double ratio = through[c] / open[c];
+        std::printf("shadow transmission, lamp behind the tinted slab, channel %u: %.5f, ratio %.5f, expected "
+                    "%.5f (ratio %.5f)\n",
+                    c, through[c], ratio, TintTransmittance(c), ratio / TintTransmittance(c));
+        CHECK(open[c] > 0.01);
+        CHECK(std::abs(ratio / TintTransmittance(c) - 1.0) < 0.10);
+        CHECK(blocked[c] == 0.0);
+    }
+    CHECK(blocked_max == 0.0f);
+    CloseShadowRig(s);
 }
