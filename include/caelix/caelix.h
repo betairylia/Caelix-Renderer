@@ -88,7 +88,11 @@ extern "C" {
    output-size pass), also without a bump. The shadow transmission step added CAELIX_SSS_MODEL_NONE,
    CAELIX_SSS_MODEL_HG and CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION and turned reserved_voxel_id[0] of
    CaelixRenderOptions into bounce_nee_probability (same size), also without a bump. The subsurface
-   step added CAELIX_RENDER_FLAG_SUBSURFACE (a new flag bit), also without a bump. A host built
+   step added CAELIX_RENDER_FLAG_SUBSURFACE (a new flag bit), also without a bump. The visibility hint
+   step turned reserved[0] of CaelixLightNeeOptions and of CaelixLightNeeStats into hint_patch (both
+   stay 16 bytes; reserved[2] -> hint_patch + reserved), added CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT
+   and CAELIX_VIEW_LIGHT_HINT, and made the kernels use bounce_nee_probability, also without a bump. A
+   host built
    against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -854,9 +858,9 @@ typedef enum CaelixDebugView
     CAELIX_VIEW_GROUP = 3,  /* hash colour of the render group of the hit */
     CAELIX_VIEW_BRICK = 4,  /* hash colour of the brick of the hit (group and dense brick id) */
     CAELIX_VIEW_STEPS = 5,  /* heat map of the procedural candidates of the ray, 0 .. 64 */
-    /* Views 6, 7, 8 and 10 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo view
-       for them, CAELIX_MODE_REFERENCE ignores debug_view); views 9 and 11 to CAELIX_MODE_PRIMARY (the
-       lighting modes ignore them). */
+    /* Views 6, 7, 8, 10 and 12 apply to CAELIX_MODE_PATH_TRACE (CAELIX_MODE_PRIMARY shows the albedo
+       view for them, CAELIX_MODE_REFERENCE ignores debug_view); views 9 and 11 to CAELIX_MODE_PRIMARY
+       (the lighting modes ignore them). */
     CAELIX_VIEW_NRD_VALIDATION = 6, /* NRD's validation layer (CommonSettings::enableValidation) blended
                                        over the image by its alpha (after the sRGB encode); the normal
                                        image when the frame was not denoised */
@@ -876,11 +880,17 @@ typedef enum CaelixDebugView
     CAELIX_VIEW_NRD_SPEC = 10,      /* CAELIX_MODE_PATH_TRACE: the denoised specular radiance without
                                        the albedo (the raw specular radiance when the frame was not
                                        denoised), exposure applied; like CAELIX_VIEW_NRD_DIFF */
-    CAELIX_VIEW_VOXEL_ID = 11       /* CAELIX_MODE_PRIMARY: a pastel hash colour of the voxel key of the
+    CAELIX_VIEW_VOXEL_ID = 11,      /* CAELIX_MODE_PRIMARY: a pastel hash colour of the voxel key of the
                                        primary hit (word 0 of the voxel id target's value, see
                                        CaelixRenderTargets::voxel_id), no shading; a miss and a hit
                                        farther than voxel_id_tmax are sky_color. The lighting modes
                                        ignore it. */
+    CAELIX_VIEW_LIGHT_HINT = 12     /* CAELIX_MODE_PATH_TRACE with light NEE: the light NEE visibility
+                                       hint that the primary vertex read (docs/LIGHT_NEE.md section 12):
+                                       rgb = (sun visibility, lamp visibility, 0) at surface pixels,
+                                       exposure applied, no radiance; 0.5 where the hint does not run
+                                       (light NEE off, CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT, the
+                                       first frame). Misses show the sky as usual. */
 } CaelixDebugView;
 
 /* CaelixRenderOptions::flags */
@@ -1088,8 +1098,9 @@ typedef struct CaelixRenderOptions
                                  voxel id debug view treat a hit farther than this along the camera ray
                                  as a miss; 0 = no limit. Must be finite and >= 0. */
     float bounce_nee_probability; /* lighting modes: bounce vertices run their NEE with this probability and
-                                     scale it by 1 / p; 0 = 1 (every vertex); else must be in (0, 1]. See
-                                     docs/LIGHT_NEE.md section 12 (not used by the kernels yet) */
+                                     scale it by 1 / p (sun and lamps alike; the primary vertex always
+                                     runs it); 0 = 1 (every vertex); else must be in (0, 1]. See
+                                     docs/LIGHT_NEE.md section 12 */
     uint32_t reserved[2];         /* reserved, pass 0 */
 } CaelixRenderOptions;
 
@@ -1232,27 +1243,36 @@ CAELIX_API CaelixResult caelix_renderer_render(CaelixRenderer* renderer, const C
  * caelix_scene_set_light_options) in the lighting modes. Every diffuse path vertex with a next
  * segment draws one lamp point from the light tree for its own point and normal. One shadow ray is
  * chosen between the sun candidate (CAELIX_RENDER_FLAG_SUN_NEE) and the lamp candidate by their
- * unoccluded contributions (one-sample RIS, no hint) and traced. The next BSDF hit on a lamp that the
+ * unoccluded contributions (one-sample RIS) and traced; at the primary vertex both weights are
+ * multiplied by a per-pixel-patch visibility hint (the sun and lamp visibility that earlier frames
+ * measured around the reprojected pixel; unbiased for any positive weights). The next BSDF hit on a lamp that the
  * NEE can sample is weighted by the balance heuristic (MIS) with the exact light tree pdf of that
  * point, evaluated for the same receiver point and normal as the draw. Lamp points closer than 8
- * world units to the receiver belong to the BSDF path on both sides (the near field). The light NEE
- * uses no memory: nothing is kept between frames or shared between pixels. Without a light tree (or
- * in the primary mode) it does not run; frames without light NEE use a trace kernel without its code.
+ * world units to the receiver belong to the BSDF path on both sides (the near field). The only memory
+ * is the visibility hint (two small R8G8 images per renderer, ceil(size / patch)). Without a light
+ * tree (or in the primary mode) it does not run; frames without light NEE use a trace kernel without
+ * its code.
  * ------------------------------------------------------------------------- */
 
 #define CAELIX_LIGHT_NEE_FLAG_NO_MIS (1u << 0) /* exclusive rule instead of the balance heuristic: the
                                                   BSDF path counts no lamp the NEE can sample */
+#define CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT (1u << 1) /* the primary vertex's sun / lamp choice
+                                                              without the visibility hint */
 
 typedef struct CaelixLightNeeOptions
 {
-    uint32_t enabled;     /* 0 = off (the default), 1 = on */
-    uint32_t flags;       /* CAELIX_LIGHT_NEE_FLAG_* */
-    uint32_t reserved[2]; /* must be 0 */
-} CaelixLightNeeOptions;  /* 16 bytes */
+    uint32_t enabled;    /* 0 = off (the default), 1 = on */
+    uint32_t flags;      /* CAELIX_LIGHT_NEE_FLAG_* */
+    uint32_t hint_patch; /* the visibility hint's patch in pixels (one hint per patch x patch pixels):
+                            0 = the library default (2), else 1, 2 or 4 */
+    uint32_t reserved;   /* must be 0 */
+} CaelixLightNeeOptions; /* 16 bytes */
 
 /* Sets the light NEE options of a renderer; they apply from its next render call. Invalid values
-   (enabled not 0 or 1, unknown flag bits, reserved not 0) return CAELIX_ERROR_INVALID_ARGUMENT
-   (logged) and change nothing. */
+   (enabled not 0 or 1, unknown flag bits, hint_patch not 0, 1, 2 or 4, reserved not 0) return
+   CAELIX_ERROR_INVALID_ARGUMENT (logged) and change nothing. A new hint_patch recreates the
+   renderer's internal targets at the next lighting render (which restarts the reference
+   accumulation). */
 CAELIX_API CaelixResult caelix_renderer_set_light_nee_options(CaelixRenderer* renderer,
                                                               const CaelixLightNeeOptions* options);
 
@@ -1261,7 +1281,9 @@ typedef struct CaelixLightNeeStats
 {
     uint32_t enabled;     /* 1 while the options enable light NEE */
     uint32_t running;     /* 1 when the newest render call ran it (a lighting mode, a light tree) */
-    uint32_t reserved[2]; /* 0 */
+    uint32_t hint_patch;  /* the visibility hint's patch of the newest render call (1, 2 or 4), 0 when
+                             the hint did not run */
+    uint32_t reserved;    /* 0 */
 } CaelixLightNeeStats;
 
 /* Fills *out. A NULL argument is ignored. */

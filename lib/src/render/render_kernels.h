@@ -19,11 +19,12 @@ namespace caelix {
 // kFrameSetIndex.
 //
 // Trace set (also bound by the voxel id kernel): binding 0 the TLAS, bindings 1..7 the host
-// targets (7 = the voxel id target), bindings 8..19 the internal targets of the lighting modes
-// (Renderer::Internal order up to kInternalAccum: the NRD G-buffer and radiance, the device depth
-// and the four DLSS RR guides), binding 20 the sky cubemap (sampled image), 21 its sampler.
+// targets (7 = the voxel id target), bindings 8..21 the internal targets of the lighting modes
+// (Renderer::Internal order up to kInternalAccum: the NRD G-buffer and radiance, the device depth,
+// the four DLSS RR guides and the two light NEE hint images, 20 = the previous, 21 = the current
+// one), binding 22 the sky cubemap (sampled image), 23 its sampler.
 constexpr uint32_t kTargetCount = 7;          // descriptor bindings 1..7
-constexpr uint32_t kTraceInternalCount = 12;  // descriptor bindings 8..19
+constexpr uint32_t kTraceInternalCount = 14;  // descriptor bindings 8..21
 constexpr uint32_t kTraceSkyBinding = 1 + kTargetCount + kTraceInternalCount;
 constexpr uint32_t kTraceBindingCount = kTraceSkyBinding + 2;
 // Composite set (also bound by the cross resolve kernel): binding 0 the host colour

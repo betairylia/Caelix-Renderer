@@ -84,8 +84,8 @@ struct CaelixFrameConstants
     uint64_t subsurface_table;      // 560  packed subsurface entry (32 B) by block code (common/caelix_material.hlsl)
     uint64_t reverse_tables;        // 568  reverse table pool (u16 dense id by group-local brick position)
     uint64_t group_grids;           // 576  group grid pool (u32 group index by entity grid cell)
-    float bounce_nee_probability;   // 584  bounce vertices run their NEE with this probability (no consumer yet)
-    uint hint_patch_shift;          // 588  log2 of the light NEE hint patch (no consumer yet, 0)
+    float bounce_nee_probability;   // 584  bounce vertices run their NEE with this probability (scaled by 1 / it)
+    uint hint_patch_shift;          // 588  log2 of the light NEE visibility hint's patch (0 when the hint is off)
     uint subsurface_present;        // 592  1 = the material table has an SSS entry (kBrickDdaShadowSssAware)
     uint pad_596;                   // 596
     uint64_t pad_600;               // 600 -> 608
@@ -104,6 +104,7 @@ static const uint kViewMotion = 8;         // path trace mode: the motion vector
 static const uint kViewMaterial = 9;       // primary mode: the material table's albedo, tinted by kind
 static const uint kViewNrdSpec = 10;       // path trace mode: denoised specular radiance
 static const uint kViewVoxelId = 11;       // primary mode: pastel colour of the voxel id of the primary hit
+static const uint kViewLightHint = 12;     // path trace mode: the light NEE visibility hint of the primary vertex
 
 // CaelixUpscaler
 static const uint kUpscalerNone = 0;
@@ -128,6 +129,10 @@ static const uint kRenderFlagShadowTransmission = 1u << 6;
 // would add constants to the five other frame-constant kernels, which never read them.
 #define kLightNeeOn (1u << 0)
 #define kLightNeeMis (1u << 1)
+// The primary vertex's sun / lamp choice uses the visibility hint (docs/LIGHT_NEE.md section 12.1).
+#define kLightNeeHint (1u << 2)
+// The previous hint image holds no history: read about 0.5 instead (the current image is still written).
+#define kLightNeeHintReset (1u << 3)
 
 // CaelixFrameConstants::target_mask: bit i = the target at descriptor binding i + 1.
 static const uint kTargetColor = 1u << 0;

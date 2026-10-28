@@ -430,6 +430,10 @@ fn stats_window(ui: &mut egui::Ui, stats: &Stats, demo: bool) {
                     ("enabled", "yes".to_string()),
                     ("running", if n.running != 0 { "yes" } else { "no (no light tree or primary mode)" }.to_string()),
                     ("MIS", if stats.light_nee_mis { "on" } else { "off (exclusive rule)" }.to_string()),
+                    (
+                        "hint patch",
+                        if n.hint_patch != 0 { format!("{0} x {0} px", n.hint_patch) } else { "off".to_string() },
+                    ),
                 ],
             );
         });
@@ -594,6 +598,11 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         });
         ui.add_enabled(settings.mode == Mode::Pt, egui::Checkbox::new(&mut settings.denoise, "denoise (NRD, pt mode)"));
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.sun_nee, "sun NEE"));
+        ui.horizontal(|ui| {
+            ui.label("bounce NEE p");
+            ui.add_enabled(lighting, Slider::new(&mut settings.bounce_nee_probability, 0.05..=1.0))
+                .on_hover_text("Bounce vertices run their NEE (sun and lamps) with this probability, scaled by 1 / p.");
+        });
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.shadow_transmission, "shadow transmission"))
             .on_hover_text("The primary vertex's shadow rays pass glass and SSS voxels, attenuated.");
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.subsurface, "subsurface scattering"))

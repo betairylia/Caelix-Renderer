@@ -26,7 +26,7 @@ constexpr uint32_t kWorkgroupSize = 8;
 // The smallest output of an upscaler (DLSS: 64 x 32).
 constexpr uint32_t kMinUpscaleOutputWidth = 64;
 constexpr uint32_t kMinUpscaleOutputHeight = 32;
-constexpr uint32_t kDebugViewCount = 12;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_VOXEL_ID
+constexpr uint32_t kDebugViewCount = 13;  // CAELIX_VIEW_ALBEDO .. CAELIX_VIEW_LIGHT_HINT
 constexpr uint32_t kModeCount = 3;
 constexpr float kDefaultSunAngularRadius = 0.00873f;  // 0.5 degrees
 
@@ -430,12 +430,21 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     // Internal targets of the lighting modes and the NRD executor (before anything is
     // recorded: the allocations can throw).
     bool restart_accumulation = options.reset_accumulation != 0 || options.mode != last_mode_;
-    if (lighting && EnsureInternalTargets(width, height, frame.frame_number))
+    // The hint images are sized for the options' patch whether the hint runs or not (turning it on or
+    // off keeps the targets; a new patch recreates them).
+    if (lighting && EnsureInternalTargets(width, height, LightNeeHintShift(), frame.frame_number))
     {
         restart_accumulation = true;
     }
-    // Light NEE (the lighting modes with a light tree; 0 = it does not run this frame).
-    const uint32_t light_nee_flags = LightNeeFlags(lighting);
+    // Light NEE (the lighting modes with a light tree; 0 = it does not run this frame). The visibility
+    // hint (docs/LIGHT_NEE.md section 12.1) reads about 0.5 instead of the previous hint image while that
+    // image holds no history (new internal targets, the hint has not run since, the first render).
+    uint32_t light_nee_flags = LightNeeFlags(lighting);
+    const bool light_hint = (light_nee_flags & kLightNeeHint) != 0;
+    if (light_hint && (!hint_history_valid_ || !has_prev_camera_))
+    {
+        light_nee_flags |= kLightNeeHintReset;
+    }
     bool nrd_error = false;
     NrdExecutor* denoiser = nullptr;
     if (options.mode == CAELIX_MODE_PATH_TRACE && options.denoise != 0 && composite && !nrd_failed_ &&
@@ -566,9 +575,15 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     }
     if (lighting)
     {
+        // The light hint bindings (20 = the previous image, 21 = the current one) follow hint_parity_.
         for (uint32_t i = 0; i < kTraceInternalCount; ++i)
         {
-            write_image(slot->set, 1 + kTargetCount + i, internal_[i].view());
+            uint32_t image = i;
+            if (hint_parity_ && (i == kInternalLightHintA || i == kInternalLightHintB))
+            {
+                image = i == kInternalLightHintA ? kInternalLightHintB : kInternalLightHintA;
+            }
+            write_image(slot->set, 1 + kTargetCount + i, internal_[image].view());
         }
     }
     write_sky(slot->set, kTraceSkyBinding);
@@ -607,8 +622,9 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     constants.reverse_tables = scene_.reverse_tables_address();
     constants.group_grids = scene_.group_grids_address();
     constants.subsurface_present = scene_.has_subsurface() ? 1u : 0u;
-    // docs/LIGHT_NEE.md section 12: no consumer yet (the visibility hint and the bounce NEE budget).
-    constants.hint_patch_shift = 0u;
+    // docs/LIGHT_NEE.md section 12: the visibility hint's patch (0 when it does not run) and the bounce
+    // NEE budget.
+    constants.hint_patch_shift = light_hint ? internal_hint_shift_ : 0u;
     constants.bounce_nee_probability =
         options.bounce_nee_probability == 0.0f ? 1.0f : options.bounce_nee_probability;
     constants.light_tree = scene_.light_tree_address();
@@ -971,6 +987,12 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
     last_frame_ = frame.frame_number;
     has_rendered_ = true;
     last_mode_ = options.mode;
+    if (light_hint)
+    {
+        // This render wrote the current hint image: it is the next render's previous one.
+        hint_parity_ = !hint_parity_;
+        hint_history_valid_ = true;
+    }
     if (lighting)
     {
         internal_needs_init_ = false;

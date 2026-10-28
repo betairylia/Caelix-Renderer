@@ -33,8 +33,9 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // scene's tables through buffer device addresses in the frame constants; the
 // TLAS and the images are its only descriptors (set 0: binding 0 acceleration
 // structure, bindings 1..7 the host targets colour, albedo, normal, depth,
-// motion, view_z, voxel_id, bindings 8..19 the internal targets of the lighting modes,
-// binding 20 the sky cubemap (sampled image), binding 21 its sampler; every
+// motion, view_z, voxel_id, bindings 8..21 the internal targets of the lighting modes
+// (20 and 21 the light NEE hint images: the previous and the current one by hint_parity_),
+// binding 22 the sky cubemap (sampled image), binding 23 its sampler; every
 // binding PARTIALLY_BOUND, so absent targets and a missing TLAS are simply
 // not written). In the lighting modes the composite kernel
 // (shaders/render/caelix_composite.hlsl, its own set: binding 0 the host colour target,
@@ -71,9 +72,10 @@ class NgxRuntime;  // render/dlss_upscaler.h (CAELIX_DLSS builds)
 // renderer renders at most once per frame number (last_frame_).
 //
 // Internal targets (lighting modes only): created at the first lighting render,
-// recreated when the host target size changes (the old images are destroyed once
-// the frame that last used them is safe), transitioned to GENERAL once and kept
-// there. Coverage is albedo.a.
+// recreated when the host target size or the light NEE hint patch changes (the old images
+// are destroyed once the frame that last used them is safe), transitioned to GENERAL once
+// and kept there. Coverage is albedo.a. The two light NEE hint images have the size
+// ceil(size / patch); every other internal target the render size.
 class Renderer
 {
 public:
@@ -116,6 +118,8 @@ private:
         kInternalRrSpecularAlbedo,  // RGBA8    DLSS RR specular albedo (EnvBRDFApprox2; sky 0)
         kInternalRrNormalRoughness, // RGBA16F  DLSS RR world normal + linear roughness (sky 0)
         kInternalRrHitDistance,     // R16F     DLSS RR specular hit distance (sky 65504)
+        kInternalLightHintA,        // RG8      light NEE visibility hint per patch (sun, lamp); prev or cur by
+        kInternalLightHintB,        // RG8      hint_parity_ (docs/LIGHT_NEE.md section 12.1), ceil(size / patch)
         kInternalAccum,             // RGBA32F  reference accumulation
         kInternalDiffOut,           // RGBA16F  NRD OUT_DIFF_RADIANCE_HITDIST
         kInternalSpecOut,           // RGBA16F  NRD OUT_SPEC_RADIANCE_HITDIST
@@ -204,13 +208,18 @@ private:
     VkImageView CachedViewFor(VkImage image, VkFormat format, bool cube, bool sampled, uint32_t mip_levels,
                               uint64_t frame, uint64_t safe_frame);
     bool FormatSupported(VkFormat format);
-    // Creates the internal targets when they are missing or have another size; the
-    // old ones are retired until `frame` is safe. Returns true when it created them.
-    bool EnsureInternalTargets(uint32_t width, uint32_t height, uint64_t frame);
-    // FrameConstants::light_nee_flags of this render call (kLightNee*; 0 when light NEE does not run:
-    // off, the primary mode, or a scene without a light tree, which is logged once); sets
-    // light_nee_running_.
+    // Creates the internal targets when they are missing, have another size or another hint patch
+    // (`hint_shift` = log2 of the light NEE hint's patch: the two hint images have the size
+    // ((width + patch - 1) >> hint_shift, (height + patch - 1) >> hint_shift)); the old ones are
+    // retired until `frame` is safe. Returns true when it created them.
+    bool EnsureInternalTargets(uint32_t width, uint32_t height, uint32_t hint_shift, uint64_t frame);
+    // FrameConstants::light_nee_flags of this render call (kLightNeeOn, kLightNeeMis, kLightNeeHint; 0
+    // when light NEE does not run: off, the primary mode, or a scene without a light tree, which is
+    // logged once; the caller adds kLightNeeHintReset); sets light_nee_running_ and light_nee_hint_.
     uint32_t LightNeeFlags(bool lighting);
+    // log2 of the light NEE hint patch of the options (hint_patch 0 = kDefaultHintPatch). The internal
+    // targets are sized for it whether the hint runs or not, so turning the hint on or off keeps them.
+    uint32_t LightNeeHintShift() const;
     // Destroys retired internal targets, NRD executors and upscalers whose frame is <= safe_frame.
     void FreeRetired(uint64_t safe_frame);
     // The render size of `upscaler` at `quality` for an output_width x output_height colour target
@@ -253,6 +262,13 @@ private:
     InternalImages internal_;
     uint64_t internal_last_frame_ = 0;  // the last frame that used internal_
     bool internal_needs_init_ = false;  // internal_ still in VK_IMAGE_LAYOUT_UNDEFINED
+    uint32_t internal_hint_shift_ = 0;  // the hint patch shift internal_ was created for
+    // Light NEE visibility hint (docs/LIGHT_NEE.md section 12.1): false = the trace binds
+    // kInternalLightHintA as the previous image and B as the current one, true = the reverse; flipped
+    // after every render that ran the hint. hint_history_valid_: the previous image holds a hint (a
+    // render with the hint ran since internal_ was created).
+    bool hint_parity_ = false;
+    bool hint_history_valid_ = false;
     std::vector<RetiredImages> retired_;
     uint32_t last_mode_ = UINT32_MAX;  // mode of the previous render call
     uint32_t accum_count_ = 0;         // reference frames accumulated since the last restart
@@ -284,6 +300,7 @@ private:
     // Light NEE.
     CaelixLightNeeOptions light_nee_options_{};  // as set (validated)
     bool light_nee_running_ = false;             // the newest render call ran light NEE
+    bool light_nee_hint_ = false;                // the newest render call ran the visibility hint
     bool light_nee_no_tree_logged_ = false;      // enabled without a light tree: logged once
 };
 

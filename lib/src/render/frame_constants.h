@@ -85,10 +85,10 @@ struct FrameConstants
     uint64_t subsurface_table;          // 560  packed subsurface entry (32 B) by block code, 65536 entries
     uint64_t reverse_tables;            // 568  reverse table pool (u16 dense id by group-local brick position)
     uint64_t group_grids;               // 576  group grid pool (u32 group index by entity grid cell)
-    float bounce_nee_probability;       // 584  bounce vertices run their NEE with this probability (1 = every
-                                        //      vertex; docs/LIGHT_NEE.md section 12; no consumer yet)
-    uint32_t hint_patch_shift;          // 588  log2 of the light NEE hint patch (docs/LIGHT_NEE.md section 12;
-                                        //      no consumer yet, 0)
+    float bounce_nee_probability;       // 584  bounce vertices run their NEE with this probability and scale it
+                                        //      by 1 / it (1 = every vertex; docs/LIGHT_NEE.md section 12.2)
+    uint32_t hint_patch_shift;          // 588  log2 of the light NEE visibility hint's patch (0, 1, 2; 0 when
+                                        //      the hint does not run; docs/LIGHT_NEE.md section 12.1)
     uint32_t subsurface_present;        // 592  1 = the material table has an SSS entry (Scene::has_subsurface)
     uint32_t pad_596;                   // 596
     uint64_t pad_600;                   // 600 -> 608
@@ -161,9 +161,15 @@ constexpr uint32_t kTargetDepthOutput = 1u << 17;
 // FrameConstants::light_nee_flags (docs/LIGHT_NEE.md; the macros of shaders/common/caelix_frame.hlsl):
 // kLightNeeOn = every diffuse NEE vertex draws a lamp point from the light tree and chooses between it
 // and the sun candidate (the trace kernel caelix_path_trace; 0 binds caelix_path_trace_no_light_nee);
-// kLightNeeMis = the balance heuristic with the BSDF path (else the exclusive rule).
+// kLightNeeMis = the balance heuristic with the BSDF path (else the exclusive rule);
+// kLightNeeHint = the primary vertex's sun / lamp choice uses the visibility hint (trace bindings 20 =
+// the previous hint image, 21 = the current one; patch = 1 << hint_patch_shift, docs/LIGHT_NEE.md section
+// 12.1); kLightNeeHintReset = the previous hint image holds no history (created, or the hint never ran
+// since): the kernel reads about 0.5 (128 / 255) instead of it and still writes the current image.
 constexpr uint32_t kLightNeeOn = 1u << 0;
 constexpr uint32_t kLightNeeMis = 1u << 1;
+constexpr uint32_t kLightNeeHint = 1u << 2;
+constexpr uint32_t kLightNeeHintReset = 1u << 3;
 
 // The frame set: one descriptor set layout with one binding, the frame slot's FrameConstants as a
 // uniform buffer (range sizeof(FrameConstants), offset 0). Bound as set kFrameSetIndex by the six

@@ -1,4 +1,4 @@
-# Light NEE (as built, 2026-10-24)
+# Light NEE (as built, 2026-10-24; visibility hint and bounce NEE budget 2026-10-28)
 
 Status: as built on `main`. This file is the truth for the code. The first version kept light cells
 (world-space caches of light tree draws); the owner removed them on 2026-10-24 after a visual check, and
@@ -15,9 +15,11 @@ Next-event estimation of the scene's light voxels (the light faces of the light 
 NEE. Every diffuse path vertex with a next segment draws ONE lamp point from the light tree for its
 own receiver point and normal, chooses between that lamp candidate and the sun candidate, and traces
 ONE shadow ray. The next BSDF hit on a lamp that the NEE can sample is weighted by the balance
-heuristic with the exact pdf of the same draw. The light NEE keeps no memory: nothing is kept from
-frame to frame or shared between pixels, so its error is white per ray (no cell-sized blobs, no
-temporal lag).
+heuristic with the exact pdf of the same draw. The light NEE keeps only one small memory, the
+visibility hint of the primary vertex (section 12.1: two R8G8 images per renderer that weight the sun /
+lamp choice, never the estimate itself); the samples stay independent per ray (no cell-sized blobs,
+no shared reservoirs), so the error is white per ray. Bounce vertices may skip their NEE with the
+bounce NEE budget (section 12.2).
 
 Code: `shaders/render/caelix_path_trace.hlsl` (section "Light NEE": `LampCandidate`, `SunCandidate`,
 `NextEventAtVertex`, `LampHitWeight`; the gate in `TracePath`), `shaders/render/caelix_light_nee.hlsl`
@@ -60,8 +62,10 @@ off, and a frame without light NEE consumes every stream exactly as before.
 2) and, when the sun NEE runs (`CAELIX_RENDER_FLAG_SUN_NEE` with a nonzero sun radiance), the sun
 candidate (`SunCandidate`: a direction uniform in the sun cone, `sun_radiance omega cos_l / pi`). It
 keeps one of them by one-sample RIS over the disjoint domains with the weights `w = luminance` of the
-unoccluded contributions (no visibility hint): `pick_sun = u w_sum < w_sun`, and the kept candidate's
-contribution is multiplied by `w_sum / w_kept`. So `E = C_s V_s + C_l V_l` stays unbiased. The lamp
+unoccluded contributions: `pick_sun = u w_sum < w_sun`, and the kept candidate's contribution is
+multiplied by `w_sum / w_kept`. So `E = C_s V_s + C_l V_l` stays unbiased. At the primary vertex the
+two weights are multiplied by the visibility hint (`w_sun *= max(0.05, hint.r)`, `w_lamp *= max(0.05,
+hint.g)`, section 12.1); any positive weights keep the estimator unbiased. The lamp
 candidate stays live through the sun's draw (its evaluation is the expensive one); a kept sun candidate
 is drawn again from its saved random state. One shadow ray toward the kept candidate (glass occludes,
 as for the sun NEE; at the primary vertex with `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` the ray passes
@@ -119,8 +123,10 @@ Enabled without a light tree, it logs one warning per renderer and does not run.
 
 Frame constants (`lib/src/render/frame_constants.h`, `shaders/common/caelix_frame.hlsl`; 560 bytes, the
 size before the light NEE): `light_tree` (offset 544, the light tree descriptor) and `light_nee_flags`
-(offset 552): `kLightNeeOn` (bit 0) = the light NEE runs, `kLightNeeMis` (bit 1) = with MIS; offset 556
-is a pad. `caelix_frame_layout_test` checks the uniform block of both trace kernels and the four other
+(offset 552): `kLightNeeOn` (bit 0) = the light NEE runs, `kLightNeeMis` (bit 1) = with MIS,
+`kLightNeeHint` (bit 2) = the visibility hint runs, `kLightNeeHintReset` (bit 3) = the previous hint
+image has no history (section 12.1). The frame constants are now 608 bytes; the hint and the budget use
+`bounce_nee_probability` (584) and `hint_patch_shift` (588), which existed before (section 12). `caelix_frame_layout_test` checks the uniform block of both trace kernels and the four other
 frame-constant kernels.
 
 Registers (`CAELIX_PIPELINE_STATS=1`, RTX 5080, driver 610.88): `caelix_path_trace` 128 registers and
@@ -130,41 +136,56 @@ docs/SHADOW_TRANSMISSION.md section 8; since the subsurface step, which moved ev
 variants `caelix_path_trace_sss` and `caelix_path_trace_sss_no_light_nee`, they are again 128 + 16 bytes
 and 96 + 48 bytes: docs/SUBSURFACE.md section 6). Both equal the kernels of `18282cd`: the SPIR-V function bodies are the same
 instructions modulo id numbering, except the two flag bit values (`kLightNeeContribute` 2 -> `kLightNeeOn`
-1, `kLightNeeMis` 8 -> 2); `Artifacts/light-nee-variants-20261024/cleanup/spirv/compare.txt`.
+1, `kLightNeeMis` 8 -> 2); `Artifacts/light-nee-variants-20261024/cleanup/spirv/compare.txt`. Since the visibility
+hint and the bounce NEE budget (2026-10-28) the numbers are in section 12.4 (no register boundary
+crossed; `_no_light_nee` 96 + 64 bytes).
 
 ## 7. ABI and host
 
 ```c
-#define CAELIX_LIGHT_NEE_FLAG_NO_MIS (1u << 0)  /* the exclusive rule instead of the balance heuristic */
+#define CAELIX_LIGHT_NEE_FLAG_NO_MIS (1u << 0)             /* the exclusive rule instead of the balance heuristic */
+#define CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT (1u << 1) /* the primary vertex's choice without the hint */
 
 typedef struct CaelixLightNeeOptions
 {
-    uint32_t enabled;     /* 0 = off (the default), 1 = on */
-    uint32_t flags;       /* CAELIX_LIGHT_NEE_FLAG_* */
-    uint32_t reserved[2]; /* must be 0 */
-} CaelixLightNeeOptions;  /* 16 bytes */
+    uint32_t enabled;    /* 0 = off (the default), 1 = on */
+    uint32_t flags;      /* CAELIX_LIGHT_NEE_FLAG_* */
+    uint32_t hint_patch; /* the visibility hint's patch in pixels: 0 = the library default (2), 1, 2 or 4 */
+    uint32_t reserved;   /* must be 0 */
+} CaelixLightNeeOptions; /* 16 bytes */
 
 typedef struct CaelixLightNeeStats
 {
-    uint32_t enabled;     /* 1 while the options enable light NEE */
-    uint32_t running;     /* 1 when the newest render call ran it (a lighting mode, a light tree) */
-    uint32_t reserved[2]; /* 0 */
-} CaelixLightNeeStats;    /* 16 bytes */
+    uint32_t enabled;    /* 1 while the options enable light NEE */
+    uint32_t running;    /* 1 when the newest render call ran it (a lighting mode, a light tree) */
+    uint32_t hint_patch; /* the hint's patch of the newest render call (1, 2, 4); 0 = the hint did not run */
+    uint32_t reserved;   /* 0 */
+} CaelixLightNeeStats;   /* 16 bytes */
+
+/* CaelixRenderOptions: */
+float bounce_nee_probability; /* 0 = 1 = every bounce vertex runs its NEE; else in (0, 1] */
+#define CAELIX_VIEW_LIGHT_HINT 12 /* CaelixDebugView, path trace mode */
 
 CaelixResult caelix_renderer_set_light_nee_options(CaelixRenderer*, const CaelixLightNeeOptions*);
 void caelix_renderer_get_light_nee_stats(const CaelixRenderer*, CaelixLightNeeStats*);
 ```
 
-Per renderer; the options apply from the next render call. `enabled` above 1, unknown flag bits or a
-nonzero `reserved` word return `CAELIX_ERROR_INVALID_ARGUMENT` (logged) and change nothing. The library
-default is off. ABI v2 is in development: the structs shrank from 32 / 96 bytes without a version bump
-(the Rust host is the only user). The light NEE uses no GPU memory of its own.
+Per renderer; the options apply from the next render call. `enabled` above 1, unknown flag bits, a
+`hint_patch` other than 0, 1, 2 or 4, or a nonzero `reserved` word return
+`CAELIX_ERROR_INVALID_ARGUMENT` (logged) and change nothing. The library default is off (and with it on:
+MIS, the hint at patch 2, every bounce vertex runs its NEE). ABI v2 is in development: the structs
+shrank from 32 / 96 bytes without a version bump (the Rust host is the only user), and the hint step
+turned `reserved[0]` of both into `hint_patch` (still 16 bytes). The light NEE's only GPU memory is the
+pair of hint images (section 12.1).
 
 Rust host (`caelix-app`): light NEE on by default (it also enables the light tree); `--no-light-nee`
-turns it off, `--light-no-mis` uses the exclusive rule. `--screenshot-frame N` takes the screenshot at
-frame number N (the frame seed), so runs with different options or binaries capture the same random
-numbers. The Stats window (F1) has a "Light NEE" section (enabled, running, MIS); `--timing-frames`
-adds `light_nee: running=<0|1>` to the `timings_avg:` line.
+turns it off, `--light-no-mis` uses the exclusive rule, `--light-no-hint` turns the visibility hint off,
+`--light-hint-patch N` sets its patch (0 = the library default), `--bounce-nee-probability P` sets the
+bounce NEE budget (host default 0.5; the library default is 1), `--view light-hint` shows the hint.
+`--screenshot-frame N` takes the screenshot at frame number N (the frame seed), so runs with different
+options or binaries capture the same random numbers. The Stats window (F1) has a "Light NEE" section
+(enabled, running, MIS, hint patch), the Render window a "bounce NEE p" slider; `--timing-frames` adds
+`light_nee: running=<0|1>` to the `timings_avg:` line.
 
 ## 8. Tests
 
@@ -175,6 +196,10 @@ adds `light_nee: running=<0|1>` to the `timings_avg:` line.
   exclusive rule. Tolerances: mean ratio 0.97 .. 1.03, 16 x 16 block PSNR above 30 dB. Measured
   (2026-10-24): ratio 0.9983 (sun 0) and 0.9984 (sun 1000) for both, block PSNR 40.1 / 40.2 and
   39.6 / 39.6 dB, against the path tracer's own floor (other seeds) 0.9982 / 0.9986, 37.6 / 37.7 dB.
+  Since 2026-10-28 five variants (the hint and the budget run in the reference mode too): defaults
+  (MIS, hint at patch 2), no MIS, no hint, hint patch 4, bounce NEE probability 0.25; the numbers are
+  in section 12.4.
+- `caelix_trace_test`, "light NEE: visibility hint converges and reprojects": section 12.4.
 - `caelix_trace_test`, "light NEE: lifecycle (entity and group reuse, a paused renderer, modes, no
   tree, options)": option checks (`enabled` 2, unknown flags, nonzero `reserved`), `running` in both
   lighting modes and not in the primary mode, an entity removed and its id reused at once, groups
@@ -187,7 +212,8 @@ adds `light_nee: running=<0|1>` to the `timings_avg:` line.
   sides see the same exact pdf for 25 600 drawn lamp points (same brick, relative pdf difference below
   1e-4, weights sum to 1 within 1e-4); `LightNeeMisWeight` at degenerate inputs (cos_l <= 0, densities
   0, +inf, NaN, overflow, a receiver facing away).
-- `caelix_frame_layout_test`: the 560-byte uniform block of the six frame-constant kernels.
+- `caelix_frame_layout_test`: the uniform block (608 bytes since the subsurface steps) of the frame-constant
+  kernels.
 - `caelix_abi_c99`: the 16-byte structs from C99.
 
 Not built: dynamic response curves (a lamp switched on, removed, moved; a receiver entity rotated). The
@@ -217,8 +243,9 @@ in the cell mode "rotate"): linear mean luminance ratio 0.9991 (quadrants 0.9985
 
 ## 10. Open
 
-- A per-pixel sun hint at the primary vertex is the planned replacement for the lost cell sun hint
-  (owner, 2026-10-24): the sun / lamp choice now has no visibility information.
+- Built 2026-10-28: the per-pixel-patch visibility hint at the primary vertex (sun and lamps) and the
+  bounce NEE budget (section 12); the patch default and the budget's effect wait for the measurements
+  of section 12.3.
 - Shadow rays are about 37 % of the trace with light NEE (rootfall 1440p, measured with the cells:
   about 7.5 of 20.3 ms); 85 .. 88 % of the lamp shadow rays are occluded on bistro, shroom and
   meridian-deep (`Artifacts/light-visibility-20261023/`). A visibility-aware draw is not designed yet.
@@ -264,74 +291,150 @@ vertex in a third trace kernel, which became this light NEE). Artifacts:
 `Artifacts/light-nee-main-20261024/` (fill bench, measurements, temporal and bias runs, validation) and
 `Artifacts/light-nee-variants-20261024/` (the variants; `cleanup/` = the validation of the removal).
 
-## 12. Visibility hint and bounce NEE budget (SPEC 2026-10-28; the implementer makes it "as built")
+## 12. Visibility hint and bounce NEE budget (as built 2026-10-28)
 
-Two additions, owner request 2026-10-28 (open items of section 10).
+Two additions, owner request 2026-10-28 (open items of section 10). The spec of the same day is
+implemented with the deviations listed in 12.1 and 12.2.
 
 ### 12.1 Per-pixel-patch visibility hint at the primary vertex
 
-Purpose: the sun / lamp choice (section 3) gets visibility information again. Two internal images
-`light_hint_a` / `light_hint_b` (R8G8_UNORM, size `ceil(size / patch)`, patch = 1, 2 or 4 pixels,
-`hint_patch_shift` in the frame constants) hold per patch an estimate of the SUN visibility (R) and
-the LAMP visibility (G) of the primary vertices of that patch; one is "prev" (trace binding 20),
-the other "cur" (binding 21); the renderer swaps the two descriptor writes every lighting render
-(a renderer-side parity bit, not the frame number). They live in `Renderer::Internal` after
-`kInternalRrHitDistance` (`kTraceInternalCount` 12 -> 14, the sky bindings move to 22 / 23), are
-created with the internal targets (recreated when the size OR the patch changes) and are never
-cleared: the frame after a creation carries `kLightNeeHintReset` in `light_nee_flags` and the kernel
-reads 0.5 instead of "prev".
+Purpose: the sun / lamp choice (section 3) gets visibility information again, without the cells'
+correlated error: the hint only changes the probabilities of the choice, never the estimate.
 
-Read (light NEE kernel only, at the primary vertex, flag `kLightNeeHint`): `hint = reset ? 0.5 :
-prev[prev_patch]`, `prev_patch` = the previous pixel of the primary hit (`PreviousPixel`, the same
-reprojection as the motion target, nearest) >> shift, clamped to the image; the current patch when
-the point was behind the previous camera or there is no previous camera. `NextEventAtVertex` takes
-the hint: `w_sun *= max(kHintFloor, hint.r)`, `w_lamp *= max(kHintFloor, hint.g)`, `kHintFloor =
-0.05`. The estimator stays unbiased (one-sample RIS with any positive weights; the floor keeps every
-candidate with a nonzero contribution selectable). Bounce vertices do not use the hint.
+Images: `Renderer::Internal` has `kInternalLightHintA` and `kInternalLightHintB` right after
+`kInternalRrHitDistance` (`kInternalSpecs` "light_hint_a" / "light_hint_b", R8G8_UNORM): R = the SUN
+visibility, G = the LAMP visibility of the primary vertices of one patch of `patch x patch` pixels. Size
+`((width + patch - 1) >> shift, (height + patch - 1) >> shift)`, every other internal image keeps the
+render size. `kTraceInternalCount` 12 -> 14: trace binding 20 = the previous image (read), 21 = the
+current one (written); the sky moved to 22 / 23. `EnsureInternalTargets(width, height, hint_shift,
+frame)` recreates all internal targets when the size or the shift changes (member
+`internal_hint_shift_`). The shift comes from the options' patch whether the hint runs or not
+(`Renderer::LightNeeHintShift`), so switching the hint (or the light NEE) on and off keeps the targets;
+only a new patch recreates them (and restarts the reference accumulation like a size change). The
+renderer member `hint_parity_` chooses which image is bound as the previous one; it flips after every
+render that ran the hint (not on other frames, so the history survives frames without the hint). The
+images are never cleared: `hint_history_valid_` is false after a creation (and before any render ran the
+hint), and such a frame, or a render without a previous camera, carries `kLightNeeHintReset`.
 
-Write: every lane that traced a candidate at the primary vertex contributes its result (sun: visible
-0 / 1 when the sun was the kept candidate; lamp likewise). Wave reduction without barriers (the
-kernel returns early for out-of-range pixels, so no group barrier): the patch's lanes form a mask
-computed arithmetically from the lane layout (`numthreads(8, 8, 1)`, lane = x + 8 (y mod rows), rows
-= WaveGetLaneCount() / 8; patch shift <= 2 keeps a patch inside one 32- or 64-lane wave; a 16-lane
-wave splits a 4-pixel patch over two waves, last writer wins, acceptable); `WaveActiveBallot` of
-(traced sun), (sun visible), (traced lamp), (lamp visible); counts = countbits(mask & ballot); the
-lane with `WaveMultiPrefixCountBits(true, mask) == 0` writes `cur[patch] = (sun_count > 0 ?
-lerp(prev.r, sun_visible / sun_count, kHintAlpha) : prev.r, same for G)` with `kHintAlpha = 0.2`
-and `prev` = the value that lane read. DXC: cs_6_6, `WaveMultiPrefixCountBits` is SM 6.5. Do not
-use `WaveMatch` (it needs SPV_NV_shader_subgroup_partitioned).
+Frame constants: `hint_patch_shift` @588 = the shift in use (0 when the hint does not run);
+`light_nee_flags` gains `kLightNeeHint (1u << 2)` (light NEE runs and the options lack
+`CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT`) and `kLightNeeHintReset (1u << 3)`. The kernels without light
+NEE fold all of it away (`light_nee_flags` is 0 there).
 
-Debug view `CAELIX_VIEW_LIGHT_HINT` (12, path trace mode): the trace writes `deterministic = (hint.r,
-hint.g, 0)` and zero radiance; the composite then shows the hint (kDebugViewCount 13; the host's
-View enum gets it).
+Read (`ReadLightHint`, in `main` for every in-range lane): with the reset flag about (0.5, 0.5); else the
+previous image at `prev_patch`: the previous pixel of the PRIMARY SURFACE (`chain.surface`, the hit that
+the delta chain ended on, moved by `EntityPrevWorld` and projected by `PreviousPixel`, nearest pixel)
+`>> shift` when that pixel lies inside the image; the lane's own patch when there is no surface, no
+previous camera, or the point was behind the previous camera or outside its image. `TracePath` passes
+the hint to the primary vertex's `NextEventAtVertex`, which multiplies `w_sun` by `max(kHintFloor,
+hint.r)` and `w_lamp` by `max(kHintFloor, hint.g)`, `kHintFloor = 0.05`. Bounce vertices pass (1, 1)
+(the weights unchanged, the same random numbers). `NextEventAtVertex` also returns which shadow ray it
+traced (`kNeeTracedNone`, `kNeeTracedSun`, `kNeeTracedLamp`) and whether it reached its candidate
+(`TraceShadow` found nothing, or the transmissive ray's transmittance has a channel above 0).
 
-ABI: `CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT (1u << 1)` in CaelixLightNeeOptions::flags; the
-`reserved[0]` of CaelixLightNeeOptions becomes `uint32_t hint_patch` (0 = the library default, else
-1, 2 or 4; other values are INVALID_ARGUMENT); `CaelixLightNeeStats::reserved[0]` becomes
-`hint_patch` (the patch in use, 0 when the hint is off). The library default patch is chosen by the
-measurement (section 12.3); until then 2. Host: `--light-no-hint`, `--light-hint-patch N`, the
-Stats window shows the patch.
+Write (`WriteLightHint`, in `main` after the `if (surface)` block, where every active lane of the wave
+arrives): `PatchWaveMask` builds the ballot mask of the lanes of this pixel's patch arithmetically
+(`numthreads(8, 8, 1)`, lane = x + 8 (y mod rows), rows = `WaveGetLaneCount() / 8`, the wave's first
+group row = `(y & 7) - lane / 8`; one byte mask per row, an unrolled loop over at most 8 rows).
+`WaveActiveBallot` of (traced sun), (sun visible), (traced lamp), (lamp visible); counts =
+`countbits(mask & ballot)`. The lowest active lane of the patch writes `cur[patch] = (sun_count > 0 ?
+lerp(prev.r, sun_visible / sun_count, kHintAlpha) : prev.r, the same for G)`, `kHintAlpha = 0.2`, `prev`
+= the value that lane read. The write also happens in a reset frame (it seeds the images). A wrong
+lane layout only weakens the hint (the estimator stays unbiased); a 16-lane wave splits a 4-pixel patch
+over two waves (last writer wins).
 
-Frame constants: `light_nee_flags` gains `kLightNeeHint (1u << 2)` and `kLightNeeHintReset (1u <<
-3)`; `hint_patch_shift` uint @588.
+Debug view `CAELIX_VIEW_LIGHT_HINT` (12, path trace mode; `kDebugViewCount` 13): surface pixels get
+`deterministic = (hint.r, hint.g, 0)` and zero radiance in both NRD targets, so the composite shows the
+hint the primary vertex read (exposure applied; 0.5 where the hint does not run). Host `--view
+light-hint` (View::LightHint, "light hint (pt)").
+
+Deviations from the spec:
+- The "first lane of the patch" test is `countbits(mask & WaveActiveBallot(true) & lanes_below) == 0`
+  instead of `WaveMultiPrefixCountBits(true, mask) == 0`: DXC's SPIR-V backend lowers the
+  WaveMultiPrefix* intrinsics to the partitioned group operations of SPV_NV_shader_subgroup_partitioned,
+  the same extension that rules out `WaveMatch`. The ballot form gives the same lane.
+- The reduction lives in `main`, not in `TracePath`: `main` calls `TracePath` inside the divergent `if
+  (surface)`. `TracePath` returns the primary NEE's shadow ray in one word (`nee_result` = `kNeeTraced*
+  | kNeeResultVisible`) and `main` reads the hint for every lane (a pixel without a surface reads its
+  own patch: it may be the lane that writes the patch).
+- The hint travels through the path packed into one word (`PackHint` / `UnpackHint`: the two 8-bit
+  values of the RG8 image, exact because the image stores k / 255), and the reset value is 128 / 255
+  (0.502) instead of 0.5: two words instead of four registers live across the bounce loop (the
+  driver's shared memory of `caelix_path_trace` 4352 -> 3840 bytes). Without the hint the word is
+  (1, 1), so the choice weights are bit for bit the ones before the hint; the debug view then shows
+  0.5.
+- The images are swapped only after renders that ran the hint (the spec: every lighting render), and
+  the reset flag also covers "the hint has not run since the creation" (`hint_history_valid_`).
+- `CaelixLightNeeStats::hint_patch` reports the patch the internal targets were sized for in the
+  newest render that ran the hint (`1 << internal_hint_shift_`), 0 when that render did not run it.
 
 ### 12.2 Bounce NEE budget
 
-`CaelixRenderOptions::bounce_nee_probability` (float, the former `reserved_voxel_id[0]`; 0 = 1 =
-every vertex, else in (0, 1]; other values INVALID_ARGUMENT): at every bounce vertex that would run
-NEE (sun and lamp alike), the NEE runs with probability q (one number of `nee_rng`, drawn only when
-q < 1) and its radiance is multiplied by 1 / q; when it does not run, the vertex still behaves as if
-it had: the next segment sees no sun disk (sun NEE on) and carries the lamp state
-(`kSegmentLampNee` with the MIS bit as usual, light NEE on). Unbiased (E = q (NEE / q)), bounded 1 /
-q spikes instead of the fireflies of a BSDF-found sun. The primary vertex always runs its NEE. Frame
-constant `bounce_nee_probability` @584. Host: `--bounce-nee-probability` default 0.5 (library default:
-every vertex), a slider in the lighting UI.
+`CaelixRenderOptions::bounce_nee_probability` q (0 = 1 = every vertex; else in (0, 1]; other values
+INVALID_ARGUMENT; the renderer writes 1 for 0 into the frame constant @584). In the bounce loop of
+`TracePath`, a vertex that would run its NEE (`!shade.specular_lobe && bounce_index <= bounce_count`,
+and sun NEE or light NEE on) first sets the state of a vertex that ran it (`segment_sees_sun = !nee`; with
+light NEE `segment_light = kSegmentLampNee | kSegmentLampMis` with MIS), then runs the NEE when `q >= 1`
+or `RandomFloat01(nee_rng) < q` (one number of the sun stream, drawn only when q < 1) and multiplies its
+radiance by `1 / q` (exactly 1 for q = 1). Unbiased: E = q (NEE / q); the MIS of a lamp hit after a
+skipped vertex keeps the BSDF weight of a vertex that ran the NEE, whose expected NEE weight is the
+complement. The primary vertex always runs its NEE. Host `--bounce-nee-probability` (default 0.5),
+`RenderSettings::bounce_nee_probability`, a "bounce NEE p" slider (0.05 .. 1) in the Render window.
+Deviation: none (the "as if it ran" state is set before the draw instead of in an else branch; same
+result, fewer branches).
 
-### 12.3 Measurements (main agent)
+### 12.3 Measurements (main agent; pending)
 
-Patch size: bistro and emberdeep (and one more scene with sharp sun shadows) at 1080p, path trace
-mode without the denoiser, 100-frame means: 1-spp PSNR and 16 x 16 block PSNR against a 1024-frame
-reference, for hint off / patch 1 / 2 / 4, plus trace ms. Pick the coarsest patch whose block PSNR is
-within 0.1 dB of patch 1 on every scene. Bounce budget: the same metrics for q = 1, 0.5, 0.25 and
-the trace ms. Unbiasedness: the ctest "light NEE: unbiased" gains the variants hint on (default),
-hint off, and q = 0.25.
+Pending. Plan: patch size: bistro and emberdeep (and one more scene with sharp sun shadows) at 1080p,
+path trace mode without the denoiser, 100-frame means: 1-spp PSNR and 16 x 16 block PSNR against a
+1024-frame reference, for hint off / patch 1 / 2 / 4, plus trace ms. Pick the coarsest patch whose block
+PSNR is within 0.1 dB of patch 1 on every scene. Bounce budget: the same metrics for q = 1, 0.5, 0.25
+and the trace ms.
+
+### 12.4 Registers and tests
+
+Registers (`CAELIX_PIPELINE_STATS=1`, RTX 5080, driver 610.88, `--test-entity`; registers + spill bytes,
+driver shared memory):
+
+| kernel | before (docs/SUBSURFACE.md section 6) | budget only (hint compiled out) | as built |
+|---|---|---|---|
+| `caelix_path_trace` | 128 + 16 B, 2560 B | 128 + 16 B, 3328 B | 128 + 16 B, 3840 B |
+| `caelix_path_trace_no_light_nee` | 96 + 48 B, 4864 B | 96 + 64 B, 4864 B | 96 + 64 B, 4864 B |
+| `caelix_path_trace_sss` | 128 + 32 B, 6144 B | 128 + 32 B, 6144 B | 128 + 64 B, 6144 B |
+| `caelix_path_trace_sss_no_light_nee` | 128 + 16 B, 4608 B | 128 + 16 B, 5120 B | 128 + 16 B, 5120 B |
+
+No kernel crosses a register boundary. The budget costs 16 bytes of spill in `_no_light_nee` and shared
+memory in two kernels; the hint (packed, 12.1) adds 512 bytes of shared memory to `caelix_path_trace`
+and 32 bytes of spill to `caelix_path_trace_sss`. Before packing, the hint's unpacked state gave 4352
+bytes of shared memory in `caelix_path_trace`. Whether the shared memory costs occupancy at 128
+registers is for the timing of 12.3.
+
+Tests (`caelix_trace_test`, 2026-10-28):
+- "light NEE: unbiased against the path tracer": five light NEE variants against the path tracer's
+  4096-frame reference (path tracer floor with other seeds: ratio 0.9982 / 0.9986, block PSNR 37.62 /
+  37.70 dB for sun 0 / sun 1000):
+
+  | variant | sun 0: ratio, block PSNR | sun 1000: ratio, block PSNR |
+  |---|---|---|
+  | defaults (MIS, hint patch 2) | 0.9981, 40.11 dB | 0.9982, 39.48 dB |
+  | no MIS | 0.9981, 40.13 dB | 0.9982, 39.50 dB |
+  | no hint | 0.9981, 40.11 dB | 0.9983, 39.55 dB |
+  | hint patch 4 | 0.9981, 40.11 dB | 0.9982, 39.48 dB |
+  | bounce NEE 0.25 | 0.9982, 40.22 dB | 0.9984, 39.54 dB |
+
+  Without a sun the hint cannot change the choice (one candidate), so "no hint" equals the defaults; in
+  the closed box most receivers have the sun hint at the floor for every patch size, so patch 4 and 2
+  pick the same candidates almost everywhere.
+- "light NEE: visibility hint converges and reprojects": the lamp box with a 0.25-degree sun of the
+  same energy as the 2-degree test sun. The direct sun of every primary vertex = (reference, light NEE
+  off, one bounce, 64 frames) with the sun minus without it, same seeds (the BSDF path's lamps consume the
+  same random numbers, so the difference is exactly the primary NEE's sun). A lit pixel (5 x 5
+  neighbourhood above 0.9 of the brightest non-lamp value, upward-facing) and a shadowed one (5 x 5
+  exactly 0, upward-facing); then 64 path trace frames without the denoiser in the hint view, exposure
+  1: lit sun hint 0.992 (> 0.8), shadowed 0.008 (< 0.2), G finite in [0, 1] everywhere (lamp hints 0.69
+  and 0.57 there). The camera then turns by one pixel per frame for 8 frames (yaw about the camera
+  position, so a world direction maps to a pixel exactly): the points moved 6.4 px, their sun hints
+  stay 0.992 and 0.008 (within 0.2). Patches 1, 2 and 4 run (stats report them), the hint switched off
+  reports 0 and the view shows 0.5, `hint_patch` 3 is rejected.
+- "light NEE: lifecycle": the option checks use the new layout (unknown flag bit 1 << 2, `hint_patch`
+  3, `reserved` 7).

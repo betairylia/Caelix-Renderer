@@ -53,6 +53,11 @@ Notes on the totals:
   background input. The Unity usage flags are an assumption (section 2).
 - The Rust host allocates much less (section 2): 2 swapchain images + the optional voxel id
   target = 33.8 / 60.0 / 127.5 MiB [drv] at the three output sizes.
+- The two light NEE hint images (`light_hint_a`, `light_hint_b`, added 2026-10-28 after these
+  measurements, `docs/LIGHT_NEE.md` section 12.1) are not in the tables: R8G8_UNORM at ceil(size /
+  patch), at the default patch 2 [calc] ceil(w / 2) x ceil(h / 2) x 2 B = 1.0 MiB each at 1920x1080
+  (1 036 800 B), 1.8 MiB at 2560x1440 (1 843 200 B) and 4.0 MiB at 3840x2160 (4 147 200 B), so 2.0 /
+  3.5 / 7.9 MiB for the pair.
 - At a size change or an upscaler change, the old internal targets, NRD instance and upscaler
   stay alive until their last frame is safe (`Renderer::FreeRetired`). For a few frames the VRAM
   is the old set plus the new set.
@@ -113,11 +118,12 @@ adds about 1.0 MiB [calc].
 
 `Renderer::Internal` (`lib/src/render/renderer.h`) and `kInternalSpecs`
 (`lib/src/render/renderer_internal.h`). `Renderer::EnsureInternalTargets`
-(`renderer_targets.cpp`) creates ALL 18 images together at the first lighting render (path trace
-or reference mode) and recreates them when the size changes. They are not created per mode: an
-image that a mode does not use is still allocated. Usage STORAGE | SAMPLED, VMA
-`AUTO_PREFER_DEVICE`, kept in GENERAL. Size = the render size (with an upscaler) or the common size
-of the host targets.
+(`renderer_targets.cpp`) creates ALL 20 images together at the first lighting render (path trace
+or reference mode) and recreates them when the size or the light NEE hint patch changes. They are
+not created per mode: an image that a mode does not use is still allocated. Usage STORAGE | SAMPLED,
+VMA `AUTO_PREFER_DEVICE`, kept in GENERAL. Size = the render size (with an upscaler) or the common
+size of the host targets; the two light hint images (12, 13; new 2026-10-28, after the measurements
+of this file) have ceil(size / patch).
 
 | # | Image | Format | B/px | Written by | Read by | Used in |
 |---|---|---|---|---|---|---|
@@ -133,16 +139,20 @@ of the host targets.
 | 9 | `rr_specular_albedo` | R8G8B8A8_UNORM | 4 | trace (17), RR frames only | DLSS RR | RR |
 | 10 | `rr_normal_roughness` | R16G16B16A16_SFLOAT | 8 | trace (18), RR frames only | DLSS RR | RR |
 | 11 | `rr_hit_dist` | R16_SFLOAT | 2 | trace (19), RR frames only | DLSS RR | RR |
-| 12 | `accum` | R32G32B32A32_SFLOAT | 16 | composite (5) | composite (5) | reference mode |
-| 13 | `diff_out` | R16G16B16A16_SFLOAT | 8 | NRD OUT_DIFF_RADIANCE_HITDIST (also an NRD temporary) | composite (3) | NRD |
-| 14 | `spec_out` | R16G16B16A16_SFLOAT | 8 | NRD OUT_SPEC_RADIANCE_HITDIST (also an NRD temporary) | composite (4) | NRD |
-| 15 | `validation` | R8G8B8A8_UNORM | 4 | NRD OUT_VALIDATION (debug view `nrd-validation` only) | composite (6) | debug view |
-| 16 | `resolve` | R16G16B16A16_SFLOAT | 8 | composite (8) | cross resolve | delta checkerboard (default on; RR forces it off) |
-| 17 | `upscale_in` | R16G16B16A16_SFLOAT | 8 | composite or cross resolve (9) | DLSS colour, encode on NGX failure | upscaler |
-| | **Sum** | | **118** | | | |
+| 12 | `light_hint_a` | R8G8_UNORM | 2 per patch | trace (20 = previous hint, read; or 21 = current, written: swapped per hint render) | trace | light NEE with the visibility hint |
+| 13 | `light_hint_b` | R8G8_UNORM | 2 per patch | trace (21 or 20) | trace | light NEE with the visibility hint |
+| 14 | `accum` | R32G32B32A32_SFLOAT | 16 | composite (5) | composite (5) | reference mode |
+| 15 | `diff_out` | R16G16B16A16_SFLOAT | 8 | NRD OUT_DIFF_RADIANCE_HITDIST (also an NRD temporary) | composite (3) | NRD |
+| 16 | `spec_out` | R16G16B16A16_SFLOAT | 8 | NRD OUT_SPEC_RADIANCE_HITDIST (also an NRD temporary) | composite (4) | NRD |
+| 17 | `validation` | R8G8B8A8_UNORM | 4 | NRD OUT_VALIDATION (debug view `nrd-validation` only) | composite (6) | debug view |
+| 18 | `resolve` | R16G16B16A16_SFLOAT | 8 | composite (8) | cross resolve | delta checkerboard (default on; RR forces it off) |
+| 19 | `upscale_in` | R16G16B16A16_SFLOAT | 8 | composite or cross resolve (9) | DLSS colour, encode on NGX failure | upscaler |
+| | **Sum** (without 12 and 13) | | **118** | | | |
 
-The trace writes images 0..7 in every lighting frame (images 8..11 only when the upscaler is RR).
-Numbers in brackets are descriptor bindings (section 7).
+The trace writes images 0..7 in every lighting frame (images 8..11 only when the upscaler is RR,
+12 or 13 in the frames with the light NEE visibility hint). Numbers in brackets are descriptor
+bindings (section 7). Tables 3a and 3b were measured before the hint images existed (the 18 images
+other than 12 and 13; their size is in the notes of section 1).
 
 Table 3a: internal target VRAM per size, MiB [drv] ([calc]).
 
@@ -240,11 +250,14 @@ the four RR guides (RR) from the internal targets; it needs no extra library ima
 | Path | Trace size | Library images | Host images (minimum) |
 |---|---|---|---|
 | Primary mode | common | none (no internal targets, no NRD) | any present target |
-| Path trace, no denoise | common | 18 internal | colour |
-| Path trace, NRD | common | 18 internal + NRD pools (21) | colour |
-| Path trace, DLSS SR | render | 18 internal + NRD pools at render size + `upscale_out_` + NGX | colour at output size (+ voxel id at output size, + depth at either size) |
-| Path trace, DLSS RR | render | 18 internal + `upscale_out_` + NGX (no NRD) | colour at output size |
-| Reference mode | common | 18 internal (uses `accum`), no NRD, no upscaler | colour |
+| Path trace, no denoise | common | 20 internal | colour |
+| Path trace, NRD | common | 20 internal + NRD pools (21) | colour |
+| Path trace, DLSS SR | render | 20 internal + NRD pools at render size + `upscale_out_` + NGX | colour at output size (+ voxel id at output size, + depth at either size) |
+| Path trace, DLSS RR | render | 20 internal + `upscale_out_` + NGX (no NRD) | colour at output size |
+| Reference mode | common | 20 internal (uses `accum`), no NRD, no upscaler | colour |
+
+"20 internal" = the 18 render-size images plus the two light NEE hint images at ceil(size / patch)
+(section 3; small, 2 bytes per patch each).
 
 ## 7. Descriptor layout
 
@@ -255,7 +268,7 @@ binding is PARTIALLY_BOUND. Each kernel binds its own set as set 0 and the frame
 
 | Set | Kernels | Bindings |
 |---|---|---|
-| trace (set 0) | `caelix_path_trace`, `caelix_path_trace_no_light_nee`, `caelix_path_trace_sss`, `caelix_path_trace_sss_no_light_nee`, `caelix_voxel_id` | 0 TLAS; 1..7 host targets colour, albedo, normal, depth, motion, view_z, voxel_id (`kTargetCount` = 7); 8..19 internal targets 0..11 (`kTraceInternalCount` = 12: view_z .. rr_hit_dist); 20 sky cubemap (sampled); 21 sky sampler. `caelix_voxel_id` uses only 0, 4 and 7. |
+| trace (set 0) | `caelix_path_trace`, `caelix_path_trace_no_light_nee`, `caelix_path_trace_sss`, `caelix_path_trace_sss_no_light_nee`, `caelix_voxel_id` | 0 TLAS; 1..7 host targets colour, albedo, normal, depth, motion, view_z, voxel_id (`kTargetCount` = 7); 8..21 internal targets 0..13 (`kTraceInternalCount` = 14: view_z .. rr_hit_dist, then 20 = the previous and 21 = the current light NEE hint image, `light_hint_a` / `light_hint_b` by the renderer's parity bit); 22 sky cubemap (sampled); 23 sky sampler. `caelix_voxel_id` uses only 0, 4 and 7. |
 | composite (set 0) | `caelix_composite`, `caelix_cross_resolve` | 0 host colour; 1 albedo; 2 deterministic; 3 diff_out (NRD) or diff_in; 4 spec_out (NRD) or spec_in; 5 accum; 6 validation; 7 motion; 8 resolve; 9 upscale_in; 10 sky cubemap; 11 sky sampler; 12 host background (sampled, render size) |
 | encode (set 0) | `caelix_upscale_encode` (upscaled frames) | 0 host colour; 1 `upscale_out_` (or `upscale_in` after an NGX failure); 2 internal albedo |
 | sky SH (set 0) | `caelix_sky_sh` | 0 sky cubemap; 1 sampler; writes `sky_sh_buffer_` by device address |

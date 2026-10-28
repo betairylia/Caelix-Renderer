@@ -33,10 +33,13 @@ pub enum View {
     NrdSpec,
     /// Primary mode: a colour per voxel (the voxel id key of the primary hit).
     VoxelId,
+    /// Path trace mode with light NEE: the visibility hint of the primary vertex (red = sun, green =
+    /// lamps; docs/LIGHT_NEE.md section 12.1).
+    LightHint,
 }
 
 impl View {
-    pub const ALL: [View; 12] = [
+    pub const ALL: [View; 13] = [
         View::Albedo,
         View::Normal,
         View::Depth,
@@ -49,6 +52,7 @@ impl View {
         View::Material,
         View::NrdSpec,
         View::VoxelId,
+        View::LightHint,
     ];
 
     pub fn raw(self) -> u32 {
@@ -65,6 +69,7 @@ impl View {
             View::Material => CaelixDebugView_CAELIX_VIEW_MATERIAL as u32,
             View::NrdSpec => CaelixDebugView_CAELIX_VIEW_NRD_SPEC as u32,
             View::VoxelId => CaelixDebugView_CAELIX_VIEW_VOXEL_ID as u32,
+            View::LightHint => CaelixDebugView_CAELIX_VIEW_LIGHT_HINT as u32,
         }
     }
 
@@ -82,12 +87,13 @@ impl View {
             View::Material => "material",
             View::NrdSpec => "nrd spec (pt)",
             View::VoxelId => "voxel id",
+            View::LightHint => "light hint (pt)",
         }
     }
 
     /// Views that only the path trace mode shows.
     pub fn needs_pt(self) -> bool {
-        matches!(self, View::NrdValidation | View::NrdDiff | View::Motion | View::NrdSpec)
+        matches!(self, View::NrdValidation | View::NrdDiff | View::Motion | View::NrdSpec | View::LightHint)
     }
 }
 
@@ -264,6 +270,9 @@ pub struct RenderSettings {
     pub fog_color: [f32; 3],
     /// Every mode: multiplies the emission of every material.
     pub emission_scale: f32,
+    /// Lighting modes: bounce vertices run their NEE with this probability, scaled by 1 / it (0 or 1 =
+    /// every vertex; docs/LIGHT_NEE.md section 12.2).
+    pub bounce_nee_probability: f32,
     /// Pt mode: the upscaler (the other modes always render without one).
     pub upscaler: Upscaler,
     pub upscale_quality: UpscaleQuality,
@@ -369,8 +378,8 @@ impl RenderSettings {
             upscale_preset: if upscaling { self.upscale_preset } else { 0 },
             upscale_flags,
             voxel_id_tmax: self.voxel_id_tmax,
-            // 0 = every bounce vertex runs its NEE (docs/LIGHT_NEE.md section 12; no kernel reads it yet).
-            bounce_nee_probability: 0.0,
+            // 0 = every bounce vertex runs its NEE (docs/LIGHT_NEE.md section 12.2).
+            bounce_nee_probability: self.bounce_nee_probability,
             reserved: [0; 2],
         }
     }

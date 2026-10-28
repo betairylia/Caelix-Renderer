@@ -14,7 +14,8 @@
 // lighting modes exactly (no exposure, outside the reference mean) and nothing else. Shadow
 // transmission: the primary vertex's sun and lamp shadow rays through a tinted glass slab carry its
 // transmittance, the claim keeps the refracted BSDF path from counting the sun twice, an SSS slab
-// attenuates by sss_albedo^l and kills the ray beyond its shadow length.
+// attenuates by sss_albedo^l and kills the ray beyond its shadow length. The light NEE visibility hint
+// converges to the sun visibility of a lit and a shadowed floor pixel and follows a turning camera.
 // Uses the public C ABI only.
 #include "test_scenes.h"
 
@@ -2975,26 +2976,35 @@ CaelixCamera LampBoxCamera()
     return LookAlong(position, forward, std::tan(40.0 * 3.14159265358979323846 / 180.0));
 }
 
-// Reference mode, 4 bounces, 4 transparent bounces, black sky, the sun (`sun` x a 2-degree disk; 0 = no
-// sun) tilted into the opening, sun NEE on; the colour (the running mean) after `frames` frames.
+// The lamp box's lighting options: `mode`, `bounces` bounces, 4 transparent bounces, black sky, the sun
+// (`sun_radiance` x a 2-degree disk; 0 = no sun) tilted into the opening, sun NEE on, the bounce NEE
+// budget `q`.
+CaelixRenderOptions LampBoxOptions(uint32_t mode, uint32_t bounces, uint32_t seed, float sun_radiance, float q)
+{
+    CaelixRenderOptions options = GlassOptions(mode, bounces, 4, seed);
+    options.flags = CAELIX_RENDER_FLAG_SUN_NEE;
+    const double sun[3] = {0.0, 1.0, -0.4};  // the opening lights the floor around z = 15, in view
+    const double length = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+    for (int a = 0; a < 3; ++a)
+    {
+        options.sun_dir[a] = static_cast<float>(sun[a] / length);
+    }
+    options.sun_radiance[0] = options.sun_radiance[1] = options.sun_radiance[2] = sun_radiance;
+    options.sun_angular_radius = static_cast<float>(kNeeSunRadiusDegrees * 3.14159265358979323846 / 180.0);
+    options.bounce_nee_probability = q;
+    return options;
+}
+
+// Reference mode, 4 bounces (LampBoxOptions, bounce NEE budget `q`); the colour (the running mean) after
+// `frames` frames.
 std::vector<float> LampBoxAccumulate(Rig& rig, CaelixRenderer* renderer, TargetSet& set, uint32_t frames,
-                                     uint32_t seed0, float sun_radiance)
+                                     uint32_t seed0, float sun_radiance, float q = 1.0f)
 {
     const CaelixCamera camera = LampBoxCamera();
     for (uint32_t i = 0; i < frames; ++i)
     {
-        CaelixRenderOptions options = GlassOptions(CAELIX_MODE_REFERENCE, 4, 4, seed0 + i);
+        CaelixRenderOptions options = LampBoxOptions(CAELIX_MODE_REFERENCE, 4, seed0 + i, sun_radiance, q);
         options.reset_accumulation = i == 0 ? 1u : 0u;
-        options.flags = CAELIX_RENDER_FLAG_SUN_NEE;
-        const double sun[3] = {0.0, 1.0, -0.4};  // the opening lights the floor around z = 15, in view
-        const double length = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
-        for (int a = 0; a < 3; ++a)
-        {
-            options.sun_dir[a] = static_cast<float>(sun[a] / length);
-        }
-        options.sun_radiance[0] = options.sun_radiance[1] = options.sun_radiance[2] = sun_radiance;
-        options.sun_angular_radius =
-            static_cast<float>(kNeeSunRadiusDegrees * 3.14159265358979323846 / 180.0);
         Render(rig, renderer, set, camera, options, i + 1 == frames);
     }
     const Target& color = *set.t[kColor];
@@ -3073,11 +3083,12 @@ LightComparison CompareLight(const std::vector<float>& ref, const std::vector<fl
     return c;
 }
 
-void SetLightNee(CaelixRenderer* renderer, uint32_t enabled, uint32_t flags)
+void SetLightNee(CaelixRenderer* renderer, uint32_t enabled, uint32_t flags, uint32_t hint_patch = 0)
 {
     CaelixLightNeeOptions options{};
     options.enabled = enabled;
     options.flags = flags;
+    options.hint_patch = hint_patch;
     REQUIRE(caelix_renderer_set_light_nee_options(renderer, &options) == CAELIX_OK);
 }
 
@@ -3097,14 +3108,21 @@ TEST_CASE("light NEE: unbiased against the path tracer (lamps, sun, glass)")
     TargetSet set;
     set.t[kColor] = &color;
 
+    // The visibility hint runs in the reference mode too (it changes only the sun / lamp choice weights of
+    // the primary vertex, so it is unbiased by construction), and so does the bounce NEE budget.
     struct Variant
     {
         const char* name;
         uint32_t flags;
+        uint32_t hint_patch;
+        float q;  // CaelixRenderOptions::bounce_nee_probability
     };
     const Variant variants[] = {
-        {"defaults (MIS)", 0},
-        {"no MIS (exclusive rule)", CAELIX_LIGHT_NEE_FLAG_NO_MIS},
+        {"defaults (MIS, hint)", 0, 0, 1.0f},
+        {"no MIS (exclusive rule)", CAELIX_LIGHT_NEE_FLAG_NO_MIS, 0, 1.0f},
+        {"no hint", CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT, 0, 1.0f},
+        {"hint patch 4", 0, 4, 1.0f},
+        {"bounce NEE 0.25", 0, 0, 0.25f},
     };
     // The lamps alone, then the lamps with the sun (the sun / lamp choice, the sun through glass).
     for (const float sun : {0.0f, kNeeSunRadiance})
@@ -3120,8 +3138,8 @@ TEST_CASE("light NEE: unbiased against the path tracer (lamps, sun, glass)")
                     static_cast<double>(sun), floor_c.ref_mean, floor_c.ratio, floor_c.block_psnr);
         for (const Variant& v : variants)
         {
-            SetLightNee(renderer, 1, v.flags);
-            const std::vector<float> nee = LampBoxAccumulate(rig, renderer, set, 1024, 200000, sun);
+            SetLightNee(renderer, 1, v.flags, v.hint_patch);
+            const std::vector<float> nee = LampBoxAccumulate(rig, renderer, set, 1024, 200000, sun, v.q);
             CaelixLightNeeStats stats{};
             caelix_renderer_get_light_nee_stats(renderer, &stats);
             const LightComparison c = CompareLight(pt, nee, kLampBoxImage);
@@ -3131,6 +3149,8 @@ TEST_CASE("light NEE: unbiased against the path tracer (lamps, sun, glass)")
             INFO(v.name << ", sun " << sun);
             CHECK(stats.enabled == 1);
             CHECK(stats.running == 1);
+            const bool hint = (v.flags & CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT) == 0;
+            CHECK(stats.hint_patch == (hint ? (v.hint_patch != 0 ? v.hint_patch : 2u) : 0u));
             CHECK(c.ref_mean > 0.01);
             CHECK(c.ratio > 0.97);
             CHECK(c.ratio < 1.03);
@@ -3216,11 +3236,11 @@ TEST_CASE("light NEE: lifecycle (entity and group reuse, a paused renderer, mode
             REQUIRE(caelix_renderer_set_light_nee_options(renderer, &o) == CAELIX_ERROR_INVALID_ARGUMENT);
         });
     };
-    expect_invalid(CaelixLightNeeOptions{2, 0, {0, 0}});
-    expect_invalid(CaelixLightNeeOptions{1, 1u << 31, {0, 0}});
-    expect_invalid(CaelixLightNeeOptions{1, CAELIX_LIGHT_NEE_FLAG_NO_MIS << 1, {0, 0}});
-    expect_invalid(CaelixLightNeeOptions{1, 0, {1, 0}});
-    expect_invalid(CaelixLightNeeOptions{1, 0, {0, 7}});
+    expect_invalid(CaelixLightNeeOptions{2, 0, 0, 0});
+    expect_invalid(CaelixLightNeeOptions{1, 1u << 31, 0, 0});
+    expect_invalid(CaelixLightNeeOptions{1, CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT << 1, 0, 0});
+    expect_invalid(CaelixLightNeeOptions{1, 0, 3, 0});
+    expect_invalid(CaelixLightNeeOptions{1, 0, 0, 7});
     REQUIRE(NeeStats(renderer).enabled == 0);
 
     SetLightNee(renderer, 1, 0);
@@ -3325,6 +3345,245 @@ TEST_CASE("light NEE: lifecycle (entity and group reuse, a paused renderer, mode
     caelix_renderer_release_target_views(renderer);
     caelix_renderer_destroy(renderer);
     DestroyTarget(rig.gpu, color);
+    CloseRig(rig);
+}
+
+namespace {
+
+// The pixel (x, y) where the camera `camera` (LookAlong, aspect 1, `size` x `size` pixels) sees the world
+// direction `d` (CaelixPrimaryDirection's mapping, pixel centres at + 0.5).
+void PixelOfDirection(const CaelixCamera& camera, const double d[3], uint32_t size, double& x, double& y)
+{
+    double r = 0.0;
+    double u = 0.0;
+    double f = 0.0;
+    for (int c = 0; c < 3; ++c)
+    {
+        r += d[c] * camera.right[c];
+        u += d[c] * camera.up[c];
+        f += d[c] * camera.forward[c];
+    }
+    x = (r / (f * camera.tan_half_fov_y) + 1.0) * 0.5 * size;
+    y = (1.0 - u / (f * camera.tan_half_fov_y)) * 0.5 * size;
+}
+
+// The world direction of the centre of pixel (x, y) of `camera` (LookAlong, aspect 1).
+void DirectionOfPixel(const CaelixCamera& camera, uint32_t x, uint32_t y, uint32_t size, double d[3])
+{
+    const double nx = (x + 0.5) / size * 2.0 - 1.0;
+    const double ny = 1.0 - (y + 0.5) / size * 2.0;
+    for (int c = 0; c < 3; ++c)
+    {
+        d[c] = camera.right[c] * nx * camera.tan_half_fov_y + camera.up[c] * ny * camera.tan_half_fov_y +
+               camera.forward[c];
+    }
+}
+
+}  // namespace
+
+TEST_CASE("light NEE: visibility hint converges and reprojects")
+{
+    Rig rig;
+    OpenRig(rig, "caelix_trace_test", RigDesc(0, 0, 0));
+    UploadLampBox(rig);
+    CaelixRenderer* renderer = nullptr;
+    REQUIRE(caelix_renderer_create(rig.device, rig.scene, &renderer) == CAELIX_OK);
+    constexpr uint32_t kImage = kLampBoxImage;
+    Target color = CreateTarget(rig.gpu, VK_FORMAT_R32G32B32A32_SFLOAT, kImage, kImage);
+    Target normal = CreateTarget(rig.gpu, VK_FORMAT_R16G16B16A16_SFLOAT, kImage, kImage);
+    TargetSet set;
+    set.t[kColor] = &color;
+    set.t[kNormal] = &normal;
+    const CaelixCamera camera = LampBoxCamera();
+    // A small sun (0.25 degrees, so the opening casts a sharp patch of sun on the floor) with the energy of
+    // the 2-degree test sun.
+    const double sun_radius = 0.25 * 3.14159265358979323846 / 180.0;
+    const float sun_radiance = static_cast<float>(kNeeSunRadiance * (kNeeSunRadiusDegrees / 0.25) *
+                                                  (kNeeSunRadiusDegrees / 0.25));
+    const auto hint_options = [&](uint32_t mode, uint32_t bounces, uint32_t frame_seed, float sun) {
+        CaelixRenderOptions options = LampBoxOptions(mode, bounces, frame_seed, sun, 1.0f);
+        options.sun_angular_radius = static_cast<float>(sun_radius);
+        return options;
+    };
+
+    // 1. The sun visibility of the primary vertices without the hint: light NEE off, reference mode, one
+    //    bounce, the sun on and off with the same seeds. The lamps (found by the BSDF path only) consume
+    //    the same random numbers in both runs, and with one bounce the sun reaches the image only by the
+    //    primary vertex's NEE (the bounce segment sees no sun disk), so the difference is the direct sun.
+    SetLightNee(renderer, 0, 0);
+    const auto accumulate = [&](float sun) {
+        constexpr uint32_t kFrames = 64;
+        for (uint32_t i = 0; i < kFrames; ++i)
+        {
+            CaelixRenderOptions options = hint_options(CAELIX_MODE_REFERENCE, 1, 7000 + i, sun);
+            options.reset_accumulation = i == 0 ? 1u : 0u;
+            Render(rig, renderer, set, camera, options, i + 1 == kFrames);
+        }
+        std::vector<float> image(static_cast<size_t>(kImage) * kImage * 4);
+        std::memcpy(image.data(), color.bytes.data(), image.size() * sizeof(float));
+        return image;
+    };
+    const std::vector<float> lamps_only = accumulate(0.0f);
+    const std::vector<float> with_sun = accumulate(sun_radiance);
+    const auto direct_sun = [&](uint32_t x, uint32_t y) {
+        const size_t p = (static_cast<size_t>(y) * kImage + x) * 4;
+        return with_sun[p] - lamps_only[p];
+    };
+    // A pixel that sees a lamp directly (its emission dominates; the floor lamp lies in the sun).
+    const auto sees_lamp = [&](uint32_t x, uint32_t y) {
+        return lamps_only[(static_cast<size_t>(y) * kImage + x) * 4] > kDirectLamp;
+    };
+    float max_sun = 0.0f;
+    for (uint32_t y = 0; y < kImage; ++y)
+    {
+        for (uint32_t x = 0; x < kImage; ++x)
+        {
+            if (!sees_lamp(x, y))
+            {
+                max_sun = std::max(max_sun, direct_sun(x, y));
+            }
+        }
+    }
+    REQUIRE(max_sun > 0.1f);
+    // A lit and a shadowed pixel on upward-facing surfaces (the sun candidate exists there) whose 5 x 5
+    // neighbourhood is lit or shadowed alike and sees no lamp directly (so the default hint patch and the
+    // reprojection below stay inside it); the candidates closest to the image centre.
+    constexpr int kMargin = 2;
+    int lit[2] = {-1, -1};
+    int shadow[2] = {-1, -1};
+    int lit_d = 1 << 30;
+    int shadow_d = 1 << 30;
+    for (int y = kMargin; y < static_cast<int>(kImage) - kMargin; ++y)
+    {
+        for (int x = kMargin; x < static_cast<int>(kImage) - kMargin; ++x)
+        {
+            bool all_lit = true;
+            bool all_dark = true;
+            for (int dy = -kMargin; dy <= kMargin; ++dy)
+            {
+                for (int dx = -kMargin; dx <= kMargin; ++dx)
+                {
+                    const uint32_t nx = static_cast<uint32_t>(x + dx);
+                    const uint32_t ny = static_cast<uint32_t>(y + dy);
+                    const float s = direct_sun(nx, ny);
+                    const bool up = normal.F16(nx, ny, 1) > 0.9f && normal.F16(nx, ny, 3) > 0.5f;
+                    const bool lamp = sees_lamp(nx, ny);
+                    all_lit = all_lit && up && !lamp && s > 0.9f * max_sun;
+                    all_dark = all_dark && up && !lamp && s == 0.0f;
+                }
+            }
+            const int d = std::abs(x - static_cast<int>(kImage) / 2) + std::abs(y - static_cast<int>(kImage) / 2);
+            if (all_lit && d < lit_d)
+            {
+                lit[0] = x;
+                lit[1] = y;
+                lit_d = d;
+            }
+            if (all_dark && d < shadow_d)
+            {
+                shadow[0] = x;
+                shadow[1] = y;
+                shadow_d = d;
+            }
+        }
+    }
+    std::printf("hint test: max direct sun %.4f, lit pixel (%d, %d), shadowed pixel (%d, %d)\n",
+                static_cast<double>(max_sun), lit[0], lit[1], shadow[0], shadow[1]);
+    REQUIRE(lit[0] >= 0);
+    REQUIRE(shadow[0] >= 0);
+
+    // 2. The hint (default patch 2) after 64 path trace frames without the denoiser, through the hint view.
+    SetLightNee(renderer, 1, 0);
+    uint32_t seed = 9000;
+    const auto hint_frames = [&](uint32_t count, const CaelixCamera& view) {
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            CaelixRenderOptions options = hint_options(CAELIX_MODE_PATH_TRACE, 4, seed++, sun_radiance);
+            options.debug_view = CAELIX_VIEW_LIGHT_HINT;
+            options.exposure = 1.0f;
+            Render(rig, renderer, set, view, options, i + 1 == count);
+        }
+    };
+    hint_frames(64, camera);
+    CHECK(NeeStats(renderer).hint_patch == 2);
+    bool g_valid = true;
+    for (uint32_t y = 0; y < kImage; ++y)
+    {
+        for (uint32_t x = 0; x < kImage; ++x)
+        {
+            const float g = color.F32(x, y, 1);
+            g_valid = g_valid && std::isfinite(g) && g >= 0.0f && g <= 1.0f;
+        }
+    }
+    CHECK(g_valid);
+    const float lit_r = color.F32(static_cast<uint32_t>(lit[0]), static_cast<uint32_t>(lit[1]), 0);
+    const float shadow_r = color.F32(static_cast<uint32_t>(shadow[0]), static_cast<uint32_t>(shadow[1]), 0);
+    const float lit_g = color.F32(static_cast<uint32_t>(lit[0]), static_cast<uint32_t>(lit[1]), 1);
+    const float shadow_g = color.F32(static_cast<uint32_t>(shadow[0]), static_cast<uint32_t>(shadow[1]), 1);
+    std::printf("hint after 64 frames: lit pixel sun %.3f lamp %.3f, shadowed pixel sun %.3f lamp %.3f\n",
+                static_cast<double>(lit_r), static_cast<double>(lit_g), static_cast<double>(shadow_r),
+                static_cast<double>(shadow_g));
+    CHECK(lit_r > 0.8f);
+    CHECK(shadow_r < 0.2f);
+
+    // 3. Reprojection: the camera turns by about one pixel per frame (yaw about the world Y axis, no
+    //    parallax: a world direction moves to a pixel computed exactly) for 8 frames; the hint at the
+    //    pixels where the two points now lie stays within 0.2 of its value.
+    double lit_dir[3];
+    double shadow_dir[3];
+    DirectionOfPixel(camera, static_cast<uint32_t>(lit[0]), static_cast<uint32_t>(lit[1]), kImage, lit_dir);
+    DirectionOfPixel(camera, static_cast<uint32_t>(shadow[0]), static_cast<uint32_t>(shadow[1]), kImage,
+                     shadow_dir);
+    const double pixel_angle = std::atan(2.0 * camera.tan_half_fov_y / kImage);
+    CaelixCamera turned = camera;
+    for (uint32_t k = 1; k <= 8; ++k)
+    {
+        const double a = pixel_angle * k;
+        const double f[3] = {camera.forward[0] * std::cos(a) + camera.forward[2] * std::sin(a), camera.forward[1],
+                             -camera.forward[0] * std::sin(a) + camera.forward[2] * std::cos(a)};
+        const double position[3] = {camera.position[0], camera.position[1], camera.position[2]};
+        turned = LookAlong(position, f, camera.tan_half_fov_y);
+        hint_frames(1, turned);
+    }
+    double lx = 0.0;
+    double ly = 0.0;
+    double sx = 0.0;
+    double sy = 0.0;
+    PixelOfDirection(turned, lit_dir, kImage, lx, ly);
+    PixelOfDirection(turned, shadow_dir, kImage, sx, sy);
+    const float lit_r_moved = color.F32(static_cast<uint32_t>(lx), static_cast<uint32_t>(ly), 0);
+    const float shadow_r_moved = color.F32(static_cast<uint32_t>(sx), static_cast<uint32_t>(sy), 0);
+    std::printf("hint after 8 turned frames: lit point at (%.2f, %.2f) sun %.3f, shadowed point at (%.2f, %.2f) "
+                "sun %.3f\n",
+                lx, ly, static_cast<double>(lit_r_moved), sx, sy, static_cast<double>(shadow_r_moved));
+    CHECK(std::abs(lx - lit[0]) > 4.0);  // the points moved by several pixels
+    CHECK(std::abs(lit_r_moved - lit_r) < 0.2f);
+    CHECK(std::abs(shadow_r_moved - shadow_r) < 0.2f);
+
+    // 4. Every patch size runs (the stats report it; a new patch recreates the internal targets and the
+    //    hint starts from 0.5 again), the hint switched off reports 0, an invalid patch is rejected.
+    for (const uint32_t patch : {1u, 2u, 4u})
+    {
+        SetLightNee(renderer, 1, 0, patch);
+        hint_frames(4, camera);
+        CHECK(NeeStats(renderer).hint_patch == patch);
+        CHECK(Finite(color));
+    }
+    SetLightNee(renderer, 1, CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT);
+    hint_frames(2, camera);
+    CHECK(NeeStats(renderer).hint_patch == 0);
+    // The hint view without the hint shows 0.5.
+    CHECK(color.F32(static_cast<uint32_t>(lit[0]), static_cast<uint32_t>(lit[1]), 0) == 0.5f);
+    ExpectLibraryErrors(1, [&] {
+        const CaelixLightNeeOptions bad{1, 0, 3, 0};
+        REQUIRE(caelix_renderer_set_light_nee_options(renderer, &bad) == CAELIX_ERROR_INVALID_ARGUMENT);
+    });
+
+    REQUIRE(vkDeviceWaitIdle(rig.gpu.device.device) == VK_SUCCESS);
+    caelix_renderer_release_target_views(renderer);
+    caelix_renderer_destroy(renderer);
+    DestroyTarget(rig.gpu, color);
+    DestroyTarget(rig.gpu, normal);
     CloseRig(rig);
 }
 

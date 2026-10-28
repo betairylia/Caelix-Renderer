@@ -24,6 +24,8 @@ typedef char caelix_bounce_nee_probability_at_196[(offsetof(CaelixRenderOptions,
 /* The light NEE options and stats: 16 bytes each. */
 typedef char caelix_light_nee_options_is_16_bytes[(sizeof(CaelixLightNeeOptions) == 16) ? 1 : -1];
 typedef char caelix_light_nee_stats_is_16_bytes[(sizeof(CaelixLightNeeStats) == 16) ? 1 : -1];
+typedef char caelix_light_nee_hint_patch_at_8[(offsetof(CaelixLightNeeOptions, hint_patch) == 8) ? 1 : -1];
+typedef char caelix_light_nee_stats_hint_patch_at_8[(offsetof(CaelixLightNeeStats, hint_patch) == 8) ? 1 : -1];
 
 size_t caelix_abi_c99_touch(void)
 {
@@ -92,11 +94,13 @@ size_t caelix_abi_c99_touch(void)
                  sizeof(caelix_sky_cubemap_at_152) + sizeof(caelix_upscaler_at_176) + sizeof(upscaler_query) +
                  sizeof(upscaler_result) + sizeof(upscaler_info) + sizeof(upscaler) + sizeof(quality) +
                  sizeof(reason) + upscale_flags + sizeof(caelix_bounce_nee_probability_at_196) +
-                 CAELIX_SSS_MODEL_HG;
+                 CAELIX_SSS_MODEL_HG + sizeof(caelix_light_nee_hint_patch_at_8) +
+                 sizeof(caelix_light_nee_stats_hint_patch_at_8) + CAELIX_VIEW_LIGHT_HINT;
     /* Take the address of every function so a declaration typo fails to compile. Casts between
        function pointer types are valid C; the pointers are never called. */
-    CaelixLightNeeOptions nee_options = {1, CAELIX_LIGHT_NEE_FLAG_NO_MIS, {0, 0}};
-    CaelixLightNeeStats nee_stats = {0, 0, {0, 0}};
+    CaelixLightNeeOptions nee_options = {1, CAELIX_LIGHT_NEE_FLAG_NO_MIS | CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT, 2,
+                                         0};
+    CaelixLightNeeStats nee_stats = {0, 0, 0, 0};
     AnyFn functions[36];
     functions[0] = (AnyFn)caelix_get_version;
     functions[1] = (AnyFn)caelix_version_string;

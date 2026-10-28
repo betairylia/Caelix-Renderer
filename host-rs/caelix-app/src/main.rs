@@ -177,8 +177,8 @@ struct Args {
     /// Rendering mode. Default: `pt`.
     #[arg(long, value_enum)]
     mode: Option<Mode>,
-    /// Primary mode: the debug view (albedo .. steps, material); pt mode: nrd-validation, nrd-diff,
-    /// nrd-spec, motion.
+    /// Primary mode: the debug view (albedo .. steps, material, voxel-id); pt mode: nrd-validation,
+    /// nrd-diff, nrd-spec, motion, light-hint.
     #[arg(long, value_enum, default_value_t = View::Albedo)]
     view: View,
     /// Pt mode: no NRD denoising (the raw 1 sample per pixel image).
@@ -417,6 +417,17 @@ struct Args {
     /// Light NEE without MIS (the exclusive rule).
     #[arg(long)]
     light_no_mis: bool,
+    /// Light NEE without the visibility hint at the primary vertex (docs/LIGHT_NEE.md section 12.1:
+    /// the sun / lamp choice weighted by the visibility that earlier frames measured per pixel patch).
+    #[arg(long)]
+    light_no_hint: bool,
+    /// The light NEE visibility hint's patch in pixels: 0 = the library default, else 1, 2 or 4.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    light_hint_patch: u32,
+    /// Lighting modes: bounce vertices run their NEE (sun and lamps) with this probability and scale it
+    /// by 1 / it (docs/LIGHT_NEE.md section 12.2); 1 = every vertex. The primary vertex always runs it.
+    #[arg(long, value_name = "P", default_value_t = 0.5)]
+    bounce_nee_probability: f32,
 }
 
 /// The upscaler query results for one (quality, window size): SR and RR.
@@ -746,10 +757,18 @@ impl App {
             bail!("caelix_renderer_create failed: CaelixResult {result}");
         }
         if !self.args.no_light_nee {
+            let mut flags = 0;
+            if self.args.light_no_mis {
+                flags |= CAELIX_LIGHT_NEE_FLAG_NO_MIS;
+            }
+            if self.args.light_no_hint {
+                flags |= CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT;
+            }
             let options = CaelixLightNeeOptions {
                 enabled: 1,
-                flags: if self.args.light_no_mis { CAELIX_LIGHT_NEE_FLAG_NO_MIS } else { 0 },
-                reserved: [0; 2],
+                flags,
+                hint_patch: self.args.light_hint_patch,
+                reserved: 0,
             };
             // SAFETY: the renderer is live; options is valid for the call.
             let result = unsafe { caelix_renderer_set_light_nee_options(state.renderer, &options) };
@@ -2042,9 +2061,16 @@ fn main() -> anyhow::Result<()> {
     if !args.emission_scale.is_finite() || args.emission_scale < 0.0 {
         bail!("--emission-scale {} must be a finite value >= 0", args.emission_scale);
     }
+    if !(args.bounce_nee_probability >= 0.0 && args.bounce_nee_probability <= 1.0) {
+        bail!("--bounce-nee-probability {} must be 0 or in (0, 1]", args.bounce_nee_probability);
+    }
+    if ![0, 1, 2, 4].contains(&args.light_hint_patch) {
+        bail!("--light-hint-patch {} must be 0 (the library default), 1, 2 or 4", args.light_hint_patch);
+    }
     log::info!(
         "mode {mode:?}, bounces {}, transparent bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, \
-         sun NEE {}, shadow transmission {}, sss {}, denoise {}, sky {}, fog density {} colour {:?}, emission scale {}, \
+         sun NEE {}, shadow transmission {}, sss {}, light NEE {}, light hint patch {}, bounce NEE p {}, denoise {}, \
+         sky {}, fog density {} colour {:?}, emission scale {}, \
          upscaler {:?}, upscale quality {:?}, upscale preset {}, upscale auto exposure {}, jitter phases {}, \
          window {}x{}",
         args.bounces,
@@ -2055,6 +2081,15 @@ fn main() -> anyhow::Result<()> {
         !args.no_sun_nee,
         !args.no_shadow_transmission,
         !args.no_sss,
+        !args.no_light_nee,
+        if args.no_light_nee || args.light_no_hint {
+            "off".to_string()
+        } else if args.light_hint_patch == 0 {
+            "default".to_string()
+        } else {
+            args.light_hint_patch.to_string()
+        },
+        args.bounce_nee_probability,
         mode == Mode::Pt && !args.no_denoise,
         args.sky.as_deref().map_or_else(|| "procedural".into(), |p| p.display().to_string()),
         args.fog_density,
@@ -2114,6 +2149,7 @@ fn main() -> anyhow::Result<()> {
         fog_density: args.fog_density,
         fog_color: args.fog_color,
         emission_scale: args.emission_scale,
+        bounce_nee_probability: args.bounce_nee_probability,
         upscaler: args.upscaler,
         upscale_quality: args.upscale_quality,
         upscale_preset: args.upscale_preset,

@@ -43,7 +43,8 @@ constexpr uint32_t kTargetDepthIndex = 3;
 constexpr uint32_t kTargetVoxelIdIndex = 6;
 
 // The internal targets in Renderer::Internal order. The formats match the
-// image_format qualifiers of the kernels.
+// image_format qualifiers of the kernels. The two light hint images have the size
+// ceil(size / patch) (Renderer::EnsureInternalTargets), the others the render size.
 struct InternalSpec
 {
     const char* name;
@@ -62,6 +63,8 @@ constexpr InternalSpec kInternalSpecs[] = {
     {"rr_specular_albedo", VK_FORMAT_R8G8B8A8_UNORM},
     {"rr_normal_roughness", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"rr_hit_dist", VK_FORMAT_R16_SFLOAT},
+    {"light_hint_a", VK_FORMAT_R8G8_UNORM},
+    {"light_hint_b", VK_FORMAT_R8G8_UNORM},
     {"accum", VK_FORMAT_R32G32B32A32_SFLOAT},
     {"diff_out", VK_FORMAT_R16G16B16A16_SFLOAT},
     {"spec_out", VK_FORMAT_R16G16B16A16_SFLOAT},

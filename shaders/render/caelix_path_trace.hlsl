@@ -50,6 +50,13 @@
 //                   bounce that misses receives the irradiance SH / pi that
 //                   caelix_sky_sh.hlsl projected before this dispatch
 //                   (SkyDiffuseMiss, SkySpecularMiss).
+//                   Light NEE (kLightNeeOn, docs/LIGHT_NEE.md): every diffuse NEE vertex
+//                   also draws a lamp point from the light tree and traces one shadow
+//                   ray, sun or lamp (NextEventAtVertex). With kLightNeeHint the primary
+//                   vertex weights that choice by the visibility hint of its pixel patch
+//                   (bindings 20 / 21, ReadLightHint, WriteLightHint; docs/LIGHT_NEE.md
+//                   section 12.1). Bounce vertices run their NEE with the probability
+//                   bounce_nee_probability (section 12.2).
 //                   The internal device depth (binding 15, the host depth target's
 //                   expression; the upscaler's depth) is written in every lighting
 //                   frame; with fc.upscaler = kUpscalerDlssRr the four DLSS RR guides
@@ -72,12 +79,12 @@
 // qualifier: format Unknown in SPIR-V, needs shaderStorageImageWriteWithoutFormat,
 // so every write is a float4 (uint4 for the voxel id target) and the image keeps the
 // components its format has) and the internal targets of the lighting modes (bindings
-// 8..19, fixed formats), the sky cubemap (binding 20, sampled image) and its sampler
-// (binding 21). Every
+// 8..21, fixed formats; 20 and 21 the previous and the current light NEE hint image), the
+// sky cubemap (binding 22, sampled image) and its sampler (binding 23). Every
 // binding is PARTIALLY_BOUND:
 // the library writes only the TLAS (when the scene has one), the present targets
 // and, in the lighting modes, the internal targets, and the kernel touches a
-// binding only then (has_tlas, target_mask, mode). Bindings 20 and 21 are written
+// binding only then (has_tlas, target_mask, mode). Bindings 22 and 23 are written
 // every frame (the host's cubemap, or a 1 x 1 fallback cube that is never sampled
 // because sky_cubemap is 0).
 #include "common/caelix_platform.hlsl"
@@ -89,8 +96,8 @@
 // The frame constants (g_frame, set 1).
 #include "common/caelix_frame_ubo.hlsl"
 // The sky cubemap and its sampler (caelix_shading.hlsl declares them).
-#define CAELIX_SKY_BINDING_IMAGE 20
-#define CAELIX_SKY_BINDING_SAMPLER 21
+#define CAELIX_SKY_BINDING_IMAGE 22
+#define CAELIX_SKY_BINDING_SAMPLER 23
 #include "render/caelix_shading.hlsl"
 // The light tree and the light NEE's near field and MIS weight (docs/LIGHT_NEE.md).
 #include "light/caelix_light_tree.hlsl"
@@ -123,6 +130,10 @@ CAELIX_BINDING(16, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_diffus
 CAELIX_BINDING(17, 0) CAELIX_FORMAT("rgba8") RWTexture2D<float4> g_int_rr_specular_albedo;
 CAELIX_BINDING(18, 0) CAELIX_FORMAT("rgba16f") RWTexture2D<float4> g_int_rr_normal_roughness;
 CAELIX_BINDING(19, 0) CAELIX_FORMAT("r16f") RWTexture2D<float4> g_int_rr_hit_dist;
+// The light NEE visibility hint per pixel patch (R = sun, G = lamp visibility; docs/LIGHT_NEE.md section
+// 12.1): the previous render's image (read) and this render's (written); size ceil(size / patch).
+CAELIX_BINDING(20, 0) CAELIX_FORMAT("rg8") RWTexture2D<float4> g_int_hint_prev;
+CAELIX_BINDING(21, 0) CAELIX_FORMAT("rg8") RWTexture2D<float4> g_int_hint_cur;
 
 static const float kRayTMax = 1e30f;
 static const uint kStepsHeatMax = 64;
@@ -207,10 +218,23 @@ float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, bool 
 // the BSDF's balance heuristic weight (LampHitWeight; 0 without MIS) with the exact pdf of the same
 // draw: LightTreeBrickPdf x in_brick for the segment's origin and segment_normal, which are bit for bit
 // the x_r and n that NextEventAtVertex got (both come from the shade's bounce_origin and the hit's
-// normal in TracePath). No memory: nothing is kept from frame to frame or shared between pixels. The
-// lamp stream (light_rng) draws one number per vertex (the point seed); the sun stream draws the sun's
-// two numbers and one more for the choice, so a frame without light NEE consumes every stream exactly
-// as before.
+// normal in TracePath). The lamp stream (light_rng) draws one number per vertex (the point seed); the
+// sun stream draws the sun's two numbers and one more for the choice, so a frame without light NEE
+// consumes every stream exactly as before.
+//
+// Visibility hint (kLightNeeHint, docs/LIGHT_NEE.md section 12.1): at the PRIMARY vertex the choice
+// weights are multiplied by max(kHintFloor, hint) per candidate, where hint = (sun, lamp) visibility of
+// the pixel's patch in the previous render (ReadLightHint: the primary hit reprojected into the previous
+// camera). One-sample RIS stays unbiased for any positive weights; the floor keeps every candidate with
+// a nonzero contribution selectable. After the trace, WriteLightHint (in main, where every lane of the
+// wave takes part) moves each patch's hint toward the fraction of visible shadow rays its lanes traced
+// (a wave reduction, no barrier). This is the light NEE's only memory; bounce vertices pass the hint
+// (1, 1) (the weights unchanged).
+//
+// Bounce NEE budget (docs/LIGHT_NEE.md section 12.2): a bounce vertex runs its NEE (sun and lamp alike)
+// with the probability bounce_nee_probability and scales it by 1 / that; a vertex that skips it still
+// sets the state of a vertex that ran it (no sun disk, the lamp segment state), so the expected value
+// does not change.
 
 // The state of a path segment: kSegmentLampNee = the vertex it leaves ran the lamp NEE;
 // kSegmentLampMis = with MIS.
@@ -307,28 +331,42 @@ NeeCandidate LampCandidate(CaelixFrameConstants fc, float3 x_r, float3 n_r, uint
     return c;
 }
 
+// The visibility hint's floor and its update rate per render (docs/LIGHT_NEE.md section 12.1).
+static const float kHintFloor = 0.05f;
+static const float kHintAlpha = 0.2f;
+// NextEventAtVertex's `traced`: no shadow ray, the sun's, a lamp's.
+static const uint kNeeTracedNone = 0u;
+static const uint kNeeTracedSun = 1u;
+static const uint kNeeTracedLamp = 2u;
+
 // Next-event estimation at a diffuse vertex with light NEE (pushed-off receiver x_r, world normal
 // n_r): the lamp candidate, the sun candidate when `sun` (the sun NEE runs at this vertex), the choice
 // between them and one shadow ray. Returns the demodulated radiance (the caller multiplies the
 // throughput) and the state of the segment that leaves the vertex. `transmissive`: the shadow ray is
 // TraceShadowTransmissive from the medium `medium` and the kept candidate's radiance is multiplied by
-// its transmittance (the choice still uses the unoccluded contributions); else TraceShadow.
+// its transmittance (the choice still uses the unoccluded contributions); else TraceShadow. `hint`:
+// the visibility hint (sun, lamp) that multiplies the choice weights (floored at kHintFloor); (1, 1)
+// leaves them unchanged. `traced` receives which shadow ray was traced (kNeeTraced*), `visible` whether
+// it reached its candidate (TraceShadow found nothing, or a transmittance above 0).
 float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool sun, bool transmissive,
-                         uint medium, inout uint nee_rng, inout uint light_rng, out uint segment_light)
+                         uint medium, float2 hint, inout uint nee_rng, inout uint light_rng,
+                         out uint segment_light, out uint traced, out bool visible)
 {
     const uint point_seed = RandomU32(light_rng);
     const bool mis = (fc.light_nee_flags & kLightNeeMis) != 0u;
     // The lamp candidate stays live through the sun candidate's draw (cheap); the sun candidate is drawn
     // again from its saved state when it is kept (the lamp candidate's evaluation is the expensive one).
     const NeeCandidate lamp_candidate = LampCandidate(fc, x_r, n_r, point_seed, mis);
-    const float w_lamp = LtLuminance(lamp_candidate.contribution);
+    const float w_lamp = LtLuminance(lamp_candidate.contribution) * max(kHintFloor, hint.y);
     segment_light = kSegmentLampNee | (mis ? kSegmentLampMis : 0u);
+    traced = kNeeTracedNone;
+    visible = false;
     const uint sun_start = nee_rng;
     float w_sun = 0.0f;
     float u_choice = 0.0f;
     if (sun)
     {
-        w_sun = LtLuminance(SunCandidate(fc, n_r, nee_rng).contribution);
+        w_sun = LtLuminance(SunCandidate(fc, n_r, nee_rng).contribution) * max(kHintFloor, hint.x);
         u_choice = RandomFloat01(nee_rng);
     }
     const float w_sum = w_sun + w_lamp;
@@ -349,8 +387,10 @@ float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool s
         shadow.Direction = c.direction;
         shadow.TMin = 0.0f;
         shadow.TMax = c.t_max;
-        const bool visible = c.t_max > 0.0f && (transmissive || !TraceShadow(fc, shadow));
-        if (visible)
+        // A kept candidate has a positive weight, so it exists (t_max > 0).
+        traced = pick_sun ? kNeeTracedSun : kNeeTracedLamp;
+        const bool unoccluded = c.t_max > 0.0f && (transmissive || !TraceShadow(fc, shadow));
+        if (unoccluded)
         {
             float3 transmittance = float3(1.0f, 1.0f, 1.0f);
             CAELIX_BRANCH
@@ -358,6 +398,7 @@ float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool s
             {
                 transmittance = TraceShadowTransmissive(fc, shadow, medium);
             }
+            visible = any(transmittance > 0.0f);
             radiance = c.contribution * (w_sum / (pick_sun ? w_sun : w_lamp)) * transmittance;
         }
     }
@@ -402,6 +443,135 @@ float LampHitWeight(CaelixFrameConstants fc, uint segment_light, TraceResult hit
     const float cos_l = -dot(hit.normal, bounce.Direction);
     const float p_area = LightTreeBrickPdf(tree, bounce.Origin, segment_normal, brick) * in_brick;
     return LightNeeMisWeight(p_area, segment_normal, bounce.Direction, hit.T, cos_l, false);
+}
+
+// The visibility hint travels from ReadLightHint to WriteLightHint packed into one word (it stays live
+// across the whole path): the two 8-bit UNORM values of the hint image, sun in bits 0..7, lamp in bits
+// 8..15 (exact: the image stores k / 255). kHintWordOff = (1, 1): the choice weights unchanged.
+static const uint kHintWordOff = 0xFFFFu;
+static const uint kHintWordReset = 0x8080u;  // (128 / 255, 128 / 255), about 0.5: no history
+
+uint PackHint(float2 hint)
+{
+    const uint2 k = uint2(saturate(hint) * 255.0f + 0.5f);
+    return k.x | (k.y << 8);
+}
+
+float2 UnpackHint(uint word)
+{
+    return float2(float(word & 0xFFu), float((word >> 8) & 0xFFu)) * (1.0f / 255.0f);
+}
+
+// The packed shadow ray of a primary NEE (TracePath -> WriteLightHint): kNeeTraced* in bits 0..1,
+// bit 2 = visible.
+static const uint kNeeResultVisible = 4u;
+
+// The visibility hint (sun, lamp) of pixel `pixel` for its primary vertex, packed (docs/LIGHT_NEE.md
+// section 12.1): the previous hint image at the patch of the previous pixel of the surface hit `surface`
+// (moved by its entity's previous transform, the nearest pixel of the previous camera), or at the
+// pixel's own patch when there is no surface (`has_surface` false), no previous camera, or the point was
+// behind the previous camera or outside its image. kHintWordReset with kLightNeeHintReset (no history).
+uint ReadLightHint(CaelixFrameConstants fc, uint2 pixel, TraceResult surface, bool has_surface)
+{
+    if ((fc.light_nee_flags & kLightNeeHintReset) != 0u)
+    {
+        return kHintWordReset;
+    }
+    uint2 prev_patch = pixel >> fc.hint_patch_shift;
+    CAELIX_BRANCH
+    if (has_surface && fc.has_prev_camera != 0u)
+    {
+        float2 prev_pixel;
+        float prev_view_z;
+        if (PreviousPixel(fc, EntityPrevWorld(fc, surface.group, surface.object_hit), prev_pixel, prev_view_z) &&
+            all(prev_pixel >= 0.0f) && all(prev_pixel < float2(fc.size)))
+        {
+            prev_patch = uint2(prev_pixel) >> fc.hint_patch_shift;
+        }
+    }
+    return PackHint(g_int_hint_prev[prev_patch].xy);
+}
+
+// The lanes of this wave whose pixels lie in the patch of `pixel` (patch = 1 << shift, shift <= 2), as a
+// ballot mask. Assumes the usual lane layout of [numthreads(8, 8, 1)]: lane = x + 8 (y mod rows), rows =
+// WaveGetLaneCount() / 8, so a wave holds whole rows of the 8 x 8 group and a 2- or 4-pixel patch lies
+// in one 32- or 64-lane wave (a 16-lane wave splits a 4-pixel patch: both halves write, the last one
+// wins). A wrong layout only weakens the hint; the estimator stays unbiased.
+uint4 PatchWaveMask(uint2 pixel, uint shift)
+{
+    const uint patch = 1u << shift;
+    const uint rows = WaveGetLaneCount() / 8u;
+    const uint local_y = pixel.y & 7u;
+    // The group row of the wave's lane 0.
+    const uint row0 = local_y - WaveGetLaneIndex() / 8u;
+    const uint row_bits = ((1u << patch) - 1u) << ((pixel.x & 7u) & ~(patch - 1u));
+    uint4 mask = uint4(0u, 0u, 0u, 0u);
+    CAELIX_UNROLL
+    for (uint r = 0u; r < 8u; ++r)
+    {
+        const bool in_patch = r < rows && ((row0 + r) >> shift) == (local_y >> shift);
+        const uint bits = in_patch ? row_bits << (8u * (r & 3u)) : 0u;
+        if (r < 4u)
+        {
+            mask.x |= bits;
+        }
+        else
+        {
+            mask.y |= bits;
+        }
+    }
+    return mask;
+}
+
+// The lanes of this wave below the calling lane, as a ballot mask.
+uint4 WaveLanesBelow()
+{
+    const uint lane = WaveGetLaneIndex();
+    const uint word = lane >> 5u;
+    const uint bits = (1u << (lane & 31u)) - 1u;
+    return uint4(word > 0u ? 0xFFFFFFFFu : bits, word > 1u ? 0xFFFFFFFFu : (word == 1u ? bits : 0u),
+                 word > 2u ? 0xFFFFFFFFu : (word == 2u ? bits : 0u), word == 3u ? bits : 0u);
+}
+
+// The number of lanes set in both masks.
+uint MaskCount(uint4 a, uint4 b)
+{
+    const uint4 counts = countbits(a & b);
+    return counts.x + counts.y + counts.z + counts.w;
+}
+
+// The visibility hint's update (docs/LIGHT_NEE.md section 12.1). Every active lane of the wave must call
+// it at the same point (wave operations; the kernel returns early for pixels outside the image, so no
+// group barrier). `hint_word`: what this lane read (ReadLightHint); `nee_result`: its primary NEE's
+// shadow ray (TracePath; kNeeTracedNone for a pixel without one). The lowest active lane of each patch
+// writes cur[patch] = hint moved by kHintAlpha toward the fraction of visible sun (R) and lamp (G)
+// shadow rays of the patch's lanes; a channel without a traced ray keeps its value.
+void WriteLightHint(CaelixFrameConstants fc, uint2 pixel, uint hint_word, uint nee_result)
+{
+    const float2 hint = UnpackHint(hint_word);
+    const uint traced = nee_result & 3u;
+    const bool visible = (nee_result & kNeeResultVisible) != 0u;
+    const uint4 mask = PatchWaveMask(pixel, fc.hint_patch_shift);
+    const uint sun_count = MaskCount(mask, WaveActiveBallot(traced == kNeeTracedSun));
+    const uint sun_visible = MaskCount(mask, WaveActiveBallot(traced == kNeeTracedSun && visible));
+    const uint lamp_count = MaskCount(mask, WaveActiveBallot(traced == kNeeTracedLamp));
+    const uint lamp_visible = MaskCount(mask, WaveActiveBallot(traced == kNeeTracedLamp && visible));
+    // WaveMultiPrefixCountBits(true, mask) == 0 without SM 6.5's partitioned operations (DXC lowers them to
+    // SPV_NV_shader_subgroup_partitioned): no active lane of the patch below this one.
+    const bool first = MaskCount(mask & WaveActiveBallot(true), WaveLanesBelow()) == 0u;
+    if (first)
+    {
+        float2 cur = hint;
+        if (sun_count > 0u)
+        {
+            cur.x = lerp(hint.x, float(sun_visible) / float(sun_count), kHintAlpha);
+        }
+        if (lamp_count > 0u)
+        {
+            cur.y = lerp(hint.y, float(lamp_visible) / float(lamp_count), kHintAlpha);
+        }
+        g_int_hint_cur[pixel >> fc.hint_patch_shift] = float4(cur, 0.0f, 0.0f);
+    }
 }
 
 // NRD lobe rule of a path that went through a delta interface (primary surface
@@ -539,6 +709,15 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // refracted BSDF path does not count that light a second time
 // (docs/SHADOW_TRANSMISSION.md section 1). NEE draws from its own random stream, so the
 // BSDF path consumes the same random numbers with NEE on or off.
+// Bounce NEE budget (bounce_nee_probability q < 1; docs/LIGHT_NEE.md section 12.2): a bounce vertex
+// that would run its NEE (sun or lamps) runs it with probability q (one number of the sun stream) and
+// scales its radiance by 1 / q; when it does not run, the next segment still sees no sun disk (sun NEE)
+// and carries the lamp state of a vertex that ran it (light NEE), so the expected value does not change.
+// The primary vertex always runs its NEE.
+//
+// Light NEE visibility hint (kLightNeeHint): `hint_word` (ReadLightHint, packed; kHintWordOff without
+// the hint) weights the primary vertex's sun / lamp choice; `nee_result` receives that vertex's shadow
+// ray (kNeeTraced* | kNeeResultVisible; kNeeTracedNone when it traced none) for WriteLightHint.
 //
 // Subsurface (CAELIX_SUBSURFACE kernels with kRenderFlagSubsurface; docs/SUBSURFACE.md): after the
 // shade of a vertex on an SSS material, SubsurfaceVertex may replace the vertex by the exit of a walk (a
@@ -549,8 +728,9 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // emission (at the primary: no NEE, no segment, stochastic 0). A vertex without a next segment skips
 // the walk (only its emission counts).
 CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
-                            uint medium, inout uint rng, out float4 stochastic)
+                            uint medium, uint hint_word, inout uint rng, out float4 stochastic, out uint nee_result)
 {
+    nee_result = kNeeTracedNone;
     uint nee_rng = InitRandom(pixel, fc.frame_seed ^ 0x68E31DA4u);
     const bool nee = (fc.flags & kRenderFlagSunNee) != 0u && any(fc.sun_radiance.xyz > 0.0f);
     // Light NEE: its own random stream; the state word of the current segment.
@@ -613,8 +793,12 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     CAELIX_BRANCH
     if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
     {
+        uint traced;
+        bool visible;
         radiance += NextEventAtVertex(fc, primary_shade.bounce_origin, primary_normal, nee, transmissive, medium,
-                                      nee_rng, light_rng, segment_light) * throughput;
+                                      UnpackHint(hint_word), nee_rng, light_rng, segment_light, traced, visible) *
+                    throughput;
+        nee_result = traced | (visible ? kNeeResultVisible : 0u);
         segment_sees_sun = !nee;
         claim = transmissive;
     }
@@ -717,21 +901,40 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
                 claim = false;
             }
         }
+        // NEE at this vertex (the bounce NEE budget: with probability q, scaled by 1 / q).
+        const bool nee_vertex = !shade.specular_lobe && bounce_index <= fc.bounce_count;
         CAELIX_BRANCH
-        if (light_nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
+        if ((light_nee || nee) && nee_vertex)
         {
-            const float3 nee_radiance = NextEventAtVertex(fc, shade.bounce_origin, vertex_normal, nee, false, 0u,
-                                                          nee_rng, light_rng, segment_light);
-            radiance += nee_radiance * throughput;
+            // The state of a vertex that ran its NEE, also when the budget skips it: no sun disk (sun NEE),
+            // the lamp segment state (light NEE; NextEventAtVertex sets the same).
             segment_sees_sun = !nee;
-        }
-        else
-        {
-            CAELIX_BRANCH
-            if (nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
+            if (light_nee)
             {
-                radiance += SunNextEvent(fc, shade.bounce_origin, vertex_normal, false, 0u, nee_rng) * throughput;
-                segment_sees_sun = false;
+                const bool mis = (fc.light_nee_flags & kLightNeeMis) != 0u;
+                segment_light = kSegmentLampNee | (mis ? kSegmentLampMis : 0u);
+            }
+            // q is never 0 (the renderer writes 1 for 0), and 1 / 1 is exactly 1; q = 1 draws no number.
+            const bool run =
+                fc.bounce_nee_probability >= 1.0f || RandomFloat01(nee_rng) < fc.bounce_nee_probability;
+            CAELIX_BRANCH
+            if (run)
+            {
+                CAELIX_BRANCH
+                if (light_nee)
+                {
+                    uint traced;
+                    bool visible;
+                    radiance += NextEventAtVertex(fc, shade.bounce_origin, vertex_normal, nee, false, 0u,
+                                                  float2(1.0f, 1.0f), nee_rng, light_rng, segment_light, traced,
+                                                  visible) *
+                                (throughput * (1.0f / fc.bounce_nee_probability));
+                }
+                else
+                {
+                    radiance += SunNextEvent(fc, shade.bounce_origin, vertex_normal, false, 0u, nee_rng) *
+                                (throughput * (1.0f / fc.bounce_nee_probability));
+                }
             }
         }
 
@@ -1030,12 +1233,24 @@ void main(uint3 thread_id : SV_DispatchThreadID)
         float4 rr_normal_roughness = float4(0.0f, 0.0f, 0.0f, 0.0f);
         float rr_hit_distance = kHalfMax;
 
+        // The light NEE visibility hint (docs/LIGHT_NEE.md section 12.1): every lane reads it (a pixel
+        // without a surface at its own patch: it may be the lane that writes its patch below). Never set in
+        // the kernels without light NEE (light_nee_flags 0), so this folds away there.
+        const bool light_hint = (fc.light_nee_flags & kLightNeeHint) != 0u;
+        uint hint_word = kHintWordOff;
+        CAELIX_BRANCH
+        if (light_hint)
+        {
+            hint_word = ReadLightHint(fc, pixel, chain.surface, surface);
+        }
+        uint nee_result = kNeeTracedNone;
+
         CAELIX_BRANCH
         if (surface)
         {
             float4 stochastic;
-            const CaelixShadeResult shade =
-                TracePath(fc, pixel, chain.ray, chain.surface, chain.medium, rng, stochastic);
+            const CaelixShadeResult shade = TracePath(fc, pixel, chain.ray, chain.surface, chain.medium, hint_word,
+                                                      rng, stochastic, nee_result);
             // The chain's transmission modulates everything the surface sends (Unity:
             // AlbedoTarget = throughput * albedo, deterministic = throughput * emission).
             material_albedo = chain.throughput * shade.albedo;
@@ -1105,12 +1320,28 @@ void main(uint3 thread_id : SV_DispatchThreadID)
                 }
                 rr_hit_distance = (stochastic.a > 0.0f && stochastic.a < fc.t_max) ? stochastic.a : kHalfMax;
             }
+            CAELIX_BRANCH
+            if (fc.mode == kModePathTrace && fc.debug_view == kViewLightHint)
+            {
+                // The hint view: the hint the primary vertex read (0.5 without the hint), no radiance (the
+                // composite shows it).
+                deterministic = light_hint ? float3(UnpackHint(hint_word), 0.0f) : float3(0.5f, 0.5f, 0.0f);
+                diffuse = float4(0.0f, 0.0f, 0.0f, 0.0f);
+                specular = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
         }
         else if (hit)
         {
             // The chain went through at least one interface and left the scene: the sky in
             // the last direction times the transmission (Unity: delta miss).
             deterministic = chain.throughput * SkyRadiance(fc, chain.ray.Direction) + chain.inscatter;
+        }
+        // The hint's update: outside the divergent branches above, so that every active lane of the
+        // wave takes part in its wave operations.
+        CAELIX_BRANCH
+        if (light_hint)
+        {
+            WriteLightHint(fc, pixel, hint_word, nee_result);
         }
         g_int_normal_roughness[pixel] = normal_roughness;
         // Coverage is albedo.a.

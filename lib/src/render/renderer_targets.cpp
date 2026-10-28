@@ -275,10 +275,10 @@ void Renderer::ReleaseTargetViews()
     views_.clear();
 }
 
-bool Renderer::EnsureInternalTargets(uint32_t width, uint32_t height, uint64_t frame)
+bool Renderer::EnsureInternalTargets(uint32_t width, uint32_t height, uint32_t hint_shift, uint64_t frame)
 {
     GpuImage& first = internal_[0];
-    if (first.valid() && first.width() == width && first.height() == height)
+    if (first.valid() && first.width() == width && first.height() == height && internal_hint_shift_ == hint_shift)
     {
         return false;
     }
@@ -292,17 +292,26 @@ bool Renderer::EnsureInternalTargets(uint32_t width, uint32_t height, uint64_t f
     // On a throw the images created so far are destroyed with `fresh`, and the next
     // lighting render tries again.
     InternalImages fresh;
+    // The light NEE hint images: one texel per patch x patch pixels (docs/LIGHT_NEE.md section 12.1).
+    const uint32_t patch = 1u << hint_shift;
+    const uint32_t hint_width = (width + patch - 1) >> hint_shift;
+    const uint32_t hint_height = (height + patch - 1) >> hint_shift;
     for (uint32_t i = 0; i < kInternalCount; ++i)
     {
-        fresh[i] = GpuImage(device_.allocator(), device_.device(), width, height,
-                            kInternalSpecs[i].format,
+        const bool hint = i == kInternalLightHintA || i == kInternalLightHintB;
+        fresh[i] = GpuImage(device_.allocator(), device_.device(), hint ? hint_width : width,
+                            hint ? hint_height : height, kInternalSpecs[i].format,
                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                             kInternalSpecs[i].name);
     }
     internal_ = std::move(fresh);
     internal_last_frame_ = frame;
     internal_needs_init_ = true;
-    CAELIX_LOGI("renderer: internal targets created at %ux%u", width, height);
+    internal_hint_shift_ = hint_shift;
+    // The new hint images hold no history: the next render with the hint reads 0.5 (kLightNeeHintReset).
+    hint_history_valid_ = false;
+    CAELIX_LOGI("renderer: internal targets created at %ux%u (light hint %ux%u, patch %u)", width, height,
+                hint_width, hint_height, patch);
     return true;
 }
 

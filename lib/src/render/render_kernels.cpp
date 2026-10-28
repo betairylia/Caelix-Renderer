@@ -63,8 +63,8 @@ RenderKernels::RenderKernels(Device& device)
     const VkDevice vk_device = device.device();
     try
     {
-        // Trace set: binding 0 the TLAS, bindings 1..7 the host targets, 8..19 the
-        // internal targets, 20 the sky cubemap, 21 its sampler. Every binding is
+        // Trace set: binding 0 the TLAS, bindings 1..7 the host targets, 8..21 the
+        // internal targets, 22 the sky cubemap, 23 its sampler. Every binding is
         // PARTIALLY_BOUND (descriptorBindingPartiallyBound, a device requirement): a render
         // call writes only the TLAS when there is one, the targets that are present, the
         // internal targets in the lighting modes and the sky bindings, and the kernel

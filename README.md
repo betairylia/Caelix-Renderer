@@ -419,8 +419,8 @@ flush builds the TLAS that the render binds.
 - Inputs: two descriptor sets and no push constants. Set 0 is the kernel's own set: for the
   trace kernel binding 0 the TLAS, bindings 1..7 the colour,
   albedo, normal, depth, motion, view_z and voxel_id targets as storage images without a
-  format qualifier, bindings 8..19 the internal targets of the lighting modes
-  with fixed formats, binding 20 the sky cubemap as a sampled image and 21 its
+  format qualifier, bindings 8..21 the internal targets of the lighting modes
+  with fixed formats (20 and 21 the light NEE hint images), binding 22 the sky cubemap as a sampled image and 23 its
   sampler (`lib/src/render/render_kernels.h`; the output-size pass `caelix_voxel_id`, which writes
   the voxel id target and an output-size depth target under an upscaler, binds the
   same set). Set 1 is the frame set, shared by the six
@@ -1030,12 +1030,13 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   (0, 64, -128) with pitch 15 and yaw 0.
 - `--fov <DEGREES>`: vertical field of view. Default 60.
 - `--mode <primary|pt|ref>`: the rendering mode. Default `pt`.
-- `--view <albedo|normal|depth|group|brick|steps|material|voxel-id|nrd-validation|nrd-diff|nrd-spec|motion>`:
+- `--view <albedo|normal|depth|group|brick|steps|material|voxel-id|nrd-validation|nrd-diff|nrd-spec|motion|light-hint>`:
   the debug view; the first six, `material` (the material table's albedo,
   transparent codes tinted blue, emitters white) and `voxel-id` (one hash colour per voxel) in the primary mode,
   `nrd-validation` (NRD's validation layer), `nrd-diff` / `nrd-spec` (the
-  denoised diffuse / specular radiance) and `motion` (the motion vector, see
-  "Denoising") in `pt` mode. Default `albedo`.
+  denoised diffuse / specular radiance), `motion` (the motion vector, see
+  "Denoising") and `light-hint` (the light NEE visibility hint of the primary vertex: red = sun,
+  green = lamps, 0.5 = no history; `docs/LIGHT_NEE.md` section 12.1) in `pt` mode. Default `albedo`.
 - `--no-denoise`: `pt` mode without NRD (the raw 1 spp image). Default: NRD on.
 - `--voxel-id`: pass a voxel id target (R32G32_UINT at the window size, recreated on a resize)
   to every render call; the F1 Render window switches it. `--voxel-id-tmax <F>`: a hit farther
@@ -1115,10 +1116,16 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   at or after it once the world is complete) instead of `--warmup` frames after the load, so runs
   with different options capture the same random numbers.
 - Light NEE (`docs/LIGHT_NEE.md`, on by default; it enables the light tree): `--no-light-nee` turns
-  it off, `--light-no-mis` uses the exclusive rule instead of MIS. `--light-tree` builds the light
+  it off, `--light-no-mis` uses the exclusive rule instead of MIS. `--light-no-hint` turns the
+  visibility hint of the primary vertex off (`docs/LIGHT_NEE.md` section 12.1), `--light-hint-patch <N>`
+  sets its patch in pixels (0 = the library default, 1, 2 or 4). `--light-tree` builds the light
   tree also with `--no-light-nee`; `--light-min-emission <F>` sets its threshold. The Stats window
-  (F1) has a "Light NEE" section (enabled, running, MIS); `--timing-frames` adds
+  (F1) has a "Light NEE" section (enabled, running, MIS, hint patch); `--timing-frames` adds
   `light_nee: running=<0|1>` to the `timings_avg:` line.
+- `--bounce-nee-probability <P>`: lighting modes, bounce vertices run their NEE (sun and lamps) with
+  this probability and scale it by 1 / P (`docs/LIGHT_NEE.md` section 12.2); 1 = every vertex, the
+  primary vertex always runs it. Default 0.5 (the library default is 1). The F1 Render window has a
+  "bounce NEE p" slider.
 - `--no-input`: ignore keyboard and mouse, for deterministic automated runs.
   It also disables the debug UI (no egui context, no overlay renderer).
 - `--no-ui`: start with the debug UI hidden (`F1` shows it).
