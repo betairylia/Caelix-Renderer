@@ -584,7 +584,8 @@ Design and owner decisions: `docs/STEP6D_MATERIALS_DELTA.md` (section "As built"
   fields (read by the subsurface walk and the transmissive shadow ray,
   `docs/SUBSURFACE.md`) and texture fields that no kernel reads yet), one per
   16-bit block code. The GPU
-  holds two packed tables (`docs/MATERIALS.md`): 32-byte hot entries of halves
+  holds two packed tables (`docs/MATERIALS.md`; the artist-facing meaning of every
+  value and recipes: `docs/MATERIAL_GUIDE.md`): 32-byte hot entries of halves
   in a 2 MiB device-local buffer whose address is in the frame constants
   (`materials`, offset 440), and 32-byte subsurface entries in a second 2 MiB
   buffer (`subsurface_table`, offset 560). The kernels read the hot table with `GET_MATERIAL(code)`

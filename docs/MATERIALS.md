@@ -103,3 +103,4 @@ A JSON array of entries (`host-rs/caelix-app/src/materials.rs`): `id`, `transpar
 `smoothness`, `metallic`, `emission`, `ior`, `extinction`, and the optional keys `sss_model`,
 `sss_probability`, `sss_albedo`, `sss_anisotropy`, `sss_steps`, `sss_params` (0..8 numbers, the
 missing ones 0), `texture_set`, `connect_group` (all default 0).
+What each value does to the picture, with recipes for artists: `docs/MATERIAL_GUIDE.md`.
