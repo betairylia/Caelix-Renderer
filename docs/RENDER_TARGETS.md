@@ -255,7 +255,7 @@ binding is PARTIALLY_BOUND. Each kernel binds its own set as set 0 and the frame
 
 | Set | Kernels | Bindings |
 |---|---|---|
-| trace (set 0) | `caelix_path_trace`, `caelix_path_trace_no_light_nee`, `caelix_voxel_id` | 0 TLAS; 1..7 host targets colour, albedo, normal, depth, motion, view_z, voxel_id (`kTargetCount` = 7); 8..19 internal targets 0..11 (`kTraceInternalCount` = 12: view_z .. rr_hit_dist); 20 sky cubemap (sampled); 21 sky sampler. `caelix_voxel_id` uses only 0, 4 and 7. |
+| trace (set 0) | `caelix_path_trace`, `caelix_path_trace_no_light_nee`, `caelix_path_trace_sss`, `caelix_path_trace_sss_no_light_nee`, `caelix_voxel_id` | 0 TLAS; 1..7 host targets colour, albedo, normal, depth, motion, view_z, voxel_id (`kTargetCount` = 7); 8..19 internal targets 0..11 (`kTraceInternalCount` = 12: view_z .. rr_hit_dist); 20 sky cubemap (sampled); 21 sky sampler. `caelix_voxel_id` uses only 0, 4 and 7. |
 | composite (set 0) | `caelix_composite`, `caelix_cross_resolve` | 0 host colour; 1 albedo; 2 deterministic; 3 diff_out (NRD) or diff_in; 4 spec_out (NRD) or spec_in; 5 accum; 6 validation; 7 motion; 8 resolve; 9 upscale_in; 10 sky cubemap; 11 sky sampler; 12 host background (sampled, render size) |
 | encode (set 0) | `caelix_upscale_encode` (upscaled frames) | 0 host colour; 1 `upscale_out_` (or `upscale_in` after an NGX failure); 2 internal albedo |
 | sky SH (set 0) | `caelix_sky_sh` | 0 sky cubemap; 1 sampler; writes `sky_sh_buffer_` by device address |

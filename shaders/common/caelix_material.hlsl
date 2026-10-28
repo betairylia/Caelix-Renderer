@@ -10,7 +10,9 @@
 //     w2 sss_steps (8 bits) | shadow_length << 16, w3 sss_probability | sss_model << 16 (8 bits; a
 //     mirror of hot w5), w4..w7 sss_params[0..7] in pairs.
 // The per-bounce read is one hot entry; the subsurface table is read only by the code that needs it
-// (the transmissive shadow ray of render/caelix_shadow_medium.hlsl).
+// (the transmissive shadow ray of render/caelix_shadow_medium.hlsl, the subsurface walk of
+// render/caelix_subsurface.hlsl; both only in the kernels compiled with CAELIX_SUBSURFACE 1).
+// CaelixMaterialSssWord reads the hot entry's sss word alone (the walk's vertex test).
 // The CPU side builds and uploads both (lib/src/scene/material_table.*); the decode of packed
 // colours, the glass palette and the host's table all live there.
 //
@@ -110,6 +112,14 @@ float3 CaelixMaterialEmission(uint64_t table, uint code)
 {
     const uint2 w = CAELIX_LOAD_U32x2(table + uint64_t(code) * kMaterialBytes + kMaterialEmission);
     return float3(CaelixHalfLo(w.x), CaelixHalfHi(w.x), CaelixHalfLo(w.y));
+}
+
+// The sss word of a table entry (hot w5, kMaterialSss: h(sss_probability) | sss_model << 16 | flags
+// << 24; `code` is a table index, see CaelixMaterialCode): one 4-byte load. ShadeVoxelHit's
+// CaelixGetMaterial has just loaded the same 16-byte row, so the load is a cache hit at a path vertex.
+uint CaelixMaterialSssWord(uint64_t table, uint code)
+{
+    return CAELIX_LOAD_U32(table + uint64_t(code) * kMaterialBytes + kMaterialSss);
 }
 
 CaelixSubsurface CaelixGetSubsurface(uint blk)

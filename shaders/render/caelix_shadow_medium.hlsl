@@ -9,12 +9,21 @@
 //     multiplies by sss_probability once; a segment of length l multiplies by sss_albedo^l and adds
 //     l / shadow_length to the budget; at a budget of 1 the ray dies;
 //   a transmittance below kShadowTransmitCutoff (max channel) is occluded.
+// The SSS rules exist only in the kernels compiled with CAELIX_SUBSURFACE 1 (the trace variants
+// caelix_path_trace_sss*, docs/SUBSURFACE.md section 4); with the default 0 no voxel is an SSS voxel
+// (ShadowVoxelIsSubsurface folds to false), so the main trace kernels carry no SSS code.
 #ifndef CAELIX_SHADOW_MEDIUM_HLSL
 #define CAELIX_SHADOW_MEDIUM_HLSL
 
 #include "common/caelix_platform.hlsl"
 #include "common/caelix_block.hlsl"
 #include "common/caelix_material.hlsl"
+
+// 1: the kernel carries the subsurface code (the SSS rules of the shadow ray here and the walk of
+// render/caelix_subsurface.hlsl). The variant files define it before their include.
+#ifndef CAELIX_SUBSURFACE
+#define CAELIX_SUBSURFACE 0
+#endif
 
 // Max channel of the transmittance below which a shadow ray counts as occluded.
 static const float kShadowTransmitCutoff = 1e-3f;
@@ -69,9 +78,11 @@ void ShadowSssEnter(inout ShadowMedium m, uint block)
 }
 
 // The block value is an SSS voxel: opaque, sss_model kSssModelHg, sss_probability > 0. One 4-byte load of
-// the subsurface entry's w3 (the mirror of the hot entry's sss word).
+// the subsurface entry's w3 (the mirror of the hot entry's sss word). Always false (no load) in a kernel
+// without CAELIX_SUBSURFACE.
 bool ShadowVoxelIsSubsurface(uint block)
 {
+#if CAELIX_SUBSURFACE
     if (!IsOpaque(int(block)))
     {
         return false;
@@ -79,6 +90,9 @@ bool ShadowVoxelIsSubsurface(uint block)
     const uint w3 = CAELIX_LOAD_U32(g_subsurfaceTable + uint64_t(CaelixMaterialCode(block)) * kSubsurfaceBytes +
                                     kSubsurfaceProbability);
     return ((w3 >> 16) & 0xFFu) == kSssModelHg && CaelixHalfLo(w3) > 0.0f;
+#else
+    return false;
+#endif
 }
 
 // The ray is dead: the SSS budget is used up or the transmittance is below the cutoff.

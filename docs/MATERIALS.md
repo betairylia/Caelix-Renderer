@@ -1,7 +1,8 @@
 # Materials (as built)
 
 Status: material compaction step, 2026-10-27; subsurface entry words 2 and 3 since the shadow
-transmission step, 2026-10-28 (`docs/SHADOW_TRANSMISSION.md`). The truth for the C side is `include/caelix/caelix.h`
+transmission step, 2026-10-28 (`docs/SHADOW_TRANSMISSION.md`); the subsurface walk reads the tables since
+the subsurface step, 2026-10-28 (`docs/SUBSURFACE.md`). The truth for the C side is `include/caelix/caelix.h`
 ("Materials"); this page describes the layouts behind it. History of the table: `STEP6D_MATERIALS_DELTA.md`.
 
 ## Rule
@@ -9,13 +10,19 @@ transmission step, 2026-10-28 (`docs/SHADOW_TRANSMISSION.md`). The truth for the
 The per-bounce read is one 32-byte hot entry. Subsurface (SSS) and texture data live in side
 tables, read only by the code that needs them. The GPU stores floats as IEEE halves.
 
-The transmissive shadow ray (`CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION`,
-`shaders/render/caelix_shadow_medium.hlsl`) is the first reader of the subsurface table: an SSS voxel
-is an opaque code whose entry has `sss_model` = `CAELIX_SSS_MODEL_HG` (1), `sss_probability` > 0
-(and, for `MaterialTable::has_subsurface`, `sss_steps` > 0); the ray reads w0..w3 of its subsurface
-entry. No kernel reads `sss_params`, `texture_set` or `connect_group` yet; the subsurface walk comes
-with `docs/SUBSURFACE.md`. `MaterialTable` counts the SSS entries (`has_subsurface()`, exposed by
-`Scene::has_subsurface()` and as `FrameConstants::subsurface_present`).
+The subsurface table has two readers, both only in the trace kernel variants `caelix_path_trace_sss`
+and `caelix_path_trace_sss_no_light_nee` (`CAELIX_SUBSURFACE 1`, bound for the lighting frames of a scene
+whose table has an SSS entry; the main trace kernels read no subsurface entry): the subsurface walk
+(`CAELIX_RENDER_FLAG_SUBSURFACE`, `shaders/render/caelix_subsurface.hlsl`, `docs/SUBSURFACE.md`) and the
+transmissive shadow ray (`CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION`,
+`shaders/render/caelix_shadow_medium.hlsl`). An SSS voxel is an opaque code whose entry has `sss_model`
+= `CAELIX_SSS_MODEL_HG` (1), `sss_probability` > 0 and `sss_steps` > 0 (the shadow ray's single-word
+test does not check the steps, docs/SHADOW_TRANSMISSION.md section 8). The walk tests a vertex with the
+hot entry's w5 (`CaelixMaterialSssWord`, one 4-byte load) and reads w0..w3 of the subsurface entry of
+the entry voxel and of every voxel it looks at; the shadow ray reads w3 alone in its probe and w0..w3 in
+the chain. No kernel reads `sss_params`, `texture_set` or `connect_group` yet. `MaterialTable` counts the
+SSS entries (`has_subsurface()`, exposed by `Scene::has_subsurface()`, which chooses the trace kernel,
+and as `FrameConstants::subsurface_present`).
 
 ## C ABI: `CaelixMaterial` (112 bytes)
 
@@ -85,7 +92,8 @@ computed by `SubsurfaceShadowLength` (`material_pack.h`). With w3 a voxel's whol
 `CaelixGetSubsurface` returns all of it (`shadow_length`, `probability`, `model`).
 
 `CaelixMaterialEmission(table, code)` reads only the emission (one 8-byte load); the light NEE
-(`LampEmission`) and the light tree build use it. The layout constants are mirrored in C++
+(`LampEmission`) and the light tree build use it. `CaelixMaterialSssWord(table, code)` reads only w5 (one
+4-byte load; the subsurface walk's vertex test). The layout constants are mirrored in C++
 (`material_pack.h`) and HLSL (`shaders/common/caelix_material.hlsl`); `caelix_frame_layout_test`
 checks that both sides agree.
 

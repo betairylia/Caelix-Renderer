@@ -262,6 +262,11 @@ struct Args {
     /// attenuated: tinted glass casts coloured shadows; docs/SHADOW_TRANSMISSION.md).
     #[arg(long)]
     no_shadow_transmission: bool,
+    /// Lighting modes: no subsurface scattering walk (by default a path vertex on an SSS material,
+    /// sss_model 1 in the materials JSON, runs the Henyey-Greenstein walk with probability
+    /// sss_probability; docs/SUBSURFACE.md). The shadow rays still pass SSS voxels.
+    #[arg(long)]
+    no_sss: bool,
     /// Lighting modes: a lat-long (equirectangular) sky image, .exr or .hdr, converted to a
     /// mipmapped cubemap and used instead of the procedural sky (the Render window switches back).
     /// Orientation (world Y up): the image centre faces +Z, u grows toward +X, the top row is up;
@@ -2039,7 +2044,7 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!(
         "mode {mode:?}, bounces {}, transparent bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, \
-         sun NEE {}, shadow transmission {}, denoise {}, sky {}, fog density {} colour {:?}, emission scale {}, \
+         sun NEE {}, shadow transmission {}, sss {}, denoise {}, sky {}, fog density {} colour {:?}, emission scale {}, \
          upscaler {:?}, upscale quality {:?}, upscale preset {}, upscale auto exposure {}, jitter phases {}, \
          window {}x{}",
         args.bounces,
@@ -2049,6 +2054,7 @@ fn main() -> anyhow::Result<()> {
         args.sun_radiance,
         !args.no_sun_nee,
         !args.no_shadow_transmission,
+        !args.no_sss,
         mode == Mode::Pt && !args.no_denoise,
         args.sky.as_deref().map_or_else(|| "procedural".into(), |p| p.display().to_string()),
         args.fog_density,
@@ -2089,6 +2095,7 @@ fn main() -> anyhow::Result<()> {
         denoise: !args.no_denoise,
         sun_nee: !args.no_sun_nee,
         shadow_transmission: !args.no_shadow_transmission,
+        subsurface: !args.no_sss,
         checkerboard: !args.no_checkerboard,
         sky_on_miss: !args.no_sky_on_miss,
         shading: !args.no_shading,

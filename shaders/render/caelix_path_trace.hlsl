@@ -27,6 +27,9 @@
 //                   With kRenderFlagShadowTransmission the shadow rays of the PRIMARY
 //                   vertex (sun and lamps) pass transparent and SSS voxels in a
 //                   straight line (TraceShadowTransmissive, docs/SHADOW_TRANSMISSION.md).
+//                   With kRenderFlagSubsurface (only in the CAELIX_SUBSURFACE kernel variants
+//                   caelix_path_trace_sss*) a vertex on an SSS voxel may run the subsurface
+//                   walk instead of its BSDF (SubsurfaceVertex, docs/SUBSURFACE.md).
 //                   Before the shading, the delta chain (RunDeltaChain, Unity's
 //                   AdvanceDeltaRay loop) carries the camera ray through up to
 //                   bounce_count_transparent smooth transparent interfaces
@@ -50,7 +53,8 @@
 //                   The internal device depth (binding 15, the host depth target's
 //                   expression; the upscaler's depth) is written in every lighting
 //                   frame; with fc.upscaler = kUpscalerDlssRr the four DLSS RR guides
-//                   (bindings 16..19): diffuse albedo albedo * (1 - metallic) (sky 0.5),
+//                   (bindings 16..19): diffuse albedo albedo * (1 - metallic) (sky 0.5; after an SSS
+//                   primary vertex the albedo is its guide albedo),
 //                   specular albedo EnvBRDFApprox2(lerp(0.04, albedo, metallic),
 //                   roughness^2, N.V) (sky 0), world normal + linear roughness (sky 0) and
 //                   the hit distance of the first bounce segment (sky and no segment 65504),
@@ -91,6 +95,9 @@
 // The light tree and the light NEE's near field and MIS weight (docs/LIGHT_NEE.md).
 #include "light/caelix_light_tree.hlsl"
 #include "render/caelix_light_nee.hlsl"
+// The subsurface walk (docs/SUBSURFACE.md): compiled only with CAELIX_SUBSURFACE 1 (the kernel variants
+// caelix_path_trace_sss and caelix_path_trace_sss_no_light_nee).
+#include "render/caelix_subsurface.hlsl"
 // NRD's front-end packing (normal + roughness, radiance + normalized hit distance);
 // NRDConfig.hlsli next to it fixes the encodings NRD was built with.
 #include "NRD.hlsli"
@@ -532,6 +539,15 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // refracted BSDF path does not count that light a second time
 // (docs/SHADOW_TRANSMISSION.md section 1). NEE draws from its own random stream, so the
 // BSDF path consumes the same random numbers with NEE on or off.
+//
+// Subsurface (CAELIX_SUBSURFACE kernels with kRenderFlagSubsurface; docs/SUBSURFACE.md): after the
+// shade of a vertex on an SSS material, SubsurfaceVertex may replace the vertex by the exit of a walk (a
+// diffuse vertex with the exit's normal, origin and direction, albedo = the walk's weight, in the air:
+// `medium` = 0); NEE and the next segment use that VERTEX normal and origin. The walk uses the vertex's
+// bounce (no extra bounce count). The primary returns the guide albedo lerp(albedo, sss_albedo, p)
+// and carries branch weight / guide in its throughput. A dead walk ends the path after the hit's
+// emission (at the primary: no NEE, no segment, stochastic 0). A vertex without a next segment skips
+// the walk (only its emission counts).
 CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, TraceResult surface,
                             uint medium, inout uint rng, out float4 stochastic)
 {
@@ -542,12 +558,41 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     uint light_rng = InitRandom(pixel, fc.frame_seed ^ 0x7F4A7C15u);
     uint segment_light = 0u;
     const uint surface_block = (surface.attrib >> 16) & 0xFFFFu;
-    const CaelixShadeResult primary_shade =
+    CaelixShadeResult primary_shade =
         ShadeVoxelHit(surface_block, ray.Origin + ray.Direction * surface.T, ray.Direction,
                       surface.normal, rng, medium);
+    // The normal of the primary vertex: NEE and the first segment's lobe (the exit normal after a walk).
+    float3 primary_normal = surface.normal;
 
     float3 radiance = float3(0.0f, 0.0f, 0.0f);
     float3 throughput = 1.0f / max(0.001f, primary_shade.k);
+#if CAELIX_SUBSURFACE
+    const bool subsurface = (fc.flags & kRenderFlagSubsurface) != 0u;
+    CAELIX_BRANCH
+    if (subsurface)
+    {
+        float3 guide;
+        const uint state = SubsurfaceVertex(fc, surface, ray.Direction, rng, primary_shade, primary_normal, guide,
+                                            false);
+        if (state != kSubsurfaceNone)
+        {
+            // Demodulation by the guide albedo: the composite multiplies the stochastic radiance by it, so
+            // the branch's own weight (the albedo or the walk's weight) divided by it goes here.
+            throughput = primary_shade.albedo / max(guide, 0.001f);
+            primary_shade.albedo = guide;
+            if (state == kSubsurfaceDead)
+            {
+                stochastic = float4(0.0f, 0.0f, 0.0f, 0.0f);
+                return primary_shade;
+            }
+            if (state == kSubsurfaceExit)
+            {
+                // The exit vertex lies in the air (docs/SUBSURFACE.md section 3).
+                medium = 0u;
+            }
+        }
+    }
+#endif
     // Hit distance of the first stochastic segment (primary surface -> first bounce
     // hit) in world units; t_max when it reaches the sky, 0 when there is no segment
     // (bounce_count 0).
@@ -555,7 +600,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     bool first_segment = true;
 
     // The lobe of the current segment (the sky it receives on a miss).
-    float3 segment_normal = surface.normal;
+    float3 segment_normal = primary_normal;
     bool segment_diffuse = !primary_shade.specular_lobe;
     float segment_roughness = primary_shade.roughness;
 
@@ -568,7 +613,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
     CAELIX_BRANCH
     if (light_nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
     {
-        radiance += NextEventAtVertex(fc, primary_shade.bounce_origin, surface.normal, nee, transmissive, medium,
+        radiance += NextEventAtVertex(fc, primary_shade.bounce_origin, primary_normal, nee, transmissive, medium,
                                       nee_rng, light_rng, segment_light) * throughput;
         segment_sees_sun = !nee;
         claim = transmissive;
@@ -578,7 +623,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         CAELIX_BRANCH
         if (nee && !primary_shade.specular_lobe && fc.bounce_count >= 1u)
         {
-            radiance += SunNextEvent(fc, primary_shade.bounce_origin, surface.normal, transmissive, medium,
+            radiance += SunNextEvent(fc, primary_shade.bounce_origin, primary_normal, transmissive, medium,
                                      nee_rng) * throughput;
             segment_sees_sun = false;
             claim = transmissive;
@@ -616,9 +661,21 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
             first_segment = false;
         }
         const uint hit_block = (hit.attrib >> 16) & 0xFFFFu;
-        const CaelixShadeResult shade =
+        CaelixShadeResult shade =
             ShadeVoxelHit(hit_block, bounce.Origin + bounce.Direction * hit.T, bounce.Direction, hit.normal, rng,
                           medium);
+        // The normal of this vertex: NEE and the next segment's lobe (the exit normal after a walk).
+        float3 vertex_normal = hit.normal;
+#if CAELIX_SUBSURFACE
+        uint walk_state = kSubsurfaceNone;
+        CAELIX_BRANCH
+        if (subsurface)
+        {
+            float3 guide;
+            walk_state = SubsurfaceVertex(fc, hit, bounce.Direction, rng, shade, vertex_normal, guide,
+                                          bounce_index + 1u > fc.bounce_count);
+        }
+#endif
         bounce_index += 1;
 
         // A lamp's emission on a segment that left a lamp NEE vertex: the BSDF's MIS weight
@@ -630,6 +687,16 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
             emission_weight = LampHitWeight(fc, segment_light, hit, bounce, segment_normal);
         }
         radiance += shade.emission * (throughput * emission_weight);
+#if CAELIX_SUBSURFACE
+        if (walk_state == kSubsurfaceDead)
+        {
+            break;
+        }
+        if (walk_state == kSubsurfaceExit)
+        {
+            medium = 0u;
+        }
+#endif
         throughput *= shade.albedo / max(0.001f, shade.k);
 
         segment_sees_sun = true;
@@ -653,7 +720,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
         CAELIX_BRANCH
         if (light_nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
         {
-            const float3 nee_radiance = NextEventAtVertex(fc, shade.bounce_origin, hit.normal, nee, false, 0u,
+            const float3 nee_radiance = NextEventAtVertex(fc, shade.bounce_origin, vertex_normal, nee, false, 0u,
                                                           nee_rng, light_rng, segment_light);
             radiance += nee_radiance * throughput;
             segment_sees_sun = !nee;
@@ -663,7 +730,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
             CAELIX_BRANCH
             if (nee && !shade.specular_lobe && bounce_index <= fc.bounce_count)
             {
-                radiance += SunNextEvent(fc, shade.bounce_origin, hit.normal, false, 0u, nee_rng) * throughput;
+                radiance += SunNextEvent(fc, shade.bounce_origin, vertex_normal, false, 0u, nee_rng) * throughput;
                 segment_sees_sun = false;
             }
         }
@@ -679,7 +746,7 @@ CaelixShadeResult TracePath(CaelixFrameConstants fc, uint2 pixel, RayDesc ray, T
 
         bounce.Origin = shade.bounce_origin;
         bounce.Direction = shade.bounce_direction;
-        segment_normal = hit.normal;
+        segment_normal = vertex_normal;
         segment_diffuse = !shade.specular_lobe;
         segment_roughness = shade.roughness;
     }
@@ -720,7 +787,9 @@ float3 MaterialViewColor(uint block)
 // CAELIX_SPEC_BOUNCES_TRANSPARENT forces the delta chain budget. CAELIX_SPEC_NO_LIGHT_NEE: no light NEE
 // (the build's kernel variant caelix_path_trace_no_light_nee, render/caelix_path_trace_no_light_nee.hlsl,
 // which the renderer binds for frames without light NEE: the light NEE code holds registers and costs
-// occupancy even when its flags are 0).
+// occupancy even when its flags are 0). CAELIX_SPEC_NO_SUBSURFACE: no subsurface walk (kRenderFlagSubsurface
+// cleared; a measurement hook of the CAELIX_SUBSURFACE variants: the walk folds away, the SSS shadow ray
+// stays).
 void SpecializeFrameConstants(inout CaelixFrameConstants fc)
 {
 #ifdef CAELIX_SPEC_NO_PRIMARY_MODE
@@ -750,6 +819,9 @@ void SpecializeFrameConstants(inout CaelixFrameConstants fc)
 #endif
 #ifdef CAELIX_SPEC_NO_LIGHT_NEE
     fc.light_nee_flags = 0u;
+#endif
+#ifdef CAELIX_SPEC_NO_SUBSURFACE
+    fc.flags &= ~kRenderFlagSubsurface;
 #endif
 }
 
@@ -1019,7 +1091,8 @@ void main(uint3 thread_id : SV_DispatchThreadID)
                     const float roughness = 1.0f - material.smoothness;
                     const float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), material.albedo, material.metallic);
                     const float NoV = dot(surface_normal, -chain.ray.Direction);
-                    rr_diffuse_albedo = transmission * material.albedo * (1.0f - material.metallic);
+                    // shade.albedo: the material's albedo, or the guide albedo after an SSS primary vertex.
+                    rr_diffuse_albedo = transmission * shade.albedo * (1.0f - material.metallic);
                     rr_specular_albedo = transmission * EnvBRDFApprox2(f0, roughness * roughness, NoV);
                     rr_normal_roughness = float4(surface_normal, roughness);
                 }

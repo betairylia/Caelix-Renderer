@@ -256,11 +256,15 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         }
     }
     // DLSS RR replaces NRD and must not see checkerboard rendering (RR guide 3.5). The transmissive
-    // shadow rays exist only in the lighting modes.
+    // shadow rays exist only in the lighting modes. The subsurface code exists only in the trace kernel
+    // variants caelix_path_trace_sss*, bound for the lighting frames of a scene whose material table has
+    // an SSS entry (docs/SUBSURFACE.md section 4); the subsurface flag reaches only them.
     const bool ray_reconstruction = upscaling && options.upscaler == CAELIX_UPSCALER_DLSS_RR;
+    const bool sss_kernel = lighting && scene_.has_subsurface();
     const uint32_t flags =
         (ray_reconstruction ? (options.flags & ~CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) : options.flags) &
-        (lighting ? ~0u : ~CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION);
+        (lighting ? ~0u : ~CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION) &
+        (sss_kernel ? ~0u : ~CAELIX_RENDER_FLAG_SUBSURFACE);
 
     // The present targets (image != 0), in binding order.
     const CaelixTargetImage* const all[kTargetCount] = {&targets.color,  &targets.albedo, &targets.normal,
@@ -769,8 +773,11 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         sh_written.Record(cmd);
     }
-    // Trace (the variant without the light NEE code when this frame runs none).
-    const ComputePipeline& trace = light_nee_flags != 0 ? kernels_.trace() : kernels_.trace_no_light_nee();
+    // Trace (the variant without the light NEE code when this frame runs none; the subsurface variants
+    // when the scene has SSS materials in a lighting frame).
+    const ComputePipeline& trace =
+        sss_kernel ? (light_nee_flags != 0 ? kernels_.trace_sss() : kernels_.trace_sss_no_light_nee())
+                   : (light_nee_flags != 0 ? kernels_.trace() : kernels_.trace_no_light_nee());
     bind_sets(trace, slot->set);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
     // The output-size pass (an upscaler and a voxel id target or an output-size depth target): those

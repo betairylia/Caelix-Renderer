@@ -7,6 +7,8 @@
 // transform helpers (render/caelix_voxel_cursor.hlsl, included here; the subsurface walk of
 // docs/SUBSURFACE.md moves through the voxel grid with them), VoxelIdHash and the block code in
 // TraceResult::attrib; nothing above it knows what a record, a slot row or a group is.
+// The SSS parts of TraceShadowTransmissive exist only with CAELIX_SUBSURFACE 1 (the trace kernel
+// variants caelix_path_trace_sss*; render/caelix_shadow_medium.hlsl defines the default 0).
 //
 // Instances: instanceCustomIndex (CandidateInstanceID()) is the scene-wide group
 // index, the primitive index is the dense brick id inside the group, and the
@@ -254,7 +256,8 @@ bool CaelixShadowPassesOpaque(uint block)
 // either (kBrickDdaShadowOpaque / kBrickDdaShadowSssAware); `medium_seen` reports that a candidate's DDA
 // passed a medium (a transparent voxel with id != 0, or an SSS voxel). Conservative: the DDA of a
 // candidate also visits voxels beyond TMax, so a medium behind the end of the ray may set medium_seen
-// (the caller then runs the exact chain).
+// (the caller then runs the exact chain). Without CAELIX_SUBSURFACE only kBrickDdaShadowOpaque is
+// compiled (`sss_aware` is ignored).
 bool TraceShadowProbe(CaelixFrameConstants fc, RayDesc ray, bool sss_aware, out bool medium_seen)
 {
     bool occluded = false;
@@ -272,6 +275,7 @@ bool TraceShadowProbe(CaelixFrameConstants fc, RayDesc ray, bool sss_aware, out 
             }
             AttributeData attrib;
             float t;
+#if CAELIX_SUBSURFACE
             CAELIX_BRANCH
             if (sss_aware)
             {
@@ -280,6 +284,7 @@ bool TraceShadowProbe(CaelixFrameConstants fc, RayDesc ray, bool sss_aware, out 
                                    kBrickDdaShadowSssAware, medium_seen, attrib);
             }
             else
+#endif
             {
                 t = TraceCandidate(fc, q.CandidateInstanceID(), q.CandidatePrimitiveIndex(),
                                    q.CandidateObjectRayOrigin(), q.CandidateObjectRayDirection(), q.CommittedRayT(),
@@ -314,11 +319,17 @@ static const float kShadowZeroStep = 1e-6f;
 // Step 1: the any-hit probe; occluded -> 0; no medium seen and the ray starts in the air -> 1 (the common
 // case costs one any-hit query, as TraceShadow). Step 2: the chain of up to kShadowMaxHops closest-hit
 // queries, interface to interface; an SSS hit walks the voxels of its entity along the ray (the voxel
-// cursor) to the exit face. After the hop cap: 0.
+// cursor) to the exit face. After the hop cap: 0. Without CAELIX_SUBSURFACE (the main trace kernels) the
+// SSS part is not compiled: the probe runs kBrickDdaShadowOpaque and every opaque hit occludes.
 float3 TraceShadowTransmissive(CaelixFrameConstants fc, RayDesc ray, uint medium)
 {
     bool medium_seen;
-    if (TraceShadowProbe(fc, ray, fc.subsurface_present != 0u, medium_seen))
+#if CAELIX_SUBSURFACE
+    const bool sss_aware = fc.subsurface_present != 0u;
+#else
+    const bool sss_aware = false;
+#endif
+    if (TraceShadowProbe(fc, ray, sss_aware, medium_seen))
     {
         return float3(0.0f, 0.0f, 0.0f);
     }
@@ -363,6 +374,7 @@ float3 TraceShadowTransmissive(CaelixFrameConstants fc, RayDesc ray, uint medium
             remaining -= dot(offset, hop.Direction);
             continue;
         }
+#if CAELIX_SUBSURFACE
         if (!ShadowVoxelIsSubsurface(block))
         {
             return float3(0.0f, 0.0f, 0.0f);
@@ -460,6 +472,10 @@ float3 TraceShadowTransmissive(CaelixFrameConstants fc, RayDesc ray, uint medium
         {
             return float3(0.0f, 0.0f, 0.0f);
         }
+#else
+        // An opaque voxel occludes (no SSS voxels in this kernel).
+        return float3(0.0f, 0.0f, 0.0f);
+#endif
     }
     return float3(0.0f, 0.0f, 0.0f);
 }

@@ -87,7 +87,8 @@ extern "C" {
    192 bytes) and let the depth target have the output size under an upscaler (written by the
    output-size pass), also without a bump. The shadow transmission step added CAELIX_SSS_MODEL_NONE,
    CAELIX_SSS_MODEL_HG and CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION and turned reserved_voxel_id[0] of
-   CaelixRenderOptions into bounce_nee_probability (same size), also without a bump. A host built
+   CaelixRenderOptions into bounce_nee_probability (same size), also without a bump. The subsurface
+   step added CAELIX_RENDER_FLAG_SUBSURFACE (a new flag bit), also without a bump. A host built
    against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -484,8 +485,9 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * that needs it. Every float is stored as an IEEE half, so a magnitude above 65504 is rejected and
  * the GPU sees each value rounded to half precision. An SSS voxel is an opaque code whose entry has
  * sss_model CAELIX_SSS_MODEL_HG, sss_probability > 0 and sss_steps > 0: the transmissive shadow rays
- * (CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION) read its subsurface entry and pass it, attenuated; the
- * random walk itself comes with a later step (docs/SUBSURFACE.md). No kernel reads sss_params,
+ * (CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION) read its subsurface entry and pass it, attenuated, and
+ * with CAELIX_RENDER_FLAG_SUBSURFACE a path vertex on it runs the random walk with probability
+ * sss_probability (docs/SUBSURFACE.md). No kernel reads sss_params,
  * texture_set or connect_group yet: they are validated, stored and uploaded.
  *
  * Built-in content, by encoding:
@@ -508,8 +510,8 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
    never read). */
 #define CAELIX_SSS_MODEL_NONE 0u /* no subsurface scattering: the opaque surface BSDF only */
 #define CAELIX_SSS_MODEL_HG 1u   /* the Henyey-Greenstein lattice walk (docs/SUBSURFACE.md): sss_probability,
-                                    sss_albedo, sss_anisotropy (g), sss_steps (the step cap); sss_params unused.
-                                    Transmissive shadow rays pass such voxels in a straight line, times
+                                    sss_albedo, sss_anisotropy (g), sss_steps (the step cap, 0 = no walk:
+                                    the entry acts as none); sss_params unused. Transmissive shadow rays pass such voxels in a straight line, times
                                     sss_probability on entry and sss_albedo per voxel unit, and die after
                                     sqrt(sss_steps (1 + g) / (1 - g)) voxels (g clamped to [-0.95, 0.95]) */
 
@@ -530,8 +532,9 @@ typedef struct CaelixMaterial
                           transmits exp(-(1 - albedo) * t * extinction). Must be >= 0. */
     uint32_t sss_model;     /* subsurface scattering model, 0..255: CAELIX_SSS_MODEL_NONE (0) or
                                CAELIX_SSS_MODEL_HG (1); other values are stored and act as none. Only
-                               opaque codes scatter. The transmissive shadow rays read the SSS fields
-                               (CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION); the walk comes later */
+                               opaque codes scatter: the walk (CAELIX_RENDER_FLAG_SUBSURFACE) and the
+                               transmissive shadow rays (CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION) read
+                               the SSS fields */
     float sss_probability;  /* 0..1: probability that a path entering the voxel scatters */
     float sss_albedo[3];    /* 0..1 per channel, per scattering step */
     float sss_anisotropy;   /* -1..1 (Henyey-Greenstein g or the model's equivalent) */
@@ -925,6 +928,22 @@ typedef enum CaelixDebugView
                                                 internal targets (also NRD's inputs) are not
                                                 flipped: an image rendered with the flag is the
                                                 image rendered without it, mirrored in y. */
+#define CAELIX_RENDER_FLAG_SUBSURFACE (1u << 5) /* lighting modes only: subsurface scattering. A path
+                                                vertex (the primary surface or a bounce hit with a
+                                                next segment) on an SSS voxel (an opaque code whose
+                                                material has sss_model CAELIX_SSS_MODEL_HG,
+                                                sss_probability > 0 and sss_steps > 0) runs, with
+                                                probability sss_probability, a Henyey-Greenstein
+                                                random walk through the voxels of its entity instead
+                                                of the surface BSDF; the walk's exit becomes a
+                                                diffuse vertex (weight = the product of the
+                                                sss_albedo of its steps), a walk that reaches
+                                                sss_steps is absorbed. The primary albedo (albedo
+                                                target, NRD demodulation, DLSS RR guide) is then
+                                                lerp(albedo, sss_albedo, sss_probability). Ignored
+                                                when the scene's material table has no SSS entry
+                                                (such scenes keep their images and their trace
+                                                kernel). See docs/SUBSURFACE.md. */
 #define CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION (1u << 6) /* lighting modes only: the NEE shadow rays (sun
                                                 and lamps) of the PRIMARY vertex pass transparent voxels
                                                 and SSS voxels (CAELIX_SSS_MODEL_HG) in a straight line

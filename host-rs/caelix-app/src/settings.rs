@@ -233,6 +233,8 @@ pub struct RenderSettings {
     pub sun_nee: bool,
     /// Lighting modes: the primary vertex's NEE shadow rays pass glass and SSS voxels, attenuated.
     pub shadow_transmission: bool,
+    /// Lighting modes: the subsurface scattering walk at SSS material vertices.
+    pub subsurface: bool,
     /// Pt mode: the delta checkerboard at the first glass interface, with the cross resolve.
     pub checkerboard: bool,
     /// Lighting modes: the sky where the primary ray misses.
@@ -318,6 +320,9 @@ impl RenderSettings {
         }
         if lighting && self.shadow_transmission {
             flags |= CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION;
+        }
+        if lighting && self.subsurface {
+            flags |= CAELIX_RENDER_FLAG_SUBSURFACE;
         }
         if self.mode == Mode::Pt && self.checkerboard {
             flags |= CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD;

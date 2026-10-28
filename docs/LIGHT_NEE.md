@@ -125,8 +125,10 @@ frame-constant kernels.
 
 Registers (`CAELIX_PIPELINE_STATS=1`, RTX 5080, driver 610.88): `caelix_path_trace` 128 registers and
 16 bytes of spill (driver binary 174976 bytes, shared memory 2560 bytes), `caelix_path_trace_no_light_nee`
-96 and 48 bytes of spill (since the shadow transmission step both are 128 registers + 16 bytes:
-docs/SHADOW_TRANSMISSION.md section 8). Both equal the kernels of `18282cd`: the SPIR-V function bodies are the same
+96 and 48 bytes of spill (the shadow transmission step lifted both to 128 registers + 16 bytes,
+docs/SHADOW_TRANSMISSION.md section 8; since the subsurface step, which moved every SSS code path into the
+variants `caelix_path_trace_sss` and `caelix_path_trace_sss_no_light_nee`, they are again 128 + 16 bytes
+and 96 + 48 bytes: docs/SUBSURFACE.md section 6). Both equal the kernels of `18282cd`: the SPIR-V function bodies are the same
 instructions modulo id numbering, except the two flag bit values (`kLightNeeContribute` 2 -> `kLightNeeOn`
 1, `kLightNeeMis` 8 -> 2); `Artifacts/light-nee-variants-20261024/cleanup/spirv/compare.txt`.
 

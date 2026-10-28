@@ -596,6 +596,8 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.sun_nee, "sun NEE"));
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.shadow_transmission, "shadow transmission"))
             .on_hover_text("The primary vertex's shadow rays pass glass and SSS voxels, attenuated.");
+        ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.subsurface, "subsurface scattering"))
+            .on_hover_text("Vertices on SSS materials (sss_model 1) run the random walk with their sss_probability.");
         ui.add_enabled(
             settings.mode == Mode::Pt,
             egui::Checkbox::new(&mut settings.checkerboard, "glass checkerboard (pt mode)"),

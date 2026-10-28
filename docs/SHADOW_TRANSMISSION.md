@@ -1,7 +1,9 @@
 # Shadow rays through transparent and subsurface voxels (primary vertex)
 
 Status: AS BUILT, 2026-10-28 (spec of the same day; the deviations and measurements are in section 8,
-"As built"). Owner request: shadow rays (sun and lamp) at the PRIMARY hit vertex pass through
+"As built"). Since the subsurface step of the same day (docs/SUBSURFACE.md) the SSS parts of this ray
+(section 1's SSS rules, the SSS-aware probe, the straight SSS walk) are compiled only into the trace
+kernel variants `caelix_path_trace_sss` and `caelix_path_trace_sss_no_light_nee` (section 9). Owner request: shadow rays (sun and lamp) at the PRIMARY hit vertex pass through
 transparent voxels and through subsurface-scattering (SSS) opaque voxels in a straight line (no
 reflection, no refraction, as if one medium), attenuated by the glass extinction (tinted glass leaves
 coloured shadows) and by the SSS albedo, and die when they travel farther in SSS voxels than a rough
@@ -150,7 +152,9 @@ include/caelix/caelix.h; the layout test compares them). `MaterialTable` counts 
   transparent while `claim`: `segment_sees_sun = !nee` and `segment_light = light_nee ?
   kSegmentLampNee : 0` (no MIS bit), the claim stays; at an opaque hit `claim = false` before the
   vertex's own rule. The kernel variant without light NEE compiles the same code (`segment_light`
-  folds to 0 there).
+  folds to 0 there). Every SSS part above (`ShadowVoxelIsSubsurface`, the `kBrickDdaShadowSssAware` branch
+  of the probe, the straight SSS walk of the chain) is inside `#if CAELIX_SUBSURFACE`; the main kernels
+  compile it out (section 9).
 
 ## 4. ABI and host
 
@@ -160,7 +164,8 @@ include/caelix/caelix.h; the layout test compares them). `MaterialTable` counts 
   (`renderer_render.cpp`).
 - `CAELIX_SSS_MODEL_NONE 0u`, `CAELIX_SSS_MODEL_HG 1u` next to `CaelixMaterial` (other values act as
   none). The "Materials" comment and the `sss_model` field comment say that the shadow ray reads the
-  subsurface entry and that the walk comes later.
+  subsurface entry and that the walk comes later (since the subsurface step they describe the walk,
+  docs/SUBSURFACE.md).
 - `CaelixRenderOptions::bounce_nee_probability` (float, the former `reserved_voxel_id[0]`; `reserved[2]`
   follows; still 208 bytes): 0 = 1, else in (0, 1]; other values (NaN included) return
   CAELIX_ERROR_INVALID_ARGUMENT from `caelix_renderer_render`. No kernel reads it yet
@@ -278,6 +283,28 @@ Test results (caelix_trace_test, RTX 5080):
 - lamp: plain block 0 (largest pixel 0); glass / air 0.99875 / 0.66955 / 0.54821 against 1 / 0.67032 /
   0.54881 (relative 0.9988 .. 0.9989: the BSDF share of the MIS that the claim drops).
 
-Open: the register count of the kernel without light NEE (above); thin SSS objects can count the sun
-twice once the walk exists (section 1, accepted); the probe's `medium_seen` can run the chain for a
-medium behind the end of a lamp ray (cost only).
+Open: thin SSS objects can count the sun twice now that the walk exists (section 1, accepted); the
+probe's `medium_seen` can run the chain for a medium behind the end of a lamp ray (cost only). The
+register count of the kernel without light NEE is solved by section 9.
+
+## 9. Kernel variants (subsurface step, 2026-10-28)
+
+The SSS parts of this ray moved into the variants `caelix_path_trace_sss` and
+`caelix_path_trace_sss_no_light_nee` (`CAELIX_SUBSURFACE 1`, docs/SUBSURFACE.md section 4), which the
+renderer binds for the lighting frames of a scene whose material table has an SSS entry
+(`Scene::has_subsurface()`). The main kernels `caelix_path_trace` and `caelix_path_trace_no_light_nee`
+compile with `CAELIX_SUBSURFACE 0`: `ShadowVoxelIsSubsurface` (and so `CaelixShadowPassesOpaque`)
+returns false without a load, `TraceShadowProbe` compiles only `kBrickDdaShadowOpaque`, and
+`TraceShadowTransmissive` returns 0 at every opaque hit (no straight SSS walk). The glass part (probe,
+chain, claim) stays in all four kernels. A scene without SSS materials keeps its images (the SSS rules
+never applied to it). Registers (`CAELIX_PIPELINE_STATS=1`, RTX 5080, driver 610.88):
+
+| kernel | registers + spill |
+| --- | --- |
+| `caelix_path_trace` | 128 + 16 B |
+| `caelix_path_trace_no_light_nee` | 96 + 48 B (was 128 + 16 B in section 8) |
+| `caelix_path_trace_sss` (with the vertex walk) | 128 + 32 B |
+| `caelix_path_trace_sss_no_light_nee` (with the vertex walk) | 128 + 16 B |
+
+The three tests of section 5 pass with the same numbers; test 2 (the SSS slab) now runs on
+`caelix_path_trace_sss`, tests 1 and 3 on the main kernels.

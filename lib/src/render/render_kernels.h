@@ -80,8 +80,8 @@ struct NrdKernels
 // - the descriptor set layouts of the trace set, the composite set (also used by the
 //   cross resolve kernel), the sky SH set (binding 0 the cubemap, 1 the sampler), the
 //   encode set and the frame set (one uniform buffer), every binding PARTIALLY_BOUND;
-// - the compute pipelines caelix_path_trace, caelix_path_trace_no_light_nee, caelix_voxel_id
-//   (trace set), caelix_composite, caelix_cross_resolve, caelix_sky_sh and caelix_upscale_encode
+// - the compute pipelines caelix_path_trace, caelix_path_trace_no_light_nee, caelix_path_trace_sss,
+//   caelix_path_trace_sss_no_light_nee, caelix_voxel_id (trace set), caelix_composite, caelix_cross_resolve, caelix_sky_sh and caelix_upscale_encode
 //   (set 0 their own set, set kFrameSetIndex the frame set; no push constants);
 // - the sky sampler (linear, mipmapped, clamp to edge) and the fallback sky cube (1 x 1
 //   RGBA8), bound in every sky binding when the host gives no cubemap. The first render
@@ -127,6 +127,17 @@ public:
     const ComputePipeline& trace_no_light_nee() const
     {
         return trace_no_light_nee_;
+    }
+    // The same pair with the subsurface code (lighting frames of a scene whose material table has an SSS
+    // entry; shaders/render/caelix_path_trace_sss.hlsl, caelix_path_trace_sss_no_light_nee.hlsl,
+    // docs/SUBSURFACE.md section 4).
+    const ComputePipeline& trace_sss() const
+    {
+        return trace_sss_;
+    }
+    const ComputePipeline& trace_sss_no_light_nee() const
+    {
+        return trace_sss_no_light_nee_;
     }
     // The output-size pass: the voxel id target and an output-size depth target (frames with an
     // upscaler and either target; shaders/render/caelix_voxel_id.hlsl, trace set).
@@ -186,6 +197,8 @@ private:
     VkDescriptorSetLayout frame_layout_ = VK_NULL_HANDLE;  // the frame constants (uniform buffer)
     ComputePipeline trace_;                   // shaders/render/caelix_path_trace.hlsl, trace set
     ComputePipeline trace_no_light_nee_;      // caelix_path_trace_no_light_nee.hlsl, trace set
+    ComputePipeline trace_sss_;               // caelix_path_trace_sss.hlsl, trace set
+    ComputePipeline trace_sss_no_light_nee_;  // caelix_path_trace_sss_no_light_nee.hlsl, trace set
     ComputePipeline voxel_id_;                // shaders/render/caelix_voxel_id.hlsl, trace set
     ComputePipeline composite_;               // shaders/render/caelix_composite.hlsl, composite set
     ComputePipeline cross_resolve_;           // shaders/render/caelix_cross_resolve.hlsl, composite set

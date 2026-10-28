@@ -4230,3 +4230,191 @@ TEST_CASE("shadow transmission: hard occluder and lamp candidate")
     CHECK(blocked_max == 0.0f);
     CloseShadowRig(s);
 }
+
+namespace {
+
+// The subsurface walk tests (docs/SUBSURFACE.md section 5): a white procedural sky (all three colours 1,
+// no sun radiance), so a vertex that sees only the sky receives exactly 1 from every direction.
+
+// An opaque SSS entry of code `code` (albedo 0.5) with the given walk parameters.
+CaelixMaterialEntry WalkEntry(uint16_t code, uint32_t model, float probability, float sss_albedo, float anisotropy,
+                              uint32_t steps)
+{
+    CaelixMaterialEntry e{};
+    e.code = code;
+    e.material.albedo[0] = e.material.albedo[1] = e.material.albedo[2] = 0.5f;
+    e.material.ior = 1.5f;
+    e.material.sss_model = model;
+    e.material.sss_probability = probability;
+    e.material.sss_albedo[0] = e.material.sss_albedo[1] = e.material.sss_albedo[2] = sss_albedo;
+    e.material.sss_anisotropy = anisotropy;
+    e.material.sss_steps = steps;
+    return e;
+}
+
+// The white-sky options: sky on miss, the subsurface flag when asked, no sun NEE and no sun radiance.
+CaelixRenderOptions FurnaceOptions(uint32_t mode, uint32_t bounces, uint32_t seed, bool subsurface)
+{
+    CaelixRenderOptions options = LightOptions(mode, bounces, seed);
+    const float white[3] = {1.0f, 1.0f, 1.0f};
+    Set3(options.sky_zenith, white);
+    Set3(options.sky_horizon, white);
+    Set3(options.sky_ground, white);
+    options.flags = CAELIX_RENDER_FLAG_SKY_ON_MISS | (subsurface ? CAELIX_RENDER_FLAG_SUBSURFACE : 0u);
+    return options;
+}
+
+// Reference mode over `frames` frames with FurnaceOptions; the centre 64 x 64 mean of every channel.
+std::array<double, 3> FurnaceReference(ShadowRig& s, const CaelixCamera& camera, uint32_t bounces, bool subsurface,
+                                       uint32_t frames, uint32_t seed0)
+{
+    for (uint32_t i = 0; i < frames; ++i)
+    {
+        CaelixRenderOptions options = FurnaceOptions(CAELIX_MODE_REFERENCE, bounces, seed0 + i, subsurface);
+        options.reset_accumulation = i == 0 ? 1u : 0u;
+        Render(s.rig, s.renderer, s.set, camera, options, i + 1 == frames);
+    }
+    return {CentreMean(s.color, 64, 0), CentreMean(s.color, 64, 1), CentreMean(s.color, 64, 2)};
+}
+
+void UploadWorld(Rig& rig, const World& world)
+{
+    Upload(rig, world, KeysOf(world));
+    DrainBuilds(rig);
+}
+
+}  // namespace
+
+TEST_CASE("subsurface: furnace")
+{
+    ShadowRig s;
+    OpenShadowRig(s);
+    {
+        // A 4^3 cube of the SSS code floating in the white sky (x, y, z in [0, 4)).
+        World world;
+        FillBox(world, 0, 0, 0, 3, 3, 3, kSssCode);
+        UploadWorld(s.rig, world);
+    }
+    // 6 units above the top face: the top face fills the whole image.
+    const CaelixCamera camera = LookDownFrom(2.0f, 10.0f, 2.0f);
+
+    // sss_albedo 1, probability 1, g 0: every primary vertex walks; an exit is a diffuse vertex on the
+    // cube's surface that sees only the sky (the cube is convex), so the pixel is the sky radiance 1 times
+    // the fraction of walks that leave before the step cap. The guide albedo is lerp(0.5, 1, 1) = 1.
+    // The dead fraction of a 4^3 cube at 64 steps is about 0.81^64 = 1e-6 (the survival of a lattice walk
+    // in 4 cells per axis), far below the 2 % of the spec.
+    const CaelixMaterialEntry walk = WalkEntry(kSssCode, CAELIX_SSS_MODEL_HG, 1.0f, 1.0f, 0.0f, 64u);
+    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &walk, 1) == CAELIX_OK);
+    const std::array<double, 3> sss = FurnaceReference(s, camera, 4, true, 512, 100);
+    std::printf("subsurface furnace, 4^3 cube, steps 64: mean %.6f %.6f %.6f (dead fraction %.2e)\n", sss[0], sss[1],
+                sss[2], 1.0 - sss[0]);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        CHECK(sss[c] >= 0.95);
+        CHECK(sss[c] <= 1.0 + 1e-4);
+    }
+
+    // A short step cap: the dead fraction becomes visible (the cap works).
+    const CaelixMaterialEntry short_walk = WalkEntry(kSssCode, CAELIX_SSS_MODEL_HG, 1.0f, 1.0f, 0.0f, 2u);
+    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &short_walk, 1) == CAELIX_OK);
+    const std::array<double, 3> capped = FurnaceReference(s, camera, 4, true, 256, 200);
+    std::printf("subsurface furnace, steps 2: mean %.5f (dead fraction %.4f)\n", capped[0], 1.0 - capped[0]);
+    CHECK(capped[0] < sss[0] - 0.05);
+    CHECK(capped[0] > 0.1);
+
+    // The flag off (the subsurface kernel, no walk): the plain opaque surface, albedo 0.5 under a sky of 1.
+    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &walk, 1) == CAELIX_OK);
+    const std::array<double, 3> flag_off = FurnaceReference(s, camera, 4, false, 64, 300);
+    // sss_model 0 (the gate; no SSS entry, so the main kernel): the same plain surface.
+    const CaelixMaterialEntry plain = WalkEntry(kSssCode, CAELIX_SSS_MODEL_NONE, 1.0f, 1.0f, 0.0f, 64u);
+    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &plain, 1) == CAELIX_OK);
+    const std::array<double, 3> model_none = FurnaceReference(s, camera, 4, true, 64, 300);
+    std::printf("subsurface furnace, flag off: %.5f; sss_model 0: %.5f (expected 0.5)\n", flag_off[0], model_none[0]);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        CHECK(std::abs(flag_off[c] - 0.5) < 0.01);
+        CHECK(std::abs(model_none[c] - 0.5) < 0.01);
+    }
+    CloseShadowRig(s);
+}
+
+TEST_CASE("subsurface: lifecycle")
+{
+    ShadowRig s;
+    OpenShadowRig(s);
+    CaelixMaterialEntry plain_block = WalkEntry(kPlainCode, CAELIX_SSS_MODEL_NONE, 0.0f, 0.0f, 0.0f, 0u);
+    REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &plain_block, 1) == CAELIX_OK);
+
+    // 1. A scene without SSS materials: a white floor and a plain block. The flag changes nothing (the
+    //    renderer binds the main kernel and drops the flag): the same image bit for bit, same seed.
+    {
+        World world;
+        FillBox(world, 0, -8, 0, 63, -1, 63, kWhiteFloor);
+        FillBox(world, 24, 0, 24, 39, 15, 39, kPlainCode);
+        UploadWorld(s.rig, world);
+    }
+    const CaelixCamera beside = LookDownFrom(48.0f, 6.0f, 32.0f);
+    std::vector<std::vector<uint8_t>> main_images;
+    for (uint32_t frame = 0; frame < 3; ++frame)
+    {
+        Render(s.rig, s.renderer, s.set, beside, FurnaceOptions(CAELIX_MODE_PATH_TRACE, 3, 40 + frame, false));
+        const std::vector<uint8_t> off = s.color.bytes;
+        Render(s.rig, s.renderer, s.set, beside, FurnaceOptions(CAELIX_MODE_PATH_TRACE, 3, 40 + frame, true));
+        CHECK(s.color.bytes == off);
+        main_images.push_back(off);
+    }
+    // The same scene with an SSS entry on a code that no voxel uses: the subsurface kernel draws the same
+    // image as the main kernel (no SSS vertex draws a number; the flag on and off).
+    {
+        const CaelixMaterialEntry unused = WalkEntry(kSssCode, CAELIX_SSS_MODEL_HG, 1.0f, 1.0f, 0.0f, 8u);
+        REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &unused, 1) == CAELIX_OK);
+        size_t differing = 0;
+        for (uint32_t frame = 0; frame < 3; ++frame)
+        {
+            for (const bool flag : {false, true})
+            {
+                Render(s.rig, s.renderer, s.set, beside, FurnaceOptions(CAELIX_MODE_PATH_TRACE, 3, 40 + frame, flag));
+                differing += s.color.bytes == main_images[frame] ? 0u : 1u;
+            }
+        }
+        std::printf("subsurface lifecycle: subsurface kernel vs main kernel without SSS voxels: %zu of 6 images "
+                    "differ\n",
+                    differing);
+        CHECK(differing == 0);
+    }
+
+    // 2. The walk at a bounce vertex: the block becomes SSS; the camera sees only the floor beside it, so
+    //    every change of the image comes from walks at bounce vertices. Finite, and not the flag-off image.
+    {
+        CaelixMaterialEntry sss_block = WalkEntry(kPlainCode, CAELIX_SSS_MODEL_HG, 0.8f, 0.9f, 0.3f, 32u);
+        REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &sss_block, 1) == CAELIX_OK);
+        const std::array<double, 3> off = FurnaceReference(s, beside, 3, false, 64, 500);
+        const std::vector<uint8_t> off_image = s.color.bytes;
+        const std::array<double, 3> on = FurnaceReference(s, beside, 3, true, 64, 500);
+        std::printf("subsurface lifecycle, floor beside an SSS block: flag off %.5f, flag on %.5f\n", off[0], on[0]);
+        CHECK(Finite(s.color));
+        CHECK(s.color.bytes != off_image);
+        CHECK(on[0] > 0.1);
+    }
+
+    // 3. Dead walks: steps 1, g 0.9 (forward, into the slab), probability 1, sss_albedo 1 in a slab 16
+    //    voxels thick. A walk survives only when its single step turns back out of the top face, so the lit
+    //    top face stays close to black (no emission), against 0.5 for the plain surface.
+    {
+        World world;
+        FillBox(world, 0, 0, 0, 31, 15, 31, kSssCode);
+        UploadWorld(s.rig, world);
+        const CaelixMaterialEntry dead = WalkEntry(kSssCode, CAELIX_SSS_MODEL_HG, 1.0f, 1.0f, 0.9f, 1u);
+        REQUIRE(caelix_scene_set_material_entries(s.rig.scene, &dead, 1) == CAELIX_OK);
+        const CaelixCamera top = LookDownFrom(16.0f, 24.0f, 16.0f);
+        const std::array<double, 3> slab = FurnaceReference(s, top, 4, true, 128, 700);
+        std::printf("subsurface lifecycle, dead walks (steps 1, g 0.9): top face %.5f %.5f %.5f\n", slab[0], slab[1],
+                    slab[2]);
+        CHECK(Finite(s.color));
+        for (uint32_t c = 0; c < 3; ++c)
+        {
+            CHECK(slab[c] < 0.05);
+        }
+    }
+    CloseShadowRig(s);
+}

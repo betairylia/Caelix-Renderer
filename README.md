@@ -220,6 +220,19 @@ NEE bind the kernel variant `caelix_path_trace_no_light_nee`): [`docs/LIGHT_NEE.
 The light cells of the first version (removed 2026-10-24) are in its history section. Tests:
 `caelix_light_nee_test`, the "light NEE" cases of `caelix_trace_test`.
 
+### Subsurface scattering
+
+Opaque materials with `sss_model` = `CAELIX_SSS_MODEL_HG`, `sss_probability` > 0 and `sss_steps` > 0
+are SSS voxels: with `CAELIX_RENDER_FLAG_SUBSURFACE` a path vertex on one runs, with probability
+`sss_probability`, a Henyey-Greenstein lattice walk through the voxels of its entity instead of the
+surface BSDF; the exit is a diffuse vertex (`shaders/render/caelix_subsurface.hlsl`). The transmissive
+shadow ray (`CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION`, [`docs/SHADOW_TRANSMISSION.md`](docs/SHADOW_TRANSMISSION.md))
+passes SSS voxels in a straight line. All subsurface code lives in the trace kernel variants
+`caelix_path_trace_sss` and `caelix_path_trace_sss_no_light_nee` (`CAELIX_SUBSURFACE 1`); the renderer
+binds them for the lighting frames of a scene whose material table has an SSS entry, so the main
+kernels `caelix_path_trace` / `caelix_path_trace_no_light_nee` carry no SSS code:
+[`docs/SUBSURFACE.md`](docs/SUBSURFACE.md). Tests: the "subsurface" cases of `caelix_trace_test`.
+
 ### Hash table
 
 A reusable GPU hash table (64-bit keys -> payload indices, `lib/src/rhi/hash_table.h`,
@@ -327,8 +340,9 @@ which replaces frame constant fields by constants when a `CAELIX_SPEC_*` macro i
 so the compiler removes the code they select: `CAELIX_SPEC_NO_RR_GUIDES` (no DLSS RR guides),
 `CAELIX_SPEC_NO_PRIMARY_MODE` (a primary-mode frame renders as path trace; `lighting` is then
 `true`), `CAELIX_SPEC_PT_ONLY` (path trace mode, debug view 0), `CAELIX_SPEC_NO_FOG`,
-`CAELIX_SPEC_NO_SKY_CUBEMAP`, `CAELIX_SPEC_FLAGS_MASK=<bits>` (keeps only those render flags) and
-`CAELIX_SPEC_BOUNCES_TRANSPARENT=<n>`. A kernel built with them is valid only for frames whose
+`CAELIX_SPEC_NO_SKY_CUBEMAP`, `CAELIX_SPEC_FLAGS_MASK=<bits>` (keeps only those render flags),
+`CAELIX_SPEC_BOUNCES_TRANSPARENT=<n>` and `CAELIX_SPEC_NO_SUBSURFACE` (clears the subsurface flag: the
+walk of the `caelix_path_trace_sss*` variants folds away). A kernel built with them is valid only for frames whose
 options match. The build defines none: the default SPIR-V is byte-identical to the source without
 the hook. `Claude/regstat.py` (outside the repo) compiles the kernel with them and loads it through
 `CAELIX_SHADER_DIR` with `CAELIX_PIPELINE_STATS` to read the register count.
@@ -566,8 +580,10 @@ mean of the raw estimate.
 Design and owner decisions: `docs/STEP6D_MATERIALS_DELTA.md` (section "As built").
 
 - Material table: every scene has 65536 `CaelixMaterial` entries (112 bytes:
-  albedo, smoothness, emission, metallic, ior, extinction, plus subsurface and
-  texture fields that no kernel reads yet), one per 16-bit block code. The GPU
+  albedo, smoothness, emission, metallic, ior, extinction, plus subsurface
+  fields (read by the subsurface walk and the transmissive shadow ray,
+  `docs/SUBSURFACE.md`) and texture fields that no kernel reads yet), one per
+  16-bit block code. The GPU
   holds two packed tables (`docs/MATERIALS.md`): 32-byte hot entries of halves
   in a 2 MiB device-local buffer whose address is in the frame constants
   (`materials`, offset 440), and 32-byte subsurface entries in a second 2 MiB
@@ -939,7 +955,8 @@ links them. Configure with `-DCAELIX_BUILD_TESTS=OFF` to skip them.
   random) the mean of 128 checkerboard frames is within 0.02 % of the
   stochastic reference.
 - `caelix_frame_layout_test`: no GPU. Reads `build/shaders/<kernel>.spv` of the six
-  frame-constant kernels and the trace variant `caelix_path_trace_no_light_nee`, parses the SPIR-V binary (the Uniform variable whose struct is decorated
+  frame-constant kernels and the trace variants `caelix_path_trace_no_light_nee`, `caelix_path_trace_sss` and
+  `caelix_path_trace_sss_no_light_nee`, parses the SPIR-V binary (the Uniform variable whose struct is decorated
   `Block`; member `Offset`, `ArrayStride`, `MatrixStride`, `DescriptorSet` / `Binding`), recomputes
   the C natural layout of the same member sequence and fails on the first member whose offset
   differs (printing the member index, its name and both offsets), on a stride that is not the
@@ -1064,6 +1081,9 @@ ctest --test-dir build -C Debug --output-on-failure   # after cmake --build --pr
   behaviour: the sun is found only by the bounce rays).
 - `--no-shadow-transmission`: lighting modes, the primary vertex's NEE shadow rays stop at glass and
   SSS voxels again (by default they pass them, attenuated; `docs/SHADOW_TRANSMISSION.md`).
+- `--no-sss`: lighting modes, no subsurface scattering walk (by default a vertex on an SSS material,
+  `"sss_model": 1` in the `--materials` JSON, runs the walk with its `sss_probability`;
+  `docs/SUBSURFACE.md`). The checkbox "subsurface scattering" in the render settings does the same.
 - `--sky <PATH>`: lighting modes, a lat-long (equirectangular) sky image,
   `.exr` or `.hdr`, converted on the CPU (`caelix-app/src/sky.rs`) to a
   mipmapped RGBA32F cubemap, uploaded once at start (`caelix-vk`

@@ -121,6 +121,7 @@ static const uint kRenderFlagSkyOnMiss = 1u << 1;
 static const uint kRenderFlagSunNee = 1u << 2;
 static const uint kRenderFlagDeltaCheckerboard = 1u << 3;
 static const uint kRenderFlagFlipY = 1u << 4;
+static const uint kRenderFlagSubsurface = 1u << 5;
 static const uint kRenderFlagShadowTransmission = 1u << 6;
 
 // CaelixFrameConstants::light_nee_flags (lib/src/render/frame_constants.h). Macros: a static const here
