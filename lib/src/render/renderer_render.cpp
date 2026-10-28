@@ -256,15 +256,16 @@ CaelixResult Renderer::Render(const CaelixFrameDesc& frame, const CaelixRenderTa
         }
     }
     // DLSS RR replaces NRD and must not see checkerboard rendering (RR guide 3.5). The transmissive
-    // shadow rays exist only in the lighting modes. The subsurface code exists only in the trace kernel
-    // variants caelix_path_trace_sss*, bound for the lighting frames of a scene whose material table has
-    // an SSS entry (docs/SUBSURFACE.md section 4); the subsurface flag reaches only them.
+    // shadow rays (both of their flags) exist only in the lighting modes. The subsurface code exists only
+    // in the trace kernel variants caelix_path_trace_sss*, bound for the lighting frames of a scene whose
+    // material table has an SSS entry (docs/SUBSURFACE.md section 4); the subsurface flag and the shadow
+    // ray's SSS walk flag (CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE) reach only them.
     const bool ray_reconstruction = upscaling && options.upscaler == CAELIX_UPSCALER_DLSS_RR;
     const bool sss_kernel = lighting && scene_.has_subsurface();
     const uint32_t flags =
         (ray_reconstruction ? (options.flags & ~CAELIX_RENDER_FLAG_DELTA_CHECKERBOARD) : options.flags) &
-        (lighting ? ~0u : ~CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION) &
-        (sss_kernel ? ~0u : ~CAELIX_RENDER_FLAG_SUBSURFACE);
+        (lighting ? ~0u : ~(CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION | CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE)) &
+        (sss_kernel ? ~0u : ~(CAELIX_RENDER_FLAG_SUBSURFACE | CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE));
 
     // The present targets (image != 0), in binding order.
     const CaelixTargetImage* const all[kTargetCount] = {&targets.color,  &targets.albedo, &targets.normal,

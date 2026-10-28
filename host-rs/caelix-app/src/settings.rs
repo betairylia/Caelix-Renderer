@@ -222,6 +222,44 @@ impl UpscaleQuality {
     }
 }
 
+/// Level of the "transmissive shadows" knob: the primary vertex's NEE shadow rays (sun and lamps;
+/// docs/SHADOW_TRANSMISSION.md). Lighting modes only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum TransmissiveShadows {
+    /// Hard any-hit rays: glass and SSS voxels occlude, as at the bounce vertices.
+    Off,
+    /// A closest-hit chain that passes glass in a straight line, attenuated
+    /// (`CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION`); SSS voxels occlude.
+    High,
+    /// The chain also enters SSS voxels with their sss_probability and walks straight through them
+    /// (`CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` + `CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE`).
+    VeryHigh,
+}
+
+impl TransmissiveShadows {
+    pub const ALL: [TransmissiveShadows; 3] =
+        [TransmissiveShadows::Off, TransmissiveShadows::High, TransmissiveShadows::VeryHigh];
+
+    /// The `CaelixRenderOptions::flags` bits of the level.
+    pub fn flags(self) -> u32 {
+        match self {
+            TransmissiveShadows::Off => 0,
+            TransmissiveShadows::High => CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION,
+            TransmissiveShadows::VeryHigh => {
+                CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION | CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE
+            }
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TransmissiveShadows::Off => "off",
+            TransmissiveShadows::High => "high",
+            TransmissiveShadows::VeryHigh => "very high",
+        }
+    }
+}
+
 /// Largest `--upscale-preset` / preset value of the debug UI.
 pub const MAX_UPSCALE_PRESET: u32 = 15;
 
@@ -237,8 +275,9 @@ pub struct RenderSettings {
     pub denoise: bool,
     /// Lighting modes: sun next-event estimation.
     pub sun_nee: bool,
-    /// Lighting modes: the primary vertex's NEE shadow rays pass glass, attenuated.
-    pub shadow_transmission: bool,
+    /// Lighting modes: the level of the primary vertex's transmissive NEE shadow rays (off = hard
+    /// rays, high = through glass, attenuated, very high = also straight through SSS voxels).
+    pub transmissive_shadows: TransmissiveShadows,
     /// Lighting modes: the subsurface scattering walk at SSS material vertices.
     pub subsurface: bool,
     /// Pt mode: the delta checkerboard at the first glass interface, with the cross resolve.
@@ -327,8 +366,8 @@ impl RenderSettings {
         if lighting && self.sun_nee {
             flags |= CAELIX_RENDER_FLAG_SUN_NEE;
         }
-        if lighting && self.shadow_transmission {
-            flags |= CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION;
+        if lighting {
+            flags |= self.transmissive_shadows.flags();
         }
         if lighting && self.subsurface {
             flags |= CAELIX_RENDER_FLAG_SUBSURFACE;

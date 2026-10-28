@@ -42,7 +42,8 @@ size_t caelix_abi_c99_touch(void)
     CaelixCamera camera = {{0.0f, 0.0f, 0.0f}, 0.0f, {1.0f, 0.0f, 0.0f}, 0.0f, {0.0f, 1.0f, 0.0f}, 0.0f, {0.0f, 0.0f, 1.0f}, 0.0f, 0.577f, 1.0f, 0.1f, 1000.0f, {1.732f, 0.0f, 0.0f, 0.0f, 0.0f, 1.732f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.1f, 0.0f}};
     CaelixRenderOptions options = {CAELIX_VIEW_ALBEDO,
                                    CAELIX_RENDER_FLAG_SHADING | CAELIX_RENDER_FLAG_SKY_ON_MISS |
-                                       CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION | CAELIX_RENDER_FLAG_SUBSURFACE,
+                                       CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION | CAELIX_RENDER_FLAG_SUBSURFACE |
+                                       CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE,
                                    {0.0f, 1.0f, 0.0f},
                                    0.0f,
                                    {0.5f, 0.7f, 0.9f},

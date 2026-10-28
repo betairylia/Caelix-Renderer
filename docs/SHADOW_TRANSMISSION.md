@@ -1,22 +1,25 @@
 # Shadow rays through glass (primary vertex)
 
-Status: AS BUILT, 2026-10-28 (second version of the same day, plus the straight SSS walk of the
-experiment in section 6; the first version is in "History" at the end). Owner request: shadow rays (sun
-and lamp) at the PRIMARY hit vertex pass through transparent voxels in a straight line (no reflection, no
-refraction, as if one medium), attenuated by the glass extinction, so tinted glass leaves coloured
-shadows. Every opaque voxel occludes, except that in the SSS kernel variants the ray enters an SSS voxel
-(docs/SUBSURFACE.md) with its `sss_probability` and walks straight through the SSS voxels. Bounce
-vertices keep the hard any-hit shadow ray (`TraceShadow`, glass and SSS voxels occlude).
+Status: AS BUILT, 2026-10-28 (second version of the same day, plus the straight SSS walk, now the
+"very high" level of the "transmissive shadows" knob, section 3; the first version is in "History" at the
+end). Owner request: shadow rays (sun and lamp) at the PRIMARY hit vertex pass through transparent voxels
+in a straight line (no reflection, no refraction, as if one medium), attenuated by the glass extinction,
+so tinted glass leaves coloured shadows. Every opaque voxel occludes, except that in the SSS kernel
+variants with `CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE` the ray enters an SSS voxel (docs/SUBSURFACE.md)
+with its `sss_probability` and walks straight through the SSS voxels. Bounce vertices keep the hard
+any-hit shadow ray (`TraceShadow`, glass and SSS voxels occlude). Hosts expose three levels: off (hard
+rays), high (through glass) and very high (through glass and SSS voxels).
 
 ## 1. Model
 
 `T(ray) in [0, 1]^3` replaces the boolean occlusion of the shadow ray at the primary vertex:
 
-- An opaque voxel occludes (`T = 0`). In the main kernels (`CAELIX_SUBSURFACE 0`, no SSS code) this
-  includes the SSS voxels.
+- An opaque voxel occludes (`T = 0`). In the main kernels (`CAELIX_SUBSURFACE 0`, no SSS code) and
+  without `CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE` this includes the SSS voxels.
 - An SSS voxel (opaque, `sss_model` HG, `sss_probability` p > 0, `sss_steps` > 0) in the SSS kernels
   (`caelix_path_trace_sss*`, `CAELIX_SUBSURFACE 1`, bound for the lighting frames of a scene with an SSS
-  entry) with `CAELIX_RENDER_FLAG_SUBSURFACE` (the vertex walk's flag): the ray enters with probability
+  entry) with `CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE` and `CAELIX_RENDER_FLAG_SUBSURFACE` (the vertex
+  walk's flag): the ray enters with probability
   p, else it is occluded (Russian roulette WITHOUT the 1 / p weight: the estimate of p x T stays unbiased, the same
   entry probability as the vertex walk). An entered ray walks straight on through the voxel grid of the
   hit entity (a 3D DDA; other entities count as air). Every SSS voxel it visits, the entry voxel
@@ -63,7 +66,7 @@ The straight line is an approximation (no refraction). Its interaction with the 
     ray adds no segment) the glass segment `remaining`; return `T` (0 below the cutoff). A hit at
     `h.T`: the glass segment `h.T` (below the cutoff -> 0); `remaining -= h.T`; block = `h.attrib >>
     16`:
-    - opaque: return 0; in the SSS kernels an SSS voxel first draws its entry (`SubsurfaceEntry`, one
+    - opaque: return 0; in the SSS kernels with both flags an SSS voxel first draws its entry (`SubsurfaceEntry`, one
       number of the caller's `rng`): entered, `ShadowSubsurfaceWalk` returns occluded (0), the end
       (return `T`) or the exit (`cur` = the exit voxel's transparent id, origin = the exit point pushed
       off along the leaving face's normal, `remaining -=` the distance from the hit to that origin, next
@@ -119,16 +122,26 @@ The straight line is an approximation (no refraction). Its interaction with the 
   the primary vertex's NEE shadow rays (sun and lamp) use the transmissive trace. HLSL mirror
   `kRenderFlagShadowTransmission`. The renderer keeps the bit only in the lighting modes
   (`renderer_render.cpp`).
-- In the SSS kernels the shadow ray reads the subsurface entry (w0..w3: sss_albedo, steps, probability
-  + model) of every opaque voxel it hits or walks through; the main kernels read none
+- `CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE (1u << 7)`: lighting modes; with
+  `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` and `CAELIX_RENDER_FLAG_SUBSURFACE` the transmissive shadow
+  ray walks straight through SSS voxels (section 1); without either of them it does nothing. HLSL mirror
+  `kRenderFlagShadowSubsurface`; a runtime bit, no new kernel variant. The renderer clears it outside
+  the lighting modes and when no SSS kernel is bound (together with the subsurface flag).
+- The three levels of "transmissive shadows": off = neither bit (the hard any-hit ray), high =
+  `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION`, very high = both bits (about +1 ms at 1440p on doverley-sss,
+  section 6).
+- With both bits the shadow ray in the SSS kernels reads the subsurface entry (w0..w3: sss_albedo, steps,
+  probability + model) of every opaque voxel it hits or walks through; otherwise it reads none
   (docs/MATERIALS.md). The SSS part needs `CAELIX_RENDER_FLAG_SUBSURFACE` (host `--no-sss` clears it:
   SSS voxels then occlude, as they are plain opaque voxels for the vertices too).
 - `CaelixRenderOptions::bounce_nee_probability` (float, the former `reserved_voxel_id[0]`) came with
   the first version of this step; docs/LIGHT_NEE.md section 12.2 describes it.
-- Rust host (caelix-app): on by default; `--no-shadow-transmission` turns it off; the checkbox "shadow
-  transmission" next to "sun NEE" in the render settings UI (enabled in the lighting modes);
-  `settings.rs` field `shadow_transmission`; the startup line prints `shadow transmission true|false`.
-- Unity plugin: no packet change (a flag bit); the C# side may set the flag later.
+- Rust host (caelix-app): `--transmissive-shadows off|high|very-high` (default `high`; the former
+  `--no-shadow-transmission` is removed); the combo box "transmissive shadows" next to "sun NEE" in the
+  render settings UI (enabled in the lighting modes); `settings.rs` field `transmissive_shadows` (enum
+  `TransmissiveShadows`); the startup line prints `transmissive shadows Off|High|VeryHigh`.
+- Unity plugin: no packet change (flag bits); the C# side may set the flags later
+  (`CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE` is not exposed there yet).
 
 ## 4. Tests (tests/trace_test.cpp)
 
@@ -144,11 +157,13 @@ The straight line is an approximation (no refraction). Its interaction with the 
 2. "shadow transmission: SSS slab walk": the same floor; an opaque SSS slab (albedo 0.5, model HG,
    sss_albedo 0.8, steps 16) 2 voxels thick over one quarter, 6 over another, a plain opaque block over
    the third; the sun straight up with a 0.25-degree radius (the DDA crosses exactly 2 or 6 voxels, a
-   lateral crossing is rare); flag on, 1 bounce, ratios against the open floor (lit > 0.01): p 1:
+   lateral crossing is rare); flag on with the walk bits (`CAELIX_RENDER_FLAG_SUBSURFACE |
+   CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE`), 1 bounce, ratios against the open floor (lit > 0.01): p 1:
    0.8^2 = 0.64 within 4 % under 2 voxels, 0.8^6 = 0.262144 within 6 % under 6 voxels, exactly 0 (mean
    and centre maximum) under the plain block; p 0.5 (128 frames): 0.32 within 6 %; p 1 with steps 4: 0.64
-   within 4 % under 2 voxels, exactly 0 under 6 voxels (dead at the cap); flag off: 0; subsurface flag
-   off: 0. The scene binds `caelix_path_trace_sss`; the renders set the subsurface flag.
+   within 4 % under 2 voxels, exactly 0 under 6 voxels (dead at the cap); flag off (walk bits set): 0;
+   subsurface flag off: 0; shadow subsurface bit off (the high level, 16 frames): exactly 0 (mean and
+   centre maximum). The scene binds `caelix_path_trace_sss`.
 3. "shadow transmission: hard occluder and lamp candidate": a 2 x 2 lamp 30 units above a white floor,
    the box between them tinted glass, a plain opaque block or air; light tree on, light NEE on (MIS),
    no sun radiance, flag on, 1 bounce: the plain block gives exactly 0; glass / air = the slab's
@@ -160,11 +175,12 @@ tests 1 and 3:
 - tinted slab, flag on, 1 bounce: ratios 1.00011 / 0.67046 / 0.54895 against 1 / 0.67032 / 0.54881;
   flag off, refracted path only: 0.92112 / 0.61759 / 0.50571 against T (1 - F)^2 = 0.92160 / 0.61777 /
   0.50578; flag on, 3 bounces: 1.00016 / 0.67052 / 0.54901; sun NEE off: bit-identical images.
-- SSS slab walk (experiment, section 6): open floor 0.01903; p 1: 0.63855 under 2 voxels (relative
+- SSS slab walk (very high level, section 6): open floor 0.01903; p 1: 0.63855 under 2 voxels (relative
   0.99774), 0.26006 under 6 voxels (0.99207), plain block 0 (largest pixel 0); p 0.5: 0.31954 (0.99856);
   steps 4: 0.63852 under 2 voxels (0.99769), 0 under 6 voxels (largest pixel 0). The ratios lie slightly
   below the products because a lateral voxel crossing visits one SSS voxel more. (The second version
-  without the walk: 0 under both slabs, open floor 1.21755 with the 2-degree sun.)
+  without the walk: 0 under both slabs, open floor 1.21755 with the 2-degree sun.) Shadow subsurface bit
+  off: 0 (largest pixel 0).
 - lamp: plain block 0 (largest pixel 0); glass / air 0.99875 / 0.66955 / 0.54821 against 1 / 0.67032 /
   0.54881 (relative 0.9988 .. 0.9989: the BSDF share of the MIS that the claim drops).
 
@@ -204,7 +220,8 @@ only and 21.8, 21.8 -> 22.7, 22.7 ms with the sun (about +1 ms, the same in ever
 there is no any-hit probe: the walk starts only where the closest-hit chain hits an SSS voxel, the entry
 is drawn with `sss_probability` (Russian roulette without a weight), the DDA multiplies `sss_albedo` per
 SSS voxel visited and dies beyond `sss_steps` voxels (no derived length), and the code exists only in
-the `caelix_path_trace_sss*` kernels.
+the `caelix_path_trace_sss*` kernels. The same day the experiment became the Very High level of the
+"transmissive shadows" knob (`CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE`, host default High).
 
 Measured before / after the chain-only ray (1440p, 100-frame trace means, two or more runs each, noise
 about +-1.5 ms; `Artifacts/doverley-sss-cost-20261028/ab_chain.py`, `ab-chain/`): bistro 15.6, 14.9 ->

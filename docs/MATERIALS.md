@@ -18,7 +18,8 @@ whose table has an SSS entry; the main trace kernels read no subsurface entry): 
 voxel is an opaque code whose entry has `sss_model` = `CAELIX_SSS_MODEL_HG` (1), `sss_probability` > 0
 and `sss_steps` > 0. The walk tests a vertex with the hot entry's w5 (`CaelixMaterialSssWord`, one 4-byte
 load) and reads w0..w3 of the subsurface entry of the entry voxel and of every voxel it looks at. The
-transmissive shadow ray of `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` reads the same words in these kernels:
+transmissive shadow ray of `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` with
+`CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE` reads the same words in these kernels:
 it enters an SSS voxel with its `sss_probability` and walks straight through the SSS voxels
 (`docs/SHADOW_TRANSMISSION.md`); every other shadow ray reads no subsurface entry and stops at an SSS
 voxel like at any opaque voxel. No kernel reads

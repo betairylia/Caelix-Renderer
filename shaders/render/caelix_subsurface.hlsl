@@ -24,9 +24,10 @@
 // Compiled only with CAELIX_SUBSURFACE 1: the trace kernel variants caelix_path_trace_sss and
 // caelix_path_trace_sss_no_light_nee (render/caelix_path_trace_sss*.hlsl), which the renderer binds
 // for the lighting frames of a scene whose material table has an SSS entry. The default 0 (defined
-// below) compiles nothing of this file, so the main trace kernels keep their code. The primary vertex's
-// transmissive shadow ray enters SSS voxels with the same probability and walks straight through them
-// (docs/SHADOW_TRANSMISSION.md); the other shadow rays stop at SSS voxels like at any opaque voxel.
+// below) compiles nothing of this file, so the main trace kernels keep their code. With
+// kRenderFlagShadowSubsurface the primary vertex's transmissive shadow ray enters SSS voxels with the
+// same probability and walks straight through them (docs/SHADOW_TRANSMISSION.md); the other shadow rays
+// (and that ray without the flag) stop at SSS voxels like at any opaque voxel.
 #ifndef CAELIX_SUBSURFACE_HLSL
 #define CAELIX_SUBSURFACE_HLSL
 

@@ -4387,15 +4387,17 @@ TEST_CASE("shadow transmission: SSS slab walk")
     const CaelixCamera plain = LookDownFrom(16.0f, 4.0f, 48.0f);
     const CaelixCamera open_floor = LookDownFrom(48.0f, 4.0f, 48.0f);
 
-    // TransmissionReference with the sun narrowed to 0.25 degrees: the straight walk of a sun ray from
-    // the floor crosses the slab's 2 or 6 voxels and rarely a lateral voxel boundary (each lateral step
-    // visits one more SSS voxel).
-    auto reference = [&](const CaelixCamera& camera, bool transmission, bool subsurface, uint32_t frames,
+    // TransmissionReference with the sun narrowed to 0.25 degrees and `extra_flags` ORed into the flags
+    // (the walk needs CAELIX_RENDER_FLAG_SUBSURFACE and CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE): the straight
+    // walk of a sun ray from the floor crosses the slab's 2 or 6 voxels and rarely a lateral voxel
+    // boundary (each lateral step visits one more SSS voxel).
+    constexpr uint32_t kWalk = CAELIX_RENDER_FLAG_SUBSURFACE | CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE;
+    auto reference = [&](const CaelixCamera& camera, bool transmission, uint32_t extra_flags, uint32_t frames,
                          uint32_t seed0) {
         for (uint32_t i = 0; i < frames; ++i)
         {
             CaelixRenderOptions options = TransmissionOptions(CAELIX_MODE_REFERENCE, 1, seed0 + i, true, transmission);
-            options.flags |= subsurface ? CAELIX_RENDER_FLAG_SUBSURFACE : 0u;
+            options.flags |= extra_flags;
             options.sun_angular_radius = static_cast<float>(0.25 * 3.14159265358979323846 / 180.0);
             options.reset_accumulation = i == 0 ? 1u : 0u;
             Render(s.rig, s.renderer, s.set, camera, options, i + 1 == frames);
@@ -4416,15 +4418,16 @@ TEST_CASE("shadow transmission: SSS slab walk")
         }
     };
 
-    // Flag on, 1 bounce, p = 1: the transmissive NEE ray walks straight through the SSS slab (0.8 per
-    // voxel: 0.8^2 under 2 voxels, 0.8^6 under 6); the plain opaque block occludes.
-    const std::array<double, 3> lit = reference(open_floor, true, true, 64, 4000);
+    // Flag on with the walk bits (the "very high" level), 1 bounce, p = 1: the transmissive NEE ray walks
+    // straight through the SSS slab (0.8 per voxel: 0.8^2 under 2 voxels, 0.8^6 under 6); the plain opaque
+    // block occludes.
+    const std::array<double, 3> lit = reference(open_floor, true, kWalk, 64, 4000);
     std::printf("shadow transmission, SSS slab walk: lit %.5f %.5f %.5f\n", lit[0], lit[1], lit[2]);
     // Radiance 1000 x the solid angle of the 0.25-degree cone / pi = 0.019.
     CHECK(lit[0] > 0.01);
-    const std::array<double, 3> thin_t = reference(thin, true, true, 64, 5000);
-    const std::array<double, 3> thick_t = reference(thick, true, true, 64, 6000);
-    const std::array<double, 3> plain_t = reference(plain, true, true, 64, 7000);
+    const std::array<double, 3> thin_t = reference(thin, true, kWalk, 64, 5000);
+    const std::array<double, 3> thick_t = reference(thick, true, kWalk, 64, 6000);
+    const std::array<double, 3> plain_t = reference(plain, true, kWalk, 64, 7000);
     const float plain_max = CentreMax(s.color, 64);
     check_ratio("p 1, 2 voxels", thin_t, lit, 0.64, 0.04);
     check_ratio("p 1, 6 voxels", thick_t, lit, 0.262144, 0.06);
@@ -4438,16 +4441,16 @@ TEST_CASE("shadow transmission: SSS slab walk")
     // p = 0.5: the ray enters with probability 0.5 (Russian roulette without a weight): 0.5 x 0.8^2.
     entries[0] = SssEntry(0.5f);
     REQUIRE(caelix_scene_set_material_entries(s.rig.scene, entries, 2) == CAELIX_OK);
-    const std::array<double, 3> half_t = reference(thin, true, true, 128, 8000);
+    const std::array<double, 3> half_t = reference(thin, true, kWalk, 128, 8000);
     check_ratio("p 0.5, 2 voxels", half_t, lit, 0.32, 0.06);
 
     // p = 1 with sss_steps 4: the walk dies beyond 4 SSS voxels, so the 6-voxel slab occludes.
     entries[0] = SssEntry(1.0f);
     entries[0].material.sss_steps = 4u;
     REQUIRE(caelix_scene_set_material_entries(s.rig.scene, entries, 2) == CAELIX_OK);
-    const std::array<double, 3> capped_thin = reference(thin, true, true, 64, 9000);
+    const std::array<double, 3> capped_thin = reference(thin, true, kWalk, 64, 9000);
     check_ratio("p 1, steps 4, 2 voxels", capped_thin, lit, 0.64, 0.04);
-    const std::array<double, 3> capped_thick = reference(thick, true, true, 64, 10000);
+    const std::array<double, 3> capped_thick = reference(thick, true, kWalk, 64, 10000);
     const float capped_thick_max = CentreMax(s.color, 64);
     std::printf("shadow transmission, SSS slab walk, steps 4, 6 voxels: %.6f (max %.6f)\n", capped_thick[0],
                 capped_thick_max);
@@ -4457,14 +4460,24 @@ TEST_CASE("shadow transmission: SSS slab walk")
     }
     CHECK(capped_thick_max == 0.0f);
 
-    // Shadow transmission off, or the subsurface flag off (an SSS voxel is then a plain opaque voxel):
-    // the SSS slab occludes like any opaque voxel.
-    const std::array<double, 3> off = reference(thin, false, true, 16, 11000);
+    // Shadow transmission off (the "off" level, walk bits set), the subsurface flag off (an SSS voxel is
+    // then a plain opaque voxel), or the shadow subsurface bit off (the "high" level): the SSS slab
+    // occludes like any opaque voxel.
+    const std::array<double, 3> off = reference(thin, false, kWalk, 16, 11000);
     CHECK(off[0] == 0.0);
     CHECK(CentreMax(s.color, 64) == 0.0f);
-    const std::array<double, 3> no_sss = reference(thin, true, false, 16, 12000);
+    const std::array<double, 3> no_sss = reference(thin, true, CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE, 16, 12000);
     CHECK(no_sss[0] == 0.0);
     CHECK(CentreMax(s.color, 64) == 0.0f);
+    const std::array<double, 3> high = reference(thin, true, CAELIX_RENDER_FLAG_SUBSURFACE, 16, 13000);
+    const float high_max = CentreMax(s.color, 64);
+    std::printf("shadow transmission, SSS slab walk, shadow subsurface bit off (high level): %.6f (max %.6f)\n",
+                high[0], high_max);
+    for (uint32_t c = 0; c < 3; ++c)
+    {
+        CHECK(high[c] == 0.0);
+    }
+    CHECK(high_max == 0.0f);
     CloseShadowRig(s);
 }
 

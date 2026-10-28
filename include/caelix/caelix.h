@@ -91,8 +91,9 @@ extern "C" {
    step added CAELIX_RENDER_FLAG_SUBSURFACE (a new flag bit), also without a bump. The visibility hint
    step turned reserved[0] of CaelixLightNeeOptions and of CaelixLightNeeStats into hint_patch (both
    stay 16 bytes; reserved[2] -> hint_patch + reserved), added CAELIX_LIGHT_NEE_FLAG_NO_VISIBILITY_HINT
-   and CAELIX_VIEW_LIGHT_HINT, and made the kernels use bounce_nee_probability, also without a bump. A
-   host built
+   and CAELIX_VIEW_LIGHT_HINT, and made the kernels use bounce_nee_probability, also without a bump. The
+   transmissive shadows step added CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE (a new flag bit), also without a
+   bump. A host built
    against an older version-2 header must be rebuilt (the library reads and writes the larger
    structs). */
 #define CAELIX_ABI_VERSION 2u
@@ -490,8 +491,8 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * to half precision. An SSS voxel is an opaque code whose entry has sss_model CAELIX_SSS_MODEL_HG,
  * sss_probability > 0 and sss_steps > 0: with CAELIX_RENDER_FLAG_SUBSURFACE a path vertex on it runs
  * the random walk with probability sss_probability (docs/SUBSURFACE.md). The transmissive shadow rays
- * of CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION (with CAELIX_RENDER_FLAG_SUBSURFACE) enter an SSS voxel
- * with its sss_probability and walk
+ * of CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION (with CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE and
+ * CAELIX_RENDER_FLAG_SUBSURFACE) enter an SSS voxel with its sss_probability and walk
  * straight through the SSS voxels (times sss_albedo per voxel, occluded beyond sss_steps voxels;
  * docs/SHADOW_TRANSMISSION.md); every other shadow ray stops at an SSS voxel like at any opaque voxel.
  * No kernel reads sss_params,
@@ -520,6 +521,7 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
                                     sss_albedo, sss_anisotropy (g), sss_steps (the step cap, 0 = no walk:
                                     the entry acts as none); sss_params unused. The transmissive shadow
                                     rays (CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION with
+                                    CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE and
                                     CAELIX_RENDER_FLAG_SUBSURFACE) enter such voxels with
                                     sss_probability and walk straight through them; other shadow rays
                                     stop at them like at any opaque voxel */
@@ -964,11 +966,8 @@ typedef enum CaelixDebugView
                                                 closest-hit queries from interface to interface (at
                                                 most 8): a medium attenuates by its extinction (tinted
                                                 glass casts coloured shadows); every opaque voxel
-                                                occludes, except an SSS voxel (CAELIX_SSS_MODEL_HG) with
-                                                CAELIX_RENDER_FLAG_SUBSURFACE: the ray enters it with
-                                                its sss_probability and walks
-                                                straight through the SSS voxels (sss_albedo per voxel,
-                                                occluded beyond sss_steps voxels). A
+                                                occludes, SSS voxels too unless
+                                                CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE. A
                                                 path whose primary vertex ran such an NEE does not
                                                 count the sun disk (sun NEE) or the lamps that the
                                                 light NEE samples beyond the near field on its BSDF
@@ -976,6 +975,21 @@ typedef enum CaelixDebugView
                                                 opaque vertex. Bounce vertices keep the occluding
                                                 shadow ray (glass occludes). See
                                                 docs/SHADOW_TRANSMISSION.md. */
+#define CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE (1u << 7) /* lighting modes only, needs
+                                                CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION and
+                                                CAELIX_RENDER_FLAG_SUBSURFACE (without either it does
+                                                nothing): the transmissive shadow ray enters an SSS
+                                                voxel (CAELIX_SSS_MODEL_HG) with its sss_probability
+                                                (Russian roulette, no weight) and walks straight
+                                                through the SSS voxels (sss_albedo per voxel visited,
+                                                occluded beyond sss_steps voxels or at a non-SSS
+                                                opaque voxel), continuing the chain at the exit.
+                                                Without this bit SSS voxels occlude the ray like any
+                                                opaque voxel. Cost about 1 ms at 1440p on a foliage
+                                                scene. Hosts expose the three levels off / high / very
+                                                high of "transmissive shadows" as the two bits (off =
+                                                neither, high = CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION,
+                                                very high = both). See docs/SHADOW_TRANSMISSION.md. */
 
 /* A cubemap of the sky for the lighting modes, given per render call like a target. A cube image
    (VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT, 6 layers in the Vulkan face order +X, -X, +Y, -Y, +Z,

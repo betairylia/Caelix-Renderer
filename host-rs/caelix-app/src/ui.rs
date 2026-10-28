@@ -16,7 +16,7 @@ use winit::window::Window;
 
 use crate::camera::{self, Camera};
 use crate::sequence::{Interpolation, Playback, Sequencer, MIN_DURATION};
-use crate::settings::{Mode, RenderSettings, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
+use crate::settings::{Mode, RenderSettings, TransmissiveShadows, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
 use crate::testscene::{EditPattern, TestScene};
 use crate::world::EntityEntry;
 
@@ -603,8 +603,23 @@ fn render_window(ui: &mut egui::Ui, panel: &mut Panel<'_>, demo: bool) {
             ui.add_enabled(lighting, Slider::new(&mut settings.bounce_nee_probability, 0.05..=1.0))
                 .on_hover_text("Bounce vertices run their NEE (sun and lamps) with this probability, scaled by 1 / p.");
         });
-        ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.shadow_transmission, "shadow transmission"))
-            .on_hover_text("The primary vertex's shadow rays pass glass, attenuated.");
+        ui.horizontal(|ui| {
+            ui.label("transmissive shadows");
+            ui.add_enabled_ui(lighting, |ui| {
+                ComboBox::from_id_salt("transmissive_shadows")
+                    .selected_text(settings.transmissive_shadows.label())
+                    .show_ui(ui, |ui| {
+                        for level in TransmissiveShadows::ALL {
+                            ui.selectable_value(&mut settings.transmissive_shadows, level, level.label());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Primary vertex shadow rays: off = hard; high = through glass, attenuated; very high = also \
+                         through SSS voxels with their sss_probability.",
+                    );
+            });
+        });
         ui.add_enabled(lighting, egui::Checkbox::new(&mut settings.subsurface, "subsurface scattering"))
             .on_hover_text("Vertices on SSS materials (sss_model 1) run the random walk with their sss_probability.");
         ui.add_enabled(

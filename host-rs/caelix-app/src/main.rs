@@ -62,7 +62,10 @@ use winit::window::{Window, WindowId};
 
 use camera::Camera;
 use sequence::{Playback, Sequence, Sequencer};
-use settings::{same_options, Encoding, Mode, RenderSettings, UpscaleQuality, Upscaler, View, MAX_UPSCALE_PRESET};
+use settings::{
+    same_options, Encoding, Mode, RenderSettings, TransmissiveShadows, UpscaleQuality, Upscaler, View,
+    MAX_UPSCALE_PRESET,
+};
 use testscene::{EditPattern, TestScene};
 
 /// Free camera: default speed in world units (blocks) per second.
@@ -257,16 +260,19 @@ struct Args {
     /// bounce rays, as in step 6a).
     #[arg(long)]
     no_sun_nee: bool,
-    /// Lighting modes: the primary vertex's NEE shadow rays (sun and lamps) stop at glass again, as
-    /// at the bounce vertices (by default they pass glass in a straight line, attenuated: tinted
-    /// glass casts coloured shadows; docs/SHADOW_TRANSMISSION.md).
-    #[arg(long)]
-    no_shadow_transmission: bool,
+    /// Lighting modes: the primary vertex's NEE shadow rays (sun and lamps). off: hard any-hit rays
+    /// (glass and SSS voxels occlude, as at the bounce vertices). high: a closest-hit chain that
+    /// passes glass in a straight line, attenuated (tinted glass casts coloured shadows). very-high:
+    /// the chain also enters SSS voxels with their sss_probability and walks straight through them
+    /// (about 1 ms at 1440p on a foliage scene). docs/SHADOW_TRANSMISSION.md.
+    #[arg(long, value_enum, default_value_t = TransmissiveShadows::High)]
+    transmissive_shadows: TransmissiveShadows,
     /// Lighting modes: no subsurface scattering walk (by default a path vertex on an SSS material,
     /// sss_model 1 in the materials JSON, runs the Henyey-Greenstein walk with probability
-    /// sss_probability; docs/SUBSURFACE.md, and the primary vertex's transmissive shadow rays enter SSS
-    /// voxels with the same probability and walk straight through them; docs/SHADOW_TRANSMISSION.md).
-    /// With the walk off every shadow ray stops at SSS voxels.
+    /// sss_probability; docs/SUBSURFACE.md, and at --transmissive-shadows very-high the primary
+    /// vertex's transmissive shadow rays enter SSS voxels with the same probability and walk straight
+    /// through them; docs/SHADOW_TRANSMISSION.md). With the walk off every shadow ray stops at SSS
+    /// voxels, whatever the --transmissive-shadows level.
     #[arg(long)]
     no_sss: bool,
     /// Lighting modes: a lat-long (equirectangular) sky image, .exr or .hdr, converted to a
@@ -2071,7 +2077,7 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!(
         "mode {mode:?}, bounces {}, transparent bounces {}, exposure {}, sky on miss {}, sun radiance {:?}, \
-         sun NEE {}, shadow transmission {}, sss {}, light NEE {}, light hint patch {}, bounce NEE p {}, denoise {}, \
+         sun NEE {}, transmissive shadows {:?}, sss {}, light NEE {}, light hint patch {}, bounce NEE p {}, denoise {}, \
          sky {}, fog density {} colour {:?}, emission scale {}, \
          upscaler {:?}, upscale quality {:?}, upscale preset {}, upscale auto exposure {}, jitter phases {}, \
          window {}x{}",
@@ -2081,7 +2087,7 @@ fn main() -> anyhow::Result<()> {
         !args.no_sky_on_miss,
         args.sun_radiance,
         !args.no_sun_nee,
-        !args.no_shadow_transmission,
+        args.transmissive_shadows,
         !args.no_sss,
         !args.no_light_nee,
         if args.no_light_nee || args.light_no_hint {
@@ -2131,7 +2137,7 @@ fn main() -> anyhow::Result<()> {
         bounces_transparent: args.bounces_transparent,
         denoise: !args.no_denoise,
         sun_nee: !args.no_sun_nee,
-        shadow_transmission: !args.no_shadow_transmission,
+        transmissive_shadows: args.transmissive_shadows,
         subsurface: !args.no_sss,
         checkerboard: !args.no_checkerboard,
         sky_on_miss: !args.no_sky_on_miss,

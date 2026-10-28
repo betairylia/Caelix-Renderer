@@ -136,10 +136,11 @@ steps, it is absorbed (black).
   g 0.9: 17. Each step costs time; 6..16 is the normal range.
 - A thick object needs a low g (0..0.3) and a high `sss_albedo` (0.9+) to stay bright. A thin object
   (leaves, petals, a lampshade) can take g 0.7..0.8 and 6..8 steps.
-- Shadows: the sun and lamp shadow rays of the first surface the camera sees enter an SSS block with
+- Shadows: at the "very high" level of the transmissive shadows (host `--transmissive-shadows
+  very-high`) the sun and lamp shadow rays of the first surface the camera sees enter an SSS block with
   its `sss_probability` and pass straight through it, darkened by `sss_albedo` per voxel and blocked
-  beyond `sss_steps` voxels (`docs/SHADOW_TRANSMISSION.md`); every other shadow ray stops at it like at
-  any opaque block. Light also reaches the shadow side through the walk: a thin leaf or wax wall still glows from behind (the
+  beyond `sss_steps` voxels (`docs/SHADOW_TRANSMISSION.md`); at the default "high" level, and for every
+  other shadow ray, it stops them like any opaque block. Light also reaches the shadow side through the walk: a thin leaf or wax wall still glows from behind (the
   walk carries the sun from the lit side), and the ground under a canopy gets the light that bounces
   through the leaves (noisier than a direct shadow ray).
 - Cost: a scene with any SSS material runs the SSS kernels (small, fixed cost) plus the steps that
@@ -165,8 +166,9 @@ caelix-app --world scene.cxw --encoding block-id --materials scene-materials.jso
 ```
 
 - `--sun-radiance 2e4,1.9e4,1.8e4` gives a daylight sun; without it only the sky lights the scene.
-- `--no-sss` switches the SSS walk off and `--no-shadow-transmission` the shadow rays through glass and
-  SSS blocks, for a comparison; `--emission-scale 2` doubles every lamp; `--no-denoise` shows the raw samples; `--mode ref`
+- `--no-sss` switches the SSS walk off; `--transmissive-shadows off|high|very-high` chooses the shadow
+  rays (off: glass and SSS blocks stop them; high, the default: through glass; very high: also through
+  SSS blocks), for a comparison; `--emission-scale 2` doubles every lamp; `--no-denoise` shows the raw samples; `--mode ref`
   accumulates a clean reference over many frames.
 - The F1 panel has the same switches live.
 - In Unity, `CaelixNativeRenderer.MaterialsJson` loads the same file at the start of a session.

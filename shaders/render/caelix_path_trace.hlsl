@@ -27,8 +27,9 @@
 //                   With kRenderFlagShadowTransmission the shadow rays of the PRIMARY
 //                   vertex (sun and lamps) pass transparent voxels in a
 //                   straight line (TraceShadowTransmissive, docs/SHADOW_TRANSMISSION.md);
-//                   in the CAELIX_SUBSURFACE variants they also enter SSS voxels with
-//                   their sss_probability and walk straight through them.
+//                   in the CAELIX_SUBSURFACE variants with kRenderFlagShadowSubsurface
+//                   they also enter SSS voxels with their sss_probability and walk
+//                   straight through them.
 //                   With kRenderFlagSubsurface (only in the CAELIX_SUBSURFACE kernel variants
 //                   caelix_path_trace_sss*) a vertex on an SSS voxel may run the subsurface
 //                   walk instead of its BSDF (SubsurfaceVertex, docs/SUBSURFACE.md).
@@ -706,8 +707,8 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // still sees the disk, so the sun is counted once on every path. Shadow rays treat
 // glass as opaque, except the primary vertex's with kRenderFlagShadowTransmission
 // (TraceShadowTransmissive: straight through transparent voxels, attenuated; in the
-// CAELIX_SUBSURFACE variants also straight through SSS voxels, entered with their
-// sss_probability and attenuated by their sss_albedo).
+// CAELIX_SUBSURFACE variants with kRenderFlagShadowSubsurface also straight through SSS voxels,
+// entered with their sss_probability and attenuated by their sss_albedo).
 // Such a primary NEE CLAIMS the light it saw through the media: every segment after a
 // transparent (delta) bounce vertex, up to the first opaque vertex, sees the sky without
 // the sun disk (sun NEE) and carries kSegmentLampNee without the MIS bit (light NEE:

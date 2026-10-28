@@ -4,7 +4,8 @@
 // entity infos) through the device addresses in CaelixFrameConstants. The
 // integrator above this file uses only TraceScene, TraceShadow, TraceShadowTransmissive (the
 // transmissive shadow ray of docs/SHADOW_TRANSMISSION.md: a chain of closest-hit queries through
-// glass; in the CAELIX_SUBSURFACE kernels also a straight walk through SSS voxels), the voxel cursor
+// glass; in the CAELIX_SUBSURFACE kernels with kRenderFlagShadowSubsurface also a straight walk through
+// SSS voxels), the voxel cursor
 // and the entity transform helpers (render/caelix_voxel_cursor.hlsl, included here; the subsurface
 // walk of docs/SUBSURFACE.md and the shadow ray's SSS walk move through the voxel grid with them),
 // VoxelIdHash and the block code in TraceResult::attrib; nothing above it knows what a record, a slot
@@ -390,11 +391,12 @@ uint ShadowSubsurfaceWalk(CaelixFrameConstants fc, TraceResult hit, float3 direc
 // A chain of up to kShadowMaxHops closest-hit queries, interface to interface (a glass exit is a hit on
 // an air cell with face bits): the common case (air, nothing or an opaque voxel on the ray) costs one
 // query. After the hop cap: 0.
-// SSS voxels: in the CAELIX_SUBSURFACE kernels with kRenderFlagSubsurface (the vertex walk's flag) the
-// ray enters an SSS voxel with its sss_probability (one number of `rng`; Russian roulette without a weight) and walks straight through the SSS voxels
+// SSS voxels: in the CAELIX_SUBSURFACE kernels with kRenderFlagShadowSubsurface and kRenderFlagSubsurface
+// (the vertex walk's flag) the ray enters an SSS voxel with its sss_probability (one number of `rng`;
+// Russian roulette without a weight) and walks straight through the SSS voxels
 // (ShadowSubsurfaceWalk: sss_albedo per voxel visited, dead beyond the entry material's sss_steps
 // voxels, a non-SSS opaque voxel occludes); the walk and its exit use one hop of the cap, and the exit
-// point starts the next hop. Without CAELIX_SUBSURFACE or without the flag an SSS voxel occludes like
+// point starts the next hop. Without CAELIX_SUBSURFACE or without both flags an SSS voxel occludes like
 // any opaque voxel (`rng` is not used).
 float3 TraceShadowTransmissive(CaelixFrameConstants fc, RayDesc ray, uint medium, inout uint rng)
 {
@@ -431,8 +433,9 @@ float3 TraceShadowTransmissive(CaelixFrameConstants fc, RayDesc ray, uint medium
             float3 sss_albedo;
             float sss_probability;
             uint sss_steps;
+            const uint sss_flags = kRenderFlagSubsurface | kRenderFlagShadowSubsurface;
             CAELIX_BRANCH
-            if ((fc.flags & kRenderFlagSubsurface) != 0u &&
+            if ((fc.flags & sss_flags) == sss_flags &&
                 SubsurfaceEntry(block, sss_albedo, sss_probability, sss_steps))
             {
                 if (!(RandomFloat01(rng) < sss_probability))

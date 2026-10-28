@@ -69,7 +69,8 @@ hint.g)`, section 12.1); any positive weights keep the estimator unbiased. The l
 candidate stays live through the sun's draw (its evaluation is the expensive one); a kept sun candidate
 is drawn again from its saved random state. One shadow ray toward the kept candidate (glass occludes,
 as for the sun NEE; at the primary vertex with `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` the ray passes
-glass, attenuated, docs/SHADOW_TRANSMISSION.md). The segment that leaves the vertex sees the sky without the sun disk when the sun
+glass, attenuated, and with `CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE` also SSS voxels,
+docs/SHADOW_TRANSMISSION.md). The segment that leaves the vertex sees the sky without the sun disk when the sun
 NEE runs (as without light NEE).
 
 ## 4. MIS with the BSDF path

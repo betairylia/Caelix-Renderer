@@ -618,6 +618,12 @@ checked in Unity: the blit into the imported background RenderTexture, the layou
 reports for it after the barrier, the look of the rims under DLSS, and the TAA / motion vector path
 with the new pass order.
 
+C# mirror gap (2026-10-28, transmissive shadows): the library ABI has the render flag
+`CAELIX_RENDER_FLAG_SHADOW_SUBSURFACE` (1u << 7; with `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` and
+`CAELIX_RENDER_FLAG_SUBSURFACE` the primary vertex's shadow rays walk straight through SSS voxels, the
+"very high" level of docs/SHADOW_TRANSMISSION.md). The C# component does not expose it (nor the
+three levels off / high / very high) yet; the Unity side follows with the next packet change.
+
 ## Open questions for the owner
 
 1. (answered) Loading time: "Load on startup" on the plugin importer; P1 verifies it.
