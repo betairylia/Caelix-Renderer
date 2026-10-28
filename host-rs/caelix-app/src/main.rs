@@ -264,7 +264,9 @@ struct Args {
     no_shadow_transmission: bool,
     /// Lighting modes: no subsurface scattering walk (by default a path vertex on an SSS material,
     /// sss_model 1 in the materials JSON, runs the Henyey-Greenstein walk with probability
-    /// sss_probability; docs/SUBSURFACE.md). SSS voxels occlude shadow rays.
+    /// sss_probability; docs/SUBSURFACE.md, and the primary vertex's transmissive shadow rays enter SSS
+    /// voxels with the same probability and walk straight through them; docs/SHADOW_TRANSMISSION.md).
+    /// With the walk off every shadow ray stops at SSS voxels.
     #[arg(long)]
     no_sss: bool,
     /// Lighting modes: a lat-long (equirectangular) sky image, .exr or .hdr, converted to a

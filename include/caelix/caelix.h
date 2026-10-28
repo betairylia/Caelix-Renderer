@@ -489,9 +489,12 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
  * stored as an IEEE half, so a magnitude above 65504 is rejected and the GPU sees each value rounded
  * to half precision. An SSS voxel is an opaque code whose entry has sss_model CAELIX_SSS_MODEL_HG,
  * sss_probability > 0 and sss_steps > 0: with CAELIX_RENDER_FLAG_SUBSURFACE a path vertex on it runs
- * the random walk with probability sss_probability (docs/SUBSURFACE.md). Shadow rays do not read the
- * subsurface entry: an SSS voxel occludes them like any opaque voxel (also the transmissive shadow
- * rays of CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION). No kernel reads sss_params,
+ * the random walk with probability sss_probability (docs/SUBSURFACE.md). The transmissive shadow rays
+ * of CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION (with CAELIX_RENDER_FLAG_SUBSURFACE) enter an SSS voxel
+ * with its sss_probability and walk
+ * straight through the SSS voxels (times sss_albedo per voxel, occluded beyond sss_steps voxels;
+ * docs/SHADOW_TRANSMISSION.md); every other shadow ray stops at an SSS voxel like at any opaque voxel.
+ * No kernel reads sss_params,
  * texture_set or connect_group yet: they are validated, stored and uploaded.
  *
  * Built-in content, by encoding:
@@ -515,8 +518,11 @@ CAELIX_API CaelixResult caelix_scene_get_tlas(const CaelixScene* scene, uint64_t
 #define CAELIX_SSS_MODEL_NONE 0u /* no subsurface scattering: the opaque surface BSDF only */
 #define CAELIX_SSS_MODEL_HG 1u   /* the Henyey-Greenstein lattice walk (docs/SUBSURFACE.md): sss_probability,
                                     sss_albedo, sss_anisotropy (g), sss_steps (the step cap, 0 = no walk:
-                                    the entry acts as none); sss_params unused. Shadow rays stop at such
-                                    voxels (they occlude like any opaque voxel) */
+                                    the entry acts as none); sss_params unused. The transmissive shadow
+                                    rays (CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION with
+                                    CAELIX_RENDER_FLAG_SUBSURFACE) enter such voxels with
+                                    sss_probability and walk straight through them; other shadow rays
+                                    stop at them like at any opaque voxel */
 
 /* One material table entry. 112 bytes. All values are linear. Every float must be finite with a
    magnitude <= 65504 (the GPU stores halves). */
@@ -958,7 +964,11 @@ typedef enum CaelixDebugView
                                                 closest-hit queries from interface to interface (at
                                                 most 8): a medium attenuates by its extinction (tinted
                                                 glass casts coloured shadows); every opaque voxel
-                                                occludes, SSS voxels (CAELIX_SSS_MODEL_HG) too. A
+                                                occludes, except an SSS voxel (CAELIX_SSS_MODEL_HG) with
+                                                CAELIX_RENDER_FLAG_SUBSURFACE: the ray enters it with
+                                                its sss_probability and walks
+                                                straight through the SSS voxels (sss_albedo per voxel,
+                                                occluded beyond sss_steps voxels). A
                                                 path whose primary vertex ran such an NEE does not
                                                 count the sun disk (sun NEE) or the lamps that the
                                                 light NEE samples beyond the near field on its BSDF

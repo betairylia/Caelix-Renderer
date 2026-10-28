@@ -153,6 +153,7 @@ caelix_add_shaders(caelix_renderer CAELIX_SHADER_SPV
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_scene_trace.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_ray.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_voxel_cursor.hlsl
+    ${PROJECT_SOURCE_DIR}/shaders/render/caelix_random.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_shading.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_light_nee.hlsl
     ${PROJECT_SOURCE_DIR}/shaders/render/caelix_subsurface.hlsl

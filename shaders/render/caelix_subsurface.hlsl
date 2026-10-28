@@ -18,13 +18,15 @@
 // Material reads: the vertex test loads the hot entry's sss word (CaelixMaterialSssWord, 4 bytes, a
 // cache hit after ShadeVoxelHit); an SSS candidate then loads w0..w3 of its subsurface entry (16 bytes:
 // one minus sss_albedo, anisotropy, steps, probability and model), and so does every voxel the walk
-// looks at.
+// looks at (SubsurfaceVoxel, defined with SubsurfaceEntry in render/caelix_scene_trace.hlsl under
+// CAELIX_SUBSURFACE: the transmissive shadow ray reads the same entries).
 //
 // Compiled only with CAELIX_SUBSURFACE 1: the trace kernel variants caelix_path_trace_sss and
 // caelix_path_trace_sss_no_light_nee (render/caelix_path_trace_sss*.hlsl), which the renderer binds
 // for the lighting frames of a scene whose material table has an SSS entry. The default 0 (defined
-// below) compiles nothing of this file, so the main trace kernels keep their code. Shadow rays stop at
-// SSS voxels like at any opaque voxel (docs/SHADOW_TRANSMISSION.md).
+// below) compiles nothing of this file, so the main trace kernels keep their code. The primary vertex's
+// transmissive shadow ray enters SSS voxels with the same probability and walks straight through them
+// (docs/SHADOW_TRANSMISSION.md); the other shadow rays stop at SSS voxels like at any opaque voxel.
 #ifndef CAELIX_SUBSURFACE_HLSL
 #define CAELIX_SUBSURFACE_HLSL
 
@@ -84,23 +86,6 @@ float3 SampleHenyeyGreenstein(float3 w, float g, inout uint rng)
 
 // ---------------------------------------------------------------------------
 // The walk
-
-// The voxel of block value `block` is an SSS voxel of the HG walk: opaque, model kSssModelHg,
-// sss_probability > 0 and sss_steps > 0. One 16-byte load of the subsurface entry (w0..w3) for an
-// opaque code, none for the others; `albedo` = its sss_albedo (0 when it is not an SSS voxel).
-bool SubsurfaceVoxel(uint block, out float3 albedo)
-{
-    albedo = float3(0.0f, 0.0f, 0.0f);
-    CAELIX_BRANCH
-    if (!IsOpaque(int(block)))
-    {
-        return false;
-    }
-    const uint4 w = CAELIX_LOAD_U32x4(g_subsurfaceTable + uint64_t(CaelixMaterialCode(block)) * kSubsurfaceBytes);
-    const bool sss = ((w.w >> 16) & 0xFFu) == kSssModelHg && CaelixHalfLo(w.w) > 0.0f && (w.z & 0xFFu) != 0u;
-    albedo = sss ? 1.0f - float3(CaelixHalfLo(w.x), CaelixHalfHi(w.x), CaelixHalfLo(w.y)) : albedo;
-    return sss;
-}
 
 // The walk from the SSS face hit `hit` of a ray with world direction `ray_direction`, in the hit entity's
 // voxel grid (docs/SUBSURFACE.md section 2). `g` (clamped) and `steps` (> 0) come from the entry

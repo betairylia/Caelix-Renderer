@@ -3,9 +3,10 @@
 // binding 0) and reads the scene's tables (page table, slot rows, group infos,
 // entity infos) through the device addresses in CaelixFrameConstants. The
 // integrator above this file uses only TraceScene, TraceShadow, TraceShadowTransmissive (the
-// transmissive shadow ray of docs/SHADOW_TRANSMISSION.md: glass only, a chain of closest-hit
-// queries), the voxel cursor and the entity transform helpers (render/caelix_voxel_cursor.hlsl,
-// included here; the subsurface walk of docs/SUBSURFACE.md moves through the voxel grid with them),
+// transmissive shadow ray of docs/SHADOW_TRANSMISSION.md: a chain of closest-hit queries through
+// glass; in the CAELIX_SUBSURFACE kernels also a straight walk through SSS voxels), the voxel cursor
+// and the entity transform helpers (render/caelix_voxel_cursor.hlsl, included here; the subsurface
+// walk of docs/SUBSURFACE.md and the shadow ray's SSS walk move through the voxel grid with them),
 // VoxelIdHash and the block code in TraceResult::attrib; nothing above it knows what a record, a slot
 // row or a group is.
 //
@@ -229,6 +230,12 @@ float3 EntityPrevWorld(CaelixFrameConstants fc, uint group, float3 p)
 
 // The voxel cursor and the entity transform helpers by entity id (they read TraceResult).
 #include "render/caelix_voxel_cursor.hlsl"
+// RandomFloat01: the entry draw of an SSS voxel in TraceShadowTransmissive.
+#include "render/caelix_random.hlsl"
+
+#ifndef CAELIX_SUBSURFACE
+#define CAELIX_SUBSURFACE 0
+#endif
 
 // The cap of closest-hit queries (hops) of the transmissive shadow ray.
 static const uint kShadowMaxHops = 8;
@@ -257,13 +264,139 @@ bool ShadowOccluded(float3 transmittance)
     return max(transmittance.r, max(transmittance.g, transmittance.b)) < kShadowTransmitCutoff;
 }
 
+#if CAELIX_SUBSURFACE
+
+// The subsurface entry of the block `block`: true for an SSS voxel of the HG walk (opaque, model
+// kSssModelHg, sss_probability > 0 and sss_steps > 0) with its sss_albedo, probability and step count;
+// one 16-byte load of the subsurface entry (w0..w3) for an opaque code, none for the others (albedo 0,
+// probability 0, steps 0 when it is not an SSS voxel).
+bool SubsurfaceEntry(uint block, out float3 albedo, out float probability, out uint steps)
+{
+    albedo = float3(0.0f, 0.0f, 0.0f);
+    probability = 0.0f;
+    steps = 0u;
+    CAELIX_BRANCH
+    if (!IsOpaque(int(block)))
+    {
+        return false;
+    }
+    const uint4 w = CAELIX_LOAD_U32x4(g_subsurfaceTable + uint64_t(CaelixMaterialCode(block)) * kSubsurfaceBytes);
+    const float p = CaelixHalfLo(w.w);
+    const uint s = w.z & 0xFFu;
+    const bool sss = ((w.w >> 16) & 0xFFu) == kSssModelHg && p > 0.0f && s != 0u;
+    albedo = sss ? 1.0f - float3(CaelixHalfLo(w.x), CaelixHalfHi(w.x), CaelixHalfLo(w.y)) : albedo;
+    probability = sss ? p : 0.0f;
+    steps = sss ? s : 0u;
+    return sss;
+}
+
+// SubsurfaceEntry with the albedo only (the walk's per-voxel read).
+bool SubsurfaceVoxel(uint block, out float3 albedo)
+{
+    float probability;
+    uint steps;
+    return SubsurfaceEntry(block, albedo, probability, steps);
+}
+
+// ShadowSubsurfaceWalk results.
+static const uint kShadowWalkOccluded = 0;  // a non-SSS opaque voxel, or the step cap: the ray is occluded
+static const uint kShadowWalkExit = 1;      // the ray left the SSS voxels: the chain continues at `exit_origin`
+static const uint kShadowWalkEnd = 2;       // the ray's end point lies inside the SSS voxels (a lamp ray): visible
+
+// The straight walk of a shadow ray with unit world direction `direction` through the SSS voxels it
+// entered at `hit` (an SSS voxel whose subsurface entry gave `entry_albedo` and `steps`; the chain has
+// already drawn the entry): a 3D DDA through the hit entity's voxel grid from hit.object_hit, with the
+// voxel cursor (other entities count as air, as in SubsurfaceWalk). Every SSS voxel visited (the entry
+// voxel included) multiplies `transmittance` by its sss_albedo; a non-SSS opaque voxel occludes; more
+// than `steps` SSS voxels occlude (the walk is dead, the rule of SubsurfaceWalk); any other voxel
+// (air, glass, an absent brick) is the exit: `exit_origin` = the world point on the leaving face pushed
+// off along the face normal, `exit_block` its block value, `travelled` the distance along the ray from
+// the hit to the pushed-off origin. `remaining` = the ray length left after the hit: a boundary at or
+// beyond it means the ray's end lies inside the current voxel (kShadowWalkEnd).
+uint ShadowSubsurfaceWalk(CaelixFrameConstants fc, TraceResult hit, float3 direction, float3 entry_albedo,
+                          uint steps, float remaining, inout float3 transmittance, out float3 exit_origin,
+                          out uint exit_block, out float travelled)
+{
+    exit_origin = float3(0.0f, 0.0f, 0.0f);
+    exit_block = 0u;
+    travelled = 0.0f;
+    VoxelCursor c = VoxelCursorFromHit(fc, hit);
+    const float3 d = EntityObjectDirectionById(fc, c.entity, direction);
+    // The entry point, clamped into the entry voxel (object_hit lies on its face up to rounding).
+    const float3 p = clamp(hit.object_hit, float3(c.voxel), float3(c.voxel) + 1.0f);
+    const float3 t_delta = 1.0f / max(abs(d), 1e-8f);
+    const int3 step = int3(d.x >= 0.0f ? 1 : -1, d.y >= 0.0f ? 1 : -1, d.z >= 0.0f ? 1 : -1);
+    const float3 next = float3(c.voxel) + float3(d.x >= 0.0f ? 1.0f : 0.0f, d.y >= 0.0f ? 1.0f : 0.0f,
+                                                 d.z >= 0.0f ? 1.0f : 0.0f);
+    float3 t_max = abs(next - p) * t_delta;
+    transmittance *= entry_albedo;
+    CAELIX_LOOP
+    for (uint i = 0; i < steps; ++i)
+    {
+        // The nearest voxel boundary (ties: x, then y, then z), then the step across it.
+        float t;
+        int3 delta;
+        if (t_max.x <= t_max.y && t_max.x <= t_max.z)
+        {
+            t = t_max.x;
+            t_max.x += t_delta.x;
+            delta = int3(step.x, 0, 0);
+        }
+        else if (t_max.y <= t_max.z)
+        {
+            t = t_max.y;
+            t_max.y += t_delta.y;
+            delta = int3(0, step.y, 0);
+        }
+        else
+        {
+            t = t_max.z;
+            t_max.z += t_delta.z;
+            delta = int3(0, 0, step.z);
+        }
+        if (t >= remaining)
+        {
+            return kShadowWalkEnd;
+        }
+        VoxelCursorStep(fc, c, delta);
+        const uint block = VoxelCursorBlock(c);
+        float3 albedo;
+        CAELIX_BRANCH
+        if (SubsurfaceVoxel(block, albedo))
+        {
+            transmittance *= albedo;
+            continue;
+        }
+        if (IsOpaque(int(block)))
+        {
+            return kShadowWalkOccluded;
+        }
+        // The exit through the face crossed by this step: into the exit voxel, pushed off along the face
+        // normal (the push-off moves the origin along the ray too).
+        const float3 n = EntityWorldDirectionById(fc, c.entity, float3(delta));
+        exit_origin = EntityWorldPointById(fc, c.entity, p + d * t) + K_RAY_ORIGIN_PUSH_OFF * n;
+        exit_block = block;
+        travelled = t + K_RAY_ORIGIN_PUSH_OFF * dot(n, direction);
+        return kShadowWalkExit;
+    }
+    return kShadowWalkOccluded;
+}
+
+#endif  // CAELIX_SUBSURFACE
+
 // The transmittance of the shadow ray `ray` (unit direction; [0, TMax)) that starts in the transparent
 // medium `medium` (a face-free transparent id, 0 = air), in a straight line (no refraction,
-// docs/SHADOW_TRANSMISSION.md): opaque voxels occlude (SSS voxels too), transparent media attenuate by
-// their extinction. A chain of up to kShadowMaxHops closest-hit queries, interface to interface (a glass
-// exit is a hit on an air cell with face bits): the common case (air, nothing or an opaque voxel on the
-// ray) costs one query. After the hop cap: 0.
-float3 TraceShadowTransmissive(CaelixFrameConstants fc, RayDesc ray, uint medium)
+// docs/SHADOW_TRANSMISSION.md): opaque voxels occlude, transparent media attenuate by their extinction.
+// A chain of up to kShadowMaxHops closest-hit queries, interface to interface (a glass exit is a hit on
+// an air cell with face bits): the common case (air, nothing or an opaque voxel on the ray) costs one
+// query. After the hop cap: 0.
+// SSS voxels: in the CAELIX_SUBSURFACE kernels with kRenderFlagSubsurface (the vertex walk's flag) the
+// ray enters an SSS voxel with its sss_probability (one number of `rng`; Russian roulette without a weight) and walks straight through the SSS voxels
+// (ShadowSubsurfaceWalk: sss_albedo per voxel visited, dead beyond the entry material's sss_steps
+// voxels, a non-SSS opaque voxel occludes); the walk and its exit use one hop of the cap, and the exit
+// point starts the next hop. Without CAELIX_SUBSURFACE or without the flag an SSS voxel occludes like
+// any opaque voxel (`rng` is not used).
+float3 TraceShadowTransmissive(CaelixFrameConstants fc, RayDesc ray, uint medium, inout uint rng)
 {
     float3 transmittance = float3(1.0f, 1.0f, 1.0f);
     uint cur = medium;
@@ -291,7 +424,41 @@ float3 TraceShadowTransmissive(CaelixFrameConstants fc, RayDesc ray, uint medium
         const uint block = (h.attrib >> 16) & 0xFFFFu;
         if (IsOpaque(int(block)))
         {
-            // An opaque voxel occludes (an SSS voxel too).
+#if CAELIX_SUBSURFACE
+            // An SSS voxel: with its sss_probability the ray enters and walks straight through the SSS
+            // voxels (Russian roulette, no weight: the estimate of p times the transmittance is unbiased);
+            // otherwise it occludes.
+            float3 sss_albedo;
+            float sss_probability;
+            uint sss_steps;
+            CAELIX_BRANCH
+            if ((fc.flags & kRenderFlagSubsurface) != 0u &&
+                SubsurfaceEntry(block, sss_albedo, sss_probability, sss_steps))
+            {
+                if (!(RandomFloat01(rng) < sss_probability))
+                {
+                    return float3(0.0f, 0.0f, 0.0f);
+                }
+                float3 exit_origin;
+                uint exit_block;
+                float travelled;
+                const uint walk = ShadowSubsurfaceWalk(fc, h, hop.Direction, sss_albedo, sss_steps, remaining,
+                                                       transmittance, exit_origin, exit_block, travelled);
+                if (walk == kShadowWalkOccluded || ShadowOccluded(transmittance))
+                {
+                    return float3(0.0f, 0.0f, 0.0f);
+                }
+                if (walk == kShadowWalkEnd)
+                {
+                    return transmittance;
+                }
+                cur = CaelixTransparentId(exit_block);
+                hop.Origin = exit_origin;
+                remaining -= travelled;
+                continue;
+            }
+#endif
+            // An opaque voxel occludes.
             return float3(0.0f, 0.0f, 0.0f);
         }
         // An interface voxel (glass entry, glass exit = an air cell with face bits, glass to glass):

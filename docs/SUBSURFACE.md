@@ -14,8 +14,10 @@ cap, exit = diffuse vertex, entry jitter always on, one phase function for now (
 `sss_steps` 1..255 (0 = never enters: treated as a non-SSS material); `sss_params` unused by HG. An SSS
 voxel = an OPAQUE code with `sss_model == HG`, `sss_probability > 0` and `sss_steps > 0`. Other model values
 are stored but ignored by the kernels (not SSS). The GPU subsurface entry layout is in
-docs/MATERIALS.md (w0 / w1 one minus sss_albedo and g, w2 steps, w3 probability + model). Shadow rays do
-not read it: an SSS voxel occludes every shadow ray like any opaque voxel (docs/SHADOW_TRANSMISSION.md).
+docs/MATERIALS.md (w0 / w1 one minus sss_albedo and g, w2 steps, w3 probability + model). In the SSS
+kernels the primary vertex's transmissive shadow ray reads it too: it enters an SSS voxel with its
+sss_probability and walks straight through the SSS voxels (sss_albedo per voxel, occluded beyond sss_steps
+voxels); every other shadow ray stops at an SSS voxel like at any opaque voxel (docs/SHADOW_TRANSMISSION.md).
 `CaelixMaterialSssWord(table, code)`
 (shaders/common/caelix_material.hlsl) is one 4-byte load of the hot entry's w5 (the vertex test; a cache
 hit after ShadeVoxelHit, whose CaelixGetMaterial loads the same 16-byte row).
@@ -28,7 +30,9 @@ caelix_scene_trace.hlsl, which came with the first version of docs/SHADOW_TRANSM
 entity's voxel grid (object space; rigid transforms, scale 1).
 
 - `SubsurfaceVoxel(block, out albedo)`: opaque, then ONE 16-byte load of the subsurface entry (w0..w3):
-  model HG, probability > 0 and steps > 0; `albedo` = `1 - one_minus_albedo`.
+  model HG, probability > 0 and steps > 0; `albedo` = `1 - one_minus_albedo`. Defined, with
+  `SubsurfaceEntry` (also probability and steps), in caelix_scene_trace.hlsl under `#if
+  CAELIX_SUBSURFACE`: the transmissive shadow ray uses the same reads.
 - `SampleHenyeyGreenstein(w, g, rng)`: inversion of the HG cosine (|g| < 1e-3: uniform sphere), the
   azimuth around `w` with `OrthonormalBasis(w, t, b)` (shaders/render/caelix_shading.hlsl: the Duff et al.
   construction of SampleSunDirection, which keeps its own copy). Two numbers.
@@ -99,8 +103,8 @@ the increment: no next segment, only the emission counts).
   compiles them as kernels; lib/CMakeLists.txt lists them). `CAELIX_SUBSURFACE` defaults to 0
   (caelix_subsurface.hlsl). With 0 the main kernels `caelix_path_trace` and
   `caelix_path_trace_no_light_nee` contain no walk: TracePath has no `SubsurfaceVertex`. The SSS variants
-  hold only the vertex walk; the shadow rays are the same in all four kernels and stop at SSS voxels
-  (docs/SHADOW_TRANSMISSION.md).
+  hold the vertex walk and the straight SSS walk of the primary vertex's transmissive shadow ray; in the
+  main kernels every shadow ray stops at SSS voxels (docs/SHADOW_TRANSMISSION.md).
 - `RenderKernels` (lib/src/render/render_kernels.*): four trace pipelines, the same trace set layout:
   `trace()`, `trace_no_light_nee()`, `trace_sss()`, `trace_sss_no_light_nee()`.
 - Renderer (renderer_render.cpp): `sss_kernel = lighting && scene_.has_subsurface()` picks the SSS pair
@@ -134,8 +138,8 @@ the increment: no next segment, only the emission counts).
    (d) dead walks: a slab 16 voxels thick, steps 1, g 0.9, p 1, sss_albedo 1, white sky: the lit top face
    is 0.0054 (checked < 0.05; a walk survives only when its single step turns back out of the face).
 3. Passing: the three "shadow transmission" tests (their SSS slab scene binds the SSS kernel without the
-   subsurface flag; since the removal of the shadow ray's SSS part the slab occludes, docs/SHADOW_TRANSMISSION.md
-   section 4) and the light NEE tests. `caelix_frame_layout_test` checks the uniform block of both new variants;
+   subsurface flag; since the straight SSS walk of the shadow ray experiment the slab transmits
+   sss_albedo per voxel, docs/SHADOW_TRANSMISSION.md section 4) and the light NEE tests. `caelix_frame_layout_test` checks the uniform block of both new variants;
    `caelix_abi_c99` touches `CAELIX_RENDER_FLAG_SUBSURFACE`.
 
 ## 6. Measurements

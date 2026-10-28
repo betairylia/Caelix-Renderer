@@ -26,7 +26,9 @@
 //                   sun cone and traces a shadow ray (TracePath, SunNextEvent).
 //                   With kRenderFlagShadowTransmission the shadow rays of the PRIMARY
 //                   vertex (sun and lamps) pass transparent voxels in a
-//                   straight line (TraceShadowTransmissive, docs/SHADOW_TRANSMISSION.md).
+//                   straight line (TraceShadowTransmissive, docs/SHADOW_TRANSMISSION.md);
+//                   in the CAELIX_SUBSURFACE variants they also enter SSS voxels with
+//                   their sss_probability and walk straight through them.
 //                   With kRenderFlagSubsurface (only in the CAELIX_SUBSURFACE kernel variants
 //                   caelix_path_trace_sss*) a vertex on an SSS voxel may run the subsurface
 //                   walk instead of its BSDF (SubsurfaceVertex, docs/SUBSURFACE.md).
@@ -174,8 +176,9 @@ bool PreviousPixel(CaelixFrameConstants fc, float3 p, out float2 pixel, out floa
 // Lambert lobe, sun_radiance * omega * dot(N, L) / pi when L is unoccluded, else 0
 // (the albedo of the vertex is in the caller's throughput, as for the bounces).
 // `transmissive`: the shadow ray is TraceShadowTransmissive from the medium `medium` (the
-// transparent id the vertex lies in, 0 = air) and the radiance is multiplied by its
-// transmittance; else TraceShadow (any voxel occludes).
+// transparent id the vertex lies in, 0 = air; in the CAELIX_SUBSURFACE variants it draws the
+// entry of an SSS voxel from `rng`) and the radiance is multiplied by its transmittance; else
+// TraceShadow (any voxel occludes).
 float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, bool transmissive, uint medium,
                     inout uint rng)
 {
@@ -194,7 +197,7 @@ float3 SunNextEvent(CaelixFrameConstants fc, float3 origin, float3 normal, bool 
     CAELIX_BRANCH
     if (transmissive)
     {
-        transmittance = TraceShadowTransmissive(fc, shadow, medium);
+        transmittance = TraceShadowTransmissive(fc, shadow, medium, rng);
     }
     else if (TraceShadow(fc, shadow))
     {
@@ -343,8 +346,9 @@ static const uint kNeeTracedLamp = 2u;
 // n_r): the lamp candidate, the sun candidate when `sun` (the sun NEE runs at this vertex), the choice
 // between them and one shadow ray. Returns the demodulated radiance (the caller multiplies the
 // throughput) and the state of the segment that leaves the vertex. `transmissive`: the shadow ray is
-// TraceShadowTransmissive from the medium `medium` and the kept candidate's radiance is multiplied by
-// its transmittance (the choice still uses the unoccluded contributions); else TraceShadow. `hint`:
+// TraceShadowTransmissive from the medium `medium` (in the CAELIX_SUBSURFACE variants it draws the entry
+// of an SSS voxel from `nee_rng`) and the kept candidate's radiance is multiplied by its transmittance
+// (the choice still uses the unoccluded contributions); else TraceShadow. `hint`:
 // the visibility hint (sun, lamp) that multiplies the choice weights (floored at kHintFloor); (1, 1)
 // leaves them unchanged. `traced` receives which shadow ray was traced (kNeeTraced*), `visible` whether
 // it reached its candidate (TraceShadow found nothing, or a transmittance above 0).
@@ -396,7 +400,7 @@ float3 NextEventAtVertex(CaelixFrameConstants fc, float3 x_r, float3 n_r, bool s
             CAELIX_BRANCH
             if (transmissive)
             {
-                transmittance = TraceShadowTransmissive(fc, shadow, medium);
+                transmittance = TraceShadowTransmissive(fc, shadow, medium, nee_rng);
             }
             visible = any(transmittance > 0.0f);
             radiance = c.contribution * (w_sum / (pick_sun ? w_sun : w_lamp)) * transmittance;
@@ -701,7 +705,9 @@ DeltaChain RunDeltaChain(CaelixFrameConstants fc, RayDesc ray, TraceResult prima
 // that leaves a specular-lobe vertex (no NEE there, transparent vertices included)
 // still sees the disk, so the sun is counted once on every path. Shadow rays treat
 // glass as opaque, except the primary vertex's with kRenderFlagShadowTransmission
-// (TraceShadowTransmissive: straight through transparent voxels, attenuated).
+// (TraceShadowTransmissive: straight through transparent voxels, attenuated; in the
+// CAELIX_SUBSURFACE variants also straight through SSS voxels, entered with their
+// sss_probability and attenuated by their sss_albedo).
 // Such a primary NEE CLAIMS the light it saw through the media: every segment after a
 // transparent (delta) bounce vertex, up to the first opaque vertex, sees the sky without
 // the sun disk (sun NEE) and carries kSegmentLampNee without the MIS bit (light NEE:

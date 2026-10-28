@@ -17,9 +17,11 @@ whose table has an SSS entry; the main trace kernels read no subsurface entry): 
 (`CAELIX_RENDER_FLAG_SUBSURFACE`, `shaders/render/caelix_subsurface.hlsl`, `docs/SUBSURFACE.md`). An SSS
 voxel is an opaque code whose entry has `sss_model` = `CAELIX_SSS_MODEL_HG` (1), `sss_probability` > 0
 and `sss_steps` > 0. The walk tests a vertex with the hot entry's w5 (`CaelixMaterialSssWord`, one 4-byte
-load) and reads w0..w3 of the subsurface entry of the entry voxel and of every voxel it looks at. Shadow
-rays read no subsurface entry: an SSS voxel occludes them like any opaque voxel (also the transmissive
-shadow ray of `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION`, `docs/SHADOW_TRANSMISSION.md`). No kernel reads
+load) and reads w0..w3 of the subsurface entry of the entry voxel and of every voxel it looks at. The
+transmissive shadow ray of `CAELIX_RENDER_FLAG_SHADOW_TRANSMISSION` reads the same words in these kernels:
+it enters an SSS voxel with its `sss_probability` and walks straight through the SSS voxels
+(`docs/SHADOW_TRANSMISSION.md`); every other shadow ray reads no subsurface entry and stops at an SSS
+voxel like at any opaque voxel. No kernel reads
 `sss_params`, `texture_set` or `connect_group` yet. `MaterialTable` counts the SSS entries
 (`has_subsurface()`, exposed by `Scene::has_subsurface()`, which chooses the trace kernel).
 
