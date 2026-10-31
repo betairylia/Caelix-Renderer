@@ -77,6 +77,7 @@ def main() -> int:
     for source, name in CPP_LICENSES:
         shutil.copy2(args.deps / source, licenses / name)
     shutil.copy2(args.ngx / "LICENSE.txt", licenses / "NVIDIA-DLSS-LICENSE.txt")
+    shutil.copy2(ROOT / "LICENSE", licenses / "Caelix-Renderer-LICENSE.txt")
 
     # cargo-about refuses a redirected stdout on Windows: it writes the file itself.
     crates = licenses / "rust-crates.txt"

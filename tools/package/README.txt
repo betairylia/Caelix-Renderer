@@ -5,7 +5,7 @@ A viewer for Caelix voxel worlds (.cxw files). It path traces the world on the
 GPU with Vulkan ray queries, denoises with NVIDIA NRD and can upscale with
 NVIDIA DLSS.
 
-This is a test build for friends. It is not a product.
+This is a development build. It is not a product.
 
 
 Requirements
@@ -62,9 +62,9 @@ Screenshots go to the folder of caelix-app.exe.
 Terms
 -----
 
-This software is shared for private, non-commercial use, "as is", without
-any warranty. Do not sell it and do not share it further without the
-author's permission.
+The Caelix renderer code and this viewer are licensed under the MIT License
+(licenses/Caelix-Renderer-LICENSE.txt), "as is", without any warranty.
+Source: https://github.com/betairylia/Caelix-RenderingPlugin
 
 The NVIDIA components (NVIDIA Real-Time Denoisers, linked into
 caelix_renderer.dll; nvngx_dlss.dll and nvngx_dlssd.dll, NVIDIA DLSS) are
