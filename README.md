@@ -1471,3 +1471,26 @@ to disable them for a run.
   Community LLVM directory (`VC/Tools/Llvm/x64/bin`); set your own value if your
   installation is different. Do not use `VC/Tools/Llvm/bin`: its
   `libclang.dll` is 32-bit.
+
+## Provenance
+
+```
+Provenance and licence note
+
+Parts of this repository were copied or ported from my projects Caelix and
+Caelix-Core, which are published under GPL-3.0. This includes, for example,
+shaders/render/caelix_brick_trace.hlsl, caelix_shading.hlsl, caelix_random.hlsl,
+caelix_cross_resolve.hlsl, data/glass-palette.json and host-rs/caelix-cxw.
+Nothing was taken from Caelix-physics (Unity Companion License).
+
+I hold the copyright in that code, or have permission from everyone who does.
+No other person contributed code to this repository. Parts of it were written
+with AI coding tools (Claude by Anthropic); no third party holds rights in them.
+I license this whole repository, including that code, under the MIT License
+in LICENSE. The GPL-3.0 terms of Caelix and Caelix-Core do not apply to it.
+
+Third-party components are listed in third_party/NOTICES.md; the Rust crate
+licenses are in licenses/rust-crates.txt of each release package.
+
+betairylia, 2026-11-01
+```
